@@ -3,8 +3,13 @@
 // - replaceable kinds (0, 3, 10000-19999): only the latest per
 //   (pubkey, kind) MUST be stored/returned; equal-timestamp ties keep the
 //   lowest id.
+// - ephemeral kinds (20000-29999): not stored at all, but still relayed
+//   live to matching open subscriptions.
 // - addressable kinds (30000-39999): only the latest per
 //   (pubkey, kind, d-tag) MUST be stored/returned.
+// - undefined ranges (45-999, >=40000): stored like regular kinds --
+//   see the comment at storage.ts's default branch for why. Locked in
+//   by a test so this doesn't get "hardened" into a rejection later.
 import { describe, expect, it } from "vitest";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
@@ -23,6 +28,38 @@ describe("NIP-01 regular kinds", () => {
 
     const events = await collectStored(conn, "subRegular", [
       { kinds: [1], authors: [OWNER_PUBKEY_HEX] },
+    ]);
+
+    expect(events.map((e) => e.id).sort()).toEqual([first.id, second.id].sort());
+    conn.close();
+  });
+});
+
+describe("NIP-01 undefined kind ranges", () => {
+  it("stores every event of an undefined kind in 45-999, not just the latest", async () => {
+    const conn = await connectRelay();
+    const first = signEvent(OWNER_SECRET_KEY_HEX, { kind: 500, content: "first", created_at: 100 });
+    const second = signEvent(OWNER_SECRET_KEY_HEX, { kind: 500, content: "second", created_at: 200 });
+    await publish(conn, first);
+    await publish(conn, second);
+
+    const events = await collectStored(conn, "subUndefinedLow", [
+      { kinds: [500], authors: [OWNER_PUBKEY_HEX] },
+    ]);
+
+    expect(events.map((e) => e.id).sort()).toEqual([first.id, second.id].sort());
+    conn.close();
+  });
+
+  it("stores every event of an undefined kind >= 40000, not just the latest", async () => {
+    const conn = await connectRelay();
+    const first = signEvent(OWNER_SECRET_KEY_HEX, { kind: 40001, content: "first", created_at: 100 });
+    const second = signEvent(OWNER_SECRET_KEY_HEX, { kind: 40001, content: "second", created_at: 200 });
+    await publish(conn, first);
+    await publish(conn, second);
+
+    const events = await collectStored(conn, "subUndefinedHigh", [
+      { kinds: [40001], authors: [OWNER_PUBKEY_HEX] },
     ]);
 
     expect(events.map((e) => e.id).sort()).toEqual([first.id, second.id].sort());
@@ -114,6 +151,50 @@ describe("NIP-01 replaceable kinds", () => {
     ]);
 
     expect(events.map((e) => e.id)).toEqual([expected!.id]);
+    conn.close();
+  });
+});
+
+describe("NIP-01 ephemeral kinds", () => {
+  it("does not persist an ephemeral-kind event", async () => {
+    const conn = await connectRelay();
+    const event = signEvent(OWNER_SECRET_KEY_HEX, { kind: 20000, content: "ephemeral" });
+    const [, , ok] = await publish(conn, event);
+    expect(ok).toBe(true);
+
+    const events = await collectStored(conn, "subEphemeral", [
+      { kinds: [20000], authors: [OWNER_PUBKEY_HEX] },
+    ]);
+
+    expect(events).toEqual([]);
+    conn.close();
+  });
+
+  it("does not persist an ephemeral-kind event at the top of its range", async () => {
+    const conn = await connectRelay();
+    const event = signEvent(OWNER_SECRET_KEY_HEX, { kind: 29999, content: "ephemeral" });
+    await publish(conn, event);
+
+    const events = await collectStored(conn, "subEphemeralTop", [
+      { kinds: [29999], authors: [OWNER_PUBKEY_HEX] },
+    ]);
+
+    expect(events).toEqual([]);
+    conn.close();
+  });
+
+  it("still relays an ephemeral event live to an open subscription", async () => {
+    const conn = await connectRelay();
+    conn.send(["REQ", "subLive", { kinds: [20001], authors: [OWNER_PUBKEY_HEX] }]);
+    await conn.nextMessage(); // EOSE for the (empty) initial snapshot
+
+    const event = signEvent(OWNER_SECRET_KEY_HEX, { kind: 20001, content: "live" });
+    await publish(conn, event); // consumes the OK frame
+
+    const frame = await conn.nextMessage();
+    expect(frame[0]).toBe("EVENT");
+    expect(frame[1]).toBe("subLive");
+    expect((frame[2] as { id: string }).id).toBe(event.id);
     conn.close();
   });
 });

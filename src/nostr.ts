@@ -21,9 +21,16 @@ export type Filter = {
   [tagKey: `#${string}`]: unknown;
 };
 
-// Replaceable and addressable kind ranges (nips/01.md "Kinds").
+// Replaceable, ephemeral, and addressable kind ranges (nips/01.md
+// "Kinds"). Everything outside these three -- regular kinds, and the
+// spec-undefined 45-999 and >=40000 ranges -- falls through storage.ts's
+// default branch and is stored like a regular event.
 export function isReplaceableKind(kind: number): boolean {
   return kind === 0 || kind === 3 || (kind >= 10000 && kind < 20000);
+}
+
+export function isEphemeralKind(kind: number): boolean {
+  return kind >= 20000 && kind < 30000;
 }
 
 export function isAddressableKind(kind: number): boolean {

@@ -1,5 +1,12 @@
 import { buildFilterQuery } from "./filters";
-import { dTagValue, type Filter, isAddressableKind, isReplaceableKind, type NostrEvent } from "./nostr";
+import {
+  dTagValue,
+  type Filter,
+  isAddressableKind,
+  isEphemeralKind,
+  isReplaceableKind,
+  type NostrEvent,
+} from "./nostr";
 
 interface EventRow extends Record<string, string | number | null> {
   id: string;
@@ -77,9 +84,16 @@ interface StoreResult {
 
 // NIP-01 "Kinds" storage rules: regular kinds keep every event;
 // replaceable/addressable kinds keep only the newest per key, with
-// equal-`created_at` ties broken by the lowest id. Duplicate and
-// already-expired checks happen before this is called (relay.ts).
+// equal-`created_at` ties broken by the lowest id; ephemeral kinds are
+// never written to a row at all -- `stored` is still set to the event so
+// relay.ts's caller broadcasts it live, but nothing here inserts a row
+// for it. Duplicate and already-expired checks happen before this is
+// called (relay.ts).
 export function storeEvent(sql: SqlStorage, event: NostrEvent): StoreResult {
+  if (isEphemeralKind(event.kind)) {
+    return { ok: true, message: "", stored: event };
+  }
+
   if (isReplaceableKind(event.kind)) {
     const existing = sql
       .exec<{ id: string; created_at: number }>(
@@ -114,6 +128,11 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent): StoreResult {
     return { ok: true, message: "", stored: event };
   }
 
+  // Regular kinds, and the spec-undefined 45-999/>=40000 ranges, land
+  // here and are stored like regular events: 45-999 holds live assigned
+  // kinds, writes are owner-only so permissiveness costs nothing, and
+  // storing too much is recoverable while rejecting the owner's own
+  // events is not.
   insertEventRow(sql, event, expirationOf(event));
   return { ok: true, message: "", stored: event };
 }

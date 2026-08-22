@@ -72,3 +72,23 @@ above. Specifically:
   event.
 
 No baseline in `docs/baselines.json` changes as a result of this chunk.
+
+## Chunk 5 audit — ephemeral kinds (20000-29999) were being stored
+
+`storeEvent` (storage.ts) only special-cased replaceable and addressable
+kinds; anything else, including ephemeral kinds, fell through to the
+plain-insert branch and was written at the full `3 + 2 * tag_count`
+rows-per-event cost, forever, with no replacement or expiry to bound it.
+NIP-01 says ephemeral events are not expected to be persisted at all.
+
+Fixed by adding `isEphemeralKind` (nostr.ts) and an early return in
+`storeEvent` that skips `insertEventRow` entirely for that range while
+still returning the event so relay.ts's caller broadcasts it live to
+open subscriptions. Net effect: ephemeral kinds now cost **0 rows
+written**, down from `3 + 2 * tag_count`. This is a pure reduction —
+regular/replaceable/addressable kinds are unaffected, so no baseline in
+`docs/baselines.json` changes.
+
+`45-999` and `>=40000` are undefined by NIP-01 and still fall through to
+the plain-insert branch (stored like a regular event) — that's an open
+question for the maintainer, not a fix, so it's not reflected here.

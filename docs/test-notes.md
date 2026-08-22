@@ -8,7 +8,8 @@ Notes for whoever implements chunk 3 against the chunk 2 conformance suite.
 - `test/nip01-write.test.ts` — EVENT/OK: accept, duplicate, bad signature, id/content mismatch.
 - `test/nip01-subscriptions.test.ts` — REQ/EOSE/CLOSE lifecycle, real-time delivery, sub replacement.
 - `test/nip01-filters.test.ts` — ids/authors/kinds/`#tag`/since/until/limit, AND-within, OR-across, ordering.
-- `test/nip01-kinds.test.ts` — regular vs. replaceable vs. addressable storage rules.
+- `test/nip01-kinds.test.ts` — regular vs. replaceable vs. ephemeral vs. addressable storage rules.
+- `test/nostr-kinds.test.ts` — kind-classifier boundary values (44/45, 999/1000, 9999/10000, 19999/20000, 29999/30000, 39999/40000), asserted directly against `isReplaceableKind`/`isEphemeralKind`/`isAddressableKind` rather than over the wire.
 - `test/nip09-deletion.test.ts`, `test/nip40-expiration.test.ts`, `test/nip42-auth.test.ts` — one file per optional NIP.
 - `test/ownership.test.ts` — owner-only write gate (fixed OWNER_PUBKEY binding).
 - `test/claim.test.ts` — TOFU claim flow: HTTP behavior with OWNER_PUBKEY set (chunk 4's actual test env), plus claim atomicity and pubkey normalization tested directly against real storage.
