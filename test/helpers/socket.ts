@@ -14,27 +14,44 @@ export interface RelayConn {
 
 const DEFAULT_TIMEOUT_MS = 250;
 
-// Opens a hibernation-safe WebSocket to the single relay Durable Object,
-// the same path exercised in test/hibernation.test.ts.
-export async function connectRelay(): Promise<RelayConn> {
+// Shared plumbing behind connectRelay/connectLiveFeed below: opens a
+// hibernation-safe WebSocket to the single relay Durable Object at the
+// given path and wraps it in the same queue/waiter machinery either
+// caller's frame shape can flow through.
+async function connectPath<T>(path: string): Promise<{
+  send(message: unknown): void;
+  nextMessage(timeoutMs?: number): Promise<T>;
+  close(): void;
+  // Resolves with the close code/reason once the socket closes, whether
+  // the client or the server (e.g. the live feed's max-lifetime alarm)
+  // initiated it -- lets tests distinguish "the server closed this" from
+  // "nothing arrived yet."
+  closed: Promise<{ code: number; reason: string }>;
+}> {
   const id = env.RELAY.idFromName("relay");
   const stub = env.RELAY.get(id);
-  const response = await stub.fetch("https://example.com/", {
+  const response = await stub.fetch(`https://example.com${path}`, {
     headers: { Upgrade: "websocket" },
   });
   const socket = response.webSocket;
   if (!socket) throw new Error("expected a websocket response");
   socket.accept();
 
-  const queue: Frame[] = [];
-  const waiters: Array<(frame: Frame) => void> = [];
+  const queue: T[] = [];
+  const waiters: Array<(frame: T) => void> = [];
 
   socket.addEventListener("message", (event: MessageEvent) => {
     if (typeof event.data !== "string") return;
-    const frame = JSON.parse(event.data) as Frame;
+    const frame = JSON.parse(event.data) as T;
     const waiter = waiters.shift();
     if (waiter) waiter(frame);
     else queue.push(frame);
+  });
+
+  const closed = new Promise<{ code: number; reason: string }>((resolve) => {
+    socket.addEventListener("close", (event: CloseEvent) => {
+      resolve({ code: event.code, reason: event.reason });
+    });
   });
 
   return {
@@ -44,13 +61,13 @@ export async function connectRelay(): Promise<RelayConn> {
     nextMessage(timeoutMs = DEFAULT_TIMEOUT_MS) {
       const queued = queue.shift();
       if (queued) return Promise.resolve(queued);
-      return new Promise<Frame>((resolve, reject) => {
+      return new Promise<T>((resolve, reject) => {
         const timer = setTimeout(() => {
           const index = waiters.indexOf(onFrame);
           if (index !== -1) waiters.splice(index, 1);
           reject(new Error(`no message received from relay within ${timeoutMs}ms`));
         }, timeoutMs);
-        function onFrame(frame: Frame) {
+        function onFrame(frame: T) {
           clearTimeout(timer);
           resolve(frame);
         }
@@ -60,7 +77,40 @@ export async function connectRelay(): Promise<RelayConn> {
     close() {
       socket.close(1000, "test done");
     },
+    closed,
   };
+}
+
+// Opens a hibernation-safe WebSocket to the single relay Durable Object,
+// the same path exercised in test/hibernation.test.ts.
+export async function connectRelay(): Promise<RelayConn> {
+  return connectPath<Frame>("/");
+}
+
+// The redacted notice shape src/relay.ts liveBroadcast sends to the
+// admin page's live feed (ROADMAP.md chunk 7) -- kind/time/truncated id
+// only, never tags or content.
+export interface LiveNotice {
+  kind: number;
+  created_at: number;
+  id: string;
+}
+
+export interface LiveFeedConn {
+  // Real live feed clients never send anything -- exposed only so tests
+  // can assert the server ignores it rather than mishandling it as a
+  // nostr protocol frame (see relay.ts webSocketMessage's early return
+  // for LIVE_FEED_TAG).
+  send(message: unknown): void;
+  nextMessage(timeoutMs?: number): Promise<LiveNotice>;
+  close(): void;
+  closed: Promise<{ code: number; reason: string }>;
+}
+
+// Opens the live feed's own push-only path, distinct from the nostr
+// protocol connection above -- see src/relay.ts fetch()'s "/live" branch.
+export async function connectLiveFeed(): Promise<LiveFeedConn> {
+  return connectPath<LiveNotice>("/live");
 }
 
 // Publishes an event and returns the ["OK", id, ok, message] reply.

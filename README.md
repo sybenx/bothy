@@ -19,7 +19,7 @@ That's it. No dashboard configuration required.
 
 ### Rate limiting (recommended)
 
-This relay's read path is intentionally public (see "Reads are public" below), so it's worth adding a free Cloudflare rate-limiting rule against abusive traffic: in the Cloudflare dashboard, go to **Security → WAF → Rate limiting rules** for your zone and add a rule capping requests per IP to your Worker's route. The relay enforces its own per-connection and per-IP limits regardless, but an edge rule catches abuse before it reaches the Worker at all.
+This relay's read path is intentionally public (gift-wrapped DMs are the one exception — see "Inbox mode" below), so it's worth adding a free Cloudflare rate-limiting rule against abusive traffic: in the Cloudflare dashboard, go to **Security → WAF → Rate limiting rules** for your zone and add a rule capping requests per IP to your Worker's route. The relay enforces its own per-connection and per-IP limits regardless, but an edge rule catches abuse before it reaches the Worker at all.
 
 ## Ownership
 
@@ -27,11 +27,31 @@ The first person to submit their pubkey through the claim form owns the relay, p
 
 If you want to skip the claim flow entirely and fix ownership at deploy time instead, set the `OWNER_PUBKEY` environment variable (hex, not npub) in your Worker's settings. This disables the claim endpoint outright.
 
+## Configuration
+
+The deploy button only asks for a project name. Everything else is an optional variable you can add later in the Cloudflare dashboard (**Workers & Pages → your worker → Settings → Variables**) if you want it:
+
+| Var | Purpose |
+|---|---|
+| `OWNER_PUBKEY` | Fix ownership at deploy time instead of claiming (hex, not npub). Disables the claim endpoint. |
+| `RELAY_NAME` / `RELAY_DESCRIPTION` / `RELAY_ICON` | Override the NIP-11 name/description/icon. Name and icon default to your claimed profile's kind-0 name/picture; description defaults to a generic string. |
+| `ALLOW_FOLLOWS` | Set to `true` to also accept writes from your kind-3 follow list, refreshed hourly from your own most recent contact list already stored on this relay. |
+
+If your Worker is connected to a GitHub repo, Cloudflare may sync `wrangler.jsonc`'s config on every deploy, which can overwrite a variable you added in the dashboard by hand — worth knowing if a dashboard-added variable seems to reset after a deploy.
+
 ## Resetting
 
 **Redeploying does *not* reset ownership.** Running `wrangler deploy` again (or re-clicking the deploy button) ships new code against the *same* storage — your events and your claim both survive. This trips people up because the instinct after "I want to start over" is to redeploy.
 
 To actually reset a relay: **delete the Worker** from the Cloudflare dashboard (Workers & Pages → your worker → Settings → Delete) and deploy a fresh one. There is no in-place "unclaim" — Durable Object storage is tied to the Worker.
+
+## Inbox mode (gift-wrapped DMs)
+
+This relay also accepts [NIP-59](https://github.com/nostr-protocol/nips/blob/master/59.md) gift wraps addressed to you, from anyone — the one exception to "only the owner can write." It's the write path a client needs if you publish a `kind:10050` DM relay list naming this relay; bothy itself never publishes that list for you, so nothing changes unless you deliberately turn your relay into a DM inbox by signing one.
+
+Reading them back is restricted to you: an unauthenticated query for gift wraps gets a [NIP-42](https://github.com/nostr-protocol/nips/blob/master/42.md) AUTH challenge instead of results, so a stranger can't use your relay to count or time-correlate your incoming DMs. You can delete a gift wrap the same way you'd delete any note ([NIP-09](https://github.com/nostr-protocol/nips/blob/master/09.md)), and [NIP-62](https://github.com/nostr-protocol/nips/blob/master/62.md) "Request to Vanish" support means either you or a message's sender can ask for it to be permanently purged.
+
+**Worth knowing:** Cloudflare terminates the TLS connection in front of this relay, so it necessarily sees the `p` tag (who a gift wrap is addressed to), the arrival time, and the sender's IP address, the same as any other Worker traffic. On a personal relay the `p` tag is always you, so that part leaks nothing new — but the sender IPs belong to other people, sending you mail through infrastructure you chose, not them.
 
 ## What this is not
 

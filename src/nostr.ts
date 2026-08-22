@@ -44,6 +44,23 @@ export function dTagValue(tags: string[][]): string {
   return tag?.[1] ?? "";
 }
 
+// NIP-59 (nips/59.md) Gift Wrap. Signed by a random one-time key, never
+// the real sender's -- the `p` tag is the only identity information a
+// relay can see, which is why deletion/read authorization for this kind
+// works off `p` tags rather than `pubkey` everywhere else in this
+// codebase (relay.ts, storage.ts, ownership.ts).
+export const GIFT_WRAP_KIND = 1059;
+
+// NIP-62 (nips/62.md) Request to Vanish.
+export const VANISH_KIND = 62;
+
+// All `p` tag values on an event -- used to find a gift wrap's
+// recipient(s), since `pubkey` on a gift wrap is a random one-time key
+// and carries no identity.
+export function pTagValues(tags: string[][]): string[] {
+  return tags.filter((t) => t[0] === "p" && t[1] !== undefined).map((t) => t[1] as string);
+}
+
 // A filter's `#<letter>` keys, e.g. `#e`, `#p` -- the single-letter tag
 // names NIP-01 defines filtering over.
 export function tagFilterEntries(filter: Filter): [string, string[]][] {

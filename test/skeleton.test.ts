@@ -2,8 +2,9 @@
 // NIP-11 returns valid JSON, and the relay accepts and holds a WebSocket
 // connection. Full NIP-01 protocol conformance is chunk 2/3's job, not
 // this file's -- do not add protocol assertions here.
-import { env, exports } from "cloudflare:workers";
+import { exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import { DEFAULT_DESCRIPTION, DEFAULT_NAME } from "../src/nip11";
 
 describe("NIP-11", () => {
   it("returns a valid relay information document", async () => {
@@ -15,9 +16,13 @@ describe("NIP-11", () => {
     expect(response.headers.get("Content-Type")).toBe("application/nostr+json");
 
     const body = await response.json();
+    // The global test env's OWNER_PUBKEY binding (vitest.config.ts) skips
+    // claim-time storage entirely, so there's no owner profile to derive
+    // name/icon from here -- falls back to the hardcoded defaults, since
+    // no RELAY_NAME/RELAY_DESCRIPTION dashboard var is set either.
     expect(body).toMatchObject({
-      name: env.RELAY_NAME,
-      description: env.RELAY_DESCRIPTION,
+      name: DEFAULT_NAME,
+      description: DEFAULT_DESCRIPTION,
       supported_nips: expect.arrayContaining([11]),
     });
   });

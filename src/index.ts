@@ -1,5 +1,6 @@
 import { nip11Response } from "./nip11";
 import { lookupProfile } from "./profile-lookup";
+import { normalizePubkey } from "./pubkey";
 
 export { Relay } from "./relay";
 
@@ -26,9 +27,16 @@ async function handleClaim(request: Request, env: Env): Promise<Response> {
   } catch {
     return json({ error: "malformed request body" }, 400);
   }
-  const pubkey = (body as { pubkey?: unknown } | null)?.pubkey;
+  const rawPubkey = (body as { pubkey?: unknown } | null)?.pubkey;
+  // Looked up here, in the stateless Worker, not inside the claim() RPC --
+  // an outbound WebSocket from inside the DO would pin it in memory for
+  // up to 15 minutes (CLAUDE.md "The budget"; profile-lookup.ts). This
+  // duplicates claim()'s own normalization, but that's cheap and pure;
+  // it's the only way to know which pubkey to look up before calling in.
+  const normalized = typeof rawPubkey === "string" ? normalizePubkey(rawPubkey) : null;
+  const profile = normalized ? await lookupProfile(normalized) : null;
 
-  const result = await relayStub(env).claim(pubkey);
+  const result = await relayStub(env).claim(rawPubkey, profile ?? undefined);
   switch (result.status) {
     case "disabled":
       // CLAUDE.md "Claim implementation": "If OWNER_PUBKEY is set in
@@ -62,7 +70,8 @@ export default {
     const url = new URL(request.url);
 
     if (request.headers.get("Accept") === "application/nostr+json") {
-      return nip11Response(env);
+      const profile = await relayStub(env).getProfile();
+      return nip11Response(env, profile);
     }
 
     if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
@@ -76,8 +85,8 @@ export default {
     return env.ASSETS.fetch(request);
   },
 
-  // ALLOW_FOLLOWS refresh and RETENTION_DAYS pruning (ROADMAP.md chunk 4).
-  // Both are no-ops when their env var is unset -- see Relay.runCron().
+  // ALLOW_FOLLOWS refresh (ROADMAP.md chunk 4) -- a no-op when the env
+  // var is unset, see Relay.runCron().
   async scheduled(_event: ScheduledController, env: Env): Promise<void> {
     await relayStub(env).runCron();
   },

@@ -34,6 +34,37 @@
   .profile img { width: 2.5rem; height: 2.5rem; border-radius: 50%; }
   #error { color: #d94a4a; }
   #reset-note { margin-top: 2rem; font-size: 0.9rem; opacity: 0.8; }
+  h2 { font-size: 1rem; margin: 1.5rem 0 0.25rem; }
+  .live-status { opacity: 0.7; font-size: 0.85rem; margin: 0 0 0.5rem; }
+  #live-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 12rem;
+    overflow-y: auto;
+    border: 1px solid #8884;
+    border-radius: 0.5rem;
+  }
+  #live-list li {
+    font-family: ui-monospace, monospace;
+    font-size: 0.85rem;
+    padding: 0.35rem 0.6rem;
+    border-bottom: 1px solid #8882;
+    display: flex;
+    gap: 0.75rem;
+  }
+  #live-list li:last-child { border-bottom: none; }
+  #live-list .kind { opacity: 0.7; width: 3.5rem; flex: none; }
+  #live-list .time { opacity: 0.7; width: 5rem; flex: none; }
+  #live-list .id { opacity: 0.9; }
+  #live-list:empty::after {
+    content: "waiting for events\2026";
+    display: block;
+    padding: 0.6rem;
+    opacity: 0.6;
+    font-size: 0.85rem;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
 </style>
 </head>
 <body>
@@ -57,6 +88,10 @@
       <div class="bar"><div id="bar-rows"></div></div>
     </div>
   </div>
+
+  <h2>Live feed</h2>
+  <p class="live-status" id="live-status">connecting&hellip;</p>
+  <ul id="live-list"></ul>
 </div>
 
 <div id="unclaimed-view" hidden>
@@ -96,6 +131,8 @@ async function main() {
     const ROWS_LIMIT = 100000;
     setBar("stat-storage", "bar-storage", stats.storageBytes, STORAGE_LIMIT, formatBytes(stats.storageBytes) + " used");
     setBar("stat-rows", "bar-rows", stats.rowsWrittenEstimate24h, ROWS_LIMIT, stats.rowsWrittenEstimate24h + " rows (est.)");
+
+    wireLiveFeed();
   } else {
     document.getElementById("unclaimed-view").hidden = false;
     wireClaimForm();
@@ -115,6 +152,102 @@ function formatBytes(n) {
   if (n < 1024 ** 2) return (n / 1024).toFixed(1) + " KB";
   if (n < 1024 ** 3) return (n / 1024 ** 2).toFixed(1) + " MB";
   return (n / 1024 ** 3).toFixed(2) + " GB";
+}
+
+// Debugging tool that doubles as onboarding (ROADMAP.md chunk 7): turns
+// the abstract wss:// URL into something visibly alive. Kind/time/
+// truncated id only -- the server (src/relay.ts liveBroadcast) never
+// sends tags or content, and never sends gift wraps at all, so there's
+// nothing here to redact client-side.
+const LIVE_MAX_ROWS = 20;
+// Closed whenever the tab isn't visible, and only reopened when it is --
+// this is the idle timeout ROADMAP.md chunk 7 requires: a background tab
+// left open for hours must not hold a live DO connection the whole time
+// (CLAUDE.md "The budget": duration only stays cheap if hibernation
+// actually works, and a socket nobody is looking at is exactly the kind
+// of thing that's easy to forget is still open).
+function wireLiveFeed() {
+  const statusEl = document.getElementById("live-status");
+  const listEl = document.getElementById("live-list");
+  let socket = null;
+  let reconnectDelayMs = 1000;
+  let reconnectTimer = null;
+  let stopped = false;
+
+  function setStatus(text) {
+    statusEl.textContent = text;
+  }
+
+  function addRow(notice) {
+    const li = document.createElement("li");
+    const kind = document.createElement("span");
+    kind.className = "kind";
+    kind.textContent = "kind " + notice.kind;
+    const time = document.createElement("span");
+    time.className = "time";
+    time.textContent = new Date(notice.created_at * 1000).toLocaleTimeString();
+    const id = document.createElement("span");
+    id.className = "id";
+    id.textContent = notice.id;
+    li.append(kind, time, id);
+    listEl.prepend(li);
+    while (listEl.children.length > LIVE_MAX_ROWS) {
+      listEl.removeChild(listEl.lastChild);
+    }
+  }
+
+  function connect() {
+    // Guards against opening a second connection on top of one already
+    // open or in flight -- a spurious extra "visibilitychange" firing
+    // right after the initial connect() call (observed in practice on
+    // page load) would otherwise leave two live DO connections racing to
+    // append the same notice twice.
+    if (stopped || document.hidden || socket) return;
+    setStatus("connecting…");
+    const url = location.origin.replace(/^http/, "ws") + "/live";
+    socket = new WebSocket(url);
+    socket.addEventListener("open", () => {
+      reconnectDelayMs = 1000;
+      setStatus("live");
+    });
+    socket.addEventListener("message", (event) => {
+      try {
+        addRow(JSON.parse(event.data));
+      } catch {
+        // ignore malformed frames
+      }
+    });
+    socket.addEventListener("close", () => {
+      socket = null;
+      if (stopped || document.hidden) {
+        setStatus("paused (tab in background)");
+        return;
+      }
+      setStatus("reconnecting…");
+      reconnectTimer = setTimeout(connect, reconnectDelayMs);
+      reconnectDelayMs = Math.min(reconnectDelayMs * 2, 30000);
+    });
+    socket.addEventListener("error", () => socket && socket.close());
+  }
+
+  function disconnect() {
+    clearTimeout(reconnectTimer);
+    if (socket) socket.close(1000, "tab hidden");
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      disconnect();
+    } else {
+      connect();
+    }
+  });
+  window.addEventListener("beforeunload", () => {
+    stopped = true;
+    disconnect();
+  });
+
+  connect();
 }
 
 function wireClaimForm() {

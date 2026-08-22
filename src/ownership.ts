@@ -1,12 +1,13 @@
+import type { Profile } from "./profile-lookup";
+
 // Kind-3 is NIP-01/NIP-02's contact list; its `p` tags are the follow set.
 const CONTACT_LIST_KIND = 3;
 
-// wrangler's generated Env type narrows ALLOW_FOLLOWS to the literal
-// default from wrangler.jsonc's `vars` ("false"); widen to `string`
-// before comparing, since a real deployment can override it to "true".
+// ALLOW_FOLLOWS is not declared in wrangler.jsonc's `vars` (ROADMAP.md
+// chunk 5), so it's undefined unless someone adds it in the Cloudflare
+// dashboard -- default to disabled, per CLAUDE.md "Configuration".
 function allowFollowsEnabled(env: Env): boolean {
-  const value: string = env.ALLOW_FOLLOWS;
-  return value === "true";
+  return (env.ALLOW_FOLLOWS ?? "false") === "true";
 }
 
 export function getOwnerPubkey(sql: SqlStorage, env: Env): string | null {
@@ -21,11 +22,38 @@ export function getOwnerPubkey(sql: SqlStorage, env: Env): string | null {
 // check-then-write is atomic without locking -- no other code path may
 // write this row. Returns false if a row already existed (already
 // claimed by an earlier call).
-export function claimOwner(sql: SqlStorage, pubkey: string): boolean {
+// `profile` is the owner's kind-0 name/picture, looked up once by the
+// Worker at claim time (CLAUDE.md "Claim implementation"; ROADMAP.md
+// chunk 5: "Derive NIP-11 name and icon from the owner's kind 0 at claim
+// time... Write to DO storage at claim."). Optional and best-effort --
+// undefined fields are stored as null and nip11.ts falls back to
+// hardcoded defaults.
+export function claimOwner(sql: SqlStorage, pubkey: string, profile?: Profile): boolean {
   const existing = sql.exec(`SELECT 1 FROM owner LIMIT 1`).toArray();
   if (existing.length > 0) return false;
-  sql.exec(`INSERT INTO owner (pubkey) VALUES (?)`, pubkey);
+  sql.exec(
+    `INSERT INTO owner (pubkey, name, picture) VALUES (?, ?, ?)`,
+    pubkey,
+    profile?.name ?? null,
+    profile?.picture ?? null,
+  );
   return true;
+}
+
+// Backs the NIP-11 document's name/icon (nip11.ts, via Relay.getProfile
+// in relay.ts). Null when unclaimed, when OWNER_PUBKEY skips storage
+// entirely (no row to read a profile from), or when the claim-time
+// lookup found nothing -- the caller falls back to hardcoded defaults in
+// all of those cases.
+export function getOwnerProfile(
+  sql: SqlStorage,
+  env: Env,
+): { name: string | null; picture: string | null } | null {
+  if (env.OWNER_PUBKEY) return null;
+  const row = sql
+    .exec<{ name: string | null; picture: string | null }>(`SELECT name, picture FROM owner LIMIT 1`)
+    .toArray()[0];
+  return row ?? null;
 }
 
 // Owner writes are always allowed; ALLOW_FOLLOWS additionally allows

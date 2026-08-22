@@ -74,7 +74,14 @@ describe("NIP-01 filters", () => {
 
   it("#<letter> tag filter matches events with that tag value", async () => {
     const conn = await connectRelay();
-    const taggedPubkey = OWNER_PUBKEY_HEX;
+    // Deliberately not OWNER_PUBKEY_HEX: an unauthenticated `#p` filter
+    // naming the owner is gated behind NIP-42 AUTH as of ROADMAP.md
+    // chunk 6 (relay.ts handleReq) since it's also how an anonymous
+    // reader could discover gift wrap volume/timing -- see
+    // test/nip59-giftwrap.test.ts. This test is about generic
+    // `#<letter>` matching, not that policy, so it uses an unrelated
+    // pubkey to stay out of its way.
+    const taggedPubkey = randomKeypair().pubkeyHex;
     const tagged = signEvent(OWNER_SECRET_KEY_HEX, {
       kind: 1,
       tags: [["p", taggedPubkey]],

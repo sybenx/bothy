@@ -70,8 +70,6 @@ All configuration is **environment variables and secrets in `wrangler.jsonc`**, 
 |---|---|
 | `OWNER_PUBKEY` | Optional. If set, ownership is fixed at deploy time and the claim flow is disabled entirely. Advanced/deterministic path. |
 | `ALLOW_FOLLOWS` | If true, also accept writes from the owner's kind-3 follow list. Default false. |
-| `RELAY_NAME`, `RELAY_DESCRIPTION`, `RELAY_ICON` | NIP-11 fields. |
-| `RETENTION_DAYS` | Optional pruning window. Off by default. |
 
 Accept `npub1...` and hex, normalize to hex at the boundary, store hex only. A user pasting an npub from their client is the expected path.
 
@@ -149,12 +147,13 @@ Nosflare sells a paid no-code deploy service. We are not competing with that ser
 Sessions here are typically unattended — the maintainer opens the repo, says go, and reviews at chunk boundaries. That makes the following non-optional:
 
 - **Read `ROADMAP.md` first.** Work the current chunk only. Do not start the next one.
-- **Read `DECISIONS.md` before proposing anything architectural.** If a change contradicts a closed decision, stop and name the decision instead of implementing it.
 - **Never proceed past red tests.** There is no human watching between chunks, so the test gate is the only gate. A failing suite ends the session; report it rather than working around it.
 - **Verify platform facts against live documentation.** The free-tier limits, wrangler config syntax, and Durable Objects migration format in this file were correct when written and change over time. Check `developers.cloudflare.com` before relying on a specific number or config shape, and update the table here if it has moved.
 - **Pin versions.** Wrangler's DO migration syntax and SQLite backend flags have shifted across majors. Do not float to latest mid-project.
 - **When genuinely ambiguous, stop and ask.** A wrong guess compounds across an unattended session. An unanswered question costs one round trip.
-- Record any non-obvious tradeoff you resolve as a new entry in `DECISIONS.md`, including the option you rejected.
+- Record any non-obvious tradeoff you resolve as a comment at its call site, including the option you rejected — not in a separate decisions log.
+
+A session is done when nothing in this file describes work rather than the project. Anything a chunk made real leaves this file and lives in the code, a comment, or a named test. CLAUDE.md describes the project as it is.
 
 ## Conventions
 

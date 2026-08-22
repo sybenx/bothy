@@ -21,7 +21,7 @@ import { env, exports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { normalizePubkey } from "../src/pubkey";
-import { claimOwner, getOwnerPubkey } from "../src/ownership";
+import { claimOwner, getOwnerPubkey, getOwnerProfile } from "../src/ownership";
 import { isolateStorage } from "./helpers/isolate";
 import { OWNER_PUBKEY_HEX, randomKeypair } from "./helpers/keys";
 
@@ -86,6 +86,43 @@ describe("TOFU claim storage (env.OWNER_PUBKEY unset)", () => {
       expect(claimOwner(state.storage.sql, second)).toBe(false);
       // The first claim wins -- ownership does not move.
       expect(getOwnerPubkey(state.storage.sql, UNCLAIMED_ENV)).toBe(first);
+    });
+  });
+});
+
+describe("claim-time profile storage (ROADMAP.md chunk 5)", () => {
+  it("stores the owner's kind-0 name/picture passed at claim time", async () => {
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    const claimant = randomKeypair().pubkeyHex;
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      expect(claimOwner(state.storage.sql, claimant, { name: "alice", picture: "https://example.com/a.png" })).toBe(
+        true,
+      );
+      expect(getOwnerProfile(state.storage.sql, UNCLAIMED_ENV)).toEqual({
+        name: "alice",
+        picture: "https://example.com/a.png",
+      });
+    });
+  });
+
+  it("stores null name/picture when no profile is given -- lookup failure is not blocking", async () => {
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    const claimant = randomKeypair().pubkeyHex;
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      expect(claimOwner(state.storage.sql, claimant)).toBe(true);
+      expect(getOwnerProfile(state.storage.sql, UNCLAIMED_ENV)).toEqual({ name: null, picture: null });
+    });
+  });
+
+  it("returns null when OWNER_PUBKEY is set in env -- no storage row to read a profile from", async () => {
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      expect(getOwnerProfile(state.storage.sql, { OWNER_PUBKEY: OWNER_PUBKEY_HEX } as unknown as Env)).toBeNull();
     });
   });
 });

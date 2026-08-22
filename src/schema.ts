@@ -29,6 +29,19 @@
 // defines filtering via "#<single-letter>" — multi-character tags are
 // still stored verbatim in `events.tags` for the client, just never
 // indexed.
+//
+// `deleted_ids` (ROADMAP.md chunk 6) is a tombstone set, not part of the
+// per-event write cost above. NIP-09/NIP-62 both require that a deleted
+// event cannot be re-stored by re-sending the same signed copy -- without
+// this, deleting a gift wrap is meaningless, since the sender still holds
+// their own copy and nothing stops them replaying it (unlike this
+// relay's other write paths, which are all owner-authored and so have no
+// adversarial reason to replay a delete). One row per tombstoned id (2
+// rows written: base + implicit PK index, same TEXT-PK shape as
+// `events.id`) -- see storage.ts `deleteAndTombstone`. Only genuine
+// deletion requests pay this; `storeEvent`'s replaceable/addressable
+// replacement path calls the untombstoned `deleteEventRow` instead, since
+// a superseded version has no replay risk to guard against.
 export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS events (
   id         TEXT PRIMARY KEY,
@@ -57,9 +70,14 @@ CREATE INDEX IF NOT EXISTS idx_event_tags_lookup
 -- TOFU ownership (CLAUDE.md "Ownership"). At most one row, ever. The
 -- claim handler is the only writer and refuses if a row already exists
 -- -- see ownership.ts. A one-time write; not part of the per-event
--- budget in the comment above.
+-- budget in the comment above. name/picture cache the owner's kind-0
+-- profile as resolved at claim time (ROADMAP.md chunk 5), backing the
+-- NIP-11 document's name/icon instead of a deploy-time var -- null when
+-- the claim-time lookup found nothing.
 CREATE TABLE IF NOT EXISTS owner (
-  pubkey TEXT NOT NULL
+  pubkey  TEXT NOT NULL,
+  name    TEXT,
+  picture TEXT
 );
 
 -- ALLOW_FOLLOWS cache (CLAUDE.md "Configuration"): the owner's own
@@ -69,6 +87,10 @@ CREATE TABLE IF NOT EXISTS owner (
 CREATE TABLE IF NOT EXISTS follows (
   pubkey     TEXT PRIMARY KEY,
   fetched_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS deleted_ids (
+  id TEXT PRIMARY KEY
 );
 `;
 
