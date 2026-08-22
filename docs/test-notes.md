@@ -10,7 +10,11 @@ Notes for whoever implements chunk 3 against the chunk 2 conformance suite.
 - `test/nip01-filters.test.ts` — ids/authors/kinds/`#tag`/since/until/limit, AND-within, OR-across, ordering.
 - `test/nip01-kinds.test.ts` — regular vs. replaceable vs. addressable storage rules.
 - `test/nip09-deletion.test.ts`, `test/nip40-expiration.test.ts`, `test/nip42-auth.test.ts` — one file per optional NIP.
-- `test/ownership.test.ts` — owner-only write gate.
+- `test/ownership.test.ts` — owner-only write gate (fixed OWNER_PUBKEY binding).
+- `test/claim.test.ts` — TOFU claim flow: HTTP behavior with OWNER_PUBKEY set (chunk 4's actual test env), plus claim atomicity and pubkey normalization tested directly against real storage.
+- `test/follows.test.ts` — ALLOW_FOLLOWS write gate, tested directly against real storage.
+- `test/read-limits.test.ts` — subscription cap, unconstrained-filter rejection, per-IP throttle.
+- `test/stats.test.ts` — `/api/stats` shape, `/api/profile` validation, admin page fallback.
 - `test/helpers/` — shared fixtures (see below).
 
 ## Helpers
@@ -25,6 +29,7 @@ Notes for whoever implements chunk 3 against the chunk 2 conformance suite.
 - Only the owner can write, so `authors`-filter tests use list membership (owner's key among others) rather than storing events from multiple authors — a second author's event can never reach storage in this relay.
 - `test/nip40-expiration.test.ts`'s "does not return a stored event whose expiration has since passed" case inserts a row directly into the `events` table (via `runInDurableObject`) instead of going through the wire. That's the one deliberate exception to testing purely over the wire: there's no way to make an event expire *after* it was validly stored without controlling wall-clock time, and NIP-40's write-time and read-time rules are independent SHOULDs that need to be tested independently.
 - NIP-42 tests cover the AUTH message's own validation contract (kind, freshness, challenge match) rather than a full challenge/response round trip — this relay has no auth-gated resource yet, so there's no scenario where it issues a challenge for a test to receive.
+- `test/claim.test.ts` and `test/follows.test.ts` cannot exercise the *unclaimed* relay or ALLOW_FOLLOWS=true over the wire: the global test env's OWNER_PUBKEY/ALLOW_FOLLOWS bindings (vitest.config.ts) are fixed for the whole run, matching every other suite. Instead they call the pure functions in `ownership.ts` (`claimOwner`, `getOwnerPubkey`, `isAllowedWriter`, `refreshFollows`) directly against real `SqlStorage` obtained via `runInDurableObject`, passing a hand-built `env` object rather than the injected one. This is the same category of exception `nip40-expiration.test.ts` documents for its own reason: no wire-protocol path exists to reach that state, so the test drops one level to real storage instead of mocking it.
 
 ## Running
 

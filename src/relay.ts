@@ -1,6 +1,15 @@
 import { DurableObject } from "cloudflare:workers";
 import { matchesAnyFilter, parseFilter } from "./filters";
+import {
+  clampFilterLimit,
+  isUnconstrainedFilter,
+  MAX_EVENTS_PER_REQ,
+  MAX_SUBSCRIPTIONS_PER_CONNECTION,
+} from "./limits";
 import type { Filter, NostrEvent } from "./nostr";
+import { claimOwner, getOwnerPubkey, isAllowedWriter, refreshFollows } from "./ownership";
+import { normalizePubkey } from "./pubkey";
+import { pruneExpiredRetention } from "./retention";
 import { initSchema } from "./schema";
 import { applyDeletion, eventExists, expirationOf, queryFilters, storeEvent } from "./storage";
 import { idMatchesContent, parseEventShape, verifySignature } from "./validate";
@@ -17,20 +26,33 @@ const AUTH_KIND = 22242;
 // ~10 minute window other relays use.
 const AUTH_MAX_DRIFT_SECONDS = 600;
 
-// Per-connection subscriptions, keyed by subscription id. Persisted via
-// WebSocket attachment (not object memory) so it survives hibernation --
-// see CLAUDE.md "The budget" on why an in-memory-only map would be wrong
+// Per-connection subscriptions, keyed by subscription id, plus the
+// connecting IP for per-IP throttling. Persisted via WebSocket
+// attachment (not object memory) so it survives hibernation -- see
+// CLAUDE.md "The budget" on why an in-memory-only map would be wrong
 // here: the object can be evicted between messages on an otherwise idle
 // connection, and the attachment is what's still there on the next one.
 type Subscriptions = Record<string, Filter[]>;
-
-function getSubscriptions(ws: WebSocket): Subscriptions {
-  return (ws.deserializeAttachment() as Subscriptions | null) ?? {};
+interface ConnState {
+  ip: string;
+  subs: Subscriptions;
 }
 
-function setSubscriptions(ws: WebSocket, subs: Subscriptions): void {
-  ws.serializeAttachment(subs);
+function getState(ws: WebSocket): ConnState {
+  return (ws.deserializeAttachment() as ConnState | null) ?? { ip: "unknown", subs: {} };
 }
+
+function setState(ws: WebSocket, state: ConnState): void {
+  ws.serializeAttachment(state);
+}
+
+// Per-IP message rate limit (CLAUDE.md "Threat model": "Per-IP
+// throttling inside the DO"). Deliberately in-memory rather than in
+// SQLite: it's a best-effort abuse mitigation, not a correctness
+// guarantee, so it's fine for it to reset on hibernation -- persisting
+// it would cost rows-written for no real benefit.
+const RATE_LIMIT_WINDOW_MS = 10_000;
+const RATE_LIMIT_MAX_MESSAGES = 50;
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
@@ -45,6 +67,11 @@ function ok(ws: WebSocket, id: string, accepted: boolean, message: string): void
 }
 
 export class Relay extends DurableObject<Env> {
+  // Per-IP sliding window counters for webSocketMessage throttling --
+  // see the RATE_LIMIT_* constants above for why this is memory, not
+  // storage.
+  private rateLimits = new Map<string, { windowStart: number; count: number }>();
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     initSchema(ctx.storage.sql);
@@ -65,12 +92,91 @@ export class Relay extends DurableObject<Env> {
     // and bills DO duration for the connection's entire lifetime -- see
     // CLAUDE.md "Architecture".
     this.ctx.acceptWebSocket(server);
+    setState(server, { ip: request.headers.get("CF-Connecting-IP") ?? "unknown", subs: {} });
 
     return new Response(null, { status: 101, webSocket: client });
   }
 
+  // TOFU claim (CLAUDE.md "Ownership"). RPC method, called directly by
+  // the Worker (src/index.ts) rather than over fetch() -- this is the
+  // only code path that may write the `owner` row (ownership.ts).
+  async claim(rawPubkey: unknown): Promise<{ status: "claimed" | "conflict" | "disabled" | "invalid"; pubkey?: string }> {
+    if (this.env.OWNER_PUBKEY) return { status: "disabled" };
+    if (typeof rawPubkey !== "string") return { status: "invalid" };
+    const pubkey = normalizePubkey(rawPubkey);
+    if (!pubkey) return { status: "invalid" };
+
+    const sql = this.ctx.storage.sql;
+    if (!claimOwner(sql, pubkey)) return { status: "conflict" };
+    return { status: "claimed", pubkey };
+  }
+
+  // Backs GET /api/stats (src/index.ts) -- see CLAUDE.md "Admin page".
+  async getStats(): Promise<{
+    claimed: boolean;
+    ownerPubkey: string | null;
+    totalEvents: number;
+    events24h: number;
+    storageBytes: number;
+    rowsWrittenEstimate24h: number;
+  }> {
+    const sql = this.ctx.storage.sql;
+    const owner = getOwnerPubkey(sql, this.env);
+    const since = nowSeconds() - 86400;
+
+    const totalEvents =
+      sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events`).toArray()[0]?.n ?? 0;
+    const recent = sql
+      .exec<{ id: string }>(`SELECT id FROM events WHERE created_at > ?`, since)
+      .toArray();
+    // Row-cost formula from schema.ts: 3 base rows + 2 per single-letter
+    // tag. A read-only estimate, not a tracked counter -- see
+    // limits.ts/relay.ts comments on why this relay avoids extra writes
+    // just to measure itself.
+    let rowsWrittenEstimate24h = 0;
+    if (recent.length > 0) {
+      const tagCounts = sql
+        .exec<{ event_id: string; n: number }>(
+          `SELECT event_id, COUNT(*) AS n FROM event_tags WHERE event_id IN (${recent
+            .map(() => "?")
+            .join(", ")}) GROUP BY event_id`,
+          ...recent.map((r) => r.id),
+        )
+        .toArray();
+      const tagsByEvent = new Map(tagCounts.map((r) => [r.event_id, r.n]));
+      for (const r of recent) {
+        rowsWrittenEstimate24h += 3 + 2 * (tagsByEvent.get(r.id) ?? 0);
+      }
+    }
+
+    return {
+      claimed: owner !== null,
+      ownerPubkey: owner,
+      totalEvents,
+      events24h: recent.length,
+      storageBytes: sql.databaseSize,
+      rowsWrittenEstimate24h,
+    };
+  }
+
+  // Cron entry point (src/index.ts scheduled()) -- refreshes the
+  // ALLOW_FOLLOWS cache and applies RETENTION_DAYS pruning. Both are
+  // no-ops when their env var is unset, so this is cheap on the common
+  // (feature-off) path.
+  async runCron(): Promise<void> {
+    const sql = this.ctx.storage.sql;
+    const now = nowSeconds();
+    refreshFollows(sql, this.env, now);
+    pruneExpiredRetention(sql, this.env, now);
+  }
+
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message !== "string") return;
+
+    if (this.isRateLimited(ws)) {
+      send(ws, ["NOTICE", "rate-limited: slow down"]);
+      return;
+    }
 
     let frame: unknown;
     try {
@@ -102,6 +208,21 @@ export class Relay extends DurableObject<Env> {
     }
   }
 
+  // True when this connection's IP has sent too many messages within
+  // the current window -- CLAUDE.md "Threat model": "Per-IP throttling
+  // inside the DO."
+  private isRateLimited(ws: WebSocket): boolean {
+    const { ip } = getState(ws);
+    const now = Date.now();
+    const entry = this.rateLimits.get(ip);
+    if (!entry || now - entry.windowStart >= RATE_LIMIT_WINDOW_MS) {
+      this.rateLimits.set(ip, { windowStart: now, count: 1 });
+      return false;
+    }
+    entry.count++;
+    return entry.count > RATE_LIMIT_MAX_MESSAGES;
+  }
+
   private handleEvent(ws: WebSocket, raw: unknown): void {
     const event = parseEventShape(raw);
     if (!event) {
@@ -118,13 +239,12 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
-    const ownerPubkey = this.env.OWNER_PUBKEY;
-    if (!ownerPubkey || event.pubkey !== ownerPubkey) {
+    const sql = this.ctx.storage.sql;
+    if (!isAllowedWriter(sql, this.env, event.pubkey)) {
       ok(ws, event.id, false, "restricted: not allowed to write.");
       return;
     }
 
-    const sql = this.ctx.storage.sql;
     if (eventExists(sql, event.id)) {
       ok(ws, event.id, true, "duplicate: already have this event");
       return;
@@ -153,6 +273,13 @@ export class Relay extends DurableObject<Env> {
       send(ws, ["NOTICE", "error: malformed REQ"]);
       return;
     }
+
+    const state = getState(ws);
+    if (!(subId in state.subs) && Object.keys(state.subs).length >= MAX_SUBSCRIPTIONS_PER_CONNECTION) {
+      send(ws, ["CLOSED", subId, "rate-limited: too many open subscriptions"]);
+      return;
+    }
+
     const filters: Filter[] = [];
     for (const raw of frame.slice(2)) {
       const filter = parseFilter(raw);
@@ -160,14 +287,17 @@ export class Relay extends DurableObject<Env> {
         send(ws, ["CLOSED", subId, "error: malformed filter"]);
         return;
       }
-      filters.push(filter);
+      if (isUnconstrainedFilter(filter)) {
+        send(ws, ["CLOSED", subId, "invalid: filter must have an authors or kinds constraint"]);
+        return;
+      }
+      filters.push(clampFilterLimit(filter));
     }
 
-    const subs = getSubscriptions(ws);
-    subs[subId] = filters;
-    setSubscriptions(ws, subs);
+    state.subs[subId] = filters;
+    setState(ws, state);
 
-    const events = queryFilters(this.ctx.storage.sql, filters, nowSeconds());
+    const events = queryFilters(this.ctx.storage.sql, filters, nowSeconds()).slice(0, MAX_EVENTS_PER_REQ);
     for (const event of events) {
       send(ws, ["EVENT", subId, event]);
     }
@@ -176,9 +306,9 @@ export class Relay extends DurableObject<Env> {
 
   private handleClose(ws: WebSocket, subId: unknown): void {
     if (typeof subId !== "string") return;
-    const subs = getSubscriptions(ws);
-    delete subs[subId];
-    setSubscriptions(ws, subs);
+    const state = getState(ws);
+    delete state.subs[subId];
+    setState(ws, state);
   }
 
   // NIP-42 (nips/42.md): AUTH MUST be answered with OK. This relay has
@@ -226,7 +356,7 @@ export class Relay extends DurableObject<Env> {
 
   private broadcast(event: NostrEvent): void {
     for (const ws of this.ctx.getWebSockets()) {
-      const subs = getSubscriptions(ws);
+      const { subs } = getState(ws);
       for (const [subId, filters] of Object.entries(subs)) {
         if (matchesAnyFilter(event, filters)) {
           send(ws, ["EVENT", subId, event]);

@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bothy</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 40rem;
+    margin: 3rem auto;
+    padding: 0 1.25rem;
+    line-height: 1.5;
+  }
+  h1 { font-size: 1.4rem; }
+  .url-row { display: flex; gap: 0.5rem; align-items: center; }
+  .url-row input {
+    flex: 1;
+    font-family: ui-monospace, monospace;
+    padding: 0.5rem;
+  }
+  button { padding: 0.5rem 0.9rem; cursor: pointer; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin: 1.5rem 0; }
+  .stat { border: 1px solid #8884; border-radius: 0.5rem; padding: 0.75rem; }
+  .stat .n { font-size: 1.3rem; font-weight: 600; }
+  .stat .label { opacity: 0.7; font-size: 0.85rem; }
+  .bar { background: #8882; border-radius: 0.25rem; height: 0.5rem; overflow: hidden; margin-top: 0.4rem; }
+  .bar > div { background: #4a90d9; height: 100%; }
+  .bar.warn > div { background: #d97a4a; }
+  form { display: flex; flex-direction: column; gap: 0.75rem; max-width: 30rem; }
+  input[type="text"] { padding: 0.5rem; font-family: ui-monospace, monospace; }
+  .profile { display: flex; gap: 0.75rem; align-items: center; }
+  .profile img { width: 2.5rem; height: 2.5rem; border-radius: 50%; }
+  #error { color: #d94a4a; }
+  #reset-note { margin-top: 2rem; font-size: 0.9rem; opacity: 0.8; }
+</style>
+</head>
+<body>
+<h1>bothy</h1>
+
+<div id="claimed-view" hidden>
+  <p>Your relay is live at:</p>
+  <div class="url-row">
+    <input id="ws-url" readonly />
+    <button id="copy-btn">Copy</button>
+  </div>
+  <div class="stats">
+    <div class="stat"><div class="n" id="stat-total">-</div><div class="label">events stored</div></div>
+    <div class="stat"><div class="n" id="stat-24h">-</div><div class="label">events, last 24h</div></div>
+    <div class="stat">
+      <div class="n" id="stat-storage">-</div><div class="label">storage used (5 GB free limit)</div>
+      <div class="bar"><div id="bar-storage"></div></div>
+    </div>
+    <div class="stat">
+      <div class="n" id="stat-rows">-</div><div class="label">rows written, last 24h (100k/day free limit)</div>
+      <div class="bar"><div id="bar-rows"></div></div>
+    </div>
+  </div>
+</div>
+
+<div id="unclaimed-view" hidden>
+  <p>This relay hasn't been claimed yet. Paste your <code>npub</code> or hex pubkey to claim it &mdash; this binds the relay to you, permanently.</p>
+  <form id="claim-form">
+    <input type="text" id="pubkey-input" placeholder="npub1... or hex pubkey" autocomplete="off" />
+    <div id="profile-preview"></div>
+    <button type="submit">Claim this relay</button>
+  </form>
+  <p id="error"></p>
+</div>
+
+<p id="reset-note" hidden>
+  Redeploying does <strong>not</strong> reset ownership &mdash; your data and claim survive <code>wrangler deploy</code>.
+  To start over, delete the Worker from the Cloudflare dashboard and deploy a fresh one. See the README.
+</p>
+
+<script>
+async function main() {
+  const res = await fetch("/api/stats");
+  const stats = await res.json();
+
+  document.getElementById("reset-note").hidden = false;
+
+  if (stats.claimed) {
+    document.getElementById("claimed-view").hidden = false;
+    const wsUrl = location.origin.replace(/^http/, "ws") + "/";
+    document.getElementById("ws-url").value = wsUrl;
+    document.getElementById("copy-btn").addEventListener("click", () => {
+      navigator.clipboard.writeText(wsUrl);
+    });
+
+    document.getElementById("stat-total").textContent = stats.totalEvents;
+    document.getElementById("stat-24h").textContent = stats.events24h;
+
+    const STORAGE_LIMIT = 5 * 1024 * 1024 * 1024;
+    const ROWS_LIMIT = 100000;
+    setBar("stat-storage", "bar-storage", stats.storageBytes, STORAGE_LIMIT, formatBytes(stats.storageBytes) + " used");
+    setBar("stat-rows", "bar-rows", stats.rowsWrittenEstimate24h, ROWS_LIMIT, stats.rowsWrittenEstimate24h + " rows (est.)");
+  } else {
+    document.getElementById("unclaimed-view").hidden = false;
+    wireClaimForm();
+  }
+}
+
+function setBar(statId, barId, value, limit, label) {
+  document.getElementById(statId).textContent = label;
+  const pct = Math.min(100, (value / limit) * 100);
+  const bar = document.getElementById(barId);
+  bar.style.width = pct + "%";
+  bar.parentElement.classList.toggle("warn", pct > 80);
+}
+
+function formatBytes(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 ** 2) return (n / 1024).toFixed(1) + " KB";
+  if (n < 1024 ** 3) return (n / 1024 ** 2).toFixed(1) + " MB";
+  return (n / 1024 ** 3).toFixed(2) + " GB";
+}
+
+function wireClaimForm() {
+  const input = document.getElementById("pubkey-input");
+  const preview = document.getElementById("profile-preview");
+  const errorEl = document.getElementById("error");
+  let lookupToken = 0;
+
+  input.addEventListener("input", async () => {
+    preview.textContent = "";
+    const value = input.value.trim();
+    if (!/^[0-9a-f]{64}$/i.test(value)) return; // profile lookup only knows hex; npub is still accepted on submit
+    const token = ++lookupToken;
+    // Courtesy lookup only -- the hex/npub the user typed is what gets
+    // claimed regardless of whether this succeeds (CLAUDE.md "Claim
+    // implementation": "If the lookup fails, allow the claim anyway").
+    try {
+      const res = await fetch("/api/profile?pubkey=" + encodeURIComponent(value));
+      const { profile } = await res.json();
+      if (token !== lookupToken || !profile) return;
+      preview.innerHTML = "";
+      const wrap = document.createElement("div");
+      wrap.className = "profile";
+      if (profile.picture) {
+        const img = document.createElement("img");
+        img.src = profile.picture;
+        wrap.appendChild(img);
+      }
+      const name = document.createElement("span");
+      name.textContent = profile.name || "(no display name)";
+      wrap.appendChild(name);
+      preview.appendChild(wrap);
+    } catch {
+      // best-effort only
+    }
+  });
+
+  document.getElementById("claim-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    errorEl.textContent = "";
+    const res = await fetch("/api/claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pubkey: input.value.trim() }),
+    });
+    if (res.ok) {
+      location.reload();
+      return;
+    }
+    const body = await res.json().catch(() => ({}));
+    errorEl.textContent = body.error || `claim failed (${res.status})`;
+  });
+}
+
+main();
+</script>
+</body>
+</html>

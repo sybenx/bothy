@@ -28,3 +28,47 @@ bare-note-equivalent writes/day before hitting the ceiling).
 Schnorr signature verification measured at ~1.1ms/call (Node/V8, see
 `docs/baselines.json` for caveats) — well under the 10ms Worker CPU
 limit, so it is not currently a release blocker.
+
+## Chunk 4 — ownership, admin, read-abuse limits
+
+None of chunk 4's additions change the per-event write-cost formula
+above. Specifically:
+
+- **Claim is a one-time write**, not per-event: one `INSERT` into the new
+  `owner` table (schema.ts), guarded so it can only ever happen once.
+  Irrelevant to the steady-state rows-written budget.
+- **`/api/stats`** is read-only. `totalEvents`/`events24h` are `COUNT`
+  queries; the rows-written estimate is computed by re-deriving the
+  existing write-cost formula (`3 + 2 * tag_count`) over events already
+  in storage, not by tracking a separate write-per-request counter —
+  adding a counter would itself cost a row write per event just to
+  measure the thing the budget exists to protect.
+- **ALLOW_FOLLOWS** refresh (`refreshFollows`, ownership.ts) re-derives
+  the follow cache from the owner's own most recent kind-3 event
+  *already stored on this relay*, not a fresh outbound fetch. This
+  avoids the outbound-WebSocket-keeps-the-DO-in-memory-for-15-minutes
+  cost entirely (see CLAUDE.md "The budget"), at the cost of the follow
+  list only being as fresh as the owner's last kind-3 publish to this
+  relay. Runs from a cron trigger, not per event, and is a full
+  delete-and-reinsert of the `follows` table (write cost proportional to
+  follow-list size, once per cron tick — hourly by default).
+- **RETENTION_DAYS pruning** (retention.ts) is off by default (empty
+  string). When set, it deletes events older than the window on the same
+  cron tick as the follows refresh, reusing one of the account's 5 cron
+  triggers rather than adding a second. Deletes count as writes (2 rows
+  per pruned bare event, same shape as storeEvent's replace path) — this
+  is an explicit tradeoff the user opts into by setting the var, not a
+  cost imposed on the default deployment.
+- **Read-abuse caps** (limits.ts: `MAX_SUBSCRIPTIONS_PER_CONNECTION`,
+  `MAX_FILTER_LIMIT`, `MAX_EVENTS_PER_REQ`, per-IP throttling) bound
+  rows-*read* and DO-request volume, not rows-written — they exist
+  against the 5M rows-read/100k DO-request ceilings, which this relay's
+  public read path is what's actually exposed to (CLAUDE.md "Threat
+  model").
+- **The outbound profile lookup at claim time** (profile-lookup.ts) runs
+  in the stateless Worker, not the Durable Object, specifically so its
+  short-lived outbound WebSocket to well-known relays never risks
+  pinning the DO in memory. It happens once, at claim time, not per
+  event.
+
+No baseline in `docs/baselines.json` changes as a result of this chunk.

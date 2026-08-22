@@ -18,11 +18,33 @@
   ],
 
   // NIP-11 display fields. RELAY_ICON blank means "no icon" in the NIP-11
-  // document rather than a broken URL. Ownership vars (OWNER_PUBKEY,
-  // ALLOW_FOLLOWS, RETENTION_DAYS) land in chunk 4 with the claim flow.
+  // document rather than a broken URL. OWNER_PUBKEY is deliberately
+  // absent here -- see CLAUDE.md "Ownership": a real deploy stays
+  // unclaimed (TOFU) by default. ALLOW_FOLLOWS/RETENTION_DAYS are safe
+  // to default here since "off" is their unclaimed-relay-safe state too.
   "vars": {
     "RELAY_NAME": "bothy",
     "RELAY_DESCRIPTION": "A single-user nostr relay.",
-    "RELAY_ICON": ""
+    "RELAY_ICON": "",
+    "ALLOW_FOLLOWS": "false",
+    "RETENTION_DAYS": ""
+  },
+
+  // Static admin page (CLAUDE.md "Admin page") -- static assets are
+  // free and unlimited on Workers Free, unlike Worker/DO requests.
+  // run_worker_first is required: without it, asset serving would
+  // intercept `/` before the Worker's Accept-header check for NIP-11
+  // ever runs.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+
+  // Drives ALLOW_FOLLOWS refresh and RETENTION_DAYS pruning (both
+  // no-ops when unset) -- see src/index.ts scheduled(). One of the
+  // account-wide 5 cron triggers on Workers Free.
+  "triggers": {
+    "crons": ["0 * * * *"]
   }
 }

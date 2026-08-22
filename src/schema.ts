@@ -53,6 +53,23 @@ CREATE TABLE IF NOT EXISTS event_tags (
 
 CREATE INDEX IF NOT EXISTS idx_event_tags_lookup
   ON event_tags (tag_name, tag_value, created_at DESC);
+
+-- TOFU ownership (CLAUDE.md "Ownership"). At most one row, ever. The
+-- claim handler is the only writer and refuses if a row already exists
+-- -- see ownership.ts. A one-time write; not part of the per-event
+-- budget in the comment above.
+CREATE TABLE IF NOT EXISTS owner (
+  pubkey TEXT NOT NULL
+);
+
+-- ALLOW_FOLLOWS cache (CLAUDE.md "Configuration"): the owner's own
+-- kind-3 follow list, re-derived on a cron schedule rather than per
+-- event -- see ownership.ts refreshFollows(). Replaced wholesale on
+-- each refresh, so no index beyond the primary key is needed.
+CREATE TABLE IF NOT EXISTS follows (
+  pubkey     TEXT PRIMARY KEY,
+  fetched_at INTEGER NOT NULL
+);
 `;
 
 export function initSchema(sql: SqlStorage): void {
