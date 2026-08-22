@@ -24,5 +24,8 @@ One user is not a scale problem. Sharding adds cost and complexity against a wor
 **Free tier is a hard constraint, enforced by tests.** *Closed.*
 "Free" is the entire product claim, so it needs a failing build behind it rather than good intentions. Rejected: treating limits as guidance.
 
+**Test-only OWNER_PUBKEY is injected via vitest's `miniflare.bindings`, not wrangler.jsonc.** *Closed.*
+The conformance suite (chunk 2) needs a deterministic owner pubkey to test the write gate without depending on chunk 4's unbuilt TOFU claim endpoint. `@cloudflare/vitest-plugin` supports pointing at a named wrangler environment (`wrangler.jsonc`'s `env.<name>`) for this, but Cloudflare's own docs confirm `vars` and bindings are non-inheritable per named environment -- using one would mean duplicating `durable_objects`, `migrations`, and all `vars` under `env.test`, with an ongoing risk of drift between the two copies. Setting `OWNER_PUBKEY` directly in wrangler.jsonc's top-level `vars` was also rejected, since that would disable TOFU-by-default for real deployments too. Instead `vitest.config.ts` passes `miniflare: { bindings: { OWNER_PUBKEY } }`, which vitest merges on top of the parsed wrangler config for tests only, matching the fixture pubkey in `test/helpers/keys.ts`. Rejected: named wrangler environment (duplication/drift risk), top-level wrangler.jsonc var (breaks TOFU default).
+
 **No key generation in the deploy flow.** *Closed.*
 Generating or storing a nostr private key requires encrypted-key-behind-social-login machinery and carries a far worse failure mode than anything else in this project. Users without a key are directed to a client. Rejected: Wisp-style onboarding, which is a different product.

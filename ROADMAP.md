@@ -2,7 +2,7 @@
 
 Work proceeds **one chunk at a time, in order**. Do not start a chunk until the previous one meets its definition of done. Update `CURRENT` below when a chunk completes.
 
-CURRENT: 2
+CURRENT: 3
 
 ---
 
