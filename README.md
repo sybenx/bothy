@@ -17,6 +17,20 @@ Click the button, paste your `npub`, get a `wss://` URL for your own relay. No t
 
 That's it. No dashboard configuration required.
 
+## Updating
+
+The deploy button forked this repo into your own GitHub account and connected it to your Worker. To pick up a new version, no terminal required:
+
+1. Open your fork on github.com (it's under your account, named `bothy`).
+2. Click **Sync fork**, then **Update branch**.
+3. Cloudflare notices the push and redeploys automatically — usually within a minute or two.
+
+Your relay stays claimed and your events survive; deploying never resets anything (see "Resetting" below for what actually does). After it redeploys, hard-refresh the admin page in your browser (`Cmd+Shift+R` / `Ctrl+Shift+R`) — the page's static assets can stick around in your browser's cache otherwise.
+
+To check whether a deploy went through, open your Worker in the Cloudflare dashboard and look at its **Deployments** tab.
+
+If you deployed manually instead of via the button (you have the code checked out locally), update the same way you would any git project, then run `npx wrangler deploy`.
+
 ### Rate limiting (recommended)
 
 This relay's read path is intentionally public (gift-wrapped DMs are the one exception — see "Inbox mode" below), so it's worth adding a free Cloudflare rate-limiting rule against abusive traffic: in the Cloudflare dashboard, go to **Security → WAF → Rate limiting rules** for your zone and add a rule capping requests per IP to your Worker's route. The relay enforces its own per-connection and per-IP limits regardless, but an edge rule catches abuse before it reaches the Worker at all.
