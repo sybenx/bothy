@@ -31,7 +31,7 @@ async function handleClaim(request: Request, env: Env): Promise<Response> {
   const normalized = typeof rawPubkey === "string" ? normalizePubkey(rawPubkey) : null;
   const profile = normalized ? await lookupProfile(normalized) : null;
 
-  const result = await relayStub(env).claim(rawPubkey, profile ?? undefined);
+  const result = await relayStub(env).claim(rawPubkey, profile ?? undefined, new URL(request.url).host);
   switch (result.status) {
     case "disabled":
       // CLAUDE.md "Claim implementation": "If OWNER_PUBKEY is set in
@@ -46,8 +46,8 @@ async function handleClaim(request: Request, env: Env): Promise<Response> {
   }
 }
 
-async function handleStats(env: Env): Promise<Response> {
-  const stats = await relayStub(env).getStats();
+async function handleStats(request: Request, env: Env): Promise<Response> {
+  const stats = await relayStub(env).getStats(new URL(request.url).host);
   return json(stats);
 }
 
@@ -65,7 +65,7 @@ export default {
     const url = new URL(request.url);
 
     if (request.headers.get("Accept") === "application/nostr+json") {
-      const profile = await relayStub(env).getProfile();
+      const profile = await relayStub(env).getProfile(url.host);
       return nip11Response(env, profile);
     }
 
@@ -74,7 +74,7 @@ export default {
     }
 
     if (url.pathname === "/api/claim") return handleClaim(request, env);
-    if (url.pathname === "/api/stats") return handleStats(env);
+    if (url.pathname === "/api/stats") return handleStats(request, env);
     if (url.pathname === "/api/profile") return handleProfile(request);
 
     return env.ASSETS.fetch(request);

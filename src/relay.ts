@@ -8,6 +8,7 @@ import {
   seedBackfillRelays,
 } from "./backfill";
 import { matchesAnyFilter, parseFilter } from "./filters";
+import { recordHost } from "./host";
 import {
   BACKFILL_PAGE_SIZE,
   clampFilterLimit,
@@ -21,8 +22,16 @@ import {
   MAX_LIVE_FEED_CONNECTIONS,
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
 } from "./limits";
+import { resolveIcon } from "./nip11";
 import { type Filter, GIFT_WRAP_KIND, type NostrEvent, pTagValues, VANISH_KIND } from "./nostr";
-import { claimOwner, getOwnerPubkey, getOwnerProfile, isAllowedWriter, refreshFollows } from "./ownership";
+import {
+  claimOwner,
+  getOwnerPubkey,
+  getOwnerProfile,
+  isAllowedWriter,
+  refreshFollows,
+  refreshProfile,
+} from "./ownership";
 import type { Profile } from "./profile-lookup";
 import { normalizePubkey } from "./pubkey";
 import { initSchema } from "./schema";
@@ -160,6 +169,12 @@ export class Relay extends DurableObject<Env> {
       return new Response("expected websocket upgrade", { status: 426 });
     }
 
+    // Opportunistic: every real client connection passes through here,
+    // so this is the most reliable single place to learn the
+    // deployment's own host (src/host.ts) for backfill's self-skip.
+    // recordHost is a no-op write once the host is already known.
+    recordHost(this.ctx.storage.sql, new URL(request.url).host);
+
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
@@ -225,6 +240,7 @@ export class Relay extends DurableObject<Env> {
   async claim(
     rawPubkey: unknown,
     profile?: Profile,
+    host?: string,
   ): Promise<{ status: "claimed" | "conflict" | "disabled" | "invalid"; pubkey?: string }> {
     if (this.env.OWNER_PUBKEY) return { status: "disabled" };
     if (typeof rawPubkey !== "string") return { status: "invalid" };
@@ -232,6 +248,7 @@ export class Relay extends DurableObject<Env> {
     if (!pubkey) return { status: "invalid" };
 
     const sql = this.ctx.storage.sql;
+    if (host) recordHost(sql, host);
     if (!claimOwner(sql, pubkey, profile)) return { status: "conflict" };
     return { status: "claimed", pubkey };
   }
@@ -241,12 +258,13 @@ export class Relay extends DurableObject<Env> {
   // ROADMAP.md chunk 5. Null when unclaimed, when OWNER_PUBKEY skips
   // storage entirely, or when the claim-time profile lookup failed; the
   // caller (nip11.ts) falls back to hardcoded defaults in all those cases.
-  async getProfile(): Promise<{ name: string | null; picture: string | null } | null> {
+  async getProfile(host?: string): Promise<{ name: string | null; picture: string | null } | null> {
+    if (host) recordHost(this.ctx.storage.sql, host);
     return getOwnerProfile(this.ctx.storage.sql, this.env);
   }
 
   // Backs GET /api/stats (src/index.ts) -- see CLAUDE.md "Admin page".
-  async getStats(): Promise<{
+  async getStats(host?: string): Promise<{
     claimed: boolean;
     ownerPubkey: string | null;
     totalEvents: number;
@@ -254,8 +272,10 @@ export class Relay extends DurableObject<Env> {
     storageBytes: number;
     rowsWrittenEstimate24h: number;
     backfill: BackfillStatus | null;
+    icon: string | null;
   }> {
     const sql = this.ctx.storage.sql;
+    if (host) recordHost(sql, host);
     const owner = getOwnerPubkey(sql, this.env);
     const since = nowSeconds() - 86400;
 
@@ -273,15 +293,24 @@ export class Relay extends DurableObject<Env> {
       storageBytes: sql.databaseSize,
       rowsWrittenEstimate24h: estimateRowsWritten24h(sql, since),
       backfill: owner !== null ? getBackfillStatus(sql) : null,
+      // Same source as the NIP-11 document's icon (src/nip11.ts
+      // resolveIcon) -- the admin page uses this to set the browser
+      // tab's favicon from the owner's kind-0 picture. Null falls back
+      // to the static default favicon client-side.
+      icon: resolveIcon(this.env, getOwnerProfile(sql, this.env)),
     };
   }
 
   // Cron entry point (src/index.ts scheduled()) -- refreshes the
-  // ALLOW_FOLLOWS cache. A no-op when the env var is unset, so this is
-  // cheap on the common (feature-off) path.
+  // ALLOW_FOLLOWS cache and, at most once/day, the cached NIP-11/favicon
+  // icon from the owner's locally-stored kind-0 (ownership.ts
+  // refreshProfile). Both are no-ops on their common paths (feature off;
+  // already refreshed today), so this stays cheap on most ticks.
   async runCron(): Promise<void> {
     const sql = this.ctx.storage.sql;
-    refreshFollows(sql, this.env, nowSeconds());
+    const now = nowSeconds();
+    refreshFollows(sql, this.env, now);
+    refreshProfile(sql, this.env, now);
   }
 
   // One-shot backfill (ROADMAP.md chunk 7), read side. Called once per

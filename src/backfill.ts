@@ -4,6 +4,7 @@
 // from relay.ts's RPC methods, exactly like ownership.ts/storage.ts. The
 // Worker-side half (outbound sockets, never here -- CLAUDE.md "The
 // budget") lives in backfill-worker.ts.
+import { getOwnHost, normalizeHost } from "./host";
 import { BACKFILL_ROWS_SHARE_LIMIT } from "./limits";
 import { isEphemeralKind } from "./nostr";
 import { estimateRowsWritten24h, isDeleted, eventExists, storeEvent } from "./storage";
@@ -92,7 +93,28 @@ export function seedBackfillRelays(sql: SqlStorage, relayUrls: string[], nowSec:
   const alreadySeeded = sql.exec(`SELECT 1 FROM backfill_relays LIMIT 1`).toArray().length > 0;
   if (alreadySeeded || relayUrls.length === 0) return;
 
-  for (const url of relayUrls) {
+  // The owner's kind-10002 write-relay list legitimately includes this
+  // relay itself -- pulling "history" from itself would seed a relay row
+  // that never exhausts (there is nothing there this relay doesn't
+  // already have) and leave /api/stats' nextRelay permanently pointing
+  // at the relay's own URL (src/host.ts's header comment has the full
+  // story). Detected by comparing the actual request host this
+  // deployment has seen traffic on, not by string-matching a project
+  // name -- the deployer can name their Worker anything.
+  const ownHost = getOwnHost(sql);
+  const relays = ownHost === null ? relayUrls : relayUrls.filter((url) => normalizeHost(url) !== ownHost);
+
+  if (relays.length === 0) {
+    // Every listed write relay was this relay itself -- there is no
+    // external history to import. Mark done rather than leaving status
+    // at "pending", which would otherwise retry discovery forever: the
+    // "pending" retry path (relayUrls.length === 0 above) is for a
+    // failed *lookup*, not a lookup that only found this relay.
+    sql.exec(`UPDATE backfill_meta SET status = 'done'`);
+    return;
+  }
+
+  for (const url of relays) {
     sql.exec(`INSERT OR IGNORE INTO backfill_relays (relay_url, until_cursor) VALUES (?, ?)`, url, nowSec);
   }
   sql.exec(`UPDATE backfill_meta SET status = 'running'`);

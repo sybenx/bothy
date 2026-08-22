@@ -53,6 +53,13 @@ Reading them back is restricted to you: an unauthenticated query for gift wraps 
 
 **Worth knowing:** Cloudflare terminates the TLS connection in front of this relay, so it necessarily sees the `p` tag (who a gift wrap is addressed to), the arrival time, and the sender's IP address, the same as any other Worker traffic. On a personal relay the `p` tag is always you, so that part leaks nothing new — but the sender IPs belong to other people, sending you mail through infrastructure you chose, not them.
 
+## HTTP endpoints
+
+- `GET /api/stats` — relay stats for the admin page. Returns `{ claimed, ownerPubkey, totalEvents, events24h, storageBytes, rowsWrittenEstimate24h, backfill, icon }`.
+- `POST /api/claim` — TOFU claim; body `{ pubkey }` (npub or hex). See "Ownership" above.
+- `GET /live` — unauthenticated, push-only WebSocket for the admin page's live feed (max 5 connections, 10-minute lifetime); sends `{ kind, created_at, id }` per stored event, never gift wraps.
+- Any path, with header `Accept: application/nostr+json` — the [NIP-11](https://github.com/nostr-protocol/nips/blob/master/11.md) relay information document.
+
 ## Choices, not requirements
 
 The NIPs leave some behavior unspecified. Where they do, here's what this relay chose and why — not what the spec required:

@@ -2,6 +2,12 @@ import type { Profile } from "./profile-lookup";
 
 // Kind-3 is NIP-01/NIP-02's contact list; its `p` tags are the follow set.
 const CONTACT_LIST_KIND = 3;
+// Kind-0 is NIP-01's profile metadata event.
+const PROFILE_KIND = 0;
+
+// Icon refresh cadence (see refreshProfile below) -- at most once/day
+// regardless of how often the hourly cron fires.
+const ICON_REFRESH_INTERVAL_SECONDS = 86400;
 
 // ALLOW_FOLLOWS is not declared in wrangler.jsonc's `vars` (ROADMAP.md
 // chunk 5), so it's undefined unless someone adds it in the Cloudflare
@@ -97,4 +103,66 @@ export function refreshFollows(sql: SqlStorage, env: Env, nowSec: number): void 
   for (const pubkey of follows) {
     sql.exec(`INSERT INTO follows (pubkey, fetched_at) VALUES (?, ?)`, pubkey, nowSec);
   }
+}
+
+// Re-derives the cached name/picture (backing NIP-11's icon and
+// /api/stats' favicon, nip11.ts resolveIcon) from the owner's own most
+// recent locally-stored kind-0 -- never a fresh fetch. The owner's own
+// client publishes kind 0 here like any other event, so profile changes
+// arrive on their own; there is nothing to poll for. Called from the
+// cron handler, gated to run at most once/day (icon_refreshed_at) even
+// though the cron itself fires hourly, and to actually re-parse content
+// only when a newer kind-0 has arrived since the last sync
+// (profile_synced_at) -- both cheap reads compared against a fresh parse
+// on every tick.
+export function refreshProfile(sql: SqlStorage, env: Env, nowSec: number): void {
+  const owner = getOwnerPubkey(sql, env);
+  if (owner === null) return;
+
+  const row = sql
+    .exec<{
+      name: string | null;
+      picture: string | null;
+      profile_synced_at: number | null;
+      icon_refreshed_at: number | null;
+    }>(`SELECT name, picture, profile_synced_at, icon_refreshed_at FROM owner LIMIT 1`)
+    .toArray()[0];
+  // No `owner` row exists when OWNER_PUBKEY skips the claim flow
+  // entirely (claimOwner above is the only writer) -- nothing to cache a
+  // profile onto.
+  if (!row) return;
+  if (row.icon_refreshed_at !== null && nowSec - row.icon_refreshed_at < ICON_REFRESH_INTERVAL_SECONDS) return;
+
+  const latest = sql
+    .exec<{ content: string; created_at: number }>(
+      `SELECT content, created_at FROM events WHERE pubkey = ? AND kind = ? ORDER BY created_at DESC LIMIT 1`,
+      owner,
+      PROFILE_KIND,
+    )
+    .toArray()[0];
+
+  let name = row.name;
+  let picture = row.picture;
+  let syncedAt = row.profile_synced_at;
+  if (latest && (row.profile_synced_at === null || latest.created_at > row.profile_synced_at)) {
+    try {
+      const content = JSON.parse(latest.content) as Record<string, unknown>;
+      name = typeof content.name === "string" ? content.name : null;
+      picture = typeof content.picture === "string" ? content.picture : null;
+      syncedAt = latest.created_at;
+    } catch {
+      // Malformed kind-0 content -- leave the cached profile as-is, but
+      // icon_refreshed_at is still bumped below so a bad kind 0 isn't
+      // re-parsed every cron tick until the owner republishes a valid
+      // one.
+    }
+  }
+
+  sql.exec(
+    `UPDATE owner SET name = ?, picture = ?, profile_synced_at = ?, icon_refreshed_at = ?`,
+    name,
+    picture,
+    syncedAt,
+    nowSec,
+  );
 }

@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>bothy</title>
+<link id="favicon" rel="icon" type="image/svg+xml" href="/favicon.svg" />
 <style>
   :root { color-scheme: light dark; }
   body {
@@ -13,7 +14,10 @@
     padding: 0 1.25rem;
     line-height: 1.5;
   }
-  h1 { font-size: 1.4rem; }
+  .brand { display: flex; align-items: baseline; flex-wrap: wrap; column-gap: 0.6rem; }
+  h1 { font-size: 1.4rem; margin: 0; }
+  .tagline { margin: 0; font-size: 0.85rem; opacity: 0.7; }
+  .tagline a { color: inherit; }
   .url-row { display: flex; gap: 0.5rem; align-items: center; }
   .url-row input {
     flex: 1;
@@ -68,7 +72,10 @@
 </style>
 </head>
 <body>
-<h1>bothy</h1>
+<div class="brand">
+  <h1>bothy</h1>
+  <p class="tagline">personal nostr relay &middot; <a href="https://github.com/sybenx/bothy" target="_blank" rel="noopener">Get your own</a></p>
+</div>
 
 <div id="claimed-view" hidden>
   <p>Your relay is live at:</p>
@@ -109,7 +116,7 @@
 
 <p id="reset-note" hidden>
   Redeploying does <strong>not</strong> reset ownership &mdash; your data and claim survive <code>wrangler deploy</code>.
-  To start over, delete the Worker from the Cloudflare dashboard and deploy a fresh one. See the README.
+  To start over, delete the Worker from the Cloudflare dashboard and deploy a fresh one. See the <a href="https://github.com/sybenx/bothy#readme" target="_blank" rel="noopener">README</a>.
 </p>
 
 <script>
@@ -118,6 +125,7 @@ async function main() {
   const stats = await res.json();
 
   document.getElementById("reset-note").hidden = false;
+  setFavicon(stats.icon);
 
   if (stats.claimed) {
     document.getElementById("claimed-view").hidden = false;
@@ -141,6 +149,23 @@ async function main() {
     document.getElementById("unclaimed-view").hidden = false;
     wireClaimForm();
   }
+}
+
+// Sets the browser tab's favicon from the owner's kind-0 picture
+// (src/nip11.ts resolveIcon, the same source NIP-11's icon field uses),
+// pre-loading it off-DOM first so a broken/unreachable picture URL never
+// replaces the default favicon.svg already in the <link> -- there's
+// nothing to "fall back" to explicitly, since the default is simply
+// never overwritten. Nothing here is cached across page loads, so a
+// picture URL that starts working again is picked up on the very next
+// load without needing to wait for anything server-side to notice.
+function setFavicon(iconUrl) {
+  if (!iconUrl) return;
+  const probe = new Image();
+  probe.onload = () => {
+    document.getElementById("favicon").href = iconUrl;
+  };
+  probe.src = iconUrl;
 }
 
 function setBar(statId, barId, value, limit, label) {

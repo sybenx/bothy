@@ -6,6 +6,7 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { applyBackfillPage, getBackfillStatus, hasBackfillHeadroom, seedBackfillRelays } from "../src/backfill";
+import { recordHost } from "../src/host";
 import { BACKFILL_ROWS_SHARE_LIMIT } from "../src/limits";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
@@ -178,6 +179,65 @@ describe("backfill ingest", () => {
       seedBackfillRelays(sql, ["wss://relay-c"], 2000);
       status = getBackfillStatus(sql);
       expect(status.relayCount).toBe(2);
+    });
+  });
+
+  it("skips its own host in the owner's write-relay list, however the deployment is named", async () => {
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      // Whatever the deployer named their Worker -- the bug this guards
+      // against was string-matching "bothy" in the URL, which a
+      // differently-named deployment would never trip.
+      recordHost(sql, "my-notes-thing.someusername.workers.dev");
+
+      seedBackfillRelays(
+        sql,
+        ["wss://my-notes-thing.someusername.workers.dev/", "wss://relay-a", "wss://relay-b"],
+        1000,
+      );
+
+      const status = getBackfillStatus(sql);
+      expect(status.status).toBe("running");
+      expect(status.relayCount).toBe(2);
+      const relays = sql
+        .exec<{ relay_url: string }>(`SELECT relay_url FROM backfill_relays ORDER BY relay_url`)
+        .toArray()
+        .map((r) => r.relay_url);
+      expect(relays).toEqual(["wss://relay-a", "wss://relay-b"]);
+    });
+  });
+
+  it("skips its own host when it's a custom domain, case- and slash-insensitively", async () => {
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      recordHost(sql, "notes.example.com");
+
+      seedBackfillRelays(sql, ["wss://NOTES.example.com", "wss://relay-a"], 1000);
+
+      const status = getBackfillStatus(sql);
+      expect(status.status).toBe("running");
+      expect(status.relayCount).toBe(1);
+      const relays = sql.exec<{ relay_url: string }>(`SELECT relay_url FROM backfill_relays`).toArray();
+      expect(relays).toEqual([{ relay_url: "wss://relay-a" }]);
+    });
+  });
+
+  it("marks backfill done, not stuck pending, when every listed write relay is itself", async () => {
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      recordHost(sql, "notes.example.com");
+
+      seedBackfillRelays(sql, ["wss://notes.example.com/"], 1000);
+
+      const status = getBackfillStatus(sql);
+      expect(status.status).toBe("done");
+      expect(status.relayCount).toBe(0);
     });
   });
 

@@ -74,10 +74,18 @@ CREATE INDEX IF NOT EXISTS idx_event_tags_lookup
 -- profile as resolved at claim time (ROADMAP.md chunk 5), backing the
 -- NIP-11 document's name/icon instead of a deploy-time var -- null when
 -- the claim-time lookup found nothing.
+-- profile_synced_at/icon_refreshed_at back the icon-refresh cron (see
+-- ownership.ts refreshProfile): profile_synced_at is the created_at of
+-- the locally-stored kind-0 event name/picture were last derived from
+-- (so a re-run can tell "is there a newer one" without re-parsing
+-- content every tick); icon_refreshed_at gates the refresh to at most
+-- once/day regardless of how often the hourly cron fires.
 CREATE TABLE IF NOT EXISTS owner (
-  pubkey  TEXT NOT NULL,
-  name    TEXT,
-  picture TEXT
+  pubkey             TEXT NOT NULL,
+  name               TEXT,
+  picture            TEXT,
+  profile_synced_at  INTEGER,
+  icon_refreshed_at  INTEGER
 );
 
 -- ALLOW_FOLLOWS cache (CLAUDE.md "Configuration"): the owner's own
@@ -91,6 +99,13 @@ CREATE TABLE IF NOT EXISTS follows (
 
 CREATE TABLE IF NOT EXISTS deleted_ids (
   id TEXT PRIMARY KEY
+);
+
+-- This deployment's own host (see src/host.ts) -- recorded from inbound
+-- request traffic, not known at deploy time. Single row, like
+-- backfill_meta below.
+CREATE TABLE IF NOT EXISTS relay_meta (
+  host TEXT
 );
 
 -- One-shot backfill (ROADMAP.md chunk 7): one row per relay pulled from
@@ -126,4 +141,8 @@ export function initSchema(sql: SqlStorage): void {
   // rather than by whichever code path happens to run first, so every
   // reader (getBackfillStatus, /api/stats) can assume it exists.
   sql.exec(`INSERT INTO backfill_meta (status) SELECT 'pending' WHERE NOT EXISTS (SELECT 1 FROM backfill_meta)`);
+  // relay_meta must have exactly one row, like backfill_meta above, so
+  // getOwnHost/recordHost (src/host.ts) never have to special-case "no
+  // row yet".
+  sql.exec(`INSERT INTO relay_meta (host) SELECT NULL WHERE NOT EXISTS (SELECT 1 FROM relay_meta)`);
 }

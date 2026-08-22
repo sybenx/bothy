@@ -10,6 +10,16 @@ export const DEFAULT_DESCRIPTION = "A single-user nostr relay.";
 
 export type OwnerProfile = { name: string | null; picture: string | null } | null;
 
+// The owner's kind-0 picture takes priority over the RELAY_ICON dashboard
+// override -- same precedence as name/description above. Shared between
+// the NIP-11 document and /api/stats (src/relay.ts getStats), which the
+// admin page uses to set the browser tab's favicon (ROADMAP.md;
+// public/index.html) from the same source rather than inventing a second
+// resolution path.
+export function resolveIcon(env: Env, profile: OwnerProfile): string | null {
+  return profile?.picture || env.RELAY_ICON || null;
+}
+
 export function buildRelayInfo(env: Env, profile: OwnerProfile): Record<string, unknown> {
   const info: Record<string, unknown> = {
     // The owner's kind-0 name/picture (resolved at claim time, see
@@ -26,7 +36,7 @@ export function buildRelayInfo(env: Env, profile: OwnerProfile): Record<string, 
     // chunk.
     supported_nips: [1, 9, 11, 40, 42, 59, 62],
   };
-  const icon = profile?.picture || env.RELAY_ICON;
+  const icon = resolveIcon(env, profile);
   if (icon) {
     info.icon = icon;
   }
