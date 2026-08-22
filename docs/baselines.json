@@ -1,0 +1,17 @@
+{
+  "_comment": "Recorded per ROADMAP.md chunk 3's 'Done when'. Rows-written measured with SqlStorageCursor.rowsWritten inside a real DO instance (runInDurableObject); CPU measured as wall-clock schnorr.verify() time, which is the dominant cost of Worker CPU per NIP-01 EVENT (see CLAUDE.md 'The budget': 'Schnorr verification is the CPU risk'). Re-measure and update this file whenever a change could plausibly shift either number -- see CLAUDE.md 'Testing'.",
+  "measured_at": "2026-08-21",
+  "rows_written_per_event": {
+    "bare_note_kind_1_no_tags": 3,
+    "reply_kind_1_with_e_and_p_tags": 7,
+    "formula": "3 + 2 * (single-letter tag count)",
+    "note": "Higher than chunk 1's original estimate of 2 base + 2/tag: `id TEXT PRIMARY KEY` is not a rowid alias, so it costs its own implicit unique index in addition to the composite (pubkey, kind, created_at) index. See schema.ts."
+  },
+  "schnorr_verify_cpu": {
+    "avg_ms_per_verification": 1.11,
+    "sample_size": 5000,
+    "environment": "Node.js (V8), not workerd -- see note",
+    "worker_cpu_limit_ms": 10,
+    "note": "Measured with @noble/curves' schnorr.verify() directly (scripts run outside the miniflare/workerd harness, which doesn't expose isolate CPU time to test code). workerd's JS engine is also V8, so this is a reasonable proxy, but re-measure against real wrangler dev / production logs before treating the 10ms ceiling as comfortably clear rather than just plausible."
+  }
+}

@@ -3,13 +3,17 @@
 // the binding constraint, not storage or requests, so this is the number
 // that decides how much headroom a single owner actually has.
 //
-//   events insert:                    1 base row + 1 for the composite
-//                                      index below (pubkey/kind/created_at
-//                                      are all written columns)          = 2
+// Measured via SqlStorageCursor.rowsWritten (chunk 3, docs/baselines.json)
+// rather than estimated, since `id TEXT PRIMARY KEY` isn't a rowid alias
+// and costs its own implicit unique index on top of the composite one:
+//
+//   events insert:                    1 base row + 1 implicit PK index
+//                                      (TEXT primary key, not a rowid
+//                                      alias) + 1 composite index below = 3
 //   event_tags insert, per tag row:   1 base row + 1 for its index       = 2
 //
-//   => 2 + 2 * (single-letter tag count) rows per stored event.
-//      A bare note costs 2 rows; a reply carrying #e and #p costs 6.
+//   => 3 + 2 * (single-letter tag count) rows per stored event.
+//      A bare note costs 3 rows; a reply carrying #e and #p costs 7.
 //      NIP-09 deletes and replaceable-event replacement cost the same
 //      shape again (a delete is a write too) plus this insert cost.
 //
