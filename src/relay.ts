@@ -207,9 +207,21 @@ export class Relay extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  // TOFU claim (CLAUDE.md "Ownership"). RPC method, called directly by
-  // the Worker (src/index.ts) rather than over fetch() -- this is the
-  // only code path that may write the `owner` row (ownership.ts).
+  // TOFU claim: the first pubkey submitted here owns the relay,
+  // permanently, with no signature check on the claim itself. This is
+  // deliberate, not a shortcut -- a signature would buy no real security,
+  // since every event is verified against its own signature regardless of
+  // who owns the relay, so a wrong claim can never be used to forge
+  // anything. The worst case of someone else claiming first is that the
+  // relay archives a stranger's public notes at the real owner's expense,
+  // and recovery is free: delete the Worker, deploy again. Requiring a
+  // signature here would only move the hard step (proving control of a
+  // key before you have anything working) onto this page, for a threat
+  // that doesn't cost anything to recover from.
+  //
+  // RPC method, called directly by the Worker (src/index.ts) rather than
+  // over fetch() -- this is the only code path that may write the `owner`
+  // row (ownership.ts).
   async claim(
     rawPubkey: unknown,
     profile?: Profile,

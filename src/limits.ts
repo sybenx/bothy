@@ -1,10 +1,14 @@
 import { tagFilterEntries, type Filter } from "./nostr";
 
-// Read-abuse caps (CLAUDE.md "Threat model": "Reads are public by
-// design... anyone can burn the daily 5M rows-read and 100k DO requests
-// without touching ownership at all"). These are the structural
-// mitigations; per-IP throttling is enforced separately in relay.ts
-// since it needs connection-level state these pure functions don't have.
+// Hijacking is not the threat here. Read abuse is. The write path is
+// already owner-gated (ownership.ts isAllowedWriter), so these caps
+// aren't defending against someone taking over the relay -- they're
+// bounding a completely different risk: reads are public by design,
+// so anyone can burn the daily 5M rows-read and 100k DO-request
+// ceilings without ever touching ownership at all. These are the
+// structural mitigations; per-IP throttling is enforced separately in
+// relay.ts since it needs connection-level state these pure functions
+// don't have.
 
 // Concurrent subscriptions a single WebSocket connection may hold open.
 export const MAX_SUBSCRIPTIONS_PER_CONNECTION = 10;

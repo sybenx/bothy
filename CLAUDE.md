@@ -1,183 +1,77 @@
 # bothy
 
-A single-user nostr relay that runs on the Cloudflare free tier and deploys in one click.
+A single-user nostr relay that deploys in one click and runs on the Cloudflare Workers free tier. Paste an npub, get a `wss://` URL, done — no terminal, no VPS, no domain.
 
-A bothy is a small unlocked shelter in the Scottish highlands — free, unowned, maintained by whoever passes through. This is that, for your notes.
+## What it is
 
-## What this is
+- One Worker ([src/index.ts](src/index.ts)) routes requests: NIP-11 on `Accept: application/nostr+json`, WebSocket upgrades to the Durable Object, `/api/claim`, `/api/stats`, `/api/profile`, everything else to the static `public/` admin page.
+- Exactly one Durable Object (`Relay`, [src/relay.ts](src/relay.ts)), addressed by `idFromName("relay")`. SQLite-backed. All protocol state, storage, and subscriptions live here.
+- WebSocket Hibernation API throughout (`acceptWebSocket`, `webSocketMessage`/`webSocketClose`/`alarm`), `setWebSocketAutoResponse` for ping/pong. No outbound socket is ever opened from inside the DO — the Worker owns every outbound connection (claim-time profile lookup, backfill fetches) so the DO can hibernate.
+- TOFU ownership: unclaimed until `POST /api/claim` binds a pubkey, permanently, with no signature required (`OWNER_PUBKEY` env var skips this and disables the endpoint). Every event is still signature-verified regardless of owner, so a wrong claim can't forge anything.
+- Owner-only writes by default, with two deliberate exceptions: `ALLOW_FOLLOWS` also accepts the owner's kind-3 follow list (cached from the owner's own stored contact list, refreshed hourly by cron — never fetched per event); kind-1059 gift wraps (NIP-59) are accepted from anyone, p-tag-addressed to the owner, gated by a separate byte cap, storage cap, and per-IP throttle.
+- Gift wrap reads require NIP-42 AUTH as the p-tagged recipient. The gate re-runs the filter restricted to `kinds: [1059]` against real storage rather than pattern-matching the filter shape.
+- NIP-09 deletion and NIP-62 vanish requests both tombstone ids (`deleted_ids`) so a deleted event — gift wraps especially, since the sender keeps their own signed copy — can't be replayed back into storage.
+- Live feed (`/live`) is a separate, unauthenticated, push-only WebSocket channel for the admin page, capped at 5 concurrent connections and a 10-minute server-enforced lifetime (DO alarm). Never sends gift wraps or event content, only kind/time/truncated id.
+- One-shot backfill pulls the owner's own historical events from their kind-10002 write relays, resumable across cron ticks, reserving at most half the daily rows-written budget so it never competes with the owner's live traffic.
 
-One person clicks a button, pastes their npub, and gets a working `wss://` URL for their own relay. No terminal, no VPS, no domain purchase, no port forwarding, no dynamic DNS, no always-on box at home. The relay lives in their own Cloudflare account, so there is no operator who can rug them.
+## What it refuses to be
 
-The target user has never opened a terminal. Every decision in this repo should be evaluated against that.
-
-## What this is not
-
-Do not add these. If a change request implies one, push back before implementing:
-
-- **Pay-to-relay / zaps / any payment flow.** Not a business.
-- **Multi-region Durable Object meshes, D1, read replication.** One user does not need horizontal scale, and these push the deployment onto the paid plan.
-- **NIP-05 identity hosting.** Requires a custom domain, which breaks one-click.
-- **Media / blossom / file uploads.** R2 has its own free-tier cliff and a different abuse profile.
-- **Moderation tooling, invite hierarchies, community features.** Those are khatru-pyramid's and relay.tools' problem.
-- **A public relay mode.** An open write path on a free tier is a storage-exhaustion attack with extra steps.
-
-Scope discipline is the feature. Every added surface is another thing that can push a non-technical user into a surprise bill or a broken relay.
-
-## Architecture
-
-```
-Client ──wss──> Worker (routing, NIP-11, static assets)
-                  │
-                  └──> Durable Object "relay" (SQLite) — the whole relay
-```
-
-- **One Worker.** Handles the `Upgrade` header, serves the NIP-11 relay info document on `Accept: application/nostr+json`, serves the static admin page otherwise, and forwards WebSocket upgrades to the DO.
-- **Exactly one Durable Object instance**, addressed by `idFromName("relay")`. All connections, all storage, all subscription state. Do not shard. A single user's relay is not a scale problem.
-- **SQLite storage backend, required.** The Workers Free plan can only create SQLite-backed DOs. Never use the key-value backend.
-- **WebSocket Hibernation API, required.** Use `state.acceptWebSocket(ws)` and the `webSocketMessage()` / `webSocketClose()` handlers. Never call `ws.accept()` — that pins the object in memory and bills duration for the entire life of the connection, which will blow the free tier in a day.
-- **`state.setWebSocketAutoResponse()`** for client-level ping/pong. Auto-responses do not incur wall-clock charges.
-- **`*.workers.dev` is the shipped default.** Custom domains are an optional advanced step, never a prerequisite.
-
-## The budget
-
-These are the Cloudflare Workers Free plan limits this project exists to fit inside. Treat them as hard constraints, not guidance. Any change that could push a normal single-user relay past them is a bug.
-
-| Dimension | Free limit | Notes |
-|---|---|---|
-| Worker requests | 100,000 / day | Static asset requests are free and unlimited |
-| DO requests | 100,000 / day | Incoming WS messages billed at a **20:1** ratio |
-| DO duration | 13,000 GB-s / day | At 128 MB that's ~101,000 object-seconds — a day is 86,400s |
-| SQLite storage | 5 GB total | |
-| Rows written | 100,000 / day | **The real write ceiling.** Each stored event is several rows |
-| Rows read | 5,000,000 / day | |
-| Worker CPU | 10 ms / request | |
-| Cron triggers | 5 / account | |
-
-Consequences to keep in mind:
-
-- **Rows written is the binding constraint, not storage or requests.** Deletes count as writes. `setAlarm()` counts as a write. Budget indexes accordingly — every index multiplies per-event write cost. Prefer fewer, wider indexes.
-- **Duration only stays cheap if hibernation actually works.** Anything that keeps the object awake — an open outbound WebSocket, a pending timer, an unawaited promise — silently converts an idle relay into a billed one. An outbound connection keeps the DO in memory for up to 15 minutes even with no traffic.
-- **Schnorr verification is the CPU risk.** Every `EVENT` gets a signature check via `@noble/curves`. Measure it. If it approaches the 10 ms Worker limit, that is a release blocker, not a footnote.
-- Free-tier limits reset at 00:00 UTC. Exceeding them fails operations rather than billing the user, which is the behaviour we want — but the admin page must make it visible when it happens.
-
-Add a `docs/budget.md` note whenever a change measurably shifts per-event write or CPU cost.
+No payments/zaps, no multi-region/D1/read-replica scaling, no NIP-05 hosting, no media/blossom uploads, no moderation/invite/community tooling, no public write mode, no continuous multi-relay sync (backfill is one-shot only). Reasoning for each lives in [README.md](README.md) "What this is not".
 
 ## Configuration
 
-All configuration is **environment variables and secrets in `wrangler.jsonc`**, never edits to source files. This is what makes the Deploy to Cloudflare button work — Cloudflare reads the config and prompts the user for each value during setup.
+Everything optional is read defensively (`env.X ?? fallback`) and declared nowhere in `wrangler.jsonc`'s absent `vars` block, because the Cloudflare deploy button prompts for every declared var with no notion of "optional" — a clean deploy must ask for nothing but a project name. Env vars, all added by hand in the Cloudflare dashboard if wanted: `OWNER_PUBKEY`, `RELAY_NAME`, `RELAY_DESCRIPTION`, `RELAY_ICON`, `ALLOW_FOLLOWS`. See [src/env.d.ts](src/env.d.ts).
 
-| Var | Purpose |
-|---|---|
-| `OWNER_PUBKEY` | Optional. If set, ownership is fixed at deploy time and the claim flow is disabled entirely. Advanced/deterministic path. |
-| `ALLOW_FOLLOWS` | If true, also accept writes from the owner's kind-3 follow list. Default false. |
+Redeploying does not reset ownership or storage — DO storage survives `wrangler deploy`. Resetting requires deleting the Worker.
 
-Accept `npub1...` and hex, normalize to hex at the boundary, store hex only. A user pasting an npub from their client is the expected path.
+## Architecture map
 
-If `ALLOW_FOLLOWS` is on, a cron trigger refreshes the follow list on a schedule — do not refetch it per event. Cache the resolved set in SQLite with a timestamp.
-
-## Ownership
-
-**Trust on first use.** A fresh deployment is unclaimed. The first `POST /api/claim` with a pubkey binds the relay to it, permanently, and the claim endpoint returns 409 forever after. No signature is required.
-
-This is deliberate, and the reasoning should not be relitigated in a PR:
-
-- **A wrong claim is not an attack.** Every event is signature-verified regardless of who owns the relay, so binding to someone else's pubkey cannot enable forgery. The worst outcome is that the relay archives a stranger's public notes at the deployer's expense.
-- **Recovery is free.** Cloudflare deployments are disposable. Delete and redeploy.
-- **It moves the one hard step onto our page.** Asking a non-technical user to fill in an env var in Cloudflare's config UI is a worse first experience than landing on our page and pasting an npub with our validation and our copy around it.
-
-Requiring a signature would buy no security and would reintroduce a signer at the exact moment we are trying to avoid one.
-
-### Claim implementation
-
-- Store the owner pubkey in DO SQLite. Under TOFU it has to be writable once, so the protection is structural in a different way: **the claim handler is the only writer, and it refuses if a row already exists.** Durable Objects are single-threaded per instance, so the check-then-write is atomic without locking. No other code path may write that row — enforce this in review.
-- If `OWNER_PUBKEY` is set in env, skip storage entirely, use the env value, and return 404 from `/api/claim`. Same binary serves both paths.
-- Accept `npub1...` and hex, normalize to hex at the boundary, store hex only. Validate the bech32 checksum before accepting.
-- **Resolve and display the profile before confirming.** Fetch kind 0 from a couple of well-known relays and show name and avatar with a confirm step. This is a courtesy against typos, not a security control — a checksum catches garbage but not a valid-but-wrong key. If the lookup fails, allow the claim anyway; never block on it.
-- Until claimed, the relay accepts no writes and the admin page shows the claim form.
-
-### Resetting
-
-Redeploying does **not** reset ownership. DO storage survives `wrangler deploy` — new code, same data, still claimed. A real reset requires deleting the Worker, or a migration with `deleted_classes` on the DO class.
-
-This is unintuitive and users will get it wrong, since the instinct is to redeploy. It needs a prominent, plainly worded section in the README and a link from the admin page.
-
-## Threat model
-
-Hijacking is not the threat. Read abuse is.
-
-Reads are public by design — serving other people's clients is what makes this useful as an outbox relay. That means anyone can burn the daily 5M rows-read and 100k DO requests without touching ownership at all. Mitigations, all required:
-
-- Cap concurrent subscriptions per connection.
-- Cap `limit` per filter, and cap total events returned per REQ.
-- Reject filters with no `authors` and no `kinds` constraint.
-- Per-IP throttling inside the DO.
-- Document the free Cloudflare rate-limiting rule in the setup guide.
-
-Writes are owner-only and signature-verified, so the write path is not the exposure.
-
-## Admin page
-
-A static HTML page served at the relay root. Deliberately minimal:
-
-- The `wss://` URL with a copy button. This is the primary job of the page.
-- Event count, storage used, events in the last 24h.
-- Current position against the daily free-tier limits, so a user can see trouble coming.
-- Nothing else. No charts library, no framework, no build step for this page.
-
-Static assets are free and unlimited on Workers, so keep the page static and have it fetch one `/api/stats` JSON endpoint. Do not server-render it.
-
-## Attribution and licensing
-
-This project is **MIT licensed** and is an **original implementation, not a fork**.
-
-[Nosflare](https://github.com/Spl0itable/nosflare) by Spl0itable is the prior art that proved a nostr relay works on Workers + Durable Objects, and is a useful reference for NIP-01 filter-matching edge cases. It is credited as such in the README. It is *not* credited in `LICENSE`, because no code is copied from it.
-
-That claim has to stay true. The rule:
-
-- **Read Nosflare to understand the protocol. Do not paste from it.** Learning how replaceable-event semantics work is fine; reproducing the function that implements them is not.
-- If a change would copy more than a few incidental lines, **stop and raise it** rather than merging it. The choice at that point is to write an independent implementation or to formally become a fork — add the upstream copyright line to `LICENSE`, restate the README as a fork, and accept the ongoing obligation. That is a project-level decision, not a per-PR one.
-- The same rule applies to any other MIT/GPL relay read for reference (khatru, haven, strfry).
-- Never imply endorsement by, or affiliation with, Nosflare or its author.
-- Protocol-level bugs found in upstream projects while reading them should be reported upstream.
-
-Nosflare sells a paid no-code deploy service. We are not competing with that service and should not position ourselves against it in any docs, commit messages, or marketing copy. Different architecture, different user, no comparisons.
-
-## Working agreement
-
-Sessions here are typically unattended — the maintainer opens the repo, says go, and reviews at chunk boundaries. That makes the following non-optional:
-
-- **Read `ROADMAP.md` first.** Work the current chunk only. Do not start the next one.
-- **Never proceed past red tests.** There is no human watching between chunks, so the test gate is the only gate. A failing suite ends the session; report it rather than working around it.
-- **Verify platform facts against live documentation.** The free-tier limits, wrangler config syntax, and Durable Objects migration format in this file were correct when written and change over time. Check `developers.cloudflare.com` before relying on a specific number or config shape, and update the table here if it has moved.
-- **Pin versions.** Wrangler's DO migration syntax and SQLite backend flags have shifted across majors. Do not float to latest mid-project.
-- **When genuinely ambiguous, stop and ask.** A wrong guess compounds across an unattended session. An unanswered question costs one round trip.
-- Record any non-obvious tradeoff you resolve as a comment at its call site, including the option you rejected — not in a separate decisions log.
-
-A session is done when nothing in this file describes work rather than the project. Anything a chunk made real leaves this file and lives in the code, a comment, or a named test. CLAUDE.md describes the project as it is.
+- [src/index.ts](src/index.ts) — Worker entry: routing, `/api/*`, `scheduled()` cron dispatch.
+- [src/relay.ts](src/relay.ts) — the `Relay` Durable Object: connection lifecycle, NIP-01 message handling, live feed, alarm.
+- [src/relay-stub.ts](src/relay-stub.ts) — the one `idFromName("relay")` accessor, shared so nothing else can shard it.
+- [src/storage.ts](src/storage.ts) / [src/schema.ts](src/schema.ts) — SQLite schema and all read/write queries, including the row-cost accounting.
+- [src/filters.ts](src/filters.ts) — REQ filter parsing, SQL query building, in-memory match testing for live broadcast.
+- [src/nostr.ts](src/nostr.ts) — wire types and kind-range classifiers (replaceable/ephemeral/addressable).
+- [src/validate.ts](src/validate.ts) — event id computation and schnorr signature verification (`@noble/curves`).
+- [src/ownership.ts](src/ownership.ts) — owner pubkey resolution, TOFU claim, follow-list cache.
+- [src/pubkey.ts](src/pubkey.ts) / [src/bech32.ts](src/bech32.ts) — npub/hex normalization.
+- [src/profile-lookup.ts](src/profile-lookup.ts) — best-effort kind-0 lookup from well-known relays, runs in the Worker only.
+- [src/backfill.ts](src/backfill.ts) / [src/backfill-worker.ts](src/backfill-worker.ts) — backfill state machine (DO-side, pure) and outbound fetch orchestration (Worker-side).
+- [src/limits.ts](src/limits.ts) — every numeric abuse/budget cap in the project, each commented with what it bounds.
+- [src/nip11.ts](src/nip11.ts) — relay info document.
+- [public/index.html](public/index.html) — the static admin page (claim form, stats, live feed).
 
 ## Conventions
 
-- TypeScript, strict mode. No `any` in the event-handling path.
-- `@noble/curves` for crypto. Do not add a second crypto dependency.
-- Dependencies are a liability here — the Worker size limit is 3 MB on the free plan. Justify every addition.
-- Protocol errors go back to the client as `["OK", id, false, "reason: message"]` or `["CLOSED", subid, "reason: message"]` with the correct NIP-01 machine-readable prefix. Never fail silently.
-- Comments explain why, especially around anything hibernation- or budget-related. The next reader needs to know which lines are load-bearing for the free tier.
+- TypeScript strict mode, no `any` in the event-handling path.
+- `@noble/curves` + `@noble/hashes` only — no second crypto dependency.
+- Protocol errors go back as `["OK", id, false, "reason: message"]` or `["CLOSED", subid, "reason: message"]` with the NIP-01 machine-readable prefix (`invalid:`, `restricted:`, `blocked:`, `rate-limited:`, `auth-required:`, `duplicate:`). Never fail silently.
+- Comments explain *why*, especially anything hibernation- or budget-related — most modules carry inline notes on their row-write cost or CPU cost and point at [docs/budget.md](docs/budget.md) for the measured baseline.
+- Cheapest/most-certain rejections run before expensive ones on every write path: ownership check and tombstone check both precede schnorr verification.
+- SQLite has exactly one secondary index on `events` (`(pubkey, kind, created_at)`) and one on `event_tags` (`(tag_name, tag_value, created_at)`) — deliberately not more, since every accepted read filter is required to constrain on `authors`/`ids`/`kinds`/a tag, and a second index would multiply per-event write cost. Don't add one without updating the schema.ts comment and docs/budget.md.
+- Verify Cloudflare's own platform limits against live docs before relying on a number in a file — they change between compatibility dates. docs/budget.md cites the source and date at each point of use rather than assuming a cached number still holds.
+- Pin dependency versions; don't float to `latest` mid-project.
 
 ## Commands
 
 ```bash
 npm install
-npm run dev        # wrangler dev, local DO with SQLite
-npm run test       # protocol conformance + budget regression
-npm run deploy     # wrangler deploy
+npm run dev         # wrangler dev, local DO with SQLite
+npm run test        # vitest — protocol conformance + budget/hibernation regression
+npm run typecheck
+npm run deploy       # wrangler deploy
+npm run cf-typegen   # regenerate worker-configuration.d.ts
 ```
 
 ## Testing
 
-Two suites, both required to pass before merge:
+Two kinds of assertion live in the same suite ([test/](test)):
 
-1. **Protocol conformance.** NIP-01 REQ/EVENT/CLOSE/EOSE semantics, filter combinations, replaceable and addressable events, NIP-09 deletion, NIP-11 document shape, NIP-42 auth. Reject-path tests matter as much as accept-path: a non-owner pubkey must be rejected with the right message.
+1. **Protocol conformance** — NIP-01 REQ/EVENT/CLOSE/EOSE, filters, replaceable/addressable/ephemeral storage rules, NIP-09/40/42/59/62. Reject paths are asserted as carefully as accept paths.
+2. **Budget/hibernation regression** — [test/hibernation.test.ts](test/hibernation.test.ts) asserts the object becomes eligible to hibernate after the last message; write-cost and CPU-cost baselines are recorded in [docs/baselines.json](docs/baselines.json) and explained in [docs/budget.md](docs/budget.md).
 
-2. **Budget regression.** Assert rows-written per stored event and CPU time per signature verification against recorded baselines. A change that raises either without an explicit, documented reason fails the build. This suite is the reason the project can promise "free."
+See [docs/test-notes.md](docs/test-notes.md) for suite layout, fixture rationale, and the couple of places tests drop below the wire protocol to real storage (documented exceptions, not the norm).
 
-Test hibernation explicitly: after the last message, assert the object becomes eligible to hibernate. A regression here is invisible in normal testing and shows up as a bill.
+## Attribution
+
+MIT licensed, original implementation. [Nosflare](https://github.com/Spl0itable/nosflare) was read as prior art for NIP-01 filter-matching edge cases but no code is shared — see [README.md](README.md) "Attribution" for the full statement and the rule for any future reference reading (khatru, haven, strfry): read to understand the protocol, never paste.

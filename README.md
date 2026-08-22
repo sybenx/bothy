@@ -53,6 +53,18 @@ Reading them back is restricted to you: an unauthenticated query for gift wraps 
 
 **Worth knowing:** Cloudflare terminates the TLS connection in front of this relay, so it necessarily sees the `p` tag (who a gift wrap is addressed to), the arrival time, and the sender's IP address, the same as any other Worker traffic. On a personal relay the `p` tag is always you, so that part leaks nothing new — but the sender IPs belong to other people, sending you mail through infrastructure you chose, not them.
 
+## Choices, not requirements
+
+The NIPs leave some behavior unspecified. Where they do, here's what this relay chose and why — not what the spec required:
+
+- Kinds outside the replaceable/ephemeral/addressable ranges (45–999, ≥40000) are undefined by NIP-01. Bothy stores them like regular events rather than rejecting them or guessing at intent.
+- NIP-62 vanish requests bypass the owner-only write gate entirely. The spec requires this regardless of write-restriction status — a vanish request's authority comes from a user erasing their own data, not from write permission.
+- A vanish request itself is never stored as a row. NIP-62 says relays MAY keep it for bookkeeping, not MUST; bothy pays no row cost for the request, only for whatever it deletes.
+- Gift wraps are never sent over the live feed, redacted or not. The admin page has no way to authenticate a viewer, so every viewer is treated as permanently unauthenticated — the same posture NIP-42 enforces for gift wrap reads elsewhere.
+- The NIP-42 gift-wrap read gate decides by asking storage directly — re-running the incoming filter restricted to `kinds: [1059]` — rather than reasoning about which filter shapes could leak a gift wrap. An earlier, cheaper version tried the latter and missed that an `ids`-only filter naming a known gift wrap id slipped through ungated.
+- `ids`/`authors` filters don't support prefix matching. NIP-01 says relays MAY support it; this one doesn't.
+- NIP-42's AUTH `created_at` drift window (600 seconds) isn't specified by the NIP. Bothy picked a number matching the ~10 minute convention other relays use.
+
 ## What this is not
 
 This project deliberately does not do: payments/zaps, multi-region scaling, NIP-05 hosting, media uploads, moderation tooling, or a public write mode. See `CLAUDE.md` for the full list and reasoning — most feature requests are already ruled out there.
