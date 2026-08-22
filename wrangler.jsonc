@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "bothy",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-21",
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "RELAY", "class_name": "Relay" }
+    ]
+  },
+
+  // SQLite is the only backend the Workers Free plan can provision for a
+  // new DO class — see CLAUDE.md "Architecture". Never add a KV-backed
+  // migration here.
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Relay"] }
+  ],
+
+  // NIP-11 display fields. RELAY_ICON blank means "no icon" in the NIP-11
+  // document rather than a broken URL. Ownership vars (OWNER_PUBKEY,
+  // ALLOW_FOLLOWS, RETENTION_DAYS) land in chunk 4 with the claim flow.
+  "vars": {
+    "RELAY_NAME": "bothy",
+    "RELAY_DESCRIPTION": "A single-user nostr relay.",
+    "RELAY_ICON": ""
+  }
+}

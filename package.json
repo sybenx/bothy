@@ -1,0 +1,30 @@
+{
+  "name": "bothy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A single-user nostr relay that runs on the Cloudflare free tier and deploys in one click.",
+  "license": "MIT",
+  "scripts": {
+    "dev": "wrangler dev",
+    "test": "vitest run",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "@noble/curves": "2.3.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.0.0",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11",
+    "wrangler": "4.125.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "fsevents@2.3.3": true,
+    "workerd@1.20260815.1": true,
+    "workerd@1.20260820.1": true
+  }
+}
