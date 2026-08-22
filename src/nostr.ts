@@ -44,6 +44,28 @@ export function dTagValue(tags: string[][]): string {
   return tag?.[1] ?? "";
 }
 
+// NIP-65 (nips/65.md) Relay List Metadata -- the owner's own outbox/inbox
+// relay set. Backfill (ROADMAP.md chunk 7) reads this to know which
+// relays hold the owner's history; it is never written by this relay.
+export const RELAY_LIST_KIND = 10002;
+
+// NIP-65 "content of these events must be empty... each tag entry must
+// contain a relay URL, and an optional marker of either 'read' or
+// 'write'." No marker means both -- so a relay is a write relay unless
+// explicitly marked 'read'-only. Duplicates collapse via the Set, and a
+// malformed tag (missing URL) is skipped rather than throwing, since this
+// reads an event authored by the owner but relayed through a third
+// party's relay, which is not something this code should trust blindly.
+export function writeRelaysFrom(tags: string[][]): string[] {
+  const urls = new Set<string>();
+  for (const tag of tags) {
+    if (tag[0] !== "r" || !tag[1]) continue;
+    if (tag[2] === "read") continue;
+    urls.add(tag[1]);
+  }
+  return [...urls];
+}
+
 // NIP-59 (nips/59.md) Gift Wrap. Signed by a random one-time key, never
 // the real sender's -- the `p` tag is the only identity information a
 // relay can see, which is why deletion/read authorization for this kind

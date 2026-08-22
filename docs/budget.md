@@ -292,3 +292,87 @@ event already being stored/broadcast, not a new write. What it does add:
   fan-out (`liveBroadcast` iterates every open one) and how much
   attachment state the object carries, at a cost of zero rows (rejected
   at the WebSocket upgrade, before any storage is touched).
+
+## Chunk 7 — one-shot backfill
+
+- **The Durable Object's CPU allowance is not the Worker's 10ms/request
+  limit.** Checked against `developers.cloudflare.com/workers/platform/limits/`
+  and `developers.cloudflare.com/durable-objects/platform/limits/`
+  (2026-08-22): the Worker's 10ms/request ceiling (this file's table
+  above) is a Workers-Free HTTP-request number; a Durable Object gets its
+  own, much larger CPU budget — **30 seconds by default per incoming
+  request or RPC call** (configurable up to 5 minutes via
+  `limits.cpu_ms`), reset on every new invocation. An RPC method call
+  (`env.RELAY.get(id).ingestBackfillPage(...)`, the same mechanism
+  `claim()`/`getStats()` already use) counts as one such invocation, not
+  as a fetch subject to the Worker's own limit. At the chunk 3 baseline of
+  ~1.1ms/schnorr-verify, `BACKFILL_PAGE_SIZE = 200` (limits.ts) costs
+  roughly 220ms of DO CPU per ingest call — under 1% of the DO's own
+  budget, nowhere near a constraint. This directly changed the design:
+  the original plan assumed small (~10-event) batches to stay under a
+  10ms ceiling that turns out not to apply here.
+- **The real constraint is rows-written, not CPU**, so `BACKFILL_PAGE_SIZE`
+  is instead sized against the 100,000 rows-written/day ceiling: one page
+  per relay per hourly cron tick, worst case `200 events * ~5 rows/event *
+  24 ticks/day ≈ 24,000 rows/day` from backfill alone — comfortably under
+  the ceiling with room left for the owner's own live traffic, which this
+  feature must not crowd out (ROADMAP.md chunk 7: "Rate-limited under the
+  daily write budget").
+- **Backfill reuses `storeEvent` (storage.ts) rather than reimplementing
+  storage semantics**, so replaceable/addressable/ephemeral handling is
+  identical to the live write path by construction: several old versions
+  of the owner's kind 0 arriving in one page collapse to the one row
+  `storeEvent`'s replaceable-kind branch already keeps, and ephemeral
+  kinds are dropped the same way `storeEvent` already drops them for live
+  writes (chunk 5 audit, above) — zero additional row cost, and no new
+  code path to keep in sync with the write-cost formula. The one place
+  this needed a correction rather than a reuse: `storeEvent`'s `stored`
+  field means "broadcast-worthy" (true even for a dropped ephemeral
+  event, so relay.ts's live path still forwards it to subscribers), not
+  "a row was written" — backfill.ts's own stored-count (surfaced on the
+  admin page) explicitly excludes ephemeral kinds from that count so
+  progress reporting isn't inflated by events that cost zero rows.
+- **Exact-id duplicates cost one `SELECT` (rows-read), not a wasted
+  write.** The same event routinely comes back from every write relay
+  that has it; `applyBackfillPage` checks `eventExists` (and `isDeleted`
+  for tombstones) before `idMatchesContent`/`verifySignature`, the same
+  cheapest-check-first ordering `relay.ts`'s live accept path already uses
+  for ownership and tombstones — a duplicate or already-deleted id never
+  reaches a schnorr verification, let alone an insert.
+- **A rows-written quota failure mid-page is caught, not fatal to the
+  tick.** `storeEvent` throwing (CLAUDE.md: "Exceeding them fails
+  operations rather than billing the user") stops the page immediately
+  and leaves `backfill_meta.status = 'paused-budget'` without advancing
+  the failed relay's cursor past whatever didn't get durably stored —
+  the next successful tick (after the daily reset) resumes from exactly
+  that point rather than silently skipping it.
+- **Backfill reserves at most half the daily rows-written ceiling for
+  itself, and checks it twice.** The `paused-budget` handling above only
+  fires *after* a write has already failed — reactive, not preventive,
+  and "a relay that can't accept the owner's new note because it's busy
+  importing 2023 has the priority backwards." `hasBackfillHeadroom`
+  (backfill.ts) reads the same rolling 24h rows-written estimate
+  `/api/stats` displays and refuses to let backfill write at all once it
+  already accounts for more than `BACKFILL_ROWS_SHARE_LIMIT` (limits.ts,
+  half the daily ceiling) — reserving the other half for the owner's own
+  traffic regardless of how much of backfill's own half it has already
+  spent earlier in the window. Checked twice: `getBackfillState` (relay.ts)
+  so the Worker's cron tick skips opening an outbound socket at all on a
+  day live traffic already dominates, and `applyBackfillPage` again,
+  authoritatively, immediately before writing — live traffic can consume
+  real quota during the several-second outbound round-trip in between, so
+  only the second check actually protects the reserved share.
+- **Fixed a real "too many SQL variables" failure in the rows-written
+  estimate query itself**, found while adding a test for the headroom
+  check above. The original `rowsWrittenEstimate24h` (chunk 4) fetched
+  matching event ids and then ran a second query with one bound
+  parameter per id (`WHERE event_id IN (?, ?, ?, ...)`) to count their
+  tags — fine for the handful of events a personal relay normally sees in
+  24h, but it throws once that count climbs into the thousands, which is
+  now a live path: `hasBackfillHeadroom` calls this same function while
+  the 24h window may contain exactly that kind of burst. Rewritten as one
+  `LEFT JOIN events ⋈ event_tags ... GROUP BY e.id` query with a single
+  bound parameter (the cutoff timestamp) regardless of how many events
+  match — no per-row parameter, so no ceiling on how large the window can
+  get. Same read-only, rows-read cost as before, just one query instead
+  of two.

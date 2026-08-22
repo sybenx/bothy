@@ -1,15 +1,10 @@
+import { runBackfillTick } from "./backfill-worker";
 import { nip11Response } from "./nip11";
 import { lookupProfile } from "./profile-lookup";
 import { normalizePubkey } from "./pubkey";
+import { relayStub } from "./relay-stub";
 
 export { Relay } from "./relay";
-
-function relayStub(env: Env) {
-  // Exactly one Relay instance for the whole deployment -- see
-  // CLAUDE.md "Architecture". Do not shard.
-  const id = env.RELAY.idFromName("relay");
-  return env.RELAY.get(id);
-}
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -86,8 +81,13 @@ export default {
   },
 
   // ALLOW_FOLLOWS refresh (ROADMAP.md chunk 4) -- a no-op when the env
-  // var is unset, see Relay.runCron().
+  // var is unset, see Relay.runCron(). One-shot backfill (ROADMAP.md
+  // chunk 7) shares this same trigger rather than requesting a second of
+  // the account's 5 available cron triggers -- see backfill-worker.ts for
+  // why its outbound sockets are opened here, in the Worker, and not
+  // inside runCron().
   async scheduled(_event: ScheduledController, env: Env): Promise<void> {
     await relayStub(env).runCron();
+    await runBackfillTick(env);
   },
 } satisfies ExportedHandler<Env>;

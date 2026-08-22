@@ -314,6 +314,44 @@ export function queryFilter(sql: SqlStorage, filter: Filter, nowSec: number): No
     .map(rowToEvent);
 }
 
+// Row-cost formula from schema.ts: 3 base rows + 2 per single-letter tag.
+// A read-only estimate, not a tracked counter -- see limits.ts/relay.ts
+// comments on why this relay avoids extra writes just to measure itself.
+// Backs /api/stats's `rowsWrittenEstimate24h` (relay.ts getStats) and
+// backfill's own headroom check (backfill.ts hasBackfillHeadroom,
+// ROADMAP.md chunk 7: backfill must yield to the owner's live traffic
+// rather than compete with it for the same daily ceiling) -- both need
+// the same number, so it lives here once rather than being computed
+// twice and risking drift between what the admin page displays and what
+// backfill actually throttles against.
+//
+// A single LEFT JOIN + GROUP BY, not a two-query "fetch ids, then IN (...)
+// those ids" -- an earlier version did the latter and passed one bound
+// parameter per matching event, which broke past a few hundred events in
+// the window with a real SqlStorage "too many SQL variables" error. That
+// window is normally small (this relay's own recent live traffic), but
+// backfill's headroom check calls this same function while the window
+// may also contain a large burst of live writes -- exactly the case this
+// query now has to hold up under.
+export function estimateRowsWritten24h(sql: SqlStorage, sinceCutoff: number): number {
+  const rows = sql
+    .exec<{ tag_count: number }>(
+      `SELECT COUNT(t.event_id) AS tag_count
+       FROM events e
+       LEFT JOIN event_tags t ON t.event_id = e.id
+       WHERE e.created_at > ?
+       GROUP BY e.id`,
+      sinceCutoff,
+    )
+    .toArray();
+
+  let total = 0;
+  for (const r of rows) {
+    total += 3 + 2 * r.tag_count;
+  }
+  return total;
+}
+
 // Multiple filters in one REQ are ORed (nips/01.md line 129) and
 // deduped/re-sorted as a single result set, newest-first with ties
 // broken by lowest id -- matching the ordering a single filter's query

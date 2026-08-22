@@ -6,7 +6,10 @@
 // outbound WebSocket from the DO would pin it in memory for up to 15
 // minutes (CLAUDE.md "The budget"); the stateless Worker has no such
 // cost.
-const WELL_KNOWN_RELAYS = ["wss://relay.damus.io", "wss://nos.lol"];
+// Also reused by backfill-worker.ts to discover the owner's kind-10002
+// relay list -- same rationale, a courtesy discovery path from the
+// stateless Worker, not a security-relevant source of truth.
+export const WELL_KNOWN_RELAYS = ["wss://relay.damus.io", "wss://nos.lol"];
 const LOOKUP_TIMEOUT_MS = 2500;
 
 export interface Profile {

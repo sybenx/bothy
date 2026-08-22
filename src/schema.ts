@@ -92,8 +92,38 @@ CREATE TABLE IF NOT EXISTS follows (
 CREATE TABLE IF NOT EXISTS deleted_ids (
   id TEXT PRIMARY KEY
 );
+
+-- One-shot backfill (ROADMAP.md chunk 7): one row per relay pulled from
+-- the owner's kind-10002 relay list, tracking how far back this relay has
+-- already fetched. until_cursor walks backward in time as pages are
+-- ingested (backfill.ts); exhausted is set once a relay returns a page
+-- shorter than requested, meaning it has no more matching history.
+-- Persisted rather than kept in memory specifically so an hourly cron
+-- tick can resume a backfill that spans days -- see CLAUDE.md "The
+-- budget" on why a large history may genuinely take more than one day
+-- against the rows-written ceiling.
+CREATE TABLE IF NOT EXISTS backfill_relays (
+  relay_url    TEXT PRIMARY KEY,
+  until_cursor INTEGER NOT NULL,
+  exhausted    INTEGER NOT NULL DEFAULT 0
+);
+
+-- Single-row backfill status (backfill.ts getBackfillStatus/seedBackfillRelays).
+-- 'pending' until the owner's relay list has been discovered, 'running'
+-- while any backfill_relays row is unexhausted, 'paused-budget' when a
+-- cron tick's ingest hit the daily rows-written ceiling and stopped
+-- without finishing its page, 'done' once every relay is exhausted.
+CREATE TABLE IF NOT EXISTS backfill_meta (
+  status        TEXT NOT NULL DEFAULT 'pending',
+  total_stored  INTEGER NOT NULL DEFAULT 0,
+  last_run_at   INTEGER
+);
 `;
 
 export function initSchema(sql: SqlStorage): void {
   sql.exec(SCHEMA);
+  // backfill_meta must have exactly one row to hold status -- seeded here
+  // rather than by whichever code path happens to run first, so every
+  // reader (getBackfillStatus, /api/stats) can assume it exists.
+  sql.exec(`INSERT INTO backfill_meta (status) SELECT 'pending' WHERE NOT EXISTS (SELECT 1 FROM backfill_meta)`);
 }

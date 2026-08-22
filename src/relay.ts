@@ -1,6 +1,15 @@
 import { DurableObject } from "cloudflare:workers";
+import {
+  applyBackfillPage,
+  type BackfillState,
+  type BackfillStatus,
+  getBackfillStatus,
+  hasBackfillHeadroom,
+  seedBackfillRelays,
+} from "./backfill";
 import { matchesAnyFilter, parseFilter } from "./filters";
 import {
+  BACKFILL_PAGE_SIZE,
   clampFilterLimit,
   GIFT_WRAP_RATE_LIMIT_WINDOW_MS,
   isUnconstrainedFilter,
@@ -20,6 +29,7 @@ import { initSchema } from "./schema";
 import {
   applyDeletion,
   applyVanish,
+  estimateRowsWritten24h,
   eventExists,
   expirationOf,
   giftWrapCount,
@@ -231,6 +241,7 @@ export class Relay extends DurableObject<Env> {
     events24h: number;
     storageBytes: number;
     rowsWrittenEstimate24h: number;
+    backfill: BackfillStatus | null;
   }> {
     const sql = this.ctx.storage.sql;
     const owner = getOwnerPubkey(sql, this.env);
@@ -238,36 +249,18 @@ export class Relay extends DurableObject<Env> {
 
     const totalEvents =
       sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events`).toArray()[0]?.n ?? 0;
-    const recent = sql
-      .exec<{ id: string }>(`SELECT id FROM events WHERE created_at > ?`, since)
-      .toArray();
-    // Row-cost formula from schema.ts: 3 base rows + 2 per single-letter
-    // tag. A read-only estimate, not a tracked counter -- see
-    // limits.ts/relay.ts comments on why this relay avoids extra writes
-    // just to measure itself.
-    let rowsWrittenEstimate24h = 0;
-    if (recent.length > 0) {
-      const tagCounts = sql
-        .exec<{ event_id: string; n: number }>(
-          `SELECT event_id, COUNT(*) AS n FROM event_tags WHERE event_id IN (${recent
-            .map(() => "?")
-            .join(", ")}) GROUP BY event_id`,
-          ...recent.map((r) => r.id),
-        )
-        .toArray();
-      const tagsByEvent = new Map(tagCounts.map((r) => [r.event_id, r.n]));
-      for (const r of recent) {
-        rowsWrittenEstimate24h += 3 + 2 * (tagsByEvent.get(r.id) ?? 0);
-      }
-    }
+    const events24h =
+      sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events WHERE created_at > ?`, since).toArray()[0]
+        ?.n ?? 0;
 
     return {
       claimed: owner !== null,
       ownerPubkey: owner,
       totalEvents,
-      events24h: recent.length,
+      events24h,
       storageBytes: sql.databaseSize,
-      rowsWrittenEstimate24h,
+      rowsWrittenEstimate24h: estimateRowsWritten24h(sql, since),
+      backfill: owner !== null ? getBackfillStatus(sql) : null,
     };
   }
 
@@ -277,6 +270,44 @@ export class Relay extends DurableObject<Env> {
   async runCron(): Promise<void> {
     const sql = this.ctx.storage.sql;
     refreshFollows(sql, this.env, nowSeconds());
+  }
+
+  // One-shot backfill (ROADMAP.md chunk 7), read side. Called once per
+  // cron tick by backfill-worker.ts (the Worker, never this object,
+  // opens the outbound sockets -- see that file's header comment) to
+  // decide whether to discover relays, fetch a page, or do nothing. Null
+  // when unclaimed -- there's no owner pubkey to backfill and no relay
+  // list to discover yet.
+  async getBackfillState(): Promise<BackfillState | null> {
+    const sql = this.ctx.storage.sql;
+    const owner = getOwnerPubkey(sql, this.env);
+    if (owner === null) return null;
+    const now = nowSeconds();
+    return { ...getBackfillStatus(sql), ownerPubkey: owner, canIngestNow: hasBackfillHeadroom(sql, now) };
+  }
+
+  // Seeds backfill_relays from the owner's kind-10002 write relays, once
+  // the Worker has resolved them from well-known relays (backfill-worker.ts
+  // discoverWriteRelays). A pure write, no outbound connection here.
+  async discoverBackfillRelays(relayUrls: string[]): Promise<void> {
+    seedBackfillRelays(this.ctx.storage.sql, relayUrls, nowSeconds());
+  }
+
+  // Stores one page of raw EVENT payloads the Worker already fetched over
+  // its own short-lived outbound socket (backfill-worker.ts fetchPage) --
+  // see backfill.ts applyBackfillPage for validation/dedup/tombstone/
+  // storage-semantics ordering. Null when unclaimed (shouldn't happen in
+  // practice, since the Worker only calls this after getBackfillState
+  // returned a real owner, but this object must not guess an owner that
+  // doesn't exist).
+  async ingestBackfillPage(
+    relayUrl: string,
+    rawEvents: unknown[],
+  ): Promise<{ stored: number; exhausted: boolean } | null> {
+    const sql = this.ctx.storage.sql;
+    const owner = getOwnerPubkey(sql, this.env);
+    if (owner === null) return null;
+    return applyBackfillPage(sql, owner, relayUrl, rawEvents, BACKFILL_PAGE_SIZE, nowSeconds());
   }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {

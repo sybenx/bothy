@@ -2,9 +2,9 @@
 
 Work proceeds **one chunk at a time, in order**. Do not start a chunk until the previous one meets its definition of done. Update `CURRENT` when a chunk completes.
 
-CURRENT: 7
+CURRENT: 8
 
-Chunks 1–6 are complete: skeleton, schema, conformance suite, NIP-01 core, ownership, admin page, deploy button, deploy-form reduction, inbox mode.
+Chunks 1–7 are complete: skeleton, schema, conformance suite, NIP-01 core, ownership, admin page, deploy button, deploy-form reduction, inbox mode, live feed, backfill.
 
 ---
 
@@ -61,15 +61,22 @@ Bothy is currently an outbox relay (advertised via kind 10002). This chunk makes
 
 The documentation should end up in the shape of the project, not the shape of the path taken to build it. This chunk is that pass, and it is where `ROADMAP.md` deletes itself.
 
-**Regenerate, do not edit.** Editing preserves; regeneration describes what exists. The instruction is literally:
+**Regenerate, do not edit.** Editing preserves; regeneration describes what exists.
 
-> Read the codebase. Write `CLAUDE.md` from scratch as though you had never seen the existing one — architecture, layers, key design decisions, conventions, commands. Then diff it against the old file and list anything load-bearing that was lost, so it can be re-added deliberately.
+> Do not open `CLAUDE.md` — not once, not for reference. Read the codebase.
+> Write a new `CLAUDE.md` describing this project as it exists: what it is,
+> what it refuses to be, architecture, conventions, commands. Describe what
+> you find, not what you would have built. Then open the old file, diff it,
+> and list anything load-bearing the code does not make evident. Do not
+> re-add anything — present the list and stop.
 
 Then:
 
-- **Move every constraint that is now enforced by a test into a pointer.** Ten lines of storage-semantics prose becomes one line naming `test/storage-semantics.test.ts`. The budget table becomes a line naming the budget regression suite. Knowledge stays in the repo; it moves somewhere that fails loudly when violated.
-- **Delete `DECISIONS.md`.** A decisions file is a bet that the code will not explain itself. Where the code is genuinely surprising — the claim endpoint accepting an unsigned pubkey, gift wraps authorized by `p` tag rather than author — leave a one-line comment at the call site. Everything else is either evident from the code, evident from `LICENSE`, or already covered by the "what this is not" list. The history lives in git.
+- **Move every constraint that is now enforced by a test into a pointer.** [unchanged]
+- **Keep the interpretations.** [new bullet]
 - **Delete `ROADMAP.md`.** It is scaffolding for getting here.
-- **Keep permanently:** the description of what this is, the "what this is not" list, architecture, conventions, commands, attribution, and the working agreement.
+- **Keep permanently:** [unchanged]
 
-**Done when:** `CLAUDE.md` is under 90 lines, `ROADMAP.md` and `DECISIONS.md` are gone, every removed constraint is enforced by a named test, and a fresh session given only the repo can state the project's scope boundaries correctly.
+**Done when:** `CLAUDE.md` is under 90 lines, `ROADMAP.md` is gone, every
+removed constraint is enforced by a named test, and a fresh session given
+only the repo can state the project's scope boundaries correctly.

@@ -84,3 +84,41 @@ export function isUnconstrainedFilter(filter: Filter): boolean {
 // forever or speaking the /live protocol directly without ever closing.
 export const MAX_LIVE_FEED_CONNECTIONS = 5;
 export const LIVE_FEED_MAX_LIFETIME_MS = 10 * 60 * 1000;
+
+// One-shot backfill (ROADMAP.md chunk 7) -- events requested per relay
+// per cron tick. Cloudflare's own docs distinguish the Worker's 10ms/
+// request CPU limit (CLAUDE.md "The budget" table) from a Durable
+// Object's own CPU allowance, which defaults to 30 seconds per incoming
+// request/RPC call (developers.cloudflare.com/durable-objects/platform/limits/,
+// checked 2026-08-22) -- at the ~1.1ms/schnorr-verify baseline
+// (docs/baselines.json), even this page size costs ~220ms of DO CPU,
+// nowhere near that ceiling. So CPU is not what bounds this number.
+// What does: backfill runs unattended, for as long as the owner's
+// history requires, and must not crowd out the owner's own live writes
+// against the shared 100,000 rows-written/day ceiling. At ~5 rows/event
+// and one page per relay per hourly cron tick, worst case is
+// 200 * 5 * 24 = 24,000 rows/day from backfill alone -- see
+// docs/budget.md chunk 7 note.
+export const BACKFILL_PAGE_SIZE = 200;
+
+// How long the Worker's cron tick keeps one outbound backfill socket open
+// waiting for EOSE before giving up for this tick -- mirrors
+// profile-lookup.ts's LOOKUP_TIMEOUT_MS shape, scoped to backfill so a
+// slow/unreachable relay can't stall the whole cron invocation.
+export const BACKFILL_FETCH_TIMEOUT_MS = 8000;
+
+// Cloudflare Workers Free's daily rows-written ceiling (CLAUDE.md "The
+// budget"). Named here, not just left as the bare `100000` already
+// hardcoded in public/index.html's admin-page display, because
+// backfill's headroom check below needs the actual number to reason
+// about, not just a copy used for a progress bar.
+export const DAILY_ROWS_WRITTEN_LIMIT = 100_000;
+
+// Backfill (ROADMAP.md chunk 7) must yield to the owner's own live
+// traffic, never compete with it for the shared daily rows-written
+// ceiling -- see backfill.ts hasBackfillHeadroom for the full reasoning.
+// Set at half the daily ceiling: simple to reason about, and it reserves
+// the *other* half exclusively for whatever the owner does with their
+// own relay that day regardless of how much of backfill's own reserved
+// half it has already used earlier in the same rolling 24h window.
+export const BACKFILL_ROWS_SHARE_LIMIT = DAILY_ROWS_WRITTEN_LIMIT / 2;

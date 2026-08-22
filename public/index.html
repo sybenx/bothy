@@ -89,6 +89,9 @@
     </div>
   </div>
 
+  <h2>Backfill</h2>
+  <p id="backfill-status">-</p>
+
   <h2>Live feed</h2>
   <p class="live-status" id="live-status">connecting&hellip;</p>
   <ul id="live-list"></ul>
@@ -132,6 +135,7 @@ async function main() {
     setBar("stat-storage", "bar-storage", stats.storageBytes, STORAGE_LIMIT, formatBytes(stats.storageBytes) + " used");
     setBar("stat-rows", "bar-rows", stats.rowsWrittenEstimate24h, ROWS_LIMIT, stats.rowsWrittenEstimate24h + " rows (est.)");
 
+    renderBackfillStatus(stats.backfill);
     wireLiveFeed();
   } else {
     document.getElementById("unclaimed-view").hidden = false;
@@ -152,6 +156,33 @@ function formatBytes(n) {
   if (n < 1024 ** 2) return (n / 1024).toFixed(1) + " KB";
   if (n < 1024 ** 3) return (n / 1024 ** 2).toFixed(1) + " MB";
   return (n / 1024 ** 3).toFixed(2) + " GB";
+}
+
+// One-shot backfill progress (ROADMAP.md chunk 7: "visible progress on
+// the admin page"). Purely a render of whatever src/relay.ts getStats()
+// last reported -- this page has no way to trigger or influence
+// backfill, which runs entirely on the Worker's cron trigger.
+function renderBackfillStatus(backfill) {
+  const el = document.getElementById("backfill-status");
+  if (!backfill) {
+    el.textContent = "-";
+    return;
+  }
+  const count = backfill.totalStored + (backfill.totalStored === 1 ? " event" : " events");
+  switch (backfill.status) {
+    case "pending":
+      el.textContent = "looking for your relay list…";
+      break;
+    case "running":
+      el.textContent = count + " imported so far (" + backfill.exhaustedCount + "/" + backfill.relayCount + " relays done)";
+      break;
+    case "paused-budget":
+      el.textContent = count + " imported -- paused, resumes after today's write limit resets at 00:00 UTC";
+      break;
+    case "done":
+      el.textContent = count + " imported from your history -- done";
+      break;
+  }
 }
 
 // Debugging tool that doubles as onboarding (ROADMAP.md chunk 7): turns
