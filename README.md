@@ -8,7 +8,7 @@ A bothy is a small unlocked shelter in the Scottish highlands — free, unowned,
 
 Click the button, paste your `npub`, get a `wss://` URL for your own relay. No terminal, no VPS, no domain, no port forwarding, no always-on box at home. The relay lives in your own Cloudflare account.
 
-**Requires a GitHub account and a Cloudflare account.** Both are free, and don't require a card.
+**Requires a Cloudflare account** (free, no card) **and a GitHub account** (also free) — Cloudflare puts a copy of the code in your Git account and deploys from there.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/sybenx/bothy)
 
@@ -58,6 +58,8 @@ git push
 ```
 
 </details>
+
+> Cloudflare also supports GitLab, but the updater below is GitHub-only.
 
 ### Rate limiting (recommended)
 
