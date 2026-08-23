@@ -64,7 +64,10 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    if (request.headers.get("Accept") === "application/nostr+json") {
+    // Substring match, not equality -- clients commonly send compound
+    // Accept headers ("application/nostr+json, */*"), and NIP-11 only
+    // requires the media type be present, not that it stand alone.
+    if (request.headers.get("Accept")?.includes("application/nostr+json")) {
       const profile = await relayStub(env).getProfile(url.host);
       return nip11Response(env, profile);
     }
