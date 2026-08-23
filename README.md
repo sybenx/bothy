@@ -14,10 +14,11 @@ Click the button, paste your `npub`, get a `wss://` URL for your own relay. No t
 
 ## Setup
 
-1. Click **Deploy to Cloudflare** above. If you don't have a Cloudflare account yet, it'll prompt you to make one (free).
-2. Wait for the build to finish. You'll land on a `*.workers.dev` URL.
-3. Open that URL, paste your `npub` (or hex pubkey) into the claim form, and confirm. This is a one-time, permanent step — see "Ownership" below.
-4. Copy the `wss://` URL from the admin page into your nostr client's relay list.
+1. Click **Deploy to Cloudflare**. You'll be prompted to create a free Cloudflare account if you don't have one.
+2. On **Set up your application**, pick your GitHub account from the **Git account** dropdown. Cloudflare creates a repo there holding your copy. Leave **Create private Git repository** unchecked unless you have a reason — public repos get free GitHub Actions minutes, which the updater uses. Then click **Deploy**.
+3. The build takes about 30 seconds. **Refresh the page** when it finishes — the dashboard doesn't update on its own. A **Visit** button appears at the top right; that's your relay.
+4. Open that URL, paste your npub into the claim form, and confirm. One-time and permanent — see "Ownership" below.
+5. Copy the `wss://` URL from the admin page into your nostr client's relay list.
 
 That's it. No dashboard configuration required.
 
@@ -31,7 +32,7 @@ Updates come from the upstream repo, [sybenx/bothy](https://github.com/sybenx/bo
 [![2: Check for updates](https://img.shields.io/badge/2-Check%20for%20updates-555555?style=flat-square)](../../actions/workflows/sync.yml)
 
 **Enable the updater** opens GitHub's web editor with `sync.yml` pre-filled; commit it. One file, once.
-**Check for updates** opens the workflow — click **Run workflow**. Whenever you want the latest.
+**Check for updates**, whenever you want the latest: open the workflow, click **Run workflow**, leave the branch as `main`, then click the green **Run workflow** button. Takes under a minute; Cloudflare redeploys automatically.
 
 Running it pulls in this repo's files, restores your own `wrangler.jsonc` and `.github/` untouched (those hold your Cloudflare resource IDs and this workflow itself), and pushes the result straight to your default branch. Cloudflare notices the push and redeploys automatically — usually within a minute or two.
 
@@ -130,6 +131,15 @@ npm run deploy      # wrangler deploy
 ```
 
 See `CLAUDE.md` for architecture, the free-tier budget this project is built against, and the working conventions for this repo.
+
+## Removing it
+
+Two things must be deleted, and neither is obvious:
+
+- **The Worker** — Cloudflare dashboard → Workers & Pages → your project → Settings → delete. This takes the relay offline.
+- **The GitHub repo** Cloudflare created — its Settings → Danger Zone → Delete this repository.
+
+Deleting only the repo leaves the relay running; deleting only the Worker leaves the repo behind.
 
 ## License
 
