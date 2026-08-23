@@ -1,17 +1,16 @@
 # bothy
 
+[![Release](https://img.shields.io/github/v/tag/sybenx/bothy?style=for-the-badge)](../../tags)
+
 A single-user nostr relay that runs on the Cloudflare free tier and deploys in one click.
 
 A bothy is a small unlocked shelter in the Scottish highlands — free, unowned, maintained by whoever passes through. This is that, for your notes.
 
 Click the button, paste your `npub`, get a `wss://` URL for your own relay. No terminal, no VPS, no domain, no port forwarding, no always-on box at home. The relay lives in your own Cloudflare account.
 
-[![Release](https://img.shields.io/github/v/release/sybenx/bothy?style=for-the-badge)](../../releases)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/sybenx/bothy)
 
-<p>
-<a href="https://deploy.workers.cloudflare.com/?url=https://github.com/sybenx/bothy"><img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare" height="39"></a>
-<a href="../../actions/workflows/sync.yml"><img src="https://img.shields.io/badge/Update-from%20upstream-F38020?style=for-the-badge&logo=github&logoColor=white" alt="Update from upstream" height="39"></a>
-</p>
+*Already deployed? See "Keeping it updated" below.*
 
 ## Setup
 
@@ -22,13 +21,17 @@ Click the button, paste your `npub`, get a `wss://` URL for your own relay. No t
 
 That's it. No dashboard configuration required.
 
-## Updating
+## Keeping it updated
 
-The "Deploy to Cloudflare" button clones this repo into your own GitHub account as an independent repo, not a GitHub fork — so there's no **Sync fork** button, and no built-in way to pull in later changes. To close that gap, every copy ships with a `sync.yml` GitHub Actions workflow that does it for you:
+The "Deploy to Cloudflare" button makes an independent copy of this repo in your GitHub account, not a GitHub fork — so there's no **Sync fork** button. Worse, GitHub blocks the Cloudflare app from writing workflow files on your behalf, so your copy arrives *without* `sync.yml`, the updater workflow. Two steps close that gap:
 
-1. In your copy on github.com, go to the **Actions** tab (or click the "Update from upstream" badge above) and run the **Sync from upstream** workflow manually (`workflow_dispatch`).
-2. It pulls in this repo's files, restores your own `wrangler.jsonc` and `.github/` untouched (those hold your Cloudflare resource IDs and this workflow itself), and opens a pull request on a `sync/upstream` branch.
-3. Review the diff and merge. Cloudflare notices the push and redeploys automatically — usually within a minute or two.
+[![1: Enable the updater](https://img.shields.io/badge/1-Enable%20the%20updater-555555?style=flat-square)](../../new/main?filename=.github/workflows/sync.yml&value=name%3A%20Sync%20from%20upstream%0A%0Aon%3A%0A%20%20workflow_dispatch%3A%0A%0Apermissions%3A%0A%20%20contents%3A%20write%0A%0Ajobs%3A%0A%20%20sync%3A%0A%20%20%20%20runs-on%3A%20ubuntu-latest%0A%20%20%20%20%23%20The%20%22Deploy%20to%20Cloudflare%22%20button%20clones%20this%20repo%20into%20the%20user%27s%20account%20as%20an%0A%20%20%20%20%23%20independent%20repo%2C%20not%20a%20GitHub%20fork%2C%20so%20this%20workflow%20ships%20inside%20every%20downstream%0A%20%20%20%20%23%20copy%20too.%20Guard%20so%20it%20no-ops%20when%20it%20runs%20in%20the%20upstream%20repo%20itself.%0A%20%20%20%20if%3A%20github.repository%20%21%3D%20%27sybenx%2Fbothy%27%0A%20%20%20%20steps%3A%0A%20%20%20%20%20%20-%20name%3A%20Checkout%0A%20%20%20%20%20%20%20%20uses%3A%20actions%2Fcheckout%40v6%0A%20%20%20%20%20%20%20%20with%3A%0A%20%20%20%20%20%20%20%20%20%20fetch-depth%3A%200%0A%0A%20%20%20%20%20%20-%20name%3A%20Configure%20git%0A%20%20%20%20%20%20%20%20run%3A%20%7C%0A%20%20%20%20%20%20%20%20%20%20git%20config%20user.name%20%22github-actions%5Bbot%5D%22%0A%20%20%20%20%20%20%20%20%20%20git%20config%20user.email%20%22github-actions%5Bbot%5D%40users.noreply.github.com%22%0A%0A%20%20%20%20%20%20-%20name%3A%20Fetch%20upstream%0A%20%20%20%20%20%20%20%20run%3A%20%7C%0A%20%20%20%20%20%20%20%20%20%20git%20remote%20add%20upstream%20https%3A%2F%2Fgithub.com%2Fsybenx%2Fbothy.git%0A%20%20%20%20%20%20%20%20%20%20git%20fetch%20upstream%20main%0A%0A%20%20%20%20%20%20-%20name%3A%20Pull%20in%20upstream%20files%0A%20%20%20%20%20%20%20%20run%3A%20git%20checkout%20upstream%2Fmain%20--%20.%0A%0A%20%20%20%20%20%20-%20name%3A%20Restore%20local%20config%0A%20%20%20%20%20%20%20%20%23%20wrangler.jsonc%20holds%20the%20D1%2FKV%2FR2%20IDs%20Cloudflare%20provisioned%20for%20this%20deployment%2C%0A%20%20%20%20%20%20%20%20%23%20and%20.github%2F%20holds%20this%20workflow%20itself%20%E2%80%94%20neither%20must%20ever%20be%20overwritten%20by%20upstream.%0A%20%20%20%20%20%20%20%20run%3A%20git%20checkout%20HEAD%20--%20wrangler.jsonc%20.github%2F%0A%0A%20%20%20%20%20%20-%20name%3A%20Stage%20deletions%0A%20%20%20%20%20%20%20%20run%3A%20%7C%0A%20%20%20%20%20%20%20%20%20%20git%20diff%20--diff-filter%3DD%20--name-only%20HEAD%20upstream%2Fmain%20%5C%0A%20%20%20%20%20%20%20%20%20%20%20%20%7C%20grep%20-v%20%27%5E%5C.github%2F%27%20%5C%0A%20%20%20%20%20%20%20%20%20%20%20%20%7C%20xargs%20-r%20git%20rm%20--%0A%0A%20%20%20%20%20%20-%20name%3A%20Commit%20and%20push%0A%20%20%20%20%20%20%20%20run%3A%20%7C%0A%20%20%20%20%20%20%20%20%20%20if%20git%20diff%20--quiet%20%26%26%20git%20diff%20--cached%20--quiet%3B%20then%0A%20%20%20%20%20%20%20%20%20%20%20%20echo%20%22Already%20up%20to%20date%20with%20upstream.%22%0A%20%20%20%20%20%20%20%20%20%20%20%20exit%200%0A%20%20%20%20%20%20%20%20%20%20fi%0A%20%20%20%20%20%20%20%20%20%20git%20add%20-A%0A%20%20%20%20%20%20%20%20%20%20git%20commit%20-m%20%22Sync%20from%20upstream%20%28sybenx%2Fbothy%29%22%0A%20%20%20%20%20%20%20%20%20%20git%20push%20origin%20HEAD%3A%24%7B%7B%20github.ref_name%20%7D%7D%0A)
+[![2: Check for updates](https://img.shields.io/badge/2-Check%20for%20updates-555555?style=flat-square)](../../actions/workflows/sync.yml)
+
+**Enable the updater** opens GitHub's web editor with `sync.yml` pre-filled; commit it. One file, once.
+**Check for updates** opens the workflow — click **Run workflow**. Whenever you want the latest.
+
+Running it pulls in this repo's files, restores your own `wrangler.jsonc` and `.github/` untouched (those hold your Cloudflare resource IDs and this workflow itself), and pushes the result straight to your default branch. Cloudflare notices the push and redeploys automatically — usually within a minute or two.
 
 Your relay stays claimed and your events survive; deploying never resets anything (see "Resetting" below for what actually does). After it redeploys, hard-refresh the admin page in your browser (`Cmd+Shift+R` / `Ctrl+Shift+R`) — the page's static assets can stick around in your browser's cache otherwise.
 
@@ -36,16 +39,20 @@ To check whether a deploy went through, open your Worker in the Cloudflare dashb
 
 If you deployed manually instead of via the button (you have the code checked out locally), update the same way you would any git project, then run `npx wrangler deploy`.
 
-If your copy predates this workflow and doesn't have `sync.yml`, or you'd rather not grant it repo write access, you can do the same thing by hand:
+<details>
+<summary>Prefer the terminal?</summary>
 
 ```bash
 git remote add upstream https://github.com/sybenx/bothy.git
 git fetch upstream
 git checkout upstream/main -- .
-git checkout HEAD -- wrangler.jsonc .github/
+git checkout HEAD -- wrangler.jsonc
+git status
 git commit -m "Sync from upstream"
 git push
 ```
+
+</details>
 
 ### Rate limiting (recommended)
 
