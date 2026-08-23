@@ -721,14 +721,30 @@ export class Relay extends DurableObject<Env> {
   }
 
   private broadcast(event: NostrEvent): void {
+    // The NIP-42 gate in handleReq proves nothing about *future* events:
+    // it probes storage at REQ time, so a filter that matches no stored
+    // gift wrap when registered (most simply, a `#p` filter naming the
+    // owner while the inbox is empty) is accepted ungated -- and every
+    // gift wrap accepted afterward necessarily p-tags the owner
+    // (handleGiftWrap), so it matches. This push path must therefore
+    // enforce the same authenticated-recipient rule itself, exactly as
+    // liveBroadcast below already refuses kind 1059 for its permanently
+    // unauthenticated channel. Owner looked up only on the gated kind so
+    // the common path stays free of the extra read.
+    const gated = event.kind === GIFT_WRAP_KIND;
+    const owner = gated ? getOwnerPubkey(this.ctx.storage.sql, this.env) : null;
     for (const ws of this.ctx.getWebSockets()) {
       // ctx.getWebSockets() with no tag argument returns every socket,
       // live feed ones included -- those carry a LiveFeedState
       // attachment (connectedAt only, no `subs`), not a ConnState, so
       // they're routed to liveBroadcast instead, never here.
       if (this.ctx.getTags(ws).includes(LIVE_FEED_TAG)) continue;
-      const { subs } = getState(ws);
-      for (const [subId, filters] of Object.entries(subs)) {
+      const state = getState(ws);
+      // Same condition handleReq's gate enforces for stored reads:
+      // kind-1059 events go only to the connection authenticated as the
+      // owner (the p-tagged recipient, per handleGiftWrap's accept rule).
+      if (gated && state.authedPubkey !== owner) continue;
+      for (const [subId, filters] of Object.entries(state.subs)) {
         if (matchesAnyFilter(event, filters)) {
           send(ws, ["EVENT", subId, event]);
         }

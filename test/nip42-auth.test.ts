@@ -206,6 +206,77 @@ describe("NIP-42 gift wrap read gate (ROADMAP.md chunk 6)", () => {
 // despite carrying no kind or `#p` constraint at all, and one that must
 // NOT be gated because its `kinds` structurally excludes 1059 regardless
 // of what else the filter asks for.
+// The REQ-time gate above proves nothing about *future* events: a filter
+// that matches no stored gift wrap at registration time (most simply,
+// any `#p` filter naming the owner while the inbox is empty) registers
+// ungated, and every gift wrap accepted afterward necessarily p-tags the
+// owner (relay.ts handleGiftWrap), so it matches. The live push path
+// (relay.ts broadcast) must therefore enforce the same
+// authenticated-recipient rule itself -- these two lock that in from
+// both sides.
+describe("NIP-42 gift wrap read gate: live broadcast", () => {
+  it("does not push a live gift wrap to an unauthenticated subscription", async () => {
+    const subscriber = await connectRelay();
+    // Empty relay: the REQ-time gate finds no stored kind-1059 match, so
+    // this sub is (correctly) accepted without an AUTH challenge.
+    subscriber.send(["REQ", "subLiveLeak", { "#p": [OWNER_PUBKEY_HEX] }]);
+    const eose = await subscriber.nextMessage();
+    expect(eose[0]).toBe("EOSE");
+
+    const sender = await connectRelay();
+    const giftWrap = signEvent(randomKeypair().secretKeyHex, {
+      kind: 1059,
+      tags: [["p", OWNER_PUBKEY_HEX]],
+      content: "sealed",
+    });
+    const [, , ok] = await publish(sender, giftWrap);
+    expect(ok).toBe(true);
+
+    await expect(subscriber.nextMessage(200)).rejects.toThrow();
+    subscriber.close();
+    sender.close();
+  });
+
+  it("pushes a live gift wrap to the owner once authenticated", async () => {
+    const subscriber = await connectRelay();
+    // A kinds:[1059] REQ is gated by shape regardless of storage, so it
+    // works as a challenge trigger even on an empty relay.
+    subscriber.send(["REQ", "subChallengeTrigger", { kinds: [1059] }]);
+    const [, challenge] = await subscriber.nextMessage();
+    await subscriber.nextMessage(); // CLOSED, auth-required
+
+    const authEvent = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 22242,
+      tags: [
+        ["relay", "wss://example.com"],
+        ["challenge", challenge as string],
+      ],
+    });
+    subscriber.send(["AUTH", authEvent]);
+    const [, , authOk] = await subscriber.nextMessage();
+    expect(authOk).toBe(true);
+
+    subscriber.send(["REQ", "subLiveAuthed", { "#p": [OWNER_PUBKEY_HEX] }]);
+    const eose = await subscriber.nextMessage();
+    expect(eose[0]).toBe("EOSE");
+
+    const sender = await connectRelay();
+    const giftWrap = signEvent(randomKeypair().secretKeyHex, {
+      kind: 1059,
+      tags: [["p", OWNER_PUBKEY_HEX]],
+      content: "sealed",
+    });
+    await publish(sender, giftWrap);
+
+    const frame = await subscriber.nextMessage();
+    expect(frame[0]).toBe("EVENT");
+    expect(frame[1]).toBe("subLiveAuthed");
+    expect((frame[2] as { id: string }).id).toBe(giftWrap.id);
+    subscriber.close();
+    sender.close();
+  });
+});
+
 describe("NIP-42 gift wrap read gate: filter-shape coverage", () => {
   it("gates a filter naming kind 1059 alongside an unrelated constraint", async () => {
     const conn = await connectRelay();
