@@ -138,7 +138,7 @@ See `CLAUDE.md` for architecture, the free-tier budget this project is built aga
 
 ## Removing it
 
-Two things must be deleted, and neither is obvious:
+Two things must be deleted:
 
 - **The Worker** — Cloudflare dashboard → Workers & Pages → your project → Settings → delete. This takes the relay offline.
 - **The GitHub repo** Cloudflare created — its Settings → Danger Zone → Delete this repository.
