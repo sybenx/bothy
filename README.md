@@ -7,6 +7,7 @@ A bothy is a small unlocked shelter in the Scottish highlands — free, unowned,
 Click the button, paste your `npub`, get a `wss://` URL for your own relay. No terminal, no VPS, no domain, no port forwarding, no always-on box at home. The relay lives in your own Cloudflare account.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/sybenx/bothy)
+[![Update from upstream](https://img.shields.io/badge/update-from%20upstream-blue)](../../actions/workflows/sync.yml)
 
 ## Setup
 
@@ -19,17 +20,28 @@ That's it. No dashboard configuration required.
 
 ## Updating
 
-The deploy button forked this repo into your own GitHub account and connected it to your Worker. To pick up a new version, no terminal required:
+The "Deploy to Cloudflare" button clones this repo into your own GitHub account as an independent repo, not a GitHub fork — so there's no **Sync fork** button, and no built-in way to pull in later changes. To close that gap, every copy ships with a `sync.yml` GitHub Actions workflow that does it for you:
 
-1. Open your fork on github.com (it's under your account, named `bothy`).
-2. Click **Sync fork**, then **Update branch**.
-3. Cloudflare notices the push and redeploys automatically — usually within a minute or two.
+1. In your copy on github.com, go to the **Actions** tab (or click the "Update from upstream" badge above) and run the **Sync from upstream** workflow manually (`workflow_dispatch`).
+2. It pulls in this repo's files, restores your own `wrangler.jsonc` and `.github/` untouched (those hold your Cloudflare resource IDs and this workflow itself), and opens a pull request on a `sync/upstream` branch.
+3. Review the diff and merge. Cloudflare notices the push and redeploys automatically — usually within a minute or two.
 
 Your relay stays claimed and your events survive; deploying never resets anything (see "Resetting" below for what actually does). After it redeploys, hard-refresh the admin page in your browser (`Cmd+Shift+R` / `Ctrl+Shift+R`) — the page's static assets can stick around in your browser's cache otherwise.
 
 To check whether a deploy went through, open your Worker in the Cloudflare dashboard and look at its **Deployments** tab.
 
 If you deployed manually instead of via the button (you have the code checked out locally), update the same way you would any git project, then run `npx wrangler deploy`.
+
+If your copy predates this workflow and doesn't have `sync.yml`, or you'd rather not grant it repo write access, you can do the same thing by hand:
+
+```bash
+git remote add upstream https://github.com/sybenx/bothy.git
+git fetch upstream
+git checkout upstream/main -- .
+git checkout HEAD -- wrangler.jsonc .github/
+git commit -m "Sync from upstream"
+git push
+```
 
 ### Rate limiting (recommended)
 

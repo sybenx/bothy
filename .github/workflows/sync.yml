@@ -1,0 +1,61 @@
+name: Sync from upstream
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # The "Deploy to Cloudflare" button clones this repo into the user's account as an
+    # independent repo, not a GitHub fork, so this workflow ships inside every downstream
+    # copy too. Guard so it no-ops when it runs in the upstream repo itself.
+    if: github.repository != 'sybenx/bothy'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/sybenx/bothy.git
+          git fetch upstream main
+
+      - name: Pull in upstream files
+        run: git checkout upstream/main -- .
+
+      - name: Restore local config
+        # wrangler.jsonc holds the D1/KV/R2 IDs Cloudflare provisioned for this deployment,
+        # and .github/ holds this workflow itself — neither must ever be overwritten by upstream.
+        run: git checkout HEAD -- wrangler.jsonc .github/
+
+      - name: Stage deletions
+        run: |
+          git diff --diff-filter=D --name-only HEAD upstream/main \
+            | grep -v '^\.github/' \
+            | xargs -r git rm --
+
+      - name: Open pull request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: sync/upstream
+          title: "Sync from upstream (sybenx/bothy)"
+          commit-message: "Sync from upstream (sybenx/bothy)"
+          body: |
+            Pulls in the latest changes from the upstream template repo
+            ([sybenx/bothy](https://github.com/sybenx/bothy)).
+
+            `wrangler.jsonc` and `.github/` were restored to your own versions after the
+            sync, so your Cloudflare resource IDs and workflows are untouched. Review the
+            diff before merging.
+          delete-branch: true

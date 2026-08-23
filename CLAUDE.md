@@ -24,6 +24,8 @@ Everything optional is read defensively (`env.X ?? fallback`) and declared nowhe
 
 Redeploying does not reset ownership or storage — DO storage survives `wrangler deploy`. Resetting requires deleting the Worker.
 
+[.github/workflows/sync.yml](.github/workflows/sync.yml) is downstream-facing tooling, not CI for this repo: the "Deploy to Cloudflare" button clones this repo into the user's account rather than forking it, so this workflow ships in every downstream copy to give them a way to pull in upstream changes anyway (it no-ops in `sybenx/bothy` itself via the job-level `if` guard). The `git checkout HEAD -- wrangler.jsonc .github/` step is load-bearing — it restores the user's own Cloudflare resource IDs and this workflow after the upstream checkout overwrites them; don't remove or reorder it.
+
 ## Architecture map
 
 - [src/index.ts](src/index.ts) — Worker entry: routing, `/api/*`, `scheduled()` cron dispatch.
