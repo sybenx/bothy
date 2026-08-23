@@ -6,8 +6,12 @@ A bothy is a small unlocked shelter in the Scottish highlands — free, unowned,
 
 Click the button, paste your `npub`, get a `wss://` URL for your own relay. No terminal, no VPS, no domain, no port forwarding, no always-on box at home. The relay lives in your own Cloudflare account.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/sybenx/bothy)
-[![Update from upstream](https://img.shields.io/badge/update-from%20upstream-blue)](../../actions/workflows/sync.yml)
+[![Release](https://img.shields.io/github/v/release/sybenx/bothy?style=for-the-badge)](../../releases)
+
+<p>
+<a href="https://deploy.workers.cloudflare.com/?url=https://github.com/sybenx/bothy"><img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare" height="39"></a>
+<a href="../../actions/workflows/sync.yml"><img src="https://img.shields.io/badge/Update-from%20upstream-F38020?style=for-the-badge&logo=github&logoColor=white" alt="Update from upstream" height="39"></a>
+</p>
 
 ## Setup
 
