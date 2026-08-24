@@ -77,7 +77,7 @@ The deploy button only asks for a project name. Everything else is an optional v
 |---|---|
 | `OWNER_PUBKEY` | Fix ownership at deploy time instead of claiming (hex, not npub). Disables the claim endpoint. |
 | `RELAY_NAME` / `RELAY_DESCRIPTION` / `RELAY_ICON` | Override the NIP-11 name/description/icon. Name and icon default to your claimed profile's kind-0 name/picture; description defaults to a generic string. |
-| `ALLOW_FOLLOWS` | Writes from your kind-3 follow list are accepted by default, refreshed hourly from your own most recent contact list already stored on this relay. Set to `false` to disable and go back to owner-only writes. |
+| `ALLOW_FOLLOWS` | On by default: writes from your kind-3 follow list are accepted, refreshed hourly from your own most recent contact list and mute list already stored on this relay. Set to `false` to disable and go back to owner-only writes. |
 
 If your Worker is connected to a GitHub repo, Cloudflare may sync `wrangler.jsonc`'s config on every deploy, which can overwrite a variable you added in the dashboard by hand — worth knowing if a dashboard-added variable seems to reset after a deploy.
 
@@ -95,9 +95,23 @@ Reading them back is restricted to you: an unauthenticated query for gift wraps 
 
 **Worth knowing:** Cloudflare terminates the TLS connection in front of this relay, so it necessarily sees the `p` tag (who a gift wrap is addressed to), the arrival time, and the sender's IP address, the same as any other Worker traffic. On a personal relay the `p` tag is always you, so that part leaks nothing new; the sender IPs, though, belong to other people sending you mail through infrastructure that you chose.
 
+## Who can write here
+
+By default, bothy accepts events from two kinds of author: you (the owner), and the people you follow. Not strangers. It works by reading the follow list (kind 3) you've already published — bothy doesn't ask you to maintain a separate allowlist, it just uses the one your nostr client already keeps.
+
+Muting someone in your normal nostr client revokes their write access here too, the next time bothy refreshes its follow/mute cache (hourly). This only sees *public* mutes — the plain-text `p` tags in a NIP-51 mute list. Private mutes are encrypted to a key only your client holds, so bothy has no way to read those; it can only act on what's public.
+
+Why this is the default rather than a limitation: bothy is meant to be one of the 2-4 relays your NIP-65 relay list already tells clients to keep, not your only relay. Pair it with a permissive public relay and you get both — your own filtered archive of people you actually follow, plus a general-purpose inbox that already does the spam filtering you'd otherwise have to build yourself. A reply from someone you don't follow isn't lost; it still lands on your other relay, and on the sender's own.
+
+If you'd rather bothy only ever accept your own writes, set `ALLOW_FOLLOWS=false` (see "Configuration" below). NIP-11 advertises `restricted_writes: true` either way, so well-behaved clients know not to bother trying before they publish.
+
+The admin page at your relay's URL is public — anyone with the link can see relay stats, your follow count, and your mute count. Never the follow or mute list itself, only the counts.
+
+This is one rung of a documented ladder — see [docs/rungs.md](docs/rungs.md) for the full progression from owner-only writes up to the open-relay case bothy deliberately refuses to become.
+
 ## HTTP endpoints
 
-- `GET /api/stats` — relay stats for the admin page. Returns `{ claimed, ownerPubkey, totalEvents, events24h, storageBytes, rowsWrittenEstimate24h, backfill, icon }`.
+- `GET /api/stats` — relay stats for the admin page. Returns `{ claimed, ownerPubkey, totalEvents, events24h, storageBytes, rowsWrittenEstimate24h, backfill, icon, writePolicy, followCount, followsRefreshedAt, muteCount }`.
 - `POST /api/claim` — TOFU claim; body `{ pubkey }` (npub or hex). See "Ownership" above.
 - `GET /live` — unauthenticated, push-only WebSocket for the admin page's live feed (max 5 connections, 10-minute lifetime); sends `{ kind, created_at, id }` per stored event, never gift wraps.
 - Any path, with header `Accept: application/nostr+json` — the [NIP-11](https://github.com/nostr-protocol/nips/blob/master/11.md) relay information document.
@@ -116,7 +130,7 @@ The NIPs leave some behavior unspecified. Where they do, here's what this relay 
 
 ## What this is not
 
-This project deliberately does not do: payments/zaps, multi-region scaling, NIP-05 hosting, media uploads, moderation tooling, or a public write mode. See `CLAUDE.md` for the full list and reasoning — most feature requests are already ruled out there.
+This project deliberately does not do: payments/zaps, multi-region scaling, NIP-05 hosting, media uploads, moderation tooling, or a public write mode. Public writes sit at the top of a documented ladder ([docs/rungs.md](docs/rungs.md)) rather than being an unexplained refusal — see "Who can write here" above for the rungs bothy does implement. See `CLAUDE.md` for the full list and reasoning — most feature requests are already ruled out there.
 
 ## Attribution
 

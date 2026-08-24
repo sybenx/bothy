@@ -49,7 +49,7 @@ describe("ownership write gate", () => {
     expect(id).toBe(event.id);
     expect(ok).toBe(false);
     expect(message).toBe(
-      "restricted: writes are limited to the owner and people the owner follows, and this pubkey isn't one of them",
+      "restricted: only the owner and people they follow can publish here",
     );
     conn.close();
   });
@@ -81,7 +81,7 @@ describe("ownership write gate", () => {
 
     expect(ok).toBe(false);
     expect(message).toBe(
-      "restricted: writes are limited to the owner and people the owner follows, and this pubkey isn't one of them",
+      "restricted: only the owner and people they follow can publish here",
     );
     // Schnorr verification is the most expensive per-event operation
     // (CLAUDE.md "The budget") -- a non-owner write is rejected on the

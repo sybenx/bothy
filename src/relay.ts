@@ -162,7 +162,7 @@ function writeRejectionMessage(reason: "unclaimed" | "muted" | "not-follow" | "o
     case "muted":
       return "blocked: this pubkey has been muted by the relay owner";
     case "not-follow":
-      return "restricted: writes are limited to the owner and people the owner follows, and this pubkey isn't one of them";
+      return "restricted: only the owner and people they follow can publish here";
     case "owner-only":
       return "restricted: writes are limited to the relay owner";
   }
@@ -306,7 +306,13 @@ export class Relay extends DurableObject<Env> {
     writePolicy: "owner" | "follows";
     followCount: number;
     followsRefreshedAt: number | null;
-    // NIP-51 mute count -- see ownership.ts refreshMutes for why this is
+    // NIP-51 mute count -- exposed even though /api/stats is unauthenticated.
+    // Deliberate, not an oversight: public mutes are public by construction
+    // (NIP-51), only the count is exposed here (never the muted pubkeys),
+    // and without it the owner has no way to tell a working mute list from
+    // an empty one. Don't "fix" this by removing the field.
+    //
+    // See ownership.ts refreshMutes for why this is
     // only ever the public, unencrypted subset of what the owner has
     // muted in their own client.
     muteCount: number;
