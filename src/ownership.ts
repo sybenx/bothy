@@ -17,9 +17,11 @@ const ICON_REFRESH_INTERVAL_SECONDS = 86400;
 
 // ALLOW_FOLLOWS is not declared in wrangler.jsonc's `vars` (ROADMAP.md
 // chunk 5), so it's undefined unless someone adds it in the Cloudflare
-// dashboard -- default to disabled, per CLAUDE.md "Configuration".
-function allowFollowsEnabled(env: Env): boolean {
-  return (env.ALLOW_FOLLOWS ?? "false") === "true";
+// dashboard -- it's an opt-OUT, per CLAUDE.md "Configuration": enabled
+// unless explicitly set to the exact string "false". An unset, empty, or
+// malformed value all resolve to enabled -- only "false" disables it.
+export function allowFollowsEnabled(env: Env): boolean {
+  return env.ALLOW_FOLLOWS !== "false";
 }
 
 export function getOwnerPubkey(sql: SqlStorage, env: Env): string | null {
@@ -68,6 +70,15 @@ export function getOwnerProfile(
   return row ?? null;
 }
 
+// Discriminated result for isAllowedWriter below, so callers (handleEvent
+// in relay.ts) can surface a rejection reason instead of a bare boolean --
+// an unclaimed relay, a muted pubkey, and a non-follow under follows mode
+// are different situations for the sender, even though they all end in
+// "you may not write here".
+export type WriteAuthorization =
+  | { allowed: true }
+  | { allowed: false; reason: "unclaimed" | "muted" | "not-follow" | "owner-only" };
+
 // Owner writes are always allowed, and always override the mute list --
 // the owner can't lock themselves out by muting their own pubkey. Mutes
 // are checked before the follows lookup so a muted pubkey is rejected
@@ -77,15 +88,15 @@ export function getOwnerProfile(
 // one-time key, so there's no stable sender pubkey to check against a
 // mute list; adding a check there would be dead code implying a
 // protection that doesn't exist.
-export function isAllowedWriter(sql: SqlStorage, env: Env, pubkey: string): boolean {
+export function isAllowedWriter(sql: SqlStorage, env: Env, pubkey: string): WriteAuthorization {
   const owner = getOwnerPubkey(sql, env);
-  if (owner === null) return false;
-  if (pubkey === owner) return true;
+  if (owner === null) return { allowed: false, reason: "unclaimed" };
+  if (pubkey === owner) return { allowed: true };
   const muted = sql.exec(`SELECT 1 FROM mutes WHERE pubkey = ?`, pubkey).toArray();
-  if (muted.length > 0) return false;
-  if (!allowFollowsEnabled(env)) return false;
+  if (muted.length > 0) return { allowed: false, reason: "muted" };
+  if (!allowFollowsEnabled(env)) return { allowed: false, reason: "owner-only" };
   const row = sql.exec(`SELECT 1 FROM follows WHERE pubkey = ?`, pubkey).toArray();
-  return row.length > 0;
+  return row.length > 0 ? { allowed: true } : { allowed: false, reason: "not-follow" };
 }
 
 // Re-derives the follow cache from the owner's own most recent kind-3

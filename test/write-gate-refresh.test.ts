@@ -21,19 +21,18 @@ import { isolateStorage } from "./helpers/isolate";
 import { OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
 import { connectRelay, publish } from "./helpers/socket";
 
-// The global test env leaves ALLOW_FOLLOWS unset (vitest.config.ts), so
-// the real refreshFollows would no-op regardless of whether relay.ts
-// calls it -- see ownership.ts allowFollowsEnabled. refreshFollows is
-// wrapped to force ALLOW_FOLLOWS on for its own call only (mirroring the
-// custom FOLLOWS_ENV test/follows.test.ts builds for the same reason),
-// so the assertions below can tell "was it called" apart from "would it
-// have been a no-op anyway." refreshMutes needs no such override -- the
-// mute check is never gated by an env var.
+// ALLOW_FOLLOWS is an opt-out (ownership.ts allowFollowsEnabled), so the
+// global test env's unset value already means follows mode is on -- but
+// refreshFollows is still wrapped to force ALLOW_FOLLOWS on explicitly
+// (mirroring the custom FOLLOWS_ENV test/follows.test.ts builds), so the
+// assertions below don't depend on the default staying what it is today.
+// refreshMutes needs no such override -- the mute check is never gated by
+// an env var.
 vi.mock("../src/ownership", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/ownership")>();
   return {
     ...actual,
-    isAllowedWriter: vi.fn(() => true),
+    isAllowedWriter: vi.fn(() => ({ allowed: true }) as const),
     refreshFollows: vi.fn((sql: SqlStorage, env: Env, now: number) =>
       actual.refreshFollows(sql, { ...env, ALLOW_FOLLOWS: "true" }, now),
     ),

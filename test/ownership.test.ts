@@ -1,7 +1,12 @@
-// Owner-only writes (ROADMAP.md chunk 2; CLAUDE.md "Threat model": "Writes
-// are owner-only and signature-verified"). "restricted: not allowed to
-// write." is one of NIP-01's own worked examples for the `restricted`
-// prefix (nips/01.md line 173).
+// Owner-gated writes (ROADMAP.md chunk 2; CLAUDE.md "Threat model": "Writes
+// are owner-only and signature-verified" for anyone not the owner or,
+// under the ALLOW_FOLLOWS default, one of the owner's follows).
+//
+// The global test env leaves ALLOW_FOLLOWS unset (vitest.config.ts), which
+// under the opt-out default (ownership.ts allowFollowsEnabled) means
+// follows mode is ON -- a non-owner stranger here is rejected for not
+// being a follow, not for a blanket owner-only rule. See
+// test/follows.test.ts for the ALLOW_FOLLOWS=false owner-only case.
 //
 // The OWNER_PUBKEY fixture here is injected as a miniflare binding in
 // vitest.config.ts, matching CLAUDE.md's documented env-override path:
@@ -43,7 +48,9 @@ describe("ownership write gate", () => {
 
     expect(id).toBe(event.id);
     expect(ok).toBe(false);
-    expect(message).toBe("restricted: not allowed to write.");
+    expect(message).toBe(
+      "restricted: writes are limited to the owner and people the owner follows, and this pubkey isn't one of them",
+    );
     conn.close();
   });
 
@@ -73,7 +80,9 @@ describe("ownership write gate", () => {
     const [, , ok, message] = await publish(conn, event);
 
     expect(ok).toBe(false);
-    expect(message).toBe("restricted: not allowed to write.");
+    expect(message).toBe(
+      "restricted: writes are limited to the owner and people the owner follows, and this pubkey isn't one of them",
+    );
     // Schnorr verification is the most expensive per-event operation
     // (CLAUDE.md "The budget") -- a non-owner write is rejected on the
     // pubkey check alone, before it's ever paid for.

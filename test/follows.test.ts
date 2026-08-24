@@ -1,11 +1,11 @@
 // ALLOW_FOLLOWS (CLAUDE.md "Configuration": "also accept writes from the
 // owner's kind-3 follow list"). Follows are re-derived from the owner's
 // own most recent kind-3 event already stored on this relay, not fetched
-// from elsewhere -- see ownership.ts refreshFollows(). The global test
-// env's ALLOW_FOLLOWS defaults to "false" (wrangler.jsonc), so -- like
-// test/claim.test.ts -- the gate itself is exercised against real
-// SqlStorage via runInDurableObject with a hand-built env, rather than
-// over the wire.
+// from elsewhere -- see ownership.ts refreshFollows(). ALLOW_FOLLOWS is an
+// opt-out (ownership.ts allowFollowsEnabled), so both states are exercised
+// explicitly below with a hand-built env against real SqlStorage via
+// runInDurableObject, rather than relying on whatever the global test env
+// happens to default to.
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
@@ -14,6 +14,7 @@ import { isAllowedWriter, refreshFollows } from "../src/ownership";
 import { isolateStorage } from "./helpers/isolate";
 import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
 import { publish, connectRelay } from "./helpers/socket";
+import { storeEvent } from "../src/storage";
 
 isolateStorage();
 
@@ -27,18 +28,23 @@ describe("ALLOW_FOLLOWS write gate", () => {
       kind: 3,
       tags: [["p", friend.pubkeyHex]],
     });
-    const conn = await connectRelay();
-    await publish(conn, contacts);
-    conn.close();
 
     const id = env.RELAY.idFromName("relay");
     const stub = env.RELAY.get(id);
     await runInDurableObject(stub, async (_instance, state) => {
-      expect(isAllowedWriter(state.storage.sql, FOLLOWS_ENV, friend.pubkeyHex)).toBe(false);
+      // Stored directly via storeEvent rather than published over the
+      // wire -- publishing would go through relay.ts's own handleEvent,
+      // which (now that ALLOW_FOLLOWS is an opt-out, see
+      // ownership.ts allowFollowsEnabled) immediately refreshes the
+      // follow cache on an owner kind-3, defeating the point of this
+      // test's explicit before/after refreshFollows assertions.
+      storeEvent(state.storage.sql, contacts);
+
+      expect(isAllowedWriter(state.storage.sql, FOLLOWS_ENV, friend.pubkeyHex).allowed).toBe(false);
 
       refreshFollows(state.storage.sql, FOLLOWS_ENV, Math.floor(Date.now() / 1000));
 
-      expect(isAllowedWriter(state.storage.sql, FOLLOWS_ENV, friend.pubkeyHex)).toBe(true);
+      expect(isAllowedWriter(state.storage.sql, FOLLOWS_ENV, friend.pubkeyHex).allowed).toBe(true);
     });
   });
 
@@ -56,7 +62,7 @@ describe("ALLOW_FOLLOWS write gate", () => {
     const stub = env.RELAY.get(id);
     await runInDurableObject(stub, async (_instance, state) => {
       refreshFollows(state.storage.sql, NO_FOLLOWS_ENV, Math.floor(Date.now() / 1000));
-      expect(isAllowedWriter(state.storage.sql, NO_FOLLOWS_ENV, friend.pubkeyHex)).toBe(false);
+      expect(isAllowedWriter(state.storage.sql, NO_FOLLOWS_ENV, friend.pubkeyHex).allowed).toBe(false);
     });
   });
 
@@ -65,7 +71,7 @@ describe("ALLOW_FOLLOWS write gate", () => {
     const id = env.RELAY.idFromName("relay");
     const stub = env.RELAY.get(id);
     await runInDurableObject(stub, async (_instance, state) => {
-      expect(isAllowedWriter(state.storage.sql, FOLLOWS_ENV, stranger)).toBe(false);
+      expect(isAllowedWriter(state.storage.sql, FOLLOWS_ENV, stranger).allowed).toBe(false);
     });
   });
 
@@ -73,7 +79,7 @@ describe("ALLOW_FOLLOWS write gate", () => {
     const id = env.RELAY.idFromName("relay");
     const stub = env.RELAY.get(id);
     await runInDurableObject(stub, async (_instance, state) => {
-      expect(isAllowedWriter(state.storage.sql, NO_FOLLOWS_ENV, OWNER_PUBKEY_HEX)).toBe(true);
+      expect(isAllowedWriter(state.storage.sql, NO_FOLLOWS_ENV, OWNER_PUBKEY_HEX).allowed).toBe(true);
     });
   });
 });

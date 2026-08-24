@@ -42,7 +42,7 @@ describe("NIP-51 mute list write gate", () => {
       refreshFollows(state.storage.sql, FOLLOWS_ENV, now);
       refreshMutes(state.storage.sql, FOLLOWS_ENV, now);
 
-      expect(isAllowedWriter(state.storage.sql, FOLLOWS_ENV, friend.pubkeyHex)).toBe(false);
+      expect(isAllowedWriter(state.storage.sql, FOLLOWS_ENV, friend.pubkeyHex).allowed).toBe(false);
     });
   });
 
@@ -59,7 +59,7 @@ describe("NIP-51 mute list write gate", () => {
     const stub = env.RELAY.get(id);
     await runInDurableObject(stub, async (_instance, state) => {
       refreshMutes(state.storage.sql, FOLLOWS_ENV, Math.floor(Date.now() / 1000));
-      expect(isAllowedWriter(state.storage.sql, FOLLOWS_ENV, OWNER_PUBKEY_HEX)).toBe(true);
+      expect(isAllowedWriter(state.storage.sql, FOLLOWS_ENV, OWNER_PUBKEY_HEX).allowed).toBe(true);
     });
   });
 
@@ -71,7 +71,7 @@ describe("NIP-51 mute list write gate", () => {
       refreshMutes(state.storage.sql, FOLLOWS_ENV, Math.floor(Date.now() / 1000));
       const rows = state.storage.sql.exec(`SELECT * FROM mutes`).toArray();
       expect(rows.length).toBe(0);
-      expect(isAllowedWriter(state.storage.sql, FOLLOWS_ENV, stranger)).toBe(false);
+      expect(isAllowedWriter(state.storage.sql, FOLLOWS_ENV, stranger).allowed).toBe(false);
     });
   });
 
@@ -94,7 +94,7 @@ describe("NIP-51 mute list write gate", () => {
     await runInDurableObject(stub, async (_instance, state) => {
       refreshMutes(state.storage.sql, FOLLOWS_ENV, Math.floor(Date.now() / 1000));
 
-      expect(isAllowedWriter(state.storage.sql, FOLLOWS_ENV, pub.pubkeyHex)).toBe(false);
+      expect(isAllowedWriter(state.storage.sql, FOLLOWS_ENV, pub.pubkeyHex).allowed).toBe(false);
       // The privately-muted pubkey never appears anywhere in plaintext,
       // so there is nothing to check it against -- it is simply not in
       // the mute table, and its writes are governed by ALLOW_FOLLOWS/

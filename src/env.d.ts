@@ -4,10 +4,13 @@
 // OWNER_PUBKEY is deliberately absent so a real deploy stays unclaimed
 // (TOFU) by default, per CLAUDE.md "Ownership" -- it's injected as a
 // miniflare binding in vitest.config.ts for tests, and set by the claim
-// flow at runtime. RELAY_NAME/RELAY_DESCRIPTION/RELAY_ICON/ALLOW_FOLLOWS
-// are optional advanced overrides anyone can add in the Cloudflare
-// dashboard; read them defensively with `env.X ?? fallback` everywhere
-// they're used (nip11.ts, ownership.ts) since they may be undefined.
+// flow at runtime. RELAY_NAME/RELAY_DESCRIPTION/RELAY_ICON are optional
+// advanced overrides anyone can add in the Cloudflare dashboard; read
+// them defensively with `env.X ?? fallback` everywhere they're used
+// (nip11.ts, ownership.ts) since they may be undefined. ALLOW_FOLLOWS is
+// an opt-OUT: writes from the owner's follows are enabled by default, and
+// setting it to the exact string "false" is the only way to turn them
+// off (ownership.ts allowFollowsEnabled).
 // The generated Env type (worker-configuration.d.ts) never declares any
 // of these, so this merges the optional fields onto the global `Env`.
 interface Env {

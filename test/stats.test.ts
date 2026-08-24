@@ -38,7 +38,7 @@ describe("GET /api/stats", () => {
     expect(body.events24h).toBeGreaterThanOrEqual(1);
   });
 
-  it("reports owner-only write policy and zeroed follow/mute counts before any list is stored", async () => {
+  it("reports follows write policy and zeroed follow/mute counts before any list is stored", async () => {
     const response = await exports.default.fetch("https://example.com/api/stats");
     const body = (await response.json()) as {
       writePolicy: string;
@@ -48,9 +48,10 @@ describe("GET /api/stats", () => {
     };
 
     // The global test env leaves ALLOW_FOLLOWS unset (vitest.config.ts),
-    // so this is always "owner" here -- see follows.test.ts for the
-    // ALLOW_FOLLOWS=true write-gate itself.
-    expect(body.writePolicy).toBe("owner");
+    // and it's an opt-out (ownership.ts allowFollowsEnabled), so this is
+    // "follows" here even with an empty follow list -- see
+    // follows.test.ts for the ALLOW_FOLLOWS=false owner-only case.
+    expect(body.writePolicy).toBe("follows");
     expect(body.followCount).toBe(0);
     expect(body.followsRefreshedAt).toBeNull();
     expect(body.muteCount).toBe(0);
@@ -73,19 +74,19 @@ describe("GET /api/stats", () => {
     await publish(conn, contacts);
     // Mutes are checked regardless of ALLOW_FOLLOWS (ownership.ts
     // refreshMutes), so relay.ts's immediate refresh on this owner
-    // kind-10000 populates `mutes` for real even in this ALLOW_FOLLOWS-off
-    // env -- unlike the kind-3 case below.
+    // kind-10000 populates `mutes` for real -- and since ALLOW_FOLLOWS is
+    // an opt-out (ownership.ts allowFollowsEnabled) and the global test
+    // env leaves it unset, relay.ts's immediate refresh on the kind-3
+    // above already populates `follows` for real too.
     await publish(conn, muteList);
     conn.close();
 
-    // The global test env leaves ALLOW_FOLLOWS unset, so relay.ts's
-    // immediate refresh on the kind-3 above is a real no-op (see
-    // ownership.ts allowFollowsEnabled) -- the `follows` table only gets
-    // populated here because this test drives refreshFollows directly
-    // with a follows-enabled env, the same technique test/follows.test.ts
-    // uses for the write-gate itself. This isolates what's under test:
-    // that getStats' followCount/followsRefreshedAt reflect whatever is
-    // actually in the table, not relay.ts's refresh trigger (covered by
+    // Driven again directly with an explicit follows-enabled env (the
+    // same technique test/follows.test.ts uses for the write-gate itself)
+    // so this test doesn't depend on ALLOW_FOLLOWS's default staying what
+    // it is today -- what's under test here is that getStats'
+    // followCount/followsRefreshedAt reflect whatever is actually in the
+    // table, not relay.ts's refresh trigger (covered by
     // test/write-gate-refresh.test.ts instead).
     const id = env.RELAY.idFromName("relay");
     const stub = env.RELAY.get(id);

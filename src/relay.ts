@@ -25,6 +25,7 @@ import {
 import { resolveIcon } from "./nip11";
 import { type Filter, GIFT_WRAP_KIND, type NostrEvent, pTagValues, VANISH_KIND } from "./nostr";
 import {
+  allowFollowsEnabled,
   CONTACT_LIST_KIND,
   claimOwner,
   getOwnerPubkey,
@@ -146,6 +147,25 @@ function send(ws: WebSocket, message: unknown[]): void {
 
 function ok(ws: WebSocket, id: string, accepted: boolean, message: string): void {
   send(ws, ["OK", id, accepted, message]);
+}
+
+// Maps ownership.ts isAllowedWriter's rejection reasons to distinct
+// NIP-01 OK messages, written for the person reading them in their
+// client rather than for a developer reading logs. "muted" gets the
+// `blocked:` prefix -- it's a permanent, person-specific refusal, not a
+// generic access restriction -- everything else gets `restricted:` per
+// NIP-01's own worked example (nips/01.md line 173).
+function writeRejectionMessage(reason: "unclaimed" | "muted" | "not-follow" | "owner-only"): string {
+  switch (reason) {
+    case "unclaimed":
+      return "restricted: relay has not been claimed yet";
+    case "muted":
+      return "blocked: this pubkey has been muted by the relay owner";
+    case "not-follow":
+      return "restricted: writes are limited to the owner and people the owner follows, and this pubkey isn't one of them";
+    case "owner-only":
+      return "restricted: writes are limited to the relay owner";
+  }
 }
 
 export class Relay extends DurableObject<Env> {
@@ -277,7 +297,7 @@ export class Relay extends DurableObject<Env> {
     backfill: BackfillStatus | null;
     icon: string | null;
     // Whether writes beyond the owner are currently possible at all
-    // (CLAUDE.md "Owner-only writes by default"), plus the numbers that
+    // (CLAUDE.md "Writes are owner-gated"), plus the numbers that
     // back that state -- see the ALLOW_FOLLOWS-gate comment in
     // ownership.ts isAllowedWriter. Surfaced so an owner who enabled
     // ALLOW_FOLLOWS but never published a kind-3 here (an empty allowlist
@@ -320,7 +340,7 @@ export class Relay extends DurableObject<Env> {
       // tab's favicon from the owner's kind-0 picture. Null falls back
       // to the static default favicon client-side.
       icon: resolveIcon(this.env, getOwnerProfile(sql, this.env)),
-      writePolicy: (this.env.ALLOW_FOLLOWS ?? "false") === "true" ? "follows" : "owner",
+      writePolicy: allowFollowsEnabled(this.env) ? "follows" : "owner",
       followCount,
       followsRefreshedAt,
       muteCount,
@@ -465,11 +485,12 @@ export class Relay extends DurableObject<Env> {
     // rejected unconditionally regardless of whether it's well-formed --
     // there's no reason to pay for a check whose result can't change the
     // outcome. This also means a non-owner event with a bad id or bad
-    // signature still gets "restricted:", not "invalid:", which is fine:
-    // NIP-01 doesn't require checking id/sig before authorization.
+    // signature still gets "restricted:"/"blocked:", not "invalid:", which
+    // is fine: NIP-01 doesn't require checking id/sig before authorization.
     const sql = this.ctx.storage.sql;
-    if (!isAllowedWriter(sql, this.env, event.pubkey)) {
-      ok(ws, event.id, false, "restricted: not allowed to write.");
+    const auth = isAllowedWriter(sql, this.env, event.pubkey);
+    if (!auth.allowed) {
+      ok(ws, event.id, false, writeRejectionMessage(auth.reason));
       return;
     }
 

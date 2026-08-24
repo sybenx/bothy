@@ -77,7 +77,7 @@ The deploy button only asks for a project name. Everything else is an optional v
 |---|---|
 | `OWNER_PUBKEY` | Fix ownership at deploy time instead of claiming (hex, not npub). Disables the claim endpoint. |
 | `RELAY_NAME` / `RELAY_DESCRIPTION` / `RELAY_ICON` | Override the NIP-11 name/description/icon. Name and icon default to your claimed profile's kind-0 name/picture; description defaults to a generic string. |
-| `ALLOW_FOLLOWS` | Set to `true` to also accept writes from your kind-3 follow list, refreshed hourly from your own most recent contact list already stored on this relay. |
+| `ALLOW_FOLLOWS` | Writes from your kind-3 follow list are accepted by default, refreshed hourly from your own most recent contact list already stored on this relay. Set to `false` to disable and go back to owner-only writes. |
 
 If your Worker is connected to a GitHub repo, Cloudflare may sync `wrangler.jsonc`'s config on every deploy, which can overwrite a variable you added in the dashboard by hand — worth knowing if a dashboard-added variable seems to reset after a deploy.
 
