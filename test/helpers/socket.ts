@@ -12,7 +12,13 @@ export interface RelayConn {
   close(): void;
 }
 
-const DEFAULT_TIMEOUT_MS = 250;
+// Wall-clock budget for "the relay never replied," not a latency assertion --
+// nothing in this project's protocol behavior is timing-sensitive. Generous
+// enough to absorb Durable Object cold-start plus contention from running
+// the full suite in parallel (observed replies as slow as ~272ms under load
+// that complete in 88-133ms in isolation), while still failing fast if a
+// reply genuinely never arrives.
+const DEFAULT_TIMEOUT_MS = 2000;
 
 // Shared plumbing behind connectRelay/connectLiveFeed below: opens a
 // hibernation-safe WebSocket to the single relay Durable Object at the
