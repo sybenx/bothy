@@ -9,6 +9,7 @@
 import { exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { buildRelayInfo, DEFAULT_DESCRIPTION, DEFAULT_NAME } from "../src/nip11";
+import { MAX_FILTER_LIMIT, MAX_SUBSCRIPTIONS_PER_CONNECTION } from "../src/limits";
 import { isolateStorage } from "./helpers/isolate";
 
 isolateStorage();
@@ -45,6 +46,16 @@ describe("buildRelayInfo", () => {
   it("omits icon entirely rather than setting it to an empty string", () => {
     const info = buildRelayInfo(NO_VARS, { name: "alice", picture: null });
     expect(info).not.toHaveProperty("icon");
+  });
+
+  it("advertises a limitation object mirroring the enforced limits.ts constants", () => {
+    const info = buildRelayInfo(NO_VARS, null) as { limitation: Record<string, unknown> };
+    expect(info.limitation).toEqual({
+      restricted_writes: true,
+      max_subscriptions: MAX_SUBSCRIPTIONS_PER_CONNECTION,
+      max_limit: MAX_FILTER_LIMIT,
+      default_limit: MAX_FILTER_LIMIT,
+    });
   });
 });
 

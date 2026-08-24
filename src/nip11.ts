@@ -2,6 +2,8 @@
 // actually implemented so far -- update it as later chunks land protocol
 // support, not ahead of them.
 
+import { MAX_FILTER_LIMIT, MAX_SUBSCRIPTIONS_PER_CONNECTION } from "./limits";
+
 // Hardcoded fallbacks (ROADMAP.md chunk 5: "Hardcoded fallbacks in code
 // for when the lookup fails"). Used when there's no owner-profile
 // override and no RELAY_NAME/RELAY_DESCRIPTION dashboard var either.
@@ -35,6 +37,21 @@ export function buildRelayInfo(env: Env, profile: OwnerProfile): Record<string, 
     // NIP-59/62: gift wrap accept/read/delete and vanish requests, same
     // chunk.
     supported_nips: [1, 9, 11, 40, 42, 59, 62],
+    // Only constraints actually enforced -- imported from limits.ts so
+    // this document can never drift from the real caps. No
+    // max_message_length/max_event_tags/max_content_length/
+    // min_pow_difficulty: none of those are enforced anywhere in this
+    // codebase, and advertising an unenforced limit is worse than
+    // advertising none.
+    limitation: {
+      // This relay is never fully open -- see ownership.ts isAllowedWriter.
+      restricted_writes: true,
+      max_subscriptions: MAX_SUBSCRIPTIONS_PER_CONNECTION,
+      max_limit: MAX_FILTER_LIMIT,
+      // clampFilterLimit (limits.ts) defaults a filter's limit to this
+      // when the filter omits one.
+      default_limit: MAX_FILTER_LIMIT,
+    },
   };
   const icon = resolveIcon(env, profile);
   if (icon) {
