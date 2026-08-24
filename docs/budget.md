@@ -376,3 +376,23 @@ event already being stored/broadcast, not a new write. What it does add:
   match — no per-row parameter, so no ceiling on how large the window can
   get. Same read-only, rows-read cost as before, just one query instead
   of two.
+
+## NIP-51 mute list — write-revocation cache, same shape as ALLOW_FOLLOWS
+
+`refreshMutes` (ownership.ts) re-derives the `mutes` table (schema.ts)
+from the owner's own most recent kind-10000 event already stored on this
+relay, mirroring `refreshFollows` from chunk 4 exactly: same
+outbound-connection avoidance (no fetch from other relays — see CLAUDE.md
+"The budget"), same full delete-and-reinsert on every cron tick, same
+write cost shape (proportional to mute-list size, once per hourly cron
+tick, not per event). Called from `Relay.runCron()` alongside
+`refreshFollows`/`refreshProfile`, so it adds no new cron trigger.
+
+Unlike ALLOW_FOLLOWS, the mute check in `isAllowedWriter` is not gated by
+an env var — muting is a revocation mechanism the owner should always be
+able to rely on, not an opt-in feature. Only NIP-51's public mutes (plain
+`p` tags) are readable; private mutes are NIP-44-encrypted in `content`
+and this relay has no private key to decrypt them with, so they're
+silently ignored (see the comment on `refreshMutes`). This does not
+change the per-event write-cost formula and adds no new baseline to
+`docs/baselines.json`.

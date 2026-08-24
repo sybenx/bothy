@@ -4,6 +4,9 @@ import type { Profile } from "./profile-lookup";
 const CONTACT_LIST_KIND = 3;
 // Kind-0 is NIP-01's profile metadata event.
 const PROFILE_KIND = 0;
+// Kind-10000 is NIP-51's mute list; its public `p` tags are readable
+// without decryption (see refreshMutes below).
+const MUTE_LIST_KIND = 10000;
 
 // Icon refresh cadence (see refreshProfile below) -- at most once/day
 // regardless of how often the hourly cron fires.
@@ -62,13 +65,21 @@ export function getOwnerProfile(
   return row ?? null;
 }
 
-// Owner writes are always allowed; ALLOW_FOLLOWS additionally allows
-// pubkeys in the cached follow set (CLAUDE.md "Configuration":
-// "also accept writes from the owner's kind-3 follow list").
+// Owner writes are always allowed, and always override the mute list --
+// the owner can't lock themselves out by muting their own pubkey. Mutes
+// are checked before the follows lookup so a muted pubkey is rejected
+// even if it's also in the follow list. NOTE: this only covers the
+// owner-gated write path (handleEvent in relay.ts) -- it is deliberately
+// NOT wired into handleGiftWrap. NIP-59 gift wraps are signed by a random
+// one-time key, so there's no stable sender pubkey to check against a
+// mute list; adding a check there would be dead code implying a
+// protection that doesn't exist.
 export function isAllowedWriter(sql: SqlStorage, env: Env, pubkey: string): boolean {
   const owner = getOwnerPubkey(sql, env);
   if (owner === null) return false;
   if (pubkey === owner) return true;
+  const muted = sql.exec(`SELECT 1 FROM mutes WHERE pubkey = ?`, pubkey).toArray();
+  if (muted.length > 0) return false;
   if (!allowFollowsEnabled(env)) return false;
   const row = sql.exec(`SELECT 1 FROM follows WHERE pubkey = ?`, pubkey).toArray();
   return row.length > 0;
@@ -102,6 +113,44 @@ export function refreshFollows(sql: SqlStorage, env: Env, nowSec: number): void 
   );
   for (const pubkey of follows) {
     sql.exec(`INSERT INTO follows (pubkey, fetched_at) VALUES (?, ?)`, pubkey, nowSec);
+  }
+}
+
+// Re-derives the mute cache from the owner's own most recent kind-10000
+// event already stored on this relay -- not a fresh fetch from other
+// relays, for the same outbound-connection reasons as refreshFollows
+// above. Unlike ALLOW_FOLLOWS, mutes are always checked regardless of any
+// env var -- muting is a revocation mechanism, not an opt-in feature.
+//
+// NIP-51 (nips/51.md) supports both public mutes (plain `p` tags) and
+// private mutes (NIP-44-encrypted inside `content`, decryptable only by
+// the list owner's own private key). This relay never holds the owner's
+// private key, so private mutes CANNOT be decrypted and are silently
+// ignored here -- only the public `p` tags are read. A future reader
+// should not assume the mute set this builds is complete; it's a
+// best-effort subset of what the owner has actually muted in their
+// client.
+export function refreshMutes(sql: SqlStorage, env: Env, nowSec: number): void {
+  const owner = getOwnerPubkey(sql, env);
+  if (owner === null) return;
+
+  const latest = sql
+    .exec<{ tags: string }>(
+      `SELECT tags FROM events WHERE pubkey = ? AND kind = ? ORDER BY created_at DESC LIMIT 1`,
+      owner,
+      MUTE_LIST_KIND,
+    )
+    .toArray()[0];
+
+  sql.exec(`DELETE FROM mutes`);
+  if (!latest) return;
+
+  const tags = JSON.parse(latest.tags) as string[][];
+  const mutes = new Set(
+    tags.filter((t) => t[0] === "p" && t[1]).map((t) => t[1] as string),
+  );
+  for (const pubkey of mutes) {
+    sql.exec(`INSERT INTO mutes (pubkey, fetched_at) VALUES (?, ?)`, pubkey, nowSec);
   }
 }
 

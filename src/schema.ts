@@ -97,6 +97,19 @@ CREATE TABLE IF NOT EXISTS follows (
   fetched_at INTEGER NOT NULL
 );
 
+-- Mute list cache (NIP-51 kind-10000, CLAUDE.md "Owner-only writes"): the
+-- owner's own public mute list, re-derived on a cron schedule rather than
+-- per event -- see ownership.ts refreshMutes(). Same shape and refresh
+-- pattern as follows above: replaced wholesale on each refresh, so no
+-- index beyond the primary key is needed. Only the event's public p
+-- tags populate this table -- NIP-51 private mutes are NIP-44-encrypted
+-- in the event's content and unreadable without the owner's private
+-- key, which this relay never holds. See ownership.ts refreshMutes().
+CREATE TABLE IF NOT EXISTS mutes (
+  pubkey     TEXT PRIMARY KEY,
+  fetched_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS deleted_ids (
   id TEXT PRIMARY KEY
 );

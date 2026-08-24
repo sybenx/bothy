@@ -30,6 +30,7 @@ import {
   getOwnerProfile,
   isAllowedWriter,
   refreshFollows,
+  refreshMutes,
   refreshProfile,
 } from "./ownership";
 import type { Profile } from "./profile-lookup";
@@ -302,14 +303,16 @@ export class Relay extends DurableObject<Env> {
   }
 
   // Cron entry point (src/index.ts scheduled()) -- refreshes the
-  // ALLOW_FOLLOWS cache and, at most once/day, the cached NIP-11/favicon
-  // icon from the owner's locally-stored kind-0 (ownership.ts
-  // refreshProfile). Both are no-ops on their common paths (feature off;
-  // already refreshed today), so this stays cheap on most ticks.
+  // ALLOW_FOLLOWS cache, the NIP-51 mute cache, and, at most once/day, the
+  // cached NIP-11/favicon icon from the owner's locally-stored kind-0
+  // (ownership.ts refreshProfile). All are no-ops on their common paths
+  // (feature off; empty list; already refreshed today), so this stays
+  // cheap on most ticks.
   async runCron(): Promise<void> {
     const sql = this.ctx.storage.sql;
     const now = nowSeconds();
     refreshFollows(sql, this.env, now);
+    refreshMutes(sql, this.env, now);
     refreshProfile(sql, this.env, now);
   }
 
