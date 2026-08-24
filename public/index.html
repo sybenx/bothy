@@ -96,6 +96,9 @@
     </div>
   </div>
 
+  <h2>Write access</h2>
+  <p id="write-policy-status">-</p>
+
   <h2>Backfill</h2>
   <p id="backfill-status">-</p>
 
@@ -143,6 +146,7 @@ async function main() {
     setBar("stat-storage", "bar-storage", stats.storageBytes, STORAGE_LIMIT, formatBytes(stats.storageBytes) + " used");
     setBar("stat-rows", "bar-rows", stats.rowsWrittenEstimate24h, ROWS_LIMIT, stats.rowsWrittenEstimate24h + " rows (est.)");
 
+    renderWritePolicyStatus(stats);
     renderBackfillStatus(stats.backfill);
     wireLiveFeed();
   } else {
@@ -181,6 +185,31 @@ function formatBytes(n) {
   if (n < 1024 ** 2) return (n / 1024).toFixed(1) + " KB";
   if (n < 1024 ** 3) return (n / 1024 ** 2).toFixed(1) + " MB";
   return (n / 1024 ** 3).toFixed(2) + " GB";
+}
+
+// Write access policy (ROADMAP.md chunk 4/6: ALLOW_FOLLOWS and NIP-51
+// mutes). A bare follow count of 0 while writePolicy is "follows" reads
+// as healthy at a glance -- it isn't, it means the allowlist is empty and
+// every follow is being silently rejected -- so that case gets its own
+// plain-language sentence instead of just a number.
+function renderWritePolicyStatus(stats) {
+  const el = document.getElementById("write-policy-status");
+  const parts = [];
+  if (stats.writePolicy === "owner") {
+    parts.push("Only the owner can publish here.");
+  } else if (stats.followCount === 0) {
+    parts.push("Follows are allowed to publish, but the follow list is empty -- no one but the owner can write until the owner's kind-3 contact list is stored on this relay.");
+  } else {
+    const refreshed = stats.followsRefreshedAt
+      ? "as of " + new Date(stats.followsRefreshedAt * 1000).toLocaleString()
+      : "";
+    parts.push(
+      "Owner plus " + stats.followCount + (stats.followCount === 1 ? " follow" : " follows") +
+      " can publish here" + (refreshed ? ", " + refreshed : "") + ".",
+    );
+  }
+  parts.push(stats.muteCount + (stats.muteCount === 1 ? " public mute" : " public mutes") + " (revokes write access, NIP-51 public mutes only).");
+  el.textContent = parts.join(" ");
 }
 
 // One-shot backfill progress (ROADMAP.md chunk 7: "visible progress on

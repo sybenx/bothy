@@ -25,10 +25,12 @@ import {
 import { resolveIcon } from "./nip11";
 import { type Filter, GIFT_WRAP_KIND, type NostrEvent, pTagValues, VANISH_KIND } from "./nostr";
 import {
+  CONTACT_LIST_KIND,
   claimOwner,
   getOwnerPubkey,
   getOwnerProfile,
   isAllowedWriter,
+  MUTE_LIST_KIND,
   refreshFollows,
   refreshMutes,
   refreshProfile,
@@ -274,6 +276,20 @@ export class Relay extends DurableObject<Env> {
     rowsWrittenEstimate24h: number;
     backfill: BackfillStatus | null;
     icon: string | null;
+    // Whether writes beyond the owner are currently possible at all
+    // (CLAUDE.md "Owner-only writes by default"), plus the numbers that
+    // back that state -- see the ALLOW_FOLLOWS-gate comment in
+    // ownership.ts isAllowedWriter. Surfaced so an owner who enabled
+    // ALLOW_FOLLOWS but never published a kind-3 here (an empty allowlist
+    // that silently blocks every follow) has a visible signal instead of
+    // a mystery.
+    writePolicy: "owner" | "follows";
+    followCount: number;
+    followsRefreshedAt: number | null;
+    // NIP-51 mute count -- see ownership.ts refreshMutes for why this is
+    // only ever the public, unencrypted subset of what the owner has
+    // muted in their own client.
+    muteCount: number;
   }> {
     const sql = this.ctx.storage.sql;
     if (host) recordHost(sql, host);
@@ -285,6 +301,11 @@ export class Relay extends DurableObject<Env> {
     const events24h =
       sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events WHERE created_at > ?`, since).toArray()[0]
         ?.n ?? 0;
+    const followCount =
+      sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM follows`).toArray()[0]?.n ?? 0;
+    const followsRefreshedAt =
+      sql.exec<{ t: number | null }>(`SELECT MAX(fetched_at) AS t FROM follows`).toArray()[0]?.t ?? null;
+    const muteCount = sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM mutes`).toArray()[0]?.n ?? 0;
 
     return {
       claimed: owner !== null,
@@ -299,6 +320,10 @@ export class Relay extends DurableObject<Env> {
       // tab's favicon from the owner's kind-0 picture. Null falls back
       // to the static default favicon client-side.
       icon: resolveIcon(this.env, getOwnerProfile(sql, this.env)),
+      writePolicy: (this.env.ALLOW_FOLLOWS ?? "false") === "true" ? "follows" : "owner",
+      followCount,
+      followsRefreshedAt,
+      muteCount,
     };
   }
 
@@ -585,6 +610,22 @@ export class Relay extends DurableObject<Env> {
     ok(ws, event.id, result.ok, result.message);
 
     if (result.stored) {
+      // Refresh the follow/mute cache the instant the owner publishes a
+      // new kind-3/kind-10000, rather than waiting up to an hour for the
+      // next cron tick (docs/budget.md "NIP-51 mute list" and CLAUDE.md
+      // "Owner-only writes"). Gated on `event.pubkey === owner`, not just
+      // `event.kind` -- under ALLOW_FOLLOWS a follow can publish their own
+      // kind-3 through this same accept path, and refreshFollows/
+      // refreshMutes always re-derive from the *owner's* most recent event
+      // regardless of whose write triggered the call, so this only costs
+      // an extra check, never a wrong overwrite. Still, gating here means
+      // a follow's own kind-3 can never even trigger a redundant refresh.
+      const owner = getOwnerPubkey(sql, this.env);
+      if (event.pubkey === owner) {
+        const now = nowSeconds();
+        if (event.kind === CONTACT_LIST_KIND) refreshFollows(sql, this.env, now);
+        if (event.kind === MUTE_LIST_KIND) refreshMutes(sql, this.env, now);
+      }
       this.broadcast(result.stored);
       this.liveBroadcast(result.stored);
     }

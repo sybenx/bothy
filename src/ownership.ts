@@ -1,12 +1,15 @@
 import type { Profile } from "./profile-lookup";
 
 // Kind-3 is NIP-01/NIP-02's contact list; its `p` tags are the follow set.
-const CONTACT_LIST_KIND = 3;
+// Exported so relay.ts can recognize an owner kind-3 write and refresh the
+// follow cache immediately rather than waiting for the next cron tick.
+export const CONTACT_LIST_KIND = 3;
 // Kind-0 is NIP-01's profile metadata event.
 const PROFILE_KIND = 0;
 // Kind-10000 is NIP-51's mute list; its public `p` tags are readable
-// without decryption (see refreshMutes below).
-const MUTE_LIST_KIND = 10000;
+// without decryption (see refreshMutes below). Exported for the same
+// immediate-refresh reason as CONTACT_LIST_KIND above.
+export const MUTE_LIST_KIND = 10000;
 
 // Icon refresh cadence (see refreshProfile below) -- at most once/day
 // regardless of how often the hourly cron fires.

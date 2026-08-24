@@ -396,3 +396,35 @@ and this relay has no private key to decrypt them with, so they're
 silently ignored (see the comment on `refreshMutes`). This does not
 change the per-event write-cost formula and adds no new baseline to
 `docs/baselines.json`.
+
+## Immediate follow/mute refresh on owner writes, and stats visibility
+
+Previously `refreshFollows`/`refreshMutes` only ran on the hourly cron
+tick, so a follow the owner just added couldn't write for up to an hour,
+and a relay whose owner had never published a kind-3 here had a silently
+empty allowlist with no visible signal. `relay.ts`'s `acceptEvent` now
+calls `refreshFollows`/`refreshMutes` right after a successfully stored
+event whose kind is 3/10000 *and* whose pubkey is the owner's — the same
+delete-and-reinsert `refreshFollows`/`refreshMutes` already do on cron,
+just triggered sooner. Gated on `event.pubkey === owner`, not just
+`event.kind`, so a follow's own kind-3 (reachable under ALLOW_FOLLOWS)
+can never be mistaken for the owner's and used to drive the refresh.
+
+Write-cost impact: none in the steady state. A contact list or mute list
+edit is a rare, human-paced event, not a per-note cost — the extra
+delete-and-reinsert this triggers happens at most as often as the owner
+edits their follows or mutes, which is orders of magnitude less frequent
+than their regular note-publishing rate this project already budgets
+for. No new baseline is added to `docs/baselines.json`; the existing
+cron-triggered refresh already accounts for the same table's write cost,
+and this only changes *when* it fires, not the total volume over a day
+of normal use.
+
+`Relay.getStats()`/`GET /api/stats` also now report `writePolicy`
+("owner" | "follows"), `followCount`, `followsRefreshedAt`, and
+`muteCount` — four cheap `COUNT`/`MAX` reads over already-small tables,
+no new write cost. The admin page (`public/index.html`) renders these as
+a plain-language sentence rather than a bare number specifically so
+`writePolicy: "follows"` with `followCount: 0` — an enabled but
+functionally empty allowlist blocking every follow — is legible as a
+problem, not a healthy zero.
