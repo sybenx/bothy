@@ -368,3 +368,134 @@ export function queryFilters(sql: SqlStorage, filters: Filter[], nowSec: number)
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   });
 }
+
+// ---------------------------------------------------------------------
+// NIP-86 relay management (src/nip86.ts) storage. None of the queries
+// below run on the per-event write path or the REQ read path -- bans and
+// settings are written at operator pace, and the only one that runs on a
+// client-facing path at all is isIpBlocked, called exactly once per
+// WebSocket connection in Relay.fetch(). See schema.ts for the tables.
+// ---------------------------------------------------------------------
+
+export interface BannedEvent {
+  id: string;
+  reason: string | null;
+}
+
+// Records the ban AND tombstones the id. Both are needed and they do
+// different jobs: `banned_events` is the operator-visible record that
+// listbannedevents reads back, while the `deleted_ids` tombstone is what
+// actually stops the event from coming back -- a re-send from a client or
+// a replay from backfill (backfill.ts applyBackfillPage checks isDeleted)
+// would otherwise restore an event the operator just banned. Banning an
+// id that isn't stored is meaningful for exactly that reason: the
+// tombstone refuses it on arrival.
+export function banEvent(sql: SqlStorage, id: string, reason: string | null, nowSec: number): void {
+  deleteAndTombstone(sql, id);
+  sql.exec(
+    `INSERT INTO banned_events (id, reason, banned_at) VALUES (?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET reason = excluded.reason, banned_at = excluded.banned_at`,
+    id,
+    reason,
+    nowSec,
+  );
+}
+
+// The ONLY place in this codebase that deletes a row from `deleted_ids`,
+// deliberately and by NIP-86's definition of allowevent. Everywhere else
+// a tombstone is permanent on purpose: `deleted_ids` exists so a NIP-09
+// or NIP-62 deletion sticks even though the sender still holds a signed
+// copy they could replay (see schema.ts). Lifting it here is safe only
+// because the operator is the relay owner and is explicitly asking for
+// this id to become storable again -- which also means allowevent will
+// un-delete an id that was tombstoned by a NIP-09 deletion rather than by
+// banevent, if the owner passes one. That is the operator's call to make;
+// do not "fix" it by restricting the delete to ids present in
+// banned_events, since an id banned before it ever arrived has no other
+// way back.
+export function allowEvent(sql: SqlStorage, id: string): void {
+  sql.exec(`DELETE FROM banned_events WHERE id = ?`, id);
+  sql.exec(`DELETE FROM deleted_ids WHERE id = ?`, id);
+}
+
+// Reads `banned_events`, never `deleted_ids` -- listing every tombstone
+// would report the owner's own NIP-09 deletions and NIP-62 vanish
+// requests as "banned events", which they are not.
+export function listBannedEvents(sql: SqlStorage): BannedEvent[] {
+  return sql
+    .exec<{ id: string; reason: string | null }>(
+      `SELECT id, reason FROM banned_events ORDER BY banned_at DESC`,
+    )
+    .toArray();
+}
+
+export interface BlockedIp {
+  ip: string;
+  reason: string | null;
+}
+
+export function blockIp(sql: SqlStorage, ip: string, reason: string | null, nowSec: number): void {
+  sql.exec(
+    `INSERT INTO blocked_ips (ip, reason, blocked_at) VALUES (?, ?, ?)
+       ON CONFLICT(ip) DO UPDATE SET reason = excluded.reason, blocked_at = excluded.blocked_at`,
+    ip,
+    reason,
+    nowSec,
+  );
+}
+
+export function unblockIp(sql: SqlStorage, ip: string): void {
+  sql.exec(`DELETE FROM blocked_ips WHERE ip = ?`, ip);
+}
+
+export function listBlockedIps(sql: SqlStorage): BlockedIp[] {
+  return sql
+    .exec<{ ip: string; reason: string | null }>(`SELECT ip, reason FROM blocked_ips ORDER BY blocked_at DESC`)
+    .toArray();
+}
+
+// One indexed lookup, run once per WebSocket connection in Relay.fetch()
+// -- never per message and never per event, so an IP block costs nothing
+// on the hot path. The management endpoint never calls this: see
+// src/nip86.ts.
+export function isIpBlocked(sql: SqlStorage, ip: string): boolean {
+  return sql.exec(`SELECT 1 FROM blocked_ips WHERE ip = ?`, ip).toArray().length > 0;
+}
+
+// The stored rung of the relay identity chain (nip11.ts) -- what
+// changerelayname/changerelaydescription/changerelayicon write. Absent
+// keys read back as null; there is no "" value, because clearing deletes
+// the row (see setRelaySetting).
+export interface RelaySettings {
+  name: string | null;
+  description: string | null;
+  icon: string | null;
+}
+
+export function getRelaySettings(sql: SqlStorage): RelaySettings {
+  const rows = sql.exec<{ key: string; value: string }>(`SELECT key, value FROM relay_settings`).toArray();
+  const byKey = new Map(rows.map((r) => [r.key, r.value]));
+  return {
+    name: byKey.get("name") ?? null,
+    description: byKey.get("description") ?? null,
+    icon: byKey.get("icon") ?? null,
+  };
+}
+
+// An empty string clears the stored value rather than storing one --
+// NIP-86 defines no unset operation, so this is bothy's convention for
+// falling back down the chain (README.md "Relay management API"). Storing
+// "" instead would be indistinguishable from a deliberate empty name and
+// would shadow the kind-0 and hardcoded rungs forever.
+export function setRelaySetting(sql: SqlStorage, key: "name" | "description" | "icon", value: string): void {
+  if (value === "") {
+    sql.exec(`DELETE FROM relay_settings WHERE key = ?`, key);
+    return;
+  }
+  sql.exec(
+    `INSERT INTO relay_settings (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    key,
+    value,
+  );
+}

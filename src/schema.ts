@@ -76,14 +76,18 @@ CREATE INDEX IF NOT EXISTS idx_event_tags_lookup
 -- the claim-time lookup found nothing.
 -- profile_synced_at/icon_refreshed_at back the icon-refresh cron (see
 -- ownership.ts refreshProfile): profile_synced_at is the created_at of
--- the locally-stored kind-0 event name/picture were last derived from
--- (so a re-run can tell "is there a newer one" without re-parsing
+-- the locally-stored kind-0 event name/picture/about were last derived
+-- from (so a re-run can tell "is there a newer one" without re-parsing
 -- content every tick); icon_refreshed_at gates the refresh to at most
 -- once/day regardless of how often the hourly cron fires.
+-- about is the kind-0 field backing the NIP-11 description's kind-0
+-- rung, the same way name/picture back name/icon -- see nip11.ts
+-- resolveDescription.
 CREATE TABLE IF NOT EXISTS owner (
   pubkey             TEXT NOT NULL,
   name               TEXT,
   picture            TEXT,
+  about              TEXT,
   profile_synced_at  INTEGER,
   icon_refreshed_at  INTEGER
 );
@@ -140,6 +144,45 @@ CREATE TABLE IF NOT EXISTS backfill_meta (
   last_run_at             INTEGER,
   exhaust_reset_applied   INTEGER NOT NULL DEFAULT 0
 );
+
+-- NIP-86 banevent/allowevent/listbannedevents (src/nip86.ts). Distinct
+-- from deleted_ids on purpose, and the two must never be conflated:
+-- deleted_ids is the union of every id this relay refuses to store
+-- again, and NIP-09 deletions and NIP-62 vanish requests put ids there
+-- too. This table holds only the ids an operator banned through the
+-- management API, plus the reason they gave, so listbannedevents can
+-- answer "what did I ban" instead of "what has ever been deleted here."
+-- banevent writes both (the ban is what the operator sees; the tombstone
+-- is what actually stops a re-send or a backfill replay from restoring
+-- the event); allowevent clears both.
+CREATE TABLE IF NOT EXISTS banned_events (
+  id        TEXT PRIMARY KEY,
+  reason    TEXT,
+  banned_at INTEGER NOT NULL
+);
+
+-- NIP-86 blockip/unblockip/listblockedips (src/nip86.ts). Read exactly
+-- once per WebSocket connection, in Relay.fetch() -- never per message
+-- and never per event, so this table adds nothing to the per-event write
+-- or read cost accounted for at the top of this file. It deliberately
+-- does NOT gate the management endpoint: see the connection-time check in
+-- src/relay.ts and the rule in src/nip86.ts blockip.
+CREATE TABLE IF NOT EXISTS blocked_ips (
+  ip         TEXT PRIMARY KEY,
+  reason     TEXT,
+  blocked_at INTEGER NOT NULL
+);
+
+-- NIP-86 changerelayname/changerelaydescription/changerelayicon
+-- (src/nip86.ts). One row per set key ('name', 'description', 'icon');
+-- clearing a value deletes the row rather than storing an empty string,
+-- so "unset" and "set to empty" can never be confused by the resolution
+-- chain in nip11.ts. Written only by the management API, at operator
+-- pace -- not part of any per-event budget.
+CREATE TABLE IF NOT EXISTS relay_settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 `;
 
 export function initSchema(sql: SqlStorage): void {
@@ -159,6 +202,16 @@ export function initSchema(sql: SqlStorage): void {
       .toArray().length > 0;
   if (!hasResetMarker) {
     sql.exec(`ALTER TABLE backfill_meta ADD COLUMN exhaust_reset_applied INTEGER NOT NULL DEFAULT 0`);
+  }
+  // `owner.about` was added when NIP-86 gave the relay description a
+  // kind-0 rung (nip11.ts resolveDescription); an owner table created
+  // before that predates the column and CREATE TABLE IF NOT EXISTS above
+  // is a no-op on it. Same pragma_table_info shape as the backfill_meta
+  // column check above -- SQLite has no "ADD COLUMN IF NOT EXISTS".
+  const hasAbout =
+    sql.exec(`SELECT 1 FROM pragma_table_info('owner') WHERE name = 'about'`).toArray().length > 0;
+  if (!hasAbout) {
+    sql.exec(`ALTER TABLE owner ADD COLUMN about TEXT`);
   }
   // backfill_meta must have exactly one row to hold status -- seeded here
   // rather than by whichever code path happens to run first, so every
