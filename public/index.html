@@ -18,6 +18,7 @@
   h1 { font-size: 1.4rem; margin: 0; }
   .tagline { margin: 0; font-size: 0.85rem; opacity: 0.7; }
   .tagline a { color: inherit; }
+  .version-link { margin-left: auto; font-size: 0.85rem; opacity: 0.7; color: inherit; white-space: nowrap; }
   .url-row { display: flex; gap: 0.5rem; align-items: center; }
   .url-row input {
     flex: 1;
@@ -74,7 +75,8 @@
 <body>
 <div class="brand">
   <h1>bothy</h1>
-  <p class="tagline">personal nostr relay<span id="version"></span> &middot; <a href="https://github.com/sybenx/bothy" target="_blank" rel="noopener">Get your own</a></p>
+  <p class="tagline">personal nostr relay &middot; <a href="https://github.com/sybenx/bothy" target="_blank" rel="noopener">Get your own</a></p>
+  <a id="version" class="version-link" href="https://github.com/sybenx/bothy/releases" target="_blank" rel="noopener"></a>
 </div>
 
 <div id="claimed-view" hidden>
@@ -129,7 +131,7 @@ async function main() {
 
   document.getElementById("reset-note").hidden = false;
   setFavicon(stats.icon);
-  if (stats.version) document.getElementById("version").textContent = " v" + stats.version;
+  if (stats.version) document.getElementById("version").textContent = "v" + stats.version;
 
   if (stats.claimed) {
     document.getElementById("claimed-view").hidden = false;
