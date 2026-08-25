@@ -313,11 +313,13 @@ event already being stored/broadcast, not a new write. What it does add:
   10ms ceiling that turns out not to apply here.
 - **The real constraint is rows-written, not CPU**, so `BACKFILL_PAGE_SIZE`
   is instead sized against the 100,000 rows-written/day ceiling: one page
-  per relay per hourly cron tick, worst case `200 events * ~5 rows/event *
-  24 ticks/day ≈ 24,000 rows/day` from backfill alone — comfortably under
-  the ceiling with room left for the owner's own live traffic, which this
-  feature must not crowd out (ROADMAP.md chunk 7: "Rate-limited under the
-  daily write budget").
+  from exactly one relay per hourly cron tick (`runBackfillTick` fetches a
+  single `nextRelay`, not one page per relay — `getBackfillStatus` hands
+  back only one relay to work on at a time), worst case `200 events * ~5
+  rows/event * 24 ticks/day ≈ 24,000 rows/day` from backfill alone —
+  comfortably under the ceiling with room left for the owner's own live
+  traffic, which this feature must not crowd out (ROADMAP.md chunk 7:
+  "Rate-limited under the daily write budget").
 - **Backfill reuses `storeEvent` (storage.ts) rather than reimplementing
   storage semantics**, so replaceable/addressable/ephemeral handling is
   identical to the live write path by construction: several old versions

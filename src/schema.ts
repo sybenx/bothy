@@ -125,11 +125,13 @@ CREATE TABLE IF NOT EXISTS relay_meta (
 -- the owner's kind-10002 relay list, tracking how far back this relay has
 -- already fetched. until_cursor walks backward in time as pages are
 -- ingested (backfill.ts); exhausted is set once a relay returns a page
--- shorter than requested, meaning it has no more matching history.
--- Persisted rather than kept in memory specifically so an hourly cron
--- tick can resume a backfill that spans days -- see CLAUDE.md "The
--- budget" on why a large history may genuinely take more than one day
--- against the rows-written ceiling.
+-- that is both empty AND terminated by a real EOSE -- a short-but-nonempty
+-- page (the relay's own per-REQ cap) or a page cut off by a fetch timeout
+-- or connection error must never set this, since neither means "no more
+-- history" (see backfill.ts applyBackfillPage). Persisted rather than kept
+-- in memory specifically so an hourly cron tick can resume a backfill that
+-- spans days -- see CLAUDE.md "The budget" on why a large history may
+-- genuinely take more than one day against the rows-written ceiling.
 CREATE TABLE IF NOT EXISTS backfill_relays (
   relay_url    TEXT PRIMARY KEY,
   until_cursor INTEGER NOT NULL,
@@ -141,15 +143,32 @@ CREATE TABLE IF NOT EXISTS backfill_relays (
 -- while any backfill_relays row is unexhausted, 'paused-budget' when a
 -- cron tick's ingest hit the daily rows-written ceiling and stopped
 -- without finishing its page, 'done' once every relay is exhausted.
+-- exhaust_reset_applied guards the one-time exhaustion-flag reset
+-- (backfill.ts resetWronglyExhaustedRelays) needed to undo the effect of
+-- the short-page exhaustion bug on relays already flagged before the fix
+-- -- 0 until that reset has run once, then permanently 1.
 CREATE TABLE IF NOT EXISTS backfill_meta (
-  status        TEXT NOT NULL DEFAULT 'pending',
-  total_stored  INTEGER NOT NULL DEFAULT 0,
-  last_run_at   INTEGER
+  status                  TEXT NOT NULL DEFAULT 'pending',
+  total_stored            INTEGER NOT NULL DEFAULT 0,
+  last_run_at             INTEGER,
+  exhaust_reset_applied   INTEGER NOT NULL DEFAULT 0
 );
 `;
 
 export function initSchema(sql: SqlStorage): void {
   sql.exec(SCHEMA);
+  // exhaust_reset_applied was added after backfill_meta first shipped, so
+  // an existing deployment's table predates it -- CREATE TABLE IF NOT
+  // EXISTS above is a no-op there. SQLite has no "ADD COLUMN IF NOT
+  // EXISTS", so check pragma_table_info first; existing rows get the
+  // column's DEFAULT 0, same as a fresh deployment.
+  const hasResetMarker =
+    sql
+      .exec(`SELECT 1 FROM pragma_table_info('backfill_meta') WHERE name = 'exhaust_reset_applied'`)
+      .toArray().length > 0;
+  if (!hasResetMarker) {
+    sql.exec(`ALTER TABLE backfill_meta ADD COLUMN exhaust_reset_applied INTEGER NOT NULL DEFAULT 0`);
+  }
   // backfill_meta must have exactly one row to hold status -- seeded here
   // rather than by whichever code path happens to run first, so every
   // reader (getBackfillStatus, /api/stats) can assume it exists.

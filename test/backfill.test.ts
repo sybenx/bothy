@@ -5,7 +5,13 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { applyBackfillPage, getBackfillStatus, hasBackfillHeadroom, seedBackfillRelays } from "../src/backfill";
+import {
+  applyBackfillPage,
+  getBackfillStatus,
+  hasBackfillHeadroom,
+  resetWronglyExhaustedRelays,
+  seedBackfillRelays,
+} from "../src/backfill";
 import { recordHost } from "../src/host";
 import { BACKFILL_ROWS_SHARE_LIMIT } from "../src/limits";
 import { signEvent } from "./helpers/event";
@@ -14,8 +20,6 @@ import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers
 import { connectRelay, publish } from "./helpers/socket";
 
 isolateStorage();
-
-const PAGE_SIZE = 200;
 
 function eventRows(sql: SqlStorage, extra = ""): { id: string; kind: number; content: string }[] {
   return sql
@@ -58,10 +62,10 @@ describe("backfill ingest", () => {
     await runInDurableObject(stub, async (_instance, state) => {
       const sql = state.storage.sql;
 
-      const first = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [note], PAGE_SIZE, 1000);
+      const first = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [note], true, 1000);
       expect(first.stored).toBe(1);
 
-      const second = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-b", [note], PAGE_SIZE, 1000);
+      const second = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-b", [note], true, 1000);
       expect(second.stored).toBe(0);
 
       expect(eventRows(sql, `WHERE id = '${note.id}'`)).toHaveLength(1);
@@ -83,7 +87,7 @@ describe("backfill ingest", () => {
       const sql = state.storage.sql;
       expect(eventRows(sql, `WHERE id = '${target.id}'`)).toHaveLength(0);
 
-      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [target], PAGE_SIZE, 1000);
+      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [target], true, 1000);
       expect(result.stored).toBe(0);
       expect(eventRows(sql, `WHERE id = '${target.id}'`)).toHaveLength(0);
     });
@@ -102,7 +106,7 @@ describe("backfill ingest", () => {
       // Deliberately out of chronological order -- a real relay page
       // isn't guaranteed to arrive sorted, and storeEvent's own
       // newest-wins comparison must not depend on arrival order.
-      applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [v1, v3, v2], PAGE_SIZE, 1000);
+      applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [v1, v3, v2], true, 1000);
 
       const rows = eventRows(sql, `WHERE pubkey = '${OWNER_PUBKEY_HEX}' AND kind = 0`);
       expect(rows).toHaveLength(1);
@@ -117,7 +121,7 @@ describe("backfill ingest", () => {
     const stub = env.RELAY.get(id);
     await runInDurableObject(stub, async (_instance, state) => {
       const sql = state.storage.sql;
-      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [ephemeral], PAGE_SIZE, 1000);
+      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [ephemeral], true, 1000);
       expect(result.stored).toBe(0);
       expect(eventRows(sql, `WHERE id = '${ephemeral.id}'`)).toHaveLength(0);
     });
@@ -131,13 +135,13 @@ describe("backfill ingest", () => {
     const stub = env.RELAY.get(id);
     await runInDurableObject(stub, async (_instance, state) => {
       const sql = state.storage.sql;
-      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [spoofed], PAGE_SIZE, 1000);
+      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [spoofed], true, 1000);
       expect(result.stored).toBe(0);
       expect(eventRows(sql, `WHERE id = '${spoofed.id}'`)).toHaveLength(0);
     });
   });
 
-  it("advances the cursor backward and marks a relay exhausted once its page comes back short", async () => {
+  it("a short but non-empty page terminated by a real EOSE does not exhaust -- relays cap their own per-REQ limit", async () => {
     const older = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "older", created_at: 1000 });
     const newer = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "newer", created_at: 2000 });
 
@@ -147,19 +151,71 @@ describe("backfill ingest", () => {
       const sql = state.storage.sql;
       seedBackfillRelays(sql, ["wss://relay-a"], 5000);
 
-      // A full page (== pageSize) does not mark exhaustion yet.
-      const full = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [newer, older], 2, 5000);
-      expect(full.exhausted).toBe(false);
-      let status = getBackfillStatus(sql);
+      // Asked for PAGE_SIZE (200), got 2 back with a genuine EOSE -- a
+      // relay-side per-REQ cap, not "nothing older."
+      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [newer, older], true, 5000);
+      expect(result.exhausted).toBe(false);
+      const status = getBackfillStatus(sql);
       expect(status.status).toBe("running");
       expect(status.nextUntil).toBe(older.created_at - 1);
+    });
+  });
 
-      // A short page (< pageSize) signals the relay has no more history.
-      const short = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [], 2, 6000);
-      expect(short.exhausted).toBe(true);
-      status = getBackfillStatus(sql);
+  it("an empty page terminated by a real EOSE does exhaust -- standard nostr pagination end", async () => {
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      seedBackfillRelays(sql, ["wss://relay-a"], 5000);
+
+      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [], true, 5000);
+      expect(result.exhausted).toBe(true);
+      const status = getBackfillStatus(sql);
       expect(status.status).toBe("done");
       expect(status.nextRelay).toBeNull();
+    });
+  });
+
+  it("a timed-out fetch (no EOSE) does not exhaust even with a partial page, and still advances the cursor", async () => {
+    const older = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "older", created_at: 1000 });
+    const newer = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "newer", created_at: 2000 });
+
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      seedBackfillRelays(sql, ["wss://relay-a"], 5000);
+
+      // BACKFILL_FETCH_TIMEOUT_MS fired before EOSE arrived --
+      // fetchPage's `done()` still resolves with whatever partial page it
+      // had collected, but eose stays false.
+      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [newer, older], false, 5000);
+      expect(result.exhausted).toBe(false);
+      const status = getBackfillStatus(sql);
+      expect(status.status).toBe("running");
+      expect(status.nextRelay).toBe("wss://relay-a");
+      // Refetching events already processed would be wasted work, so the
+      // cursor still advances past them even though the fetch timed out.
+      expect(status.nextUntil).toBe(older.created_at - 1);
+    });
+  });
+
+  it("a failed fetch (no EOSE, zero events) does not exhaust", async () => {
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      seedBackfillRelays(sql, ["wss://relay-a"], 5000);
+
+      // A connection error, a close before EOSE, or the WebSocket
+      // constructor throwing all resolve fetchPage with an empty array
+      // and eose: false -- indistinguishable, at this layer, from a
+      // relay saying "nothing more," except for the eose flag.
+      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [], false, 5000);
+      expect(result.exhausted).toBe(false);
+      const status = getBackfillStatus(sql);
+      expect(status.status).toBe("running");
+      expect(status.nextRelay).toBe("wss://relay-a");
     });
   });
 
@@ -262,7 +318,7 @@ describe("backfill ingest", () => {
         return real(...(args as Parameters<typeof real>));
       };
 
-      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [a, b], 2, 6000);
+      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [a, b], true, 6000);
       expect(result.stored).toBe(0);
       expect(result.exhausted).toBe(false);
 
@@ -294,7 +350,7 @@ describe("backfill ingest", () => {
       insertSyntheticLiveRows(sql, "over", 200, now);
       expect(hasBackfillHeadroom(sql, now)).toBe(false);
 
-      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [note], PAGE_SIZE, now);
+      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [note], true, now);
       expect(result).toEqual({ stored: 0, exhausted: false });
       // Nothing this call would otherwise have done actually happened:
       // no row for the fetched event, and the relay's cursor/exhausted
@@ -304,6 +360,46 @@ describe("backfill ingest", () => {
       const status = getBackfillStatus(sql);
       expect(status.status).toBe("running");
       expect(status.nextUntil).toBe(now);
+    });
+  });
+
+  it("the one-time exhaustion reset clears wrongly-set flags, flips done back to running, leaves cursors untouched, and runs only once", async () => {
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      seedBackfillRelays(sql, ["wss://relay-a", "wss://relay-b"], 1000);
+      // Simulate the pre-fix bug's damage directly -- both relays wrongly
+      // flagged exhausted by a short page that was really a timeout or a
+      // per-REQ cap, with status consequently flipped to 'done'.
+      sql.exec(`UPDATE backfill_relays SET exhausted = 1, until_cursor = 4242`);
+      sql.exec(`UPDATE backfill_meta SET status = 'done'`);
+
+      resetWronglyExhaustedRelays(sql);
+
+      const relays = sql
+        .exec<{ relay_url: string; exhausted: number; until_cursor: number }>(
+          `SELECT relay_url, exhausted, until_cursor FROM backfill_relays ORDER BY relay_url`,
+        )
+        .toArray();
+      expect(relays.every((r) => r.exhausted === 0)).toBe(true);
+      // until_cursor is exactly where each relay stopped -- resetting it
+      // would re-fetch history already stored, so it must be untouched.
+      expect(relays.every((r) => r.until_cursor === 4242)).toBe(true);
+
+      let status = getBackfillStatus(sql);
+      expect(status.status).toBe("running");
+
+      // Re-flag one relay exhausted (as the fixed applyBackfillPage rule
+      // legitimately would) and re-run -- the marker must prevent a
+      // second reset from wiping out real progress.
+      sql.exec(`UPDATE backfill_relays SET exhausted = 1 WHERE relay_url = 'wss://relay-a'`);
+      sql.exec(`UPDATE backfill_meta SET status = 'running'`);
+      resetWronglyExhaustedRelays(sql);
+
+      status = getBackfillStatus(sql);
+      expect(status.exhaustedCount).toBe(1);
+      expect(status.status).toBe("running");
     });
   });
 });

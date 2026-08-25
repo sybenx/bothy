@@ -100,7 +100,7 @@ export const LIVE_FEED_MAX_LIFETIME_MS = 10 * 60 * 1000;
 // What does: backfill runs unattended, for as long as the owner's
 // history requires, and must not crowd out the owner's own live writes
 // against the shared 100,000 rows-written/day ceiling. At ~5 rows/event
-// and one page per relay per hourly cron tick, worst case is
+// and one page from exactly one relay per hourly cron tick, worst case is
 // 200 * 5 * 24 = 24,000 rows/day from backfill alone -- see
 // docs/budget.md chunk 7 note.
 export const BACKFILL_PAGE_SIZE = 200;

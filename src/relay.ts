@@ -5,12 +5,12 @@ import {
   type BackfillStatus,
   getBackfillStatus,
   hasBackfillHeadroom,
+  resetWronglyExhaustedRelays,
   seedBackfillRelays,
 } from "./backfill";
 import { matchesAnyFilter, parseFilter } from "./filters";
 import { recordHost } from "./host";
 import {
-  BACKFILL_PAGE_SIZE,
   clampFilterLimit,
   GIFT_WRAP_RATE_LIMIT_WINDOW_MS,
   isUnconstrainedFilter,
@@ -365,6 +365,9 @@ export class Relay extends DurableObject<Env> {
     refreshFollows(sql, this.env, now);
     refreshMutes(sql, this.env, now);
     refreshProfile(sql, this.env, now);
+    // One-time correction for relays the pre-fix short-page exhaustion
+    // heuristic wrongly retired -- see backfill.ts resetWronglyExhaustedRelays.
+    resetWronglyExhaustedRelays(sql);
   }
 
   // One-shot backfill (ROADMAP.md chunk 7), read side. Called once per
@@ -398,11 +401,12 @@ export class Relay extends DurableObject<Env> {
   async ingestBackfillPage(
     relayUrl: string,
     rawEvents: unknown[],
+    eose: boolean,
   ): Promise<{ stored: number; exhausted: boolean } | null> {
     const sql = this.ctx.storage.sql;
     const owner = getOwnerPubkey(sql, this.env);
     if (owner === null) return null;
-    return applyBackfillPage(sql, owner, relayUrl, rawEvents, BACKFILL_PAGE_SIZE, nowSeconds());
+    return applyBackfillPage(sql, owner, relayUrl, rawEvents, eose, nowSeconds());
   }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {

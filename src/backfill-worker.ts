@@ -13,14 +13,27 @@ import { RELAY_LIST_KIND, writeRelaysFrom } from "./nostr";
 import { WELL_KNOWN_RELAYS } from "./profile-lookup";
 import { relayStub } from "./relay-stub";
 
+export interface FetchPageResult {
+  events: unknown[];
+  // True only when an actual EOSE frame arrived for this subscription --
+  // false for a timeout, a socket error, a socket close, and the
+  // WebSocket constructor throwing. backfill.ts applyBackfillPage's
+  // exhaustion rule depends on this distinction: a timed-out or failed
+  // fetch can look exactly like a short page (few or zero events
+  // collected before termination), but only a real EOSE means the relay
+  // actually told us it has nothing more.
+  eose: boolean;
+}
+
 // Collects every EVENT payload a relay sends for one REQ until EOSE or a
 // timeout, then closes the socket -- same short-lived-connection shape as
 // profile-lookup.ts's queryOne, just collecting many results instead of
 // resolving on the first one, since a backfill page is the whole point.
-function fetchPage(relayUrl: string, filter: Record<string, unknown>, timeoutMs: number): Promise<unknown[]> {
+function fetchPage(relayUrl: string, filter: Record<string, unknown>, timeoutMs: number): Promise<FetchPageResult> {
   return new Promise((resolve) => {
     const events: unknown[] = [];
     let settled = false;
+    let eose = false;
     const done = () => {
       if (settled) return;
       settled = true;
@@ -30,14 +43,14 @@ function fetchPage(relayUrl: string, filter: Record<string, unknown>, timeoutMs:
       } catch {
         // already closing/closed
       }
-      resolve(events);
+      resolve({ events, eose });
     };
 
     let socket: WebSocket;
     try {
       socket = new WebSocket(relayUrl);
     } catch {
-      resolve([]);
+      resolve({ events: [], eose: false });
       return;
     }
 
@@ -54,6 +67,7 @@ function fetchPage(relayUrl: string, filter: Record<string, unknown>, timeoutMs:
         if (frame[0] === "EVENT" && frame[1] === subId) {
           events.push(frame[2]);
         } else if (frame[0] === "EOSE" && frame[1] === subId) {
+          eose = true;
           done();
         }
       } catch {
@@ -81,7 +95,7 @@ async function discoverWriteRelays(ownerPubkey: string): Promise<string[]> {
   );
   let best: { created_at: number; tags: string[][] } | null = null;
   for (const page of pages) {
-    for (const raw of page) {
+    for (const raw of page.events) {
       const e = raw as { created_at?: unknown; tags?: unknown };
       if (typeof e.created_at !== "number" || !Array.isArray(e.tags)) continue;
       if (best === null || e.created_at > best.created_at) {
@@ -127,10 +141,10 @@ export async function runBackfillTick(env: Env): Promise<void> {
   // on a day backfill isn't going to be allowed to write anyway.
   if (!state.canIngestNow) return;
 
-  const events = await fetchPage(
+  const { events, eose } = await fetchPage(
     state.nextRelay,
     { authors: [state.ownerPubkey], until: state.nextUntil, limit: BACKFILL_PAGE_SIZE },
     BACKFILL_FETCH_TIMEOUT_MS,
   );
-  await stub.ingestBackfillPage(state.nextRelay, events);
+  await stub.ingestBackfillPage(state.nextRelay, events, eose);
 }

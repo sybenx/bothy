@@ -174,7 +174,7 @@ export function applyBackfillPage(
   ownerPubkey: string,
   relayUrl: string,
   rawEvents: unknown[],
-  pageSize: number,
+  eose: boolean,
   nowSec: number,
 ): IngestResult {
   // Authoritative yield-to-live-traffic check (see hasBackfillHeadroom's
@@ -224,13 +224,23 @@ export function applyBackfillPage(
     if (oldestProcessed === null || event.created_at < oldestProcessed) oldestProcessed = event.created_at;
   }
 
-  // A short page -- including a genuinely empty one, the common way a
-  // relay signals "nothing more" -- means the relay has nothing older
-  // left, but only when the whole page was actually processed; a budget
-  // failure ends the loop early for reasons that have nothing to do with
-  // this relay's remaining history, so it must never be mistaken for
-  // exhaustion.
-  const exhausted = !budgetExceeded && rawEvents.length < pageSize;
+  // Exhaustion means "the relay told us, via a real EOSE, that it has
+  // nothing older" -- NOT "the page came back short." A short-but-nonempty
+  // page is normal: relays apply their own per-REQ limit caps, so asking
+  // for BACKFILL_PAGE_SIZE and receiving fewer is routine, not a signal of
+  // exhaustion. And backfill-worker.ts's fetchPage calls the same done()
+  // for EOSE, a fetch timeout, a socket error, and a socket close, all
+  // resolving with whatever partial page had been collected so far -- a
+  // timed-out or failed fetch looks exactly like a short page and must not
+  // be mistaken for one, or a transient failure permanently retires a
+  // relay that still has history left. `eose` disambiguates: only a page
+  // that both terminated on a genuine EOSE AND has nothing in it is
+  // "nothing older" -- standard nostr history pagination walks `until`
+  // backwards until a page comes back empty, not until one comes back
+  // short. A budget failure ends the loop early for reasons that have
+  // nothing to do with this relay's remaining history, so it must never be
+  // mistaken for exhaustion either.
+  const exhausted = !budgetExceeded && eose && rawEvents.length === 0;
 
   // Two separate updates rather than one: an empty page has no events to
   // derive a cursor from (oldestProcessed stays null) but must still be
@@ -254,4 +264,29 @@ export function applyBackfillPage(
   );
 
   return { stored, exhausted };
+}
+
+// One-time reset for relays wrongly marked exhausted by the pre-fix
+// short-page heuristic (a relay's own per-REQ cap, or a fetchPage
+// timeout/connection error, could each produce a short page that old
+// applyBackfillPage mistook for "no more history" -- see this function's
+// caller, Relay.runCron). Gated by backfill_meta.exhaust_reset_applied so
+// it runs at most once per deployment; checked before any write, so a
+// duplicate cron invocation racing this one just no-ops on its second
+// call. Deliberately leaves until_cursor untouched -- each relay's cursor
+// already points at exactly where it stopped, and rewinding it would
+// re-fetch history already stored. Safe even for a relay that really was
+// exhausted: clearing its flag costs exactly one wasted page fetch, which
+// comes back empty with a genuine EOSE and is immediately re-flagged
+// exhausted under the fixed rule above (applyBackfillPage).
+export function resetWronglyExhaustedRelays(sql: SqlStorage): void {
+  const applied =
+    sql
+      .exec<{ exhaust_reset_applied: number }>(`SELECT exhaust_reset_applied FROM backfill_meta LIMIT 1`)
+      .toArray()[0]?.exhaust_reset_applied ?? 1;
+  if (applied) return;
+
+  sql.exec(`UPDATE backfill_relays SET exhausted = 0`);
+  sql.exec(`UPDATE backfill_meta SET status = 'running' WHERE status = 'done'`);
+  sql.exec(`UPDATE backfill_meta SET exhaust_reset_applied = 1`);
 }
