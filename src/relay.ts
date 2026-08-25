@@ -22,7 +22,7 @@ import {
   MAX_LIVE_FEED_CONNECTIONS,
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
 } from "./limits";
-import { resolveIcon } from "./nip11";
+import { resolveIcon, resolveName, type OwnerProfile } from "./nip11";
 import { version } from "../package.json";
 import { type Filter, GIFT_WRAP_KIND, type NostrEvent, pTagValues, VANISH_KIND } from "./nostr";
 import {
@@ -44,10 +44,12 @@ import {
   estimateRowsWritten24h,
   eventExists,
   expirationOf,
+  getRelaySettings,
   giftWrapCount,
   isDeleted,
   queryFilter,
   queryFilters,
+  type RelaySettings,
   storeEvent,
 } from "./storage";
 import { idMatchesContent, parseEventShape, verifySignature } from "./validate";
@@ -277,9 +279,10 @@ export class Relay extends DurableObject<Env> {
   // ROADMAP.md chunk 5. Null when unclaimed, when OWNER_PUBKEY skips
   // storage entirely, or when the claim-time profile lookup failed; the
   // caller (nip11.ts) falls back to hardcoded defaults in all those cases.
-  async getProfile(host?: string): Promise<{ name: string | null; picture: string | null } | null> {
-    if (host) recordHost(this.ctx.storage.sql, host);
-    return getOwnerProfile(this.ctx.storage.sql, this.env);
+  async getIdentity(host?: string): Promise<{ profile: OwnerProfile; settings: RelaySettings }> {
+    const sql = this.ctx.storage.sql;
+    if (host) recordHost(sql, host);
+    return { profile: getOwnerProfile(sql, this.env), settings: getRelaySettings(sql) };
   }
 
   // Backs GET /api/stats (src/index.ts) -- see CLAUDE.md "Admin page".
@@ -293,6 +296,12 @@ export class Relay extends DurableObject<Env> {
     rowsWrittenEstimate24h: number;
     backfill: BackfillStatus | null;
     icon: string | null;
+    // The name actually in effect, resolved through the same chain the
+    // NIP-11 document uses (nip11.ts resolveName) so the admin page's
+    // readout and the document a client fetches can never disagree.
+    // NIP-86 has no getrelayname, so this is the read side for
+    // changerelayname.
+    relayName: string;
     // Whether writes beyond the owner are currently possible at all
     // (CLAUDE.md "Writes are owner-gated"), plus the numbers that
     // back that state -- see the ALLOW_FOLLOWS-gate comment in
@@ -319,6 +328,9 @@ export class Relay extends DurableObject<Env> {
     const followsRefreshedAt =
       sql.exec<{ t: number | null }>(`SELECT MAX(fetched_at) AS t FROM follows`).toArray()[0]?.t ?? null;
 
+    const profile = getOwnerProfile(sql, this.env);
+    const settings = getRelaySettings(sql);
+
     return {
       version,
       claimed: owner !== null,
@@ -332,7 +344,8 @@ export class Relay extends DurableObject<Env> {
       // resolveIcon) -- the admin page uses this to set the browser
       // tab's favicon from the owner's kind-0 picture. Null falls back
       // to the static default favicon client-side.
-      icon: resolveIcon(this.env, getOwnerProfile(sql, this.env)),
+      icon: resolveIcon(this.env, settings, profile),
+      relayName: resolveName(this.env, settings, profile),
       writePolicy: allowFollowsEnabled(this.env) ? "follows" : "owner",
       followCount,
       followsRefreshedAt,

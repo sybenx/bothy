@@ -1,3 +1,4 @@
+import type { OwnerProfile } from "./nip11";
 import type { Profile } from "./profile-lookup";
 
 // Kind-3 is NIP-01/NIP-02's contact list; its `p` tags are the follow set.
@@ -42,10 +43,11 @@ export function claimOwner(sql: SqlStorage, pubkey: string, profile?: Profile): 
   const existing = sql.exec(`SELECT 1 FROM owner LIMIT 1`).toArray();
   if (existing.length > 0) return false;
   sql.exec(
-    `INSERT INTO owner (pubkey, name, picture) VALUES (?, ?, ?)`,
+    `INSERT INTO owner (pubkey, name, picture, about) VALUES (?, ?, ?, ?)`,
     pubkey,
     profile?.name ?? null,
     profile?.picture ?? null,
+    profile?.about ?? null,
   );
   return true;
 }
@@ -55,13 +57,12 @@ export function claimOwner(sql: SqlStorage, pubkey: string, profile?: Profile): 
 // entirely (no row to read a profile from), or when the claim-time
 // lookup found nothing -- the caller falls back to hardcoded defaults in
 // all of those cases.
-export function getOwnerProfile(
-  sql: SqlStorage,
-  env: Env,
-): { name: string | null; picture: string | null } | null {
+export function getOwnerProfile(sql: SqlStorage, env: Env): OwnerProfile {
   if (env.OWNER_PUBKEY) return null;
   const row = sql
-    .exec<{ name: string | null; picture: string | null }>(`SELECT name, picture FROM owner LIMIT 1`)
+    .exec<{ name: string | null; picture: string | null; about: string | null }>(
+      `SELECT name, picture, about FROM owner LIMIT 1`,
+    )
     .toArray()[0];
   return row ?? null;
 }
@@ -134,9 +135,10 @@ export function refreshProfile(sql: SqlStorage, env: Env, nowSec: number): void 
     .exec<{
       name: string | null;
       picture: string | null;
+      about: string | null;
       profile_synced_at: number | null;
       icon_refreshed_at: number | null;
-    }>(`SELECT name, picture, profile_synced_at, icon_refreshed_at FROM owner LIMIT 1`)
+    }>(`SELECT name, picture, about, profile_synced_at, icon_refreshed_at FROM owner LIMIT 1`)
     .toArray()[0];
   // No `owner` row exists when OWNER_PUBKEY skips the claim flow
   // entirely (claimOwner above is the only writer) -- nothing to cache a
@@ -154,12 +156,14 @@ export function refreshProfile(sql: SqlStorage, env: Env, nowSec: number): void 
 
   let name = row.name;
   let picture = row.picture;
+  let about = row.about;
   let syncedAt = row.profile_synced_at;
   if (latest && (row.profile_synced_at === null || latest.created_at > row.profile_synced_at)) {
     try {
       const content = JSON.parse(latest.content) as Record<string, unknown>;
       name = typeof content.name === "string" ? content.name : null;
       picture = typeof content.picture === "string" ? content.picture : null;
+      about = typeof content.about === "string" ? content.about : null;
       syncedAt = latest.created_at;
     } catch {
       // Malformed kind-0 content -- leave the cached profile as-is, but
@@ -170,9 +174,10 @@ export function refreshProfile(sql: SqlStorage, env: Env, nowSec: number): void 
   }
 
   sql.exec(
-    `UPDATE owner SET name = ?, picture = ?, profile_synced_at = ?, icon_refreshed_at = ?`,
+    `UPDATE owner SET name = ?, picture = ?, about = ?, profile_synced_at = ?, icon_refreshed_at = ?`,
     name,
     picture,
+    about,
     syncedAt,
     nowSec,
   );

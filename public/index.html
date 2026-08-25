@@ -26,6 +26,7 @@
     padding: 0.5rem;
   }
   button { padding: 0.5rem 0.9rem; cursor: pointer; }
+  .relay-name { margin: 1.5rem 0 0; font-size: 0.9rem; }
   .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin: 1.5rem 0; }
   .stat { border: 1px solid #8884; border-radius: 0.5rem; padding: 0.75rem; }
   .stat .n { font-size: 1.3rem; font-weight: 600; }
@@ -85,6 +86,8 @@
     <input id="ws-url" readonly />
     <button id="copy-btn">Copy</button>
   </div>
+  <p class="relay-name">Relay name: <strong id="relay-name">-</strong></p>
+
   <div class="stats">
     <div class="stat"><div class="n" id="stat-total">-</div><div class="label">events stored</div></div>
     <div class="stat"><div class="n" id="stat-24h">-</div><div class="label">events, last 24h</div></div>
@@ -140,6 +143,12 @@ async function main() {
     document.getElementById("copy-btn").addEventListener("click", () => {
       navigator.clipboard.writeText(wsUrl);
     });
+
+    // Read side for NIP-86's changerelayname, which the spec gives no
+    // getrelayname to pair with. Resolved server-side through the same
+    // chain the NIP-11 document uses (src/nip11.ts resolveName), so this
+    // readout and that document always agree.
+    document.getElementById("relay-name").textContent = stats.relayName;
 
     document.getElementById("stat-total").textContent = stats.totalEvents;
     document.getElementById("stat-24h").textContent = stats.events24h;

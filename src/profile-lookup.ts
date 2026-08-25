@@ -15,6 +15,10 @@ const LOOKUP_TIMEOUT_MS = 2500;
 export interface Profile {
   name?: string;
   picture?: string;
+  // kind-0's bio field, which backs the kind-0 rung of the NIP-11
+  // description (nip11.ts resolveDescription) the way name/picture back
+  // the name and icon rungs.
+  about?: string;
 }
 
 function queryOne(relayUrl: string, pubkey: string): Promise<Profile | null> {
@@ -54,6 +58,7 @@ function queryOne(relayUrl: string, pubkey: string): Promise<Profile | null> {
           const profile: Profile = {};
           if (typeof content.name === "string") profile.name = content.name;
           if (typeof content.picture === "string") profile.picture = content.picture;
+          if (typeof content.about === "string") profile.about = content.about;
           done(profile);
         } else if (frame[0] === "EOSE") {
           done(null);

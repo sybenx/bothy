@@ -91,30 +91,41 @@ describe("TOFU claim storage (env.OWNER_PUBKEY unset)", () => {
 });
 
 describe("claim-time profile storage (ROADMAP.md chunk 5)", () => {
-  it("stores the owner's kind-0 name/picture passed at claim time", async () => {
+  it("stores the owner's kind-0 name/picture/about passed at claim time", async () => {
     const id = env.RELAY.idFromName("relay");
     const stub = env.RELAY.get(id);
     const claimant = randomKeypair().pubkeyHex;
 
     await runInDurableObject(stub, async (_instance, state) => {
-      expect(claimOwner(state.storage.sql, claimant, { name: "alice", picture: "https://example.com/a.png" })).toBe(
-        true,
-      );
+      expect(
+        claimOwner(state.storage.sql, claimant, {
+          name: "alice",
+          picture: "https://example.com/a.png",
+          // Backs the kind-0 rung of the NIP-11 description -- see
+          // nip11.ts resolveDescription.
+          about: "notes and other stuff",
+        }),
+      ).toBe(true);
       expect(getOwnerProfile(state.storage.sql, UNCLAIMED_ENV)).toEqual({
         name: "alice",
         picture: "https://example.com/a.png",
+        about: "notes and other stuff",
       });
     });
   });
 
-  it("stores null name/picture when no profile is given -- lookup failure is not blocking", async () => {
+  it("stores null name/picture/about when no profile is given -- lookup failure is not blocking", async () => {
     const id = env.RELAY.idFromName("relay");
     const stub = env.RELAY.get(id);
     const claimant = randomKeypair().pubkeyHex;
 
     await runInDurableObject(stub, async (_instance, state) => {
       expect(claimOwner(state.storage.sql, claimant)).toBe(true);
-      expect(getOwnerProfile(state.storage.sql, UNCLAIMED_ENV)).toEqual({ name: null, picture: null });
+      expect(getOwnerProfile(state.storage.sql, UNCLAIMED_ENV)).toEqual({
+        name: null,
+        picture: null,
+        about: null,
+      });
     });
   });
 

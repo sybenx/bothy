@@ -68,8 +68,8 @@ export default {
     // Accept headers ("application/nostr+json, */*"), and NIP-11 only
     // requires the media type be present, not that it stand alone.
     if (request.headers.get("Accept")?.includes("application/nostr+json")) {
-      const profile = await relayStub(env).getProfile(url.host);
-      return nip11Response(env, profile);
+      const { profile, settings } = await relayStub(env).getIdentity(url.host);
+      return nip11Response(env, settings, profile);
     }
 
     if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
