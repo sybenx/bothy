@@ -74,7 +74,7 @@
 <body>
 <div class="brand">
   <h1>bothy</h1>
-  <p class="tagline">personal nostr relay &middot; <a href="https://github.com/sybenx/bothy" target="_blank" rel="noopener">Get your own</a></p>
+  <p class="tagline">personal nostr relay<span id="version"></span> &middot; <a href="https://github.com/sybenx/bothy" target="_blank" rel="noopener">Get your own</a></p>
 </div>
 
 <div id="claimed-view" hidden>
@@ -129,6 +129,7 @@ async function main() {
 
   document.getElementById("reset-note").hidden = false;
   setFavicon(stats.icon);
+  if (stats.version) document.getElementById("version").textContent = " v" + stats.version;
 
   if (stats.claimed) {
     document.getElementById("claimed-view").hidden = false;

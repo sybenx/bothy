@@ -10,6 +10,7 @@ import { exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { buildRelayInfo, DEFAULT_DESCRIPTION, DEFAULT_NAME } from "../src/nip11";
 import { MAX_FILTER_LIMIT, MAX_SUBSCRIPTIONS_PER_CONNECTION } from "../src/limits";
+import { version } from "../package.json";
 import { isolateStorage } from "./helpers/isolate";
 
 isolateStorage();
@@ -46,6 +47,12 @@ describe("buildRelayInfo", () => {
   it("omits icon entirely rather than setting it to an empty string", () => {
     const info = buildRelayInfo(NO_VARS, { name: "alice", picture: null });
     expect(info).not.toHaveProperty("icon");
+  });
+
+  it("advertises software as a URL to the upstream project and version from package.json", () => {
+    const info = buildRelayInfo(NO_VARS, null);
+    expect(info.software).toBe("https://github.com/sybenx/bothy");
+    expect(info.version).toBe(version);
   });
 
   it("advertises a limitation object mirroring the enforced limits.ts constants", () => {

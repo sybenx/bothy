@@ -3,6 +3,7 @@
 // support, not ahead of them.
 
 import { MAX_FILTER_LIMIT, MAX_SUBSCRIPTIONS_PER_CONNECTION } from "./limits";
+import { version } from "../package.json";
 
 // Hardcoded fallbacks (ROADMAP.md chunk 5: "Hardcoded fallbacks in code
 // for when the lookup fails"). Used when there's no owner-profile
@@ -37,6 +38,13 @@ export function buildRelayInfo(env: Env, profile: OwnerProfile): Record<string, 
     // NIP-59/62: gift wrap accept/read/delete and vanish requests, same
     // chunk.
     supported_nips: [1, 9, 11, 40, 42, 59, 62],
+    // Points at the upstream project, not the deployer's own cloned repo
+    // -- the NIP requires a URL identifying the implementation, not the
+    // deployment, and every deploy button clone shares this same software.
+    software: "https://github.com/sybenx/bothy",
+    // package.json's `version` is the single source of truth (CLAUDE.md
+    // "Release step") -- never hardcode this string elsewhere.
+    version,
     // Only constraints actually enforced -- imported from limits.ts so
     // this document can never drift from the real caps. No
     // max_message_length/max_event_tags/max_content_length/

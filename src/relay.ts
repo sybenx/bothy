@@ -23,6 +23,7 @@ import {
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
 } from "./limits";
 import { resolveIcon } from "./nip11";
+import { version } from "../package.json";
 import { type Filter, GIFT_WRAP_KIND, type NostrEvent, pTagValues, VANISH_KIND } from "./nostr";
 import {
   allowFollowsEnabled,
@@ -288,6 +289,7 @@ export class Relay extends DurableObject<Env> {
 
   // Backs GET /api/stats (src/index.ts) -- see CLAUDE.md "Admin page".
   async getStats(host?: string): Promise<{
+    version: string;
     claimed: boolean;
     ownerPubkey: string | null;
     totalEvents: number;
@@ -334,6 +336,7 @@ export class Relay extends DurableObject<Env> {
     const muteCount = sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM mutes`).toArray()[0]?.n ?? 0;
 
     return {
+      version,
       claimed: owner !== null,
       ownerPubkey: owner,
       totalEvents,

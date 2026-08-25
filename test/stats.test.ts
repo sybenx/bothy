@@ -8,6 +8,7 @@ import { isolateStorage } from "./helpers/isolate";
 import { OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
 import { refreshFollows } from "../src/ownership";
 import { connectRelay, publish } from "./helpers/socket";
+import { version } from "../package.json";
 
 isolateStorage();
 
@@ -21,12 +22,14 @@ describe("GET /api/stats", () => {
     const response = await exports.default.fetch("https://example.com/api/stats");
     expect(response.status).toBe(200);
     const body = (await response.json()) as {
+      version: string;
       claimed: boolean;
       totalEvents: number;
       events24h: number;
     };
 
     expect(body).toMatchObject({
+      version,
       claimed: true,
       totalEvents: expect.any(Number),
       events24h: expect.any(Number),
