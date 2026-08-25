@@ -421,3 +421,15 @@ reads over an already-small table, no new write cost. The admin page
 than a bare number specifically so `writePolicy: "follows"` with
 `followCount: 0` — an enabled but functionally empty allowlist blocking
 every follow — is legible as a problem, not a healthy zero.
+
+## NIP-86 relay management (added in v0.3.0)
+
+Phase one was scoped by exactly one rule: nothing that adds a per-event lookup. That is what decided which NIP-86 methods landed and which did not.
+
+The three new tables (`banned_events`, `blocked_ips`, `relay_settings`, see schema.ts) cost nothing on the per-event write path. `banned_events` and `relay_settings` are written only by an authenticated management call, at operator pace — a handful of rows in the lifetime of a relay, against a 100,000 rows-written/day ceiling. `banevent` additionally writes a `deleted_ids` tombstone, which is the same 2-row cost NIP-09 deletion already pays and is accounted for in the chunk 6 notes above.
+
+The only one of the three that is read on a client-facing path is `blocked_ips`, and it is read exactly once per WebSocket connection in `Relay.fetch`, before `acceptWebSocket`. One indexed lookup per connection, not per message and not per event: at the observed traffic shape (see the requests-by-type breakdown in the Cloudflare dashboard, where HTTP upgrades are a small fraction of total DO requests and WebSocket messages dominate) this is invisible against the 5,000,000 rows-read/day ceiling. Checking per message instead would have put a storage read in front of every frame on a table that is almost always empty, which is precisely the trade this phase refused to make.
+
+`banpubkey`/`allowpubkey` are deferred for the same reason in reverse. Enforcing a pubkey ban means a lookup on every incoming event, on the hot path, in front of the write. That is a real cost against the rows-read ceiling and a real addition to per-event CPU, and it deserves a measured baseline before it lands rather than after — which is why a metrics baseline was taken against the deployed relay before this work started.
+
+Authentication cost sits in the Worker, not the Durable Object. A NIP-98 verification is one schnorr verify (~1.1ms, docs/baselines.json) plus a SHA256 of the request body, and it happens before any RPC into the DO, so a forged management request costs zero DO time and zero rows. Within the verification itself the ownership comparison precedes the schnorr verify, the same cheapest-first ordering the write path uses: a stranger's syntactically perfect authorization is rejected by a string comparison rather than by curve math.

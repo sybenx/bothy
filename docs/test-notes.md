@@ -23,6 +23,7 @@ Notes for whoever implements chunk 3 against the chunk 2 conformance suite.
 - `keys.ts` — a fixed `OWNER_SECRET_KEY_HEX`/`OWNER_PUBKEY_HEX` pair (matches the `OWNER_PUBKEY` binding injected in `vitest.config.ts`), plus `randomKeypair()` for non-owner authors.
 - `event.ts` — `signEvent()` builds a correctly-signed NIP-01 event; `withCorruptSignature()`/`withTamperedContent()` build negative fixtures.
 - `socket.ts` — `connectRelay()` opens the hibernation-safe WS to the singleton DO; `publish()` and `collectStored()` wrap the send/await-response pattern.
+- `management.ts` — `callManagement()` sends a NIP-86 request through the Worker's fetch handler, signing the NIP-98 authorization for it. The management API is the one client path in this project that is plain HTTP rather than a WebSocket, so it does not go through `socket.ts` at all. Every field of `AuthOptions` overrides exactly one part of the authorization, so a reject-path test can break one rule at a time; the accept path is the same call with no overrides.
 - `isolate.ts` — `isolateStorage()` calls `reset()` in `afterEach`. **Call this at the top of every test file that writes events** — storage isolation in this vitest plugin is per file, not per test, and most files share the one owner pubkey.
 
 ## Why some things look the way they do
@@ -32,6 +33,8 @@ Notes for whoever implements chunk 3 against the chunk 2 conformance suite.
 - NIP-42 tests cover the AUTH message's own validation contract (kind, freshness, challenge match) rather than a full challenge/response round trip — this relay has no auth-gated resource yet, so there's no scenario where it issues a challenge for a test to receive.
 - `test/claim.test.ts` and `test/follows.test.ts` cannot exercise the *unclaimed* relay or ALLOW_FOLLOWS=true over the wire: the global test env's OWNER_PUBKEY/ALLOW_FOLLOWS bindings (vitest.config.ts) are fixed for the whole run, matching every other suite. Instead they call the pure functions in `ownership.ts` (`claimOwner`, `getOwnerPubkey`, `isAllowedWriter`, `refreshFollows`) directly against real `SqlStorage` obtained via `runInDurableObject`, passing a hand-built `env` object rather than the injected one. This is the same category of exception `nip40-expiration.test.ts` documents for its own reason: no wire-protocol path exists to reach that state, so the test drops one level to real storage instead of mocking it.
 
+- `test/nip86-management.test.ts`'s "still stores the value when an environment variable outranks it" case calls `handleManagementCall` directly against real `SqlStorage` with a hand-built `env`, the same exception `claim.test.ts` and `follows.test.ts` document above and for the same reason: the RELAY_NAME binding is fixed for the whole run by vitest.config.ts, so there is no wire path that reaches the state where an environment variable and a stored value are both set. Everything else about the management API is tested over real HTTP through the Worker.
+
 ## Running
 
 ```bash
@@ -40,4 +43,4 @@ npm run typecheck
 npx vitest run test/nip01-filters.test.ts   # one file
 ```
 
-As of chunk 2, all 44 protocol tests fail identically with `no message received from relay within 250ms` — `webSocketMessage` is still a stub. That's the expected state; chunk 3 is done when this suite is green.
+
