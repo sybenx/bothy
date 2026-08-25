@@ -77,6 +77,10 @@ Two kinds of assertion live in the same suite ([test/](test)):
 
 See [docs/test-notes.md](docs/test-notes.md) for suite layout, fixture rationale, and the couple of places tests drop below the wire protocol to real storage (documented exceptions, not the norm).
 
+## Release step
+
+Cutting a release means bumping `package.json`'s `version` — it's the single source of truth, imported directly (`resolveJsonModule`) into NIP-11's `version` field and `/api/stats`, which the admin page displays. Never hardcode the version string elsewhere.
+
 ## Attribution
 
 MIT licensed, original implementation. [Nosflare](https://github.com/Spl0itable/nosflare) was read as prior art for NIP-01 filter-matching edge cases but no code is shared — see [README.md](README.md) "Attribution" for the full statement and the rule for any future reference reading (khatru, haven, strfry): read to understand the protocol, never paste.
