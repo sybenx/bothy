@@ -21,6 +21,14 @@ export interface BackfillStatus {
   // have to be duplicated on both sides of the RPC boundary.
   nextRelay: string | null;
   nextUntil: number | null;
+  // Set by applyBackfillPage on every ingest call, successful or not (a
+  // page that stores zero events, e.g. all-duplicates, still updates
+  // this). Null until the first ingest ever runs. The diagnostic value
+  // is in comparing this against "now": stale means ingest is never
+  // being reached (a cron/RPC-level problem); current but totalStored
+  // not moving means it runs but stores nothing (a storage/validation
+  // problem) -- a distinction nothing else on this object can make.
+  lastRunAt: number | null;
 }
 
 // getBackfillStatus is pure over SqlStorage, like the rest of this
@@ -61,8 +69,10 @@ export function hasBackfillHeadroom(sql: SqlStorage, nowSec: number): boolean {
 // relays, fetch a page, or do nothing.
 export function getBackfillStatus(sql: SqlStorage): BackfillStatus {
   const meta = sql
-    .exec<{ status: string; total_stored: number }>(`SELECT status, total_stored FROM backfill_meta LIMIT 1`)
-    .toArray()[0] ?? { status: "pending", total_stored: 0 };
+    .exec<{ status: string; total_stored: number; last_run_at: number | null }>(
+      `SELECT status, total_stored, last_run_at FROM backfill_meta LIMIT 1`,
+    )
+    .toArray()[0] ?? { status: "pending", total_stored: 0, last_run_at: null };
 
   const relays = sql
     .exec<{ relay_url: string; until_cursor: number; exhausted: number }>(
@@ -78,6 +88,7 @@ export function getBackfillStatus(sql: SqlStorage): BackfillStatus {
     exhaustedCount: relays.filter((r) => r.exhausted !== 0).length,
     nextRelay: next?.relay_url ?? null,
     nextUntil: next?.until_cursor ?? null,
+    lastRunAt: meta.last_run_at,
   };
 }
 

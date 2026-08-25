@@ -224,18 +224,21 @@ function renderBackfillStatus(backfill) {
     return;
   }
   const count = backfill.totalStored + (backfill.totalStored === 1 ? " event" : " events");
+  const lastRun = backfill.lastRunAt
+    ? " (last ran " + new Date(backfill.lastRunAt * 1000).toLocaleString() + ")"
+    : "";
   switch (backfill.status) {
     case "pending":
       el.textContent = "looking for your relay list…";
       break;
     case "running":
-      el.textContent = count + " imported so far (" + backfill.exhaustedCount + "/" + backfill.relayCount + " relays done)";
+      el.textContent = count + " imported so far (" + backfill.exhaustedCount + "/" + backfill.relayCount + " relays done)" + lastRun;
       break;
     case "paused-budget":
-      el.textContent = count + " imported -- paused, resumes after today's write limit resets at 00:00 UTC";
+      el.textContent = count + " imported -- paused, resumes after today's write limit resets at 00:00 UTC" + lastRun;
       break;
     case "done":
-      el.textContent = count + " imported from your history -- done";
+      el.textContent = count + " imported from your history -- done" + lastRun;
       break;
   }
 }
