@@ -22,6 +22,7 @@ import {
   MAX_LIVE_FEED_CONNECTIONS,
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
 } from "./limits";
+import { handleManagementCall, type ManagementResponse } from "./nip86";
 import { resolveIcon, resolveName, type OwnerProfile } from "./nip11";
 import { version } from "../package.json";
 import { type Filter, GIFT_WRAP_KIND, type NostrEvent, pTagValues, VANISH_KIND } from "./nostr";
@@ -47,6 +48,7 @@ import {
   getRelaySettings,
   giftWrapCount,
   isDeleted,
+  isIpBlocked,
   queryFilter,
   queryFilters,
   type RelaySettings,
@@ -196,6 +198,22 @@ export class Relay extends DurableObject<Env> {
     // recordHost is a no-op write once the host is already known.
     recordHost(this.ctx.storage.sql, new URL(request.url).host);
 
+    // NIP-86 blockip (src/nip86.ts), enforced exactly here: once per
+    // connection, before the socket is accepted, and never again for the
+    // life of that connection. Checking per message or per event would
+    // put a storage read on the hot path for a table that is almost
+    // always empty -- the whole reason IP blocking made phase one.
+    //
+    // This covers both WebSocket paths (the nostr protocol connection and
+    // the admin page's /live feed) and nothing else. In particular it
+    // does NOT cover the management endpoint, which is a plain POST
+    // handled in the Worker and never reaches this method: blocking your
+    // own address must never lock you out of the API that unblocks it.
+    const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+    if (isIpBlocked(this.ctx.storage.sql, ip)) {
+      return new Response("blocked", { status: 403 });
+    }
+
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
@@ -283,6 +301,26 @@ export class Relay extends DurableObject<Env> {
     const sql = this.ctx.storage.sql;
     if (host) recordHost(sql, host);
     return { profile: getOwnerProfile(sql, this.env), settings: getRelaySettings(sql) };
+  }
+
+  // The owner pubkey on its own, for the Worker's NIP-98 check
+  // (src/nip98.ts) -- the signature has to be verified against something
+  // before any management call is allowed near storage, and verification
+  // deliberately happens in the Worker. Null when unclaimed, which
+  // verifyNip98 turns into a 401.
+  async getOwner(): Promise<string | null> {
+    return getOwnerPubkey(this.ctx.storage.sql, this.env);
+  }
+
+  // NIP-86 relay management (src/nip86.ts), write side. Reached only
+  // after the Worker has verified a NIP-98 event signed by the owner --
+  // this method performs no authentication of its own and must never be
+  // called from anywhere that hasn't done that check. Storage mutations
+  // live here rather than in the Worker for the same reason claim() and
+  // ingestBackfillPage() do: the Durable Object owns every write, and it
+  // opens no outbound connection to serve one.
+  async manage(method: unknown, params: unknown[], callerIp: string): Promise<ManagementResponse> {
+    return handleManagementCall(this.ctx.storage.sql, this.env, method, params, callerIp, nowSeconds());
   }
 
   // Backs GET /api/stats (src/index.ts) -- see CLAUDE.md "Admin page".
