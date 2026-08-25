@@ -46,5 +46,15 @@
   // Workers Free.
   "triggers": {
     "crons": ["0 * * * *"]
+  },
+
+  // Workers Logs -- without this, console.error/console.log calls (e.g.
+  // scheduled()'s fault-isolation logging) are discarded and only visible
+  // via a live `wrangler tail`, which needs credentials we don't have.
+  // Included on the Free plan: 200,000 logs/day, 3-day retention.
+  // head_sampling_rate: 1 means every invocation is logged, not sampled.
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
   }
 }

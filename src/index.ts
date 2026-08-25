@@ -89,8 +89,21 @@ export default {
   // the account's 5 available cron triggers -- see backfill-worker.ts for
   // why its outbound sockets are opened here, in the Worker, and not
   // inside runCron().
+  //
+  // These two do unrelated jobs and must not share a failure: each is
+  // caught and logged independently, so an exception in runCron (e.g. a
+  // storage error while refreshing the follow cache) can never silently
+  // stop backfill from ever running again, and vice versa.
   async scheduled(_event: ScheduledController, env: Env): Promise<void> {
-    await relayStub(env).runCron();
-    await runBackfillTick(env);
+    try {
+      await relayStub(env).runCron();
+    } catch (err) {
+      console.error("scheduled: runCron failed", err);
+    }
+    try {
+      await runBackfillTick(env);
+    } catch (err) {
+      console.error("scheduled: runBackfillTick failed", err);
+    }
   },
 } satisfies ExportedHandler<Env>;
