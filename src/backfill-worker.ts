@@ -114,24 +114,37 @@ async function discoverWriteRelays(ownerPubkey: string): Promise<string[]> {
 export async function runBackfillTick(env: Env): Promise<void> {
   const stub = relayStub(env);
   const state = await stub.getBackfillState();
+  // TEMPORARY DIAGNOSTIC LOGGING -- remove once the stall is found.
+  console.log("[backfill] state", state === null ? null : {
+    status: state.status,
+    nextRelay: state.nextRelay,
+    nextUntil: state.nextUntil,
+    canIngestNow: state.canIngestNow,
+  });
   if (state === null || state.status === "done" || state.status === "paused-budget") {
     // paused-budget resolves itself: the next successful ingest call
     // (once the daily quota resets) flips status back via
     // applyBackfillPage, not this function -- but there is nothing to
     // fetch until then, so skip opening a socket for a page that would
     // just fail to store again before 00:00 UTC.
+    console.log("[backfill] exit: state null/done/paused-budget");
     return;
   }
 
   if (state.status === "pending") {
+    console.log("[backfill] branch: pending -- discovering write relays");
     const relays = await discoverWriteRelays(state.ownerPubkey);
+    console.log("[backfill] discoverWriteRelays ->", relays);
     if (relays.length > 0) {
       await stub.discoverBackfillRelays(relays);
     }
     return;
   }
 
-  if (state.nextRelay === null || state.nextUntil === null) return;
+  if (state.nextRelay === null || state.nextUntil === null) {
+    console.log("[backfill] exit: nextRelay or nextUntil is null");
+    return;
+  }
 
   // Yield to the owner's own live traffic (backfill.ts hasBackfillHeadroom)
   // -- skip opening an outbound socket at all when today's rows-written
@@ -139,12 +152,16 @@ export async function runBackfillTick(env: Env): Promise<void> {
   // checks this same condition again, authoritatively, right before
   // writing -- this earlier check only saves a wasted outbound connection
   // on a day backfill isn't going to be allowed to write anyway.
-  if (!state.canIngestNow) return;
+  if (!state.canIngestNow) {
+    console.log("[backfill] exit: canIngestNow is false");
+    return;
+  }
 
-  const { events, eose } = await fetchPage(
-    state.nextRelay,
-    { authors: [state.ownerPubkey], until: state.nextUntil, limit: BACKFILL_PAGE_SIZE },
-    BACKFILL_FETCH_TIMEOUT_MS,
-  );
-  await stub.ingestBackfillPage(state.nextRelay, events, eose);
+  const filter = { authors: [state.ownerPubkey], until: state.nextUntil, limit: BACKFILL_PAGE_SIZE };
+  console.log("[backfill] fetchPage ->", state.nextRelay, filter);
+  const { events, eose } = await fetchPage(state.nextRelay, filter, BACKFILL_FETCH_TIMEOUT_MS);
+  console.log("[backfill] fetchPage result: events=%d eose=%s", events.length, eose);
+  const result = await stub.ingestBackfillPage(state.nextRelay, events, eose);
+  console.log("[backfill] ingestBackfillPage result", result);
+  // END TEMPORARY DIAGNOSTIC LOGGING
 }
