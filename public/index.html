@@ -190,11 +190,11 @@ function formatBytes(n) {
   return (n / 1024 ** 3).toFixed(2) + " GB";
 }
 
-// Write access policy (ROADMAP.md chunk 4/6: ALLOW_FOLLOWS and NIP-51
-// mutes). A bare follow count of 0 while writePolicy is "follows" reads
-// as healthy at a glance -- it isn't, it means the allowlist is empty and
-// every follow is being silently rejected -- so that case gets its own
-// plain-language sentence instead of just a number.
+// Write access policy (ROADMAP.md chunk 4: ALLOW_FOLLOWS). A bare follow
+// count of 0 while writePolicy is "follows" reads as healthy at a glance
+// -- it isn't, it means the allowlist is empty and every follow is being
+// silently rejected -- so that case gets its own plain-language sentence
+// instead of just a number.
 function renderWritePolicyStatus(stats) {
   const el = document.getElementById("write-policy-status");
   const parts = [];
@@ -211,7 +211,6 @@ function renderWritePolicyStatus(stats) {
       " can publish here" + (refreshed ? ", " + refreshed : "") + ".",
     );
   }
-  parts.push(stats.muteCount + (stats.muteCount === 1 ? " public mute" : " public mutes") + " (revokes write access, NIP-51 public mutes only).");
   el.textContent = parts.join(" ");
 }
 

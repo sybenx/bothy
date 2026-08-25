@@ -32,9 +32,7 @@ import {
   getOwnerPubkey,
   getOwnerProfile,
   isAllowedWriter,
-  MUTE_LIST_KIND,
   refreshFollows,
-  refreshMutes,
   refreshProfile,
 } from "./ownership";
 import type { Profile } from "./profile-lookup";
@@ -152,16 +150,13 @@ function ok(ws: WebSocket, id: string, accepted: boolean, message: string): void
 
 // Maps ownership.ts isAllowedWriter's rejection reasons to distinct
 // NIP-01 OK messages, written for the person reading them in their
-// client rather than for a developer reading logs. "muted" gets the
-// `blocked:` prefix -- it's a permanent, person-specific refusal, not a
-// generic access restriction -- everything else gets `restricted:` per
-// NIP-01's own worked example (nips/01.md line 173).
-function writeRejectionMessage(reason: "unclaimed" | "muted" | "not-follow" | "owner-only"): string {
+// client rather than for a developer reading logs. All get the
+// `restricted:` prefix per NIP-01's own worked example (nips/01.md line
+// 173).
+function writeRejectionMessage(reason: "unclaimed" | "not-follow" | "owner-only"): string {
   switch (reason) {
     case "unclaimed":
       return "restricted: relay has not been claimed yet";
-    case "muted":
-      return "blocked: this pubkey has been muted by the relay owner";
     case "not-follow":
       return "restricted: only the owner and people they follow can publish here";
     case "owner-only":
@@ -308,16 +303,6 @@ export class Relay extends DurableObject<Env> {
     writePolicy: "owner" | "follows";
     followCount: number;
     followsRefreshedAt: number | null;
-    // NIP-51 mute count -- exposed even though /api/stats is unauthenticated.
-    // Deliberate, not an oversight: public mutes are public by construction
-    // (NIP-51), only the count is exposed here (never the muted pubkeys),
-    // and without it the owner has no way to tell a working mute list from
-    // an empty one. Don't "fix" this by removing the field.
-    //
-    // See ownership.ts refreshMutes for why this is
-    // only ever the public, unencrypted subset of what the owner has
-    // muted in their own client.
-    muteCount: number;
   }> {
     const sql = this.ctx.storage.sql;
     if (host) recordHost(sql, host);
@@ -333,7 +318,6 @@ export class Relay extends DurableObject<Env> {
       sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM follows`).toArray()[0]?.n ?? 0;
     const followsRefreshedAt =
       sql.exec<{ t: number | null }>(`SELECT MAX(fetched_at) AS t FROM follows`).toArray()[0]?.t ?? null;
-    const muteCount = sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM mutes`).toArray()[0]?.n ?? 0;
 
     return {
       version,
@@ -352,21 +336,19 @@ export class Relay extends DurableObject<Env> {
       writePolicy: allowFollowsEnabled(this.env) ? "follows" : "owner",
       followCount,
       followsRefreshedAt,
-      muteCount,
     };
   }
 
   // Cron entry point (src/index.ts scheduled()) -- refreshes the
-  // ALLOW_FOLLOWS cache, the NIP-51 mute cache, and, at most once/day, the
-  // cached NIP-11/favicon icon from the owner's locally-stored kind-0
-  // (ownership.ts refreshProfile). All are no-ops on their common paths
-  // (feature off; empty list; already refreshed today), so this stays
-  // cheap on most ticks.
+  // ALLOW_FOLLOWS cache and, at most once/day, the cached NIP-11/favicon
+  // icon from the owner's locally-stored kind-0 (ownership.ts
+  // refreshProfile). Both are no-ops on their common paths (feature off;
+  // empty list; already refreshed today), so this stays cheap on most
+  // ticks.
   async runCron(): Promise<void> {
     const sql = this.ctx.storage.sql;
     const now = nowSeconds();
     refreshFollows(sql, this.env, now);
-    refreshMutes(sql, this.env, now);
     refreshProfile(sql, this.env, now);
     // One-time correction for relays the pre-fix short-page exhaustion
     // heuristic wrongly retired -- see backfill.ts resetWronglyExhaustedRelays.
@@ -644,21 +626,18 @@ export class Relay extends DurableObject<Env> {
     ok(ws, event.id, result.ok, result.message);
 
     if (result.stored) {
-      // Refresh the follow/mute cache the instant the owner publishes a
-      // new kind-3/kind-10000, rather than waiting up to an hour for the
-      // next cron tick (docs/budget.md "NIP-51 mute list" and CLAUDE.md
-      // "Owner-only writes"). Gated on `event.pubkey === owner`, not just
-      // `event.kind` -- under ALLOW_FOLLOWS a follow can publish their own
-      // kind-3 through this same accept path, and refreshFollows/
-      // refreshMutes always re-derive from the *owner's* most recent event
-      // regardless of whose write triggered the call, so this only costs
-      // an extra check, never a wrong overwrite. Still, gating here means
-      // a follow's own kind-3 can never even trigger a redundant refresh.
+      // Refresh the follow cache the instant the owner publishes a new
+      // kind-3, rather than waiting up to an hour for the next cron tick
+      // (CLAUDE.md "Owner-only writes"). Gated on `event.pubkey === owner`,
+      // not just `event.kind` -- under ALLOW_FOLLOWS a follow can publish
+      // their own kind-3 through this same accept path, and refreshFollows
+      // always re-derives from the *owner's* most recent event regardless
+      // of whose write triggered the call, so this only costs an extra
+      // check, never a wrong overwrite. Still, gating here means a
+      // follow's own kind-3 can never even trigger a redundant refresh.
       const owner = getOwnerPubkey(sql, this.env);
-      if (event.pubkey === owner) {
-        const now = nowSeconds();
-        if (event.kind === CONTACT_LIST_KIND) refreshFollows(sql, this.env, now);
-        if (event.kind === MUTE_LIST_KIND) refreshMutes(sql, this.env, now);
+      if (event.pubkey === owner && event.kind === CONTACT_LIST_KIND) {
+        refreshFollows(sql, this.env, nowSeconds());
       }
       this.broadcast(result.stored);
       this.liveBroadcast(result.stored);

@@ -379,54 +379,45 @@ event already being stored/broadcast, not a new write. What it does add:
   get. Same read-only, rows-read cost as before, just one query instead
   of two.
 
-## NIP-51 mute list — write-revocation cache, same shape as ALLOW_FOLLOWS
+## NIP-51 mute list (added in v0.2.0, removed in v0.2.2)
 
-`refreshMutes` (ownership.ts) re-derives the `mutes` table (schema.ts)
-from the owner's own most recent kind-10000 event already stored on this
-relay, mirroring `refreshFollows` from chunk 4 exactly: same
-outbound-connection avoidance (no fetch from other relays — see CLAUDE.md
-"The budget"), same full delete-and-reinsert on every cron tick, same
-write cost shape (proportional to mute-list size, once per hourly cron
-tick, not per event). Called from `Relay.runCron()` alongside
-`refreshFollows`/`refreshProfile`, so it adds no new cron trigger.
+Mute-list-based write revocation existed for one release: a `mutes`
+table and cron/immediate-refresh logic mirroring ALLOW_FOLLOWS's follow
+cache. It was removed because a relay-level mute doesn't accomplish what
+it looks like it does — bothy is meant to be one of several relays in
+the owner's NIP-65 list, so blocking someone here never stopped the
+owner's client from seeing them via another relay; muting is a client
+concern, not a relay one. The removal drops the `mutes` table (via a
+one-time `DROP TABLE IF EXISTS` in `initSchema`) and adds no new cost of
+its own — see the v0.2.2 release notes for the full rationale.
 
-Unlike ALLOW_FOLLOWS, the mute check in `isAllowedWriter` is not gated by
-an env var — muting is a revocation mechanism the owner should always be
-able to rely on, not an opt-in feature. Only NIP-51's public mutes (plain
-`p` tags) are readable; private mutes are NIP-44-encrypted in `content`
-and this relay has no private key to decrypt them with, so they're
-silently ignored (see the comment on `refreshMutes`). This does not
-change the per-event write-cost formula and adds no new baseline to
-`docs/baselines.json`.
+## Immediate follow refresh on owner writes, and stats visibility
 
-## Immediate follow/mute refresh on owner writes, and stats visibility
-
-Previously `refreshFollows`/`refreshMutes` only ran on the hourly cron
-tick, so a follow the owner just added couldn't write for up to an hour,
-and a relay whose owner had never published a kind-3 here had a silently
+Previously `refreshFollows` only ran on the hourly cron tick, so a
+follow the owner just added couldn't write for up to an hour, and a
+relay whose owner had never published a kind-3 here had a silently
 empty allowlist with no visible signal. `relay.ts`'s `acceptEvent` now
-calls `refreshFollows`/`refreshMutes` right after a successfully stored
-event whose kind is 3/10000 *and* whose pubkey is the owner's — the same
-delete-and-reinsert `refreshFollows`/`refreshMutes` already do on cron,
-just triggered sooner. Gated on `event.pubkey === owner`, not just
-`event.kind`, so a follow's own kind-3 (reachable under ALLOW_FOLLOWS)
-can never be mistaken for the owner's and used to drive the refresh.
+calls `refreshFollows` right after a successfully stored kind-3 event
+whose pubkey is the owner's — the same delete-and-reinsert
+`refreshFollows` already does on cron, just triggered sooner. Gated on
+`event.pubkey === owner`, not just `event.kind`, so a follow's own
+kind-3 (reachable under ALLOW_FOLLOWS) can never be mistaken for the
+owner's and used to drive the refresh.
 
-Write-cost impact: none in the steady state. A contact list or mute list
-edit is a rare, human-paced event, not a per-note cost — the extra
+Write-cost impact: none in the steady state. A contact list edit is a
+rare, human-paced event, not a per-note cost — the extra
 delete-and-reinsert this triggers happens at most as often as the owner
-edits their follows or mutes, which is orders of magnitude less frequent
-than their regular note-publishing rate this project already budgets
-for. No new baseline is added to `docs/baselines.json`; the existing
+edits their follows, which is orders of magnitude less frequent than
+their regular note-publishing rate this project already budgets for. No
+new baseline is added to `docs/baselines.json`; the existing
 cron-triggered refresh already accounts for the same table's write cost,
 and this only changes *when* it fires, not the total volume over a day
 of normal use.
 
-`Relay.getStats()`/`GET /api/stats` also now report `writePolicy`
-("owner" | "follows"), `followCount`, `followsRefreshedAt`, and
-`muteCount` — four cheap `COUNT`/`MAX` reads over already-small tables,
-no new write cost. The admin page (`public/index.html`) renders these as
-a plain-language sentence rather than a bare number specifically so
-`writePolicy: "follows"` with `followCount: 0` — an enabled but
-functionally empty allowlist blocking every follow — is legible as a
-problem, not a healthy zero.
+`Relay.getStats()`/`GET /api/stats` also report `writePolicy` ("owner" |
+"follows"), `followCount`, and `followsRefreshedAt` — cheap `COUNT`/`MAX`
+reads over an already-small table, no new write cost. The admin page
+(`public/index.html`) renders these as a plain-language sentence rather
+than a bare number specifically so `writePolicy: "follows"` with
+`followCount: 0` — an enabled but functionally empty allowlist blocking
+every follow — is legible as a problem, not a healthy zero.

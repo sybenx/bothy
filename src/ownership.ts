@@ -6,10 +6,6 @@ import type { Profile } from "./profile-lookup";
 export const CONTACT_LIST_KIND = 3;
 // Kind-0 is NIP-01's profile metadata event.
 const PROFILE_KIND = 0;
-// Kind-10000 is NIP-51's mute list; its public `p` tags are readable
-// without decryption (see refreshMutes below). Exported for the same
-// immediate-refresh reason as CONTACT_LIST_KIND above.
-export const MUTE_LIST_KIND = 10000;
 
 // Icon refresh cadence (see refreshProfile below) -- at most once/day
 // regardless of how often the hourly cron fires.
@@ -72,28 +68,18 @@ export function getOwnerProfile(
 
 // Discriminated result for isAllowedWriter below, so callers (handleEvent
 // in relay.ts) can surface a rejection reason instead of a bare boolean --
-// an unclaimed relay, a muted pubkey, and a non-follow under follows mode
-// are different situations for the sender, even though they all end in
-// "you may not write here".
+// an unclaimed relay and a non-follow under follows mode are different
+// situations for the sender, even though they both end in "you may not
+// write here".
 export type WriteAuthorization =
   | { allowed: true }
-  | { allowed: false; reason: "unclaimed" | "muted" | "not-follow" | "owner-only" };
+  | { allowed: false; reason: "unclaimed" | "not-follow" | "owner-only" };
 
-// Owner writes are always allowed, and always override the mute list --
-// the owner can't lock themselves out by muting their own pubkey. Mutes
-// are checked before the follows lookup so a muted pubkey is rejected
-// even if it's also in the follow list. NOTE: this only covers the
-// owner-gated write path (handleEvent in relay.ts) -- it is deliberately
-// NOT wired into handleGiftWrap. NIP-59 gift wraps are signed by a random
-// one-time key, so there's no stable sender pubkey to check against a
-// mute list; adding a check there would be dead code implying a
-// protection that doesn't exist.
+// Owner writes are always allowed.
 export function isAllowedWriter(sql: SqlStorage, env: Env, pubkey: string): WriteAuthorization {
   const owner = getOwnerPubkey(sql, env);
   if (owner === null) return { allowed: false, reason: "unclaimed" };
   if (pubkey === owner) return { allowed: true };
-  const muted = sql.exec(`SELECT 1 FROM mutes WHERE pubkey = ?`, pubkey).toArray();
-  if (muted.length > 0) return { allowed: false, reason: "muted" };
   if (!allowFollowsEnabled(env)) return { allowed: false, reason: "owner-only" };
   const row = sql.exec(`SELECT 1 FROM follows WHERE pubkey = ?`, pubkey).toArray();
   return row.length > 0 ? { allowed: true } : { allowed: false, reason: "not-follow" };
@@ -127,44 +113,6 @@ export function refreshFollows(sql: SqlStorage, env: Env, nowSec: number): void 
   );
   for (const pubkey of follows) {
     sql.exec(`INSERT INTO follows (pubkey, fetched_at) VALUES (?, ?)`, pubkey, nowSec);
-  }
-}
-
-// Re-derives the mute cache from the owner's own most recent kind-10000
-// event already stored on this relay -- not a fresh fetch from other
-// relays, for the same outbound-connection reasons as refreshFollows
-// above. Unlike ALLOW_FOLLOWS, mutes are always checked regardless of any
-// env var -- muting is a revocation mechanism, not an opt-in feature.
-//
-// NIP-51 (nips/51.md) supports both public mutes (plain `p` tags) and
-// private mutes (NIP-44-encrypted inside `content`, decryptable only by
-// the list owner's own private key). This relay never holds the owner's
-// private key, so private mutes CANNOT be decrypted and are silently
-// ignored here -- only the public `p` tags are read. A future reader
-// should not assume the mute set this builds is complete; it's a
-// best-effort subset of what the owner has actually muted in their
-// client.
-export function refreshMutes(sql: SqlStorage, env: Env, nowSec: number): void {
-  const owner = getOwnerPubkey(sql, env);
-  if (owner === null) return;
-
-  const latest = sql
-    .exec<{ tags: string }>(
-      `SELECT tags FROM events WHERE pubkey = ? AND kind = ? ORDER BY created_at DESC LIMIT 1`,
-      owner,
-      MUTE_LIST_KIND,
-    )
-    .toArray()[0];
-
-  sql.exec(`DELETE FROM mutes`);
-  if (!latest) return;
-
-  const tags = JSON.parse(latest.tags) as string[][];
-  const mutes = new Set(
-    tags.filter((t) => t[0] === "p" && t[1]).map((t) => t[1] as string),
-  );
-  for (const pubkey of mutes) {
-    sql.exec(`INSERT INTO mutes (pubkey, fetched_at) VALUES (?, ?)`, pubkey, nowSec);
   }
 }
 

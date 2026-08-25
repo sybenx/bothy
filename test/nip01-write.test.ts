@@ -20,7 +20,6 @@ const STANDARD_PREFIXES = [
   "rate-limited",
   "invalid",
   "restricted",
-  "mute",
   "error",
 ];
 

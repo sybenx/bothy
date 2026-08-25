@@ -47,9 +47,8 @@ individual. Filters sort by what they need to know, and that ordering
 cuts across the rungs above:
 
 1. **Free** — derived from something the owner already published.
-   Follows (kind 3), mutes (kind 10000), trusted-provider declarations
-   (kind 10040). Read from local storage on the existing cron. No
-   outbound connection.
+   Follows (kind 3), trusted-provider declarations (kind 10040). Read
+   from local storage on the existing cron. No outbound connection.
 
 2. **Cheap** — derived from the event itself. Kind, size, p-tag, tag
    count, proof-of-work (NIP-13). Already in hand at validation time.
