@@ -1,105 +1,302 @@
-// Regression test for the v0.2.0 backfill_meta migration (schema.ts
-// initSchema). Every other test in this suite starts from a brand-new DO,
-// where the constructor's own initSchema call creates backfill_meta via
-// CREATE TABLE IF NOT EXISTS with exhaust_reset_applied already present --
-// the ALTER TABLE branch, and the pragma_table_info probe that guards it,
-// have never once executed under test. That is exactly the path a
-// pre-v0.2.0 deployment's storage takes on its next cold start (a second
-// initSchema call against a database that already has an old-shape
-// backfill_meta), and exactly the path this test reproduces.
+// Column reconciliation (src/schema.ts reconcileColumns/initSchema).
+//
+// These are written against the MECHANISM first and the real tables
+// second, and that ordering is the lesson rather than a style choice. The
+// previous version of this file tested exactly one table, backfill_meta,
+// and passed for weeks while `owner` was missing two columns and throwing
+// `no such column: profile_synced_at` on every cron tick in production. A
+// test shaped like one table cannot catch the next table. So the first
+// describe below exercises the reconciler on a table that exists only for
+// the test, and the second walks every real table's known historical
+// shape.
+//
+// All of this drops below the wire to real SqlStorage via
+// runInDurableObject, which is unavoidable here: every other suite starts
+// from an empty database, where CREATE TABLE writes every column and there
+// is nothing to migrate. Reproducing an old deployment means building an
+// old table by hand. Same documented exception as the others in
+// docs/test-notes.md.
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { resetWronglyExhaustedRelays } from "../src/backfill";
-import { initSchema } from "../src/schema";
+import { initSchema, reconcileColumns, TABLES, type TableSpec } from "../src/schema";
 import { isolateStorage } from "./helpers/isolate";
 
 isolateStorage();
 
-describe("initSchema migration from a pre-v0.2.0 database", () => {
-  it("adds exhaust_reset_applied via ALTER TABLE, and resetWronglyExhaustedRelays clears every flag without touching cursors", async () => {
-    const id = env.RELAY.idFromName("relay");
-    const stub = env.RELAY.get(id);
-    await runInDurableObject(stub, async (_instance, state) => {
-      const sql = state.storage.sql;
+async function withSql(fn: (sql: SqlStorage) => void | Promise<void>): Promise<void> {
+  const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+  await runInDurableObject(stub, async (_instance, state) => {
+    await fn(state.storage.sql);
+  });
+}
 
-      // Roll storage back to the pre-v0.2.0 shape: backfill_meta with only
-      // the old column set (status, total_stored, last_run_at), one row,
-      // status 'done' -- as the short-page exhaustion bug would have left
-      // it once every relay was wrongly flagged exhausted.
-      sql.exec(`DROP TABLE backfill_meta`);
-      sql.exec(`
-        CREATE TABLE backfill_meta (
-          status       TEXT NOT NULL DEFAULT 'pending',
-          total_stored INTEGER NOT NULL DEFAULT 0,
-          last_run_at  INTEGER
-        )
-      `);
-      sql.exec(`INSERT INTO backfill_meta (status, total_stored, last_run_at) VALUES ('done', 42, 999)`);
+function columnsOf(sql: SqlStorage, table: string): string[] {
+  return sql
+    .exec<{ name: string }>(`SELECT name FROM pragma_table_info(?)`, table)
+    .toArray()
+    .map((r) => r.name);
+}
 
-      // Several relays wrongly flagged exhausted, one genuinely still
-      // running with a real cursor -- backfill_relays' shape is unchanged
-      // across the migration, so this just seeds realistic pre-fix damage.
-      sql.exec(`DELETE FROM backfill_relays`);
-      sql.exec(
-        `INSERT INTO backfill_relays (relay_url, until_cursor, exhausted) VALUES (?, ?, 1)`,
-        "wss://relay-a",
-        1000,
-      );
-      sql.exec(
-        `INSERT INTO backfill_relays (relay_url, until_cursor, exhausted) VALUES (?, ?, 1)`,
-        "wss://relay-b",
-        2000,
-      );
-      sql.exec(
-        `INSERT INTO backfill_relays (relay_url, until_cursor, exhausted) VALUES (?, ?, 0)`,
-        "wss://relay-c",
-        3000,
-      );
+describe("reconcileColumns", () => {
+  // A table that exists only here, so this tests the reconciler rather
+  // than any particular schema decision. Deliberately missing several
+  // columns at once, of several shapes -- nullable, defaulted, and
+  // NOT NULL DEFAULT -- because real drift arrives in batches, not one
+  // column at a time.
+  const SPEC: TableSpec = {
+    name: "reconcile_fixture",
+    columns: [
+      { name: "id", definition: "TEXT PRIMARY KEY" },
+      { name: "already_here", definition: "TEXT" },
+      { name: "added_nullable", definition: "INTEGER" },
+      { name: "added_with_default", definition: "INTEGER NOT NULL DEFAULT 7" },
+      { name: "added_text_default", definition: "TEXT NOT NULL DEFAULT 'pending'" },
+    ],
+  };
 
-      // This is the call that, in production, only ever runs against a
-      // real pre-existing database -- every other test's DO starts empty,
-      // so this is the first time the ALTER TABLE branch (and the
-      // pragma_table_info probe guarding it) executes in workerd at all.
-      // If pragma_table_info is unavailable here, this throws, and that
-      // IS the production bug.
-      expect(() => initSchema(sql)).not.toThrow();
+  it("adds every missing column and leaves existing rows intact", async () => {
+    await withSql((sql) => {
+      sql.exec(`DROP TABLE IF EXISTS reconcile_fixture`);
+      sql.exec(`CREATE TABLE reconcile_fixture (id TEXT PRIMARY KEY, already_here TEXT)`);
+      sql.exec(`INSERT INTO reconcile_fixture (id, already_here) VALUES ('a', 'kept')`);
 
-      const hasColumn =
-        sql
-          .exec(`SELECT 1 FROM pragma_table_info('backfill_meta') WHERE name = 'exhaust_reset_applied'`)
-          .toArray().length > 0;
-      expect(hasColumn).toBe(true);
+      const added = reconcileColumns(sql, SPEC);
+      expect(added).toEqual(["added_nullable", "added_with_default", "added_text_default"]);
 
       const row = sql
-        .exec<{ exhaust_reset_applied: number; status: string }>(
-          `SELECT exhaust_reset_applied, status FROM backfill_meta`,
-        )
+        .exec<{
+          id: string;
+          already_here: string | null;
+          added_nullable: number | null;
+          added_with_default: number;
+          added_text_default: string;
+        }>(`SELECT * FROM reconcile_fixture`)
         .toArray()[0];
-      expect(row?.exhaust_reset_applied).toBe(0);
-      // initSchema's seed-if-missing INSERT must not have touched the
-      // pre-existing row.
-      expect(row?.status).toBe("done");
 
-      resetWronglyExhaustedRelays(sql);
+      // The row that was already there keeps its data and picks up each
+      // new column's declared default -- exactly what it would have had
+      // on a fresh database.
+      expect(row).toEqual({
+        id: "a",
+        already_here: "kept",
+        added_nullable: null,
+        added_with_default: 7,
+        added_text_default: "pending",
+      });
 
-      const relays = sql
-        .exec<{ relay_url: string; exhausted: number; until_cursor: number }>(
-          `SELECT relay_url, exhausted, until_cursor FROM backfill_relays ORDER BY relay_url`,
+      sql.exec(`DROP TABLE reconcile_fixture`);
+    });
+  });
+
+  it("is idempotent -- a second pass adds nothing", async () => {
+    await withSql((sql) => {
+      sql.exec(`DROP TABLE IF EXISTS reconcile_fixture`);
+      sql.exec(`CREATE TABLE reconcile_fixture (id TEXT PRIMARY KEY, already_here TEXT)`);
+      reconcileColumns(sql, SPEC);
+      expect(reconcileColumns(sql, SPEC)).toEqual([]);
+      sql.exec(`DROP TABLE reconcile_fixture`);
+    });
+  });
+
+  it("does nothing when the table does not exist yet", async () => {
+    await withSql((sql) => {
+      sql.exec(`DROP TABLE IF EXISTS reconcile_fixture`);
+      // CREATE TABLE declares every column on a fresh database, so there
+      // is nothing for the reconciler to do and it must not guess.
+      expect(reconcileColumns(sql, SPEC)).toEqual([]);
+    });
+  });
+
+  // SQLite cannot ADD COLUMN these shapes. Each must fail loudly at init
+  // rather than being skipped -- silently continuing past a column the
+  // code goes on to SELECT is precisely how the owner table broke.
+  const UNADDABLE = [
+    "TEXT PRIMARY KEY",
+    "TEXT UNIQUE",
+    "INTEGER NOT NULL",
+    "INTEGER NOT NULL DEFAULT NULL",
+    "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+    "TEXT REFERENCES events(id)",
+  ];
+
+  for (const definition of UNADDABLE) {
+    it(`throws rather than skipping a missing column declared as ${definition}`, async () => {
+      await withSql((sql) => {
+        sql.exec(`DROP TABLE IF EXISTS reconcile_fixture`);
+        sql.exec(`CREATE TABLE reconcile_fixture (id TEXT PRIMARY KEY)`);
+        expect(() =>
+          reconcileColumns(sql, {
+            name: "reconcile_fixture",
+            columns: [
+              { name: "id", definition: "TEXT PRIMARY KEY" },
+              { name: "impossible", definition },
+            ],
+          }),
+        ).toThrow(/cannot add reconcile_fixture\.impossible/);
+        sql.exec(`DROP TABLE reconcile_fixture`);
+      });
+    });
+  }
+
+  it("does not object to an unaddable column that is already present", async () => {
+    // Every real table declares a PRIMARY KEY. Those are created by
+    // CREATE TABLE and must never trip the addability check, or init
+    // would throw on every fresh database.
+    await withSql((sql) => {
+      sql.exec(`DROP TABLE IF EXISTS reconcile_fixture`);
+      sql.exec(`CREATE TABLE reconcile_fixture (id TEXT PRIMARY KEY)`);
+      expect(() =>
+        reconcileColumns(sql, {
+          name: "reconcile_fixture",
+          columns: [{ name: "id", definition: "TEXT PRIMARY KEY" }],
+        }),
+      ).not.toThrow();
+      sql.exec(`DROP TABLE reconcile_fixture`);
+    });
+  });
+
+});
+
+describe("initSchema against historical table shapes", () => {
+  // Each case rebuilds a real table as an older deployment actually had
+  // it, then runs the real initSchema over it. Adding a table here is the
+  // cost of adding a table to the schema.
+  const HISTORICAL: Array<{
+    table: string;
+    label: string;
+    create: string;
+    seed: string;
+    expectAdded: string[];
+  }> = [
+    {
+      table: "owner",
+      label: "pre-bc36cbf, before the profile-refresh columns",
+      // The shape that threw `no such column: profile_synced_at` on every
+      // cron tick, because these two columns were added to CREATE TABLE
+      // with no migration beside them.
+      create: `CREATE TABLE owner (pubkey TEXT NOT NULL, name TEXT, picture TEXT)`,
+      seed: `INSERT INTO owner (pubkey, name, picture) VALUES ('abc', 'Aaro', 'https://example.com/a.png')`,
+      expectAdded: ["about", "profile_synced_at", "icon_refreshed_at"],
+    },
+    {
+      table: "backfill_meta",
+      label: "pre-v0.2.1, before exhaust_reset_applied",
+      create: `CREATE TABLE backfill_meta (status TEXT NOT NULL DEFAULT 'pending', total_stored INTEGER NOT NULL DEFAULT 0, last_run_at INTEGER)`,
+      seed: `INSERT INTO backfill_meta (status, total_stored, last_run_at) VALUES ('done', 42, 999)`,
+      expectAdded: ["exhaust_reset_applied"],
+    },
+    {
+      table: "events",
+      label: "pre-v0.3.1, before ingested_at",
+      create: `CREATE TABLE events (id TEXT PRIMARY KEY, pubkey TEXT NOT NULL, created_at INTEGER NOT NULL, kind INTEGER NOT NULL, tags TEXT NOT NULL, content TEXT NOT NULL, sig TEXT NOT NULL, expiration INTEGER)`,
+      seed: `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig) VALUES ('e1', 'p1', 100, 1, '[]', 'hi', 's1')`,
+      expectAdded: ["ingested_at"],
+    },
+    {
+      table: "backfill_relays",
+      label: "pre-v0.3.2, before last_refusal",
+      create: `CREATE TABLE backfill_relays (relay_url TEXT PRIMARY KEY, until_cursor INTEGER NOT NULL, exhausted INTEGER NOT NULL DEFAULT 0)`,
+      seed: `INSERT INTO backfill_relays (relay_url, until_cursor, exhausted) VALUES ('wss://r', 500, 1)`,
+      expectAdded: ["last_refusal"],
+    },
+  ];
+
+  for (const { table, label, create, seed, expectAdded } of HISTORICAL) {
+    it(`brings ${table} (${label}) up to the declaration without losing rows`, async () => {
+      await withSql((sql) => {
+        sql.exec(`DROP TABLE ${table}`);
+        sql.exec(create);
+        sql.exec(seed);
+        const before = sql.exec(`SELECT COUNT(*) AS n FROM ${table}`).toArray()[0] as { n: number };
+
+        initSchema(sql);
+
+        const after = columnsOf(sql, table);
+        for (const column of expectAdded) {
+          expect(after).toContain(column);
+        }
+        // Every declared column, not just the ones this case names.
+        const declared = TABLES.find((t) => t.name === table)!.columns.map((c) => c.name);
+        expect(after.sort()).toEqual(declared.sort());
+        // The row that was there is still there. A migration that
+        // silently emptied a table would otherwise pass every column
+        // assertion above.
+        const stillThere = sql.exec(`SELECT COUNT(*) AS n FROM ${table}`).toArray()[0] as { n: number };
+        expect(stillThere.n).toBeGreaterThanOrEqual(before.n);
+      });
+    });
+  }
+
+  it("leaves the pre-bc36cbf owner row readable by the query that used to throw", async () => {
+    // The actual production symptom, reproduced end to end: this exact
+    // SELECT (ownership.ts refreshProfile) is what threw
+    // `no such column: profile_synced_at` every hour.
+    await withSql((sql) => {
+      sql.exec(`DROP TABLE owner`);
+      sql.exec(`CREATE TABLE owner (pubkey TEXT NOT NULL, name TEXT, picture TEXT)`);
+      sql.exec(`INSERT INTO owner (pubkey, name) VALUES ('abc', 'Aaro')`);
+
+      initSchema(sql);
+
+      const row = sql
+        .exec(`SELECT name, picture, about, profile_synced_at, icon_refreshed_at FROM owner LIMIT 1`)
+        .toArray()[0] as Record<string, unknown>;
+      expect(row.name).toBe("Aaro");
+      expect(row.profile_synced_at).toBeNull();
+      expect(row.icon_refreshed_at).toBeNull();
+    });
+  });
+
+  it("creates every declared table and column on a fresh database", async () => {
+    await withSql((sql) => {
+      for (const spec of TABLES) {
+        sql.exec(`DROP TABLE IF EXISTS ${spec.name}`);
+      }
+      initSchema(sql);
+      for (const spec of TABLES) {
+        expect(columnsOf(sql, spec.name).sort()).toEqual(spec.columns.map((c) => c.name).sort());
+      }
+    });
+  });
+
+  it("does not clobber a pre-existing single-row table with its seed INSERT", async () => {
+    // initSchema seeds backfill_meta and relay_meta when empty. On an
+    // upgrade those rows already exist and carry real state, so the seed
+    // must be a no-op -- overwriting them would silently reset an
+    // in-progress backfill to 'pending' on every cold start.
+    await withSql((sql) => {
+      sql.exec(`DROP TABLE backfill_meta`);
+      sql.exec(
+        `CREATE TABLE backfill_meta (status TEXT NOT NULL DEFAULT 'pending', total_stored INTEGER NOT NULL DEFAULT 0, last_run_at INTEGER)`,
+      );
+      sql.exec(`INSERT INTO backfill_meta (status, total_stored, last_run_at) VALUES ('done', 42, 999)`);
+
+      initSchema(sql);
+
+      const row = sql
+        .exec<{ status: string; total_stored: number; last_run_at: number; exhaust_reset_applied: number }>(
+          `SELECT status, total_stored, last_run_at, exhaust_reset_applied FROM backfill_meta`,
         )
         .toArray();
-      expect(relays.every((r) => r.exhausted === 0)).toBe(true);
-      expect(relays.find((r) => r.relay_url === "wss://relay-a")?.until_cursor).toBe(1000);
-      expect(relays.find((r) => r.relay_url === "wss://relay-b")?.until_cursor).toBe(2000);
-      expect(relays.find((r) => r.relay_url === "wss://relay-c")?.until_cursor).toBe(3000);
+      expect(row.length).toBe(1);
+      expect(row[0]?.status).toBe("done");
+      expect(row[0]?.total_stored).toBe(42);
+      expect(row[0]?.last_run_at).toBe(999);
+      // The newly added column takes its declared DEFAULT, which is what
+      // leaves the one-time exhaustion reset still pending rather than
+      // already-applied on a relay that never got to run it.
+      expect(row[0]?.exhaust_reset_applied).toBe(0);
+    });
+  });
 
-      const meta = sql
-        .exec<{ status: string; exhaust_reset_applied: number }>(
-          `SELECT status, exhaust_reset_applied FROM backfill_meta`,
-        )
-        .toArray()[0];
-      expect(meta?.status).toBe("running");
-      expect(meta?.exhaust_reset_applied).toBe(1);
+  it("is idempotent across repeated cold starts", async () => {
+    await withSql((sql) => {
+      initSchema(sql);
+      expect(() => initSchema(sql)).not.toThrow();
+      for (const spec of TABLES) {
+        expect(columnsOf(sql, spec.name).sort()).toEqual(spec.columns.map((c) => c.name).sort());
+      }
     });
   });
 });

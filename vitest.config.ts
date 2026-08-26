@@ -15,4 +15,14 @@ export default defineConfig({
       },
     }),
   ],
+  test: {
+    // Only this repo's own suite. Without an explicit include, vitest
+    // globs the whole working tree -- including .claude/worktrees/, where
+    // a background task's checkout carries its own copy of test/. Those
+    // files then run against THIS tree's wrangler config and bindings,
+    // mixing two checkouts and failing for reasons that have nothing to
+    // do with either. `npm run test` has to mean the same thing whether
+    // or not a worktree happens to exist.
+    include: ["test/**/*.test.ts"],
+  },
 });
