@@ -26,7 +26,6 @@
     padding: 0.5rem;
   }
   button { padding: 0.5rem 0.9rem; cursor: pointer; }
-  .relay-name { margin: 1.5rem 0 0; font-size: 0.9rem; }
   .refusal { margin: 0.25rem 0 0; font-size: 0.85rem; opacity: 0.7; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
   .stat.wide { grid-column: 1 / -1; }
   .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin: 1.5rem 0; }
@@ -83,12 +82,11 @@
 </div>
 
 <div id="claimed-view" hidden>
-  <p>Your relay is live at:</p>
+  <p><strong id="relay-name">-</strong> is live at:</p>
   <div class="url-row">
     <input id="ws-url" readonly />
     <button id="copy-btn">Copy</button>
   </div>
-  <p class="relay-name">Relay name: <strong id="relay-name">-</strong></p>
 
   <div class="stats">
     <div class="stat"><div class="n" id="stat-total">-</div><div class="label">events stored</div></div>
