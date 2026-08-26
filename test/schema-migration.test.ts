@@ -20,7 +20,9 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { initSchema, reconcileColumns, TABLES, type TableSpec } from "../src/schema";
+import { refreshProfile } from "../src/ownership";
 import { isolateStorage } from "./helpers/isolate";
+import { OWNER_PUBKEY_HEX } from "./helpers/keys";
 
 isolateStorage();
 
@@ -245,6 +247,41 @@ describe("initSchema against historical table shapes", () => {
       expect(row.name).toBe("Aaro");
       expect(row.profile_synced_at).toBeNull();
       expect(row.icon_refreshed_at).toBeNull();
+    });
+  });
+
+  it("re-derives `about` once profile_synced_at already predates it (the owner.about production gap)", async () => {
+    // owner.about was added to CREATE TABLE well after profile_synced_at
+    // and icon_refreshed_at already existed on deployed relays, so it
+    // landed NULL with profile_synced_at already non-null and no newer
+    // kind-0 to trigger refreshProfile's re-parse. Reproduce exactly that:
+    // an owner row with the pre-about columns already populated from a
+    // real cron run, a locally-stored kind-0 whose created_at is not
+    // newer than profile_synced_at, and about missing from the table.
+    await withSql((sql) => {
+      sql.exec(`DROP TABLE owner`);
+      sql.exec(
+        `CREATE TABLE owner (pubkey TEXT NOT NULL, name TEXT, picture TEXT, profile_synced_at INTEGER, icon_refreshed_at INTEGER)`,
+      );
+      sql.exec(
+        `INSERT INTO owner (pubkey, name, picture, profile_synced_at, icon_refreshed_at) VALUES (?, 'Aaro', 'https://example.com/a.png', 1000, 1000)`,
+        OWNER_PUBKEY_HEX,
+      );
+      sql.exec(
+        `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig) VALUES ('e1', ?, 1000, 0, '[]', ?, 's1')`,
+        OWNER_PUBKEY_HEX,
+        JSON.stringify({ name: "Aaro", picture: "https://example.com/a.png", about: "Aaro's relay" }),
+      );
+
+      initSchema(sql);
+      // icon_refreshed_at gates refreshProfile's whole body to at most
+      // once/day (ownership.ts), so `now` has to clear that window too --
+      // not just be newer than the kind-0's created_at -- or the re-parse
+      // this test exists to prove never runs at all.
+      refreshProfile(sql, env as unknown as Env, 1000 + 86400 + 1);
+
+      const row = sql.exec(`SELECT about FROM owner LIMIT 1`).toArray()[0] as { about: string | null };
+      expect(row.about).toBe("Aaro's relay");
     });
   });
 

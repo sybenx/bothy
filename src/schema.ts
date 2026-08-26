@@ -103,6 +103,17 @@ export interface ColumnSpec {
   // verbatim in ALTER TABLE ADD COLUMN as well. Keeping one string for
   // both is what makes the two paths incapable of disagreeing.
   readonly definition: string;
+  // Other columns in the same table to reset to NULL when THIS column is
+  // newly added to an existing database via ALTER TABLE (never on a fresh
+  // CREATE TABLE, where every column starts out consistent with each
+  // other). Use this when this column caches a value derived from another
+  // column's data via a "has the source changed since we last derived
+  // this" guard -- adding the new column leaves that guard holding a
+  // stale answer (the source hasn't changed) forever, since the guard has
+  // no way to know a brand-new derived field never got its first parse.
+  // Resetting the guard column forces exactly one re-derive on the next
+  // pass. See owner.about below for the motivating case.
+  readonly resetsOnAdd?: readonly string[];
 }
 
 export interface TableSpec {
@@ -110,8 +121,8 @@ export interface TableSpec {
   readonly columns: readonly ColumnSpec[];
 }
 
-function col(name: string, definition: string): ColumnSpec {
-  return { name, definition };
+function col(name: string, definition: string, resetsOnAdd?: readonly string[]): ColumnSpec {
+  return resetsOnAdd ? { name, definition, resetsOnAdd } : { name, definition };
 }
 
 export const TABLES: readonly TableSpec[] = [
@@ -174,7 +185,16 @@ export const TABLES: readonly TableSpec[] = [
       // resolveName/resolveDescription/resolveIcon.
       col("name", "TEXT"),
       col("picture", "TEXT"),
-      col("about", "TEXT"),
+      // `about` was added to this table after profile_synced_at already
+      // existed on deployed relays, so it landed NULL with no newer kind-0
+      // to trigger a re-parse -- ownership.ts refreshProfile's "is there a
+      // newer kind-0 than profile_synced_at" guard had no way to know a
+      // brand-new derived field never got its first parse, and the
+      // description fell through to the hardcoded default forever.
+      // resetsOnAdd forces exactly one re-parse on the next refreshProfile
+      // by clearing the guard the moment this column is actually added to
+      // an existing database.
+      col("about", "TEXT", ["profile_synced_at"]),
       // profile_synced_at/icon_refreshed_at back the icon-refresh cron
       // (ownership.ts refreshProfile): profile_synced_at is the
       // created_at of the locally-stored kind-0 the cached fields were
@@ -384,6 +404,11 @@ export function reconcileColumns(sql: SqlStorage, spec: TableSpec): string[] {
   if (present.size === 0) return [];
 
   const added: string[] = [];
+  // Collected rather than applied inline: a resetsOnAdd target may itself
+  // be a column this same pass is about to add later in `spec.columns`
+  // (owner.about resets profile_synced_at, which is declared after it),
+  // and an UPDATE against a column that doesn't exist yet fails outright.
+  const resets = new Set<string>();
   for (const column of spec.columns) {
     if (present.has(column.name)) continue;
     const refusal = whyNotAddable(column);
@@ -396,6 +421,12 @@ export function reconcileColumns(sql: SqlStorage, spec: TableSpec): string[] {
     }
     sql.exec(`ALTER TABLE ${spec.name} ADD COLUMN ${column.name} ${column.definition}`);
     added.push(column.name);
+    for (const resetColumn of column.resetsOnAdd ?? []) {
+      resets.add(resetColumn);
+    }
+  }
+  for (const resetColumn of resets) {
+    sql.exec(`UPDATE ${spec.name} SET ${resetColumn} = NULL`);
   }
   return added;
 }
