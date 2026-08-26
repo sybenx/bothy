@@ -35,6 +35,7 @@ describe("GET /api/stats", () => {
       events24h: expect.any(Number),
       storageBytes: expect.any(Number),
       rowsWrittenEstimate24h: expect.any(Number),
+      ingested24h: expect.any(Number),
       backfill: { status: "pending", totalStored: 0, relayCount: 0, exhaustedCount: 0 },
     });
     expect(body.totalEvents).toBeGreaterThanOrEqual(1);

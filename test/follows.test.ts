@@ -38,7 +38,7 @@ describe("ALLOW_FOLLOWS write gate", () => {
       // ownership.ts allowFollowsEnabled) immediately refreshes the
       // follow cache on an owner kind-3, defeating the point of this
       // test's explicit before/after refreshFollows assertions.
-      storeEvent(state.storage.sql, contacts);
+      storeEvent(state.storage.sql, contacts, Math.floor(Date.now() / 1000));
 
       expect(isAllowedWriter(state.storage.sql, FOLLOWS_ENV, friend.pubkeyHex).allowed).toBe(false);
 

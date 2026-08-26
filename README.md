@@ -128,7 +128,7 @@ The effective name also appears on the admin page, since NIP-86 has no `getrelay
 
 ## HTTP endpoints
 
-- `GET /api/stats` — relay stats for the admin page. Returns `{ claimed, ownerPubkey, totalEvents, events24h, storageBytes, rowsWrittenEstimate24h, backfill, icon, relayName, writePolicy, followCount, followsRefreshedAt }`.
+- `GET /api/stats` — relay stats for the admin page. Returns `{ claimed, ownerPubkey, totalEvents, events24h, ingested24h, storageBytes, rowsWrittenEstimate24h, backfill, icon, relayName, writePolicy, followCount, followsRefreshedAt }`. `events24h` counts events by their own timestamp, which is what you posted; `ingested24h` counts what this relay actually took in, backfill included. During a backfill those differ by orders of magnitude.
 - `POST /api/claim` — TOFU claim; body `{ pubkey }` (npub or hex). See "Ownership and lifecycle" above.
 - `GET /live` — unauthenticated, push-only WebSocket for the admin page's live feed (max 5 connections, 10-minute lifetime); sends `{ kind, created_at, id }` per stored event, never gift wraps.
 - Any path, with header `Accept: application/nostr+json` — the [NIP-11](https://github.com/nostr-protocol/nips/blob/master/11.md) relay information document.

@@ -46,6 +46,7 @@ import {
   eventExists,
   expirationOf,
   getRelaySettings,
+  countIngested24h,
   giftWrapCount,
   isDeleted,
   isIpBlocked,
@@ -329,7 +330,14 @@ export class Relay extends DurableObject<Env> {
     claimed: boolean;
     ownerPubkey: string | null;
     totalEvents: number;
+    // Events whose own created_at falls in the last 24h -- what the owner
+    // has been posting lately. NOT what this relay took in: a backfilled
+    // event is years old by created_at and lands here as zero. See
+    // ingested24h below, which is the other half of that sentence.
     events24h: number;
+    // Events this relay actually wrote in the last 24h, backfill
+    // included (storage.ts countIngested24h).
+    ingested24h: number;
     storageBytes: number;
     rowsWrittenEstimate24h: number;
     backfill: BackfillStatus | null;
@@ -375,6 +383,7 @@ export class Relay extends DurableObject<Env> {
       ownerPubkey: owner,
       totalEvents,
       events24h,
+      ingested24h: countIngested24h(sql, since),
       storageBytes: sql.databaseSize,
       rowsWrittenEstimate24h: estimateRowsWritten24h(sql, since),
       backfill: owner !== null ? getBackfillStatus(sql) : null,
@@ -670,7 +679,9 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
-    const result = storeEvent(sql, event);
+    // Wall-clock now, not event.created_at -- see schema.ts's
+    // `ingested_at` comment.
+    const result = storeEvent(sql, event, nowSeconds());
     if (event.kind === 5 && result.stored) {
       applyDeletion(sql, event);
     }

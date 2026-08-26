@@ -25,6 +25,36 @@
 // secondary scan is cheap. Do not add it without updating this comment
 // and re-justifying the write cost.
 //
+// `ingested_at` is the wall-clock second this relay wrote the row, which
+// is a different thing from `created_at`, the second the author says they
+// signed it. The distinction is the whole reason the column exists.
+// storage.ts estimateRowsWritten24h originally derived "rows written in
+// the last 24h" from `created_at`, which silently measured something
+// else: rows attributable to events *timestamped* in the last 24h. A
+// backfilled event carries its original timestamp, often years old, so
+// every row backfill wrote was invisible to that estimate -- it reported
+// 729 rows for a period Cloudflare measured at 33,000. That is bad on the
+// admin page and worse in backfill.ts hasBackfillHeadroom, which uses the
+// same number to decide whether backfill may write at all: the guard
+// protecting the daily write budget from backfill could not see
+// backfill's own writes.
+//
+// A column, not a counter table. docs/budget.md rejected a write-counter
+// row on the grounds that "a counter incremented on every stored event
+// would itself cost a row write per event, which directly fights the
+// thing the stats endpoint exists to make visible," and that reasoning
+// still holds. A column added to an INSERT this code already performs
+// costs zero additional rows written: a row write is a row, not a
+// column, and no index covers `ingested_at` (adding one would cost the
+// per-event row this approach exists to avoid). The per-event cost
+// stated above is unchanged.
+//
+// Existing deployments get NULL for rows written before the migration
+// below ran, and NULL never satisfies `> cutoff`. That undercounts for at
+// most the one 24h window straddling the upgrade, and then is exactly
+// right forever after. Deliberately not backfilled from `created_at`,
+// which would reintroduce the very conflation this column exists to end.
+//
 // `event_tags` only stores single-letter tag names because NIP-01 only
 // defines filtering via "#<single-letter>" — multi-character tags are
 // still stored verbatim in `events.tags` for the client, just never
@@ -44,14 +74,15 @@
 // a superseded version has no replay risk to guard against.
 export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS events (
-  id         TEXT PRIMARY KEY,
-  pubkey     TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
-  kind       INTEGER NOT NULL,
-  tags       TEXT NOT NULL,
-  content    TEXT NOT NULL,
-  sig        TEXT NOT NULL,
-  expiration INTEGER
+  id          TEXT PRIMARY KEY,
+  pubkey      TEXT NOT NULL,
+  created_at  INTEGER NOT NULL,
+  kind        INTEGER NOT NULL,
+  tags        TEXT NOT NULL,
+  content     TEXT NOT NULL,
+  sig         TEXT NOT NULL,
+  expiration  INTEGER,
+  ingested_at INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_pubkey_kind_created
@@ -202,6 +233,15 @@ export function initSchema(sql: SqlStorage): void {
       .toArray().length > 0;
   if (!hasResetMarker) {
     sql.exec(`ALTER TABLE backfill_meta ADD COLUMN exhaust_reset_applied INTEGER NOT NULL DEFAULT 0`);
+  }
+  // `events.ingested_at` was added in v0.3.1; an events table created
+  // before that predates the column and CREATE TABLE IF NOT EXISTS above
+  // is a no-op on it. Left NULL for existing rows on purpose -- see the
+  // column's comment above.
+  const hasIngestedAt =
+    sql.exec(`SELECT 1 FROM pragma_table_info('events') WHERE name = 'ingested_at'`).toArray().length > 0;
+  if (!hasIngestedAt) {
+    sql.exec(`ALTER TABLE events ADD COLUMN ingested_at INTEGER`);
   }
   // `owner.about` was added when NIP-86 gave the relay description a
   // kind-0 rung (nip11.ts resolveDescription); an owner table created

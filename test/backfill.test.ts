@@ -14,6 +14,7 @@ import {
 } from "../src/backfill";
 import { recordHost } from "../src/host";
 import { BACKFILL_ROWS_SHARE_LIMIT } from "../src/limits";
+import { countIngested24h, estimateRowsWritten24h } from "../src/storage";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
 import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
@@ -32,26 +33,113 @@ function eventRows(sql: SqlStorage, extra = ""): { id: string; kind: number; con
 // through storeEvent/signEvent so the test can push the rolling 24h
 // rows-written estimate over BACKFILL_ROWS_SHARE_LIMIT without actually
 // signing and storing tens of thousands of events.
-function insertSyntheticLiveRows(sql: SqlStorage, idPrefix: string, count: number, createdAt: number): void {
+// `ingestedAt` is what hasBackfillHeadroom actually measures (storage.ts
+// estimateRowsWritten24h), so these rows have to carry it -- setting only
+// created_at would make them invisible to the very guard this fixture
+// exists to push over its limit. Both are set to the same second here
+// because these stand in for the owner's own live writes, where the two
+// genuinely coincide; a backfilled row is the case where they do not.
+function insertSyntheticLiveRows(sql: SqlStorage, idPrefix: string, count: number, at: number): void {
   // Cloudflare's SqlStorage caps bound parameters per statement well
-  // below stock SQLite's default -- keep each batch's param count (7
+  // below stock SQLite's default -- keep each batch's param count (8
   // columns/row) comfortably under that.
   const BATCH = 10;
   let inserted = 0;
   while (inserted < count) {
     const batchCount = Math.min(BATCH, count - inserted);
-    const values = Array(batchCount).fill("(?, ?, ?, ?, ?, ?, ?, NULL)").join(", ");
+    const values = Array(batchCount).fill("(?, ?, ?, ?, ?, ?, ?, NULL, ?)").join(", ");
     const params: (string | number)[] = [];
     for (let i = 0; i < batchCount; i++) {
-      params.push(`${idPrefix}-${inserted + i}`, "f".repeat(64), createdAt, 1, "[]", "", "0".repeat(128));
+      params.push(`${idPrefix}-${inserted + i}`, "f".repeat(64), at, 1, "[]", "", "0".repeat(128), at);
     }
     sql.exec(
-      `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration) VALUES ${values}`,
+      `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at)
+       VALUES ${values}`,
       ...params,
     );
     inserted += batchCount;
   }
 }
+
+// Regression coverage for the write-accounting bug this guard depends on.
+// estimateRowsWritten24h used to filter on `created_at`, so a backfilled
+// event -- which carries the timestamp its author signed it with, often
+// years ago -- contributed nothing to the number that decides whether
+// backfill may keep writing. The guard protecting the daily write budget
+// from backfill could not see backfill's own writes. See schema.ts's
+// `ingested_at` comment.
+describe("backfill write accounting", () => {
+  // Two years before `now` below: comfortably outside any 24h window, and
+  // representative of what a real backfilled note carries.
+  const ANCIENT = 1_700_000_000;
+  const NOW = ANCIENT + 2 * 365 * 86400;
+
+  it("counts a backfilled event's rows against the write budget despite its years-old timestamp", async () => {
+    const oldNote = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 1,
+      content: "written years ago, ingested just now",
+      created_at: ANCIENT,
+    });
+
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      const since = NOW - 86400;
+      expect(estimateRowsWritten24h(sql, since)).toBe(0);
+
+      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [oldNote], true, NOW);
+      expect(result.stored).toBe(1);
+
+      // 3 rows for the event itself (base + implicit PK index +
+      // composite index, schema.ts) and none for tags, since this note
+      // carries none.
+      expect(estimateRowsWritten24h(sql, since)).toBe(3);
+
+      // The old behaviour, shown to be the wrong question rather than
+      // just a wrong number: by created_at this event is invisible in the
+      // window, which is exactly why it used to cost nothing.
+      const byTimestamp = sql
+        .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events WHERE created_at > ?`, since)
+        .toArray()[0]?.n;
+      expect(byTimestamp).toBe(0);
+      expect(countIngested24h(sql, since)).toBe(1);
+    });
+  });
+
+  it("counts tag rows too, at the same per-event cost the schema documents", async () => {
+    const reply = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 1,
+      content: "a reply, backfilled",
+      created_at: ANCIENT,
+      tags: [
+        ["e", "a".repeat(64)],
+        ["p", "b".repeat(64)],
+      ],
+    });
+
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [reply], true, NOW);
+      // 3 + 2 per indexed tag = 7, per schema.ts's write-cost comment.
+      expect(estimateRowsWritten24h(sql, NOW - 86400)).toBe(7);
+    });
+  });
+
+  it("stops counting an ingest once it falls out of the rolling window", async () => {
+    const oldNote = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "aged out", created_at: ANCIENT });
+
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [oldNote], true, NOW);
+      expect(estimateRowsWritten24h(sql, NOW - 86400)).toBe(3);
+      // A day and a half later the same row no longer counts against the
+      // budget -- the window rolls rather than accumulating forever.
+      expect(estimateRowsWritten24h(sql, NOW + 86400 / 2)).toBe(0);
+    });
+  });
+});
 
 describe("backfill ingest", () => {
   it("dedupes an event returned by more than one relay -- checked before signature verification", async () => {

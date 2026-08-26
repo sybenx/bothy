@@ -27,6 +27,7 @@
   }
   button { padding: 0.5rem 0.9rem; cursor: pointer; }
   .relay-name { margin: 1.5rem 0 0; font-size: 0.9rem; }
+  .stat.wide { grid-column: 1 / -1; }
   .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin: 1.5rem 0; }
   .stat { border: 1px solid #8884; border-radius: 0.5rem; padding: 0.75rem; }
   .stat .n { font-size: 1.3rem; font-weight: 600; }
@@ -90,12 +91,17 @@
 
   <div class="stats">
     <div class="stat"><div class="n" id="stat-total">-</div><div class="label">events stored</div></div>
-    <div class="stat"><div class="n" id="stat-24h">-</div><div class="label">events, last 24h</div></div>
+    <!-- Two different questions, deliberately shown side by side. "Received"
+         is what this relay did; "dated" is what you posted. During a backfill
+         they differ by orders of magnitude, and showing only the second one
+         made this page report single digits on a day it imported thousands. -->
+    <div class="stat"><div class="n" id="stat-ingested">-</div><div class="label">events received, last 24h</div></div>
+    <div class="stat"><div class="n" id="stat-24h">-</div><div class="label">events dated in the last 24h</div></div>
     <div class="stat">
       <div class="n" id="stat-storage">-</div><div class="label">storage used (5 GB free limit)</div>
       <div class="bar"><div id="bar-storage"></div></div>
     </div>
-    <div class="stat">
+    <div class="stat wide">
       <div class="n" id="stat-rows">-</div><div class="label">rows written, last 24h (100k/day free limit)</div>
       <div class="bar"><div id="bar-rows"></div></div>
     </div>
@@ -151,6 +157,7 @@ async function main() {
     document.getElementById("relay-name").textContent = stats.relayName;
 
     document.getElementById("stat-total").textContent = stats.totalEvents;
+    document.getElementById("stat-ingested").textContent = stats.ingested24h;
     document.getElementById("stat-24h").textContent = stats.events24h;
 
     const STORAGE_LIMIT = 5 * 1024 * 1024 * 1024;

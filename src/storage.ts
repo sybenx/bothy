@@ -40,10 +40,19 @@ export function expirationOf(event: NostrEvent): number | null {
   return Number.isInteger(value) ? value : null;
 }
 
-function insertEventRow(sql: SqlStorage, event: NostrEvent, expiration: number | null): void {
+// `ingestedAt` is wall-clock now, not event.created_at -- see schema.ts's
+// `ingested_at` comment for why the two must never be conflated. It is
+// one more column on an INSERT this function already performs, so it adds
+// zero rows written per event.
+function insertEventRow(
+  sql: SqlStorage,
+  event: NostrEvent,
+  expiration: number | null,
+  ingestedAt: number,
+): void {
   sql.exec(
-    `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     event.id,
     event.pubkey,
     event.created_at,
@@ -52,6 +61,7 @@ function insertEventRow(sql: SqlStorage, event: NostrEvent, expiration: number |
     event.content,
     event.sig,
     expiration,
+    ingestedAt,
   );
   // Only single-letter tag names are indexed (NIP-01 `#<letter>` filters
   // only ever query those), and only each tag's first value -- see
@@ -120,7 +130,7 @@ interface StoreResult {
 // relay.ts's caller broadcasts it live, but nothing here inserts a row
 // for it. Duplicate and already-expired checks happen before this is
 // called (relay.ts).
-export function storeEvent(sql: SqlStorage, event: NostrEvent): StoreResult {
+export function storeEvent(sql: SqlStorage, event: NostrEvent, ingestedAt: number): StoreResult {
   if (isEphemeralKind(event.kind)) {
     return { ok: true, message: "", stored: event };
   }
@@ -137,7 +147,7 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent): StoreResult {
       return { ok: true, message: "", stored: null };
     }
     if (existing) deleteEventRow(sql, existing.id);
-    insertEventRow(sql, event, expirationOf(event));
+    insertEventRow(sql, event, expirationOf(event), ingestedAt);
     return { ok: true, message: "", stored: event };
   }
 
@@ -155,7 +165,7 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent): StoreResult {
       return { ok: true, message: "", stored: null };
     }
     if (existing) deleteEventRow(sql, existing.id);
-    insertEventRow(sql, event, expirationOf(event));
+    insertEventRow(sql, event, expirationOf(event), ingestedAt);
     return { ok: true, message: "", stored: event };
   }
 
@@ -164,7 +174,7 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent): StoreResult {
   // kinds, writes are owner-only so permissiveness costs nothing, and
   // storing too much is recoverable while rejecting the owner's own
   // events is not.
-  insertEventRow(sql, event, expirationOf(event));
+  insertEventRow(sql, event, expirationOf(event), ingestedAt);
   return { ok: true, message: "", stored: event };
 }
 
@@ -333,13 +343,36 @@ export function queryFilter(sql: SqlStorage, filter: Filter, nowSec: number): No
 // backfill's headroom check calls this same function while the window
 // may also contain a large burst of live writes -- exactly the case this
 // query now has to hold up under.
+// Measured by `ingested_at` -- when this relay actually wrote the row --
+// and never by `created_at`, which is when the author says they signed
+// it. Filtering on created_at made this function report rows
+// attributable to events *timestamped* in the window, so backfill's
+// writes (carrying years-old timestamps) were invisible to it: 729
+// reported against 33,000 actually written. See schema.ts's
+// `ingested_at` comment for the full account.
+//
+// Still an estimate, and still named one. It counts the rows currently
+// standing for events ingested in the window, which is not quite the
+// same as every row written in it: a row written and then deleted inside
+// the same window drops out, and the deletion's own write, plus any
+// tombstone, is not counted. Both make this a floor rather than a
+// ceiling, which is the safe direction for the budget guard in
+// backfill.ts hasBackfillHeadroom -- it will never believe there is less
+// headroom than there is, only more, and the reserved-half rule
+// (BACKFILL_ROWS_SHARE_LIMIT) is what absorbs the difference.
+//
+// Rows read: one scan of `events` joined to `event_tags`. No index
+// covers `ingested_at` and none should -- an index here would cost a row
+// write per event, the exact thing this column was chosen to avoid. The
+// unindexed scan is what the created_at version already did, so the read
+// cost is unchanged.
 export function estimateRowsWritten24h(sql: SqlStorage, sinceCutoff: number): number {
   const rows = sql
     .exec<{ tag_count: number }>(
       `SELECT COUNT(t.event_id) AS tag_count
        FROM events e
        LEFT JOIN event_tags t ON t.event_id = e.id
-       WHERE e.created_at > ?
+       WHERE e.ingested_at > ?
        GROUP BY e.id`,
       sinceCutoff,
     )
@@ -350,6 +383,21 @@ export function estimateRowsWritten24h(sql: SqlStorage, sinceCutoff: number): nu
     total += 3 + 2 * r.tag_count;
   }
   return total;
+}
+
+// How many events this relay actually took in during the window,
+// regardless of how old they are. The companion to the events24h count in
+// relay.ts getStats, which counts by `created_at` and so answers a
+// genuinely different question: "how much did the owner post lately"
+// versus "how much did this relay do lately". During a backfill those two
+// numbers differ by orders of magnitude, and reporting only the first one
+// made the admin page claim 9 events on a day it ingested thousands.
+export function countIngested24h(sql: SqlStorage, sinceCutoff: number): number {
+  return (
+    sql
+      .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events WHERE ingested_at > ?`, sinceCutoff)
+      .toArray()[0]?.n ?? 0
+  );
 }
 
 // Multiple filters in one REQ are ORed (nips/01.md line 129) and

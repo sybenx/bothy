@@ -215,7 +215,11 @@ export function applyBackfillPage(
     if (event.pubkey === ownerPubkey && !eventExists(sql, event.id) && !isDeleted(sql, event.id)) {
       if (idMatchesContent(event) && verifySignature(event)) {
         try {
-          const result = storeEvent(sql, event);
+          // nowSec, not event.created_at -- a backfilled event's own
+          // timestamp is years old, and attributing its write cost to
+          // that timestamp is exactly the bug that made this function's
+          // own headroom guard blind to backfill. See schema.ts.
+          const result = storeEvent(sql, event, nowSec);
           // storeEvent's `stored` field means "broadcast-worthy," not
           // "a row now exists" -- for ephemeral kinds those diverge on
           // purpose (storage.ts: a row is never written, but the event is
