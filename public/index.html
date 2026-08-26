@@ -14,11 +14,7 @@
     padding: 0 1.25rem;
     line-height: 1.5;
   }
-  .brand { display: flow-root; }
-  h1 { display: inline-block; font-size: 1.4rem; margin: 0; }
-  .tagline { display: inline-block; margin: 0 0 0 0.6rem; font-size: 0.85rem; opacity: 0.7; }
-  .tagline a { color: inherit; }
-  .version-link { float: right; margin-left: 0.6rem; font-size: 0.85rem; opacity: 0.7; color: inherit; white-space: nowrap; }
+  h1 { font-size: 1.4rem; margin: 0 0 1rem; }
   .url-row { display: flex; gap: 0.5rem; align-items: center; }
   .url-row input {
     flex: 1;
@@ -72,17 +68,15 @@
     font-size: 0.85rem;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   }
+  footer { margin-top: 2rem; font-size: 0.8rem; opacity: 0.6; }
+  footer a { color: inherit; }
 </style>
 </head>
 <body>
-<div class="brand">
-  <a id="version" class="version-link" href="https://github.com/sybenx/bothy/releases" target="_blank" rel="noopener"></a>
-  <h1>bothy</h1>
-  <p class="tagline">personal nostr relay &middot; <a href="https://github.com/sybenx/bothy" target="_blank" rel="noopener">Get your own</a></p>
-</div>
+<h1 id="relay-name">bothy</h1>
 
 <div id="claimed-view" hidden>
-  <p><strong id="relay-name">-</strong> is live at:</p>
+  <p>live at:</p>
   <div class="url-row">
     <input id="ws-url" readonly />
     <button id="copy-btn">Copy</button>
@@ -133,6 +127,10 @@
   To start over, delete the Worker from the Cloudflare dashboard and deploy a fresh one. See the <a href="https://github.com/sybenx/bothy#readme" target="_blank" rel="noopener">README</a>.
 </p>
 
+<footer>
+  <a id="version-link" href="https://github.com/sybenx/bothy" target="_blank" rel="noopener"></a>
+</footer>
+
 <script>
 async function main() {
   const res = await fetch("/api/stats");
@@ -140,7 +138,15 @@ async function main() {
 
   document.getElementById("reset-note").hidden = false;
   setFavicon(stats.icon);
-  if (stats.version) document.getElementById("version").textContent = "v" + stats.version;
+  document.getElementById("version-link").textContent = "bothy" + (stats.version ? " v" + stats.version : "");
+
+  // Read side for NIP-86's changerelayname, which the spec gives no
+  // getrelayname to pair with. Resolved server-side through the same
+  // chain the NIP-11 document uses (src/nip11.ts resolveName), so this
+  // readout and that document always agree. Unclaimed relays resolve
+  // through the same chain and land on the hardcoded default, so the
+  // page is branded "bothy" until someone claims it.
+  document.getElementById("relay-name").textContent = stats.relayName;
 
   if (stats.claimed) {
     document.getElementById("claimed-view").hidden = false;
@@ -149,12 +155,6 @@ async function main() {
     document.getElementById("copy-btn").addEventListener("click", () => {
       navigator.clipboard.writeText(wsUrl);
     });
-
-    // Read side for NIP-86's changerelayname, which the spec gives no
-    // getrelayname to pair with. Resolved server-side through the same
-    // chain the NIP-11 document uses (src/nip11.ts resolveName), so this
-    // readout and that document always agree.
-    document.getElementById("relay-name").textContent = stats.relayName;
 
     document.getElementById("stat-total").textContent = stats.totalEvents;
     document.getElementById("stat-ingested").textContent = stats.ingested24h;
