@@ -5,6 +5,7 @@ import {
   type BackfillStatus,
   getBackfillStatus,
   hasBackfillHeadroom,
+  purgeSelfRelay,
   resetWronglyExhaustedRelays,
   seedBackfillRelays,
 } from "./backfill";
@@ -436,6 +437,11 @@ export class Relay extends DurableObject<Env> {
       // One-time correction for relays the pre-fix short-page exhaustion
       // heuristic wrongly retired -- see backfill.ts resetWronglyExhaustedRelays.
       resetWronglyExhaustedRelays(sql);
+      // Runs AFTER the reset, deliberately: the reset clears every
+      // exhausted flag including this relay's own row, so purging has to
+      // be what happens last or backfill would spend the next tick
+      // fetching its own history from itself. See purgeSelfRelay.
+      purgeSelfRelay(sql);
     } catch (err) {
       console.error(
         "runCron failed (DO-side):",

@@ -10,6 +10,7 @@ import {
   getBackfillStatus,
   hasBackfillHeadroom,
   resetWronglyExhaustedRelays,
+  purgeSelfRelay,
   seedBackfillRelays,
 } from "../src/backfill";
 import { recordHost } from "../src/host";
@@ -146,6 +147,142 @@ describe("backfill write accounting", () => {
 // backfill-worker.ts fetchPage discarded every non-EVENT/EOSE frame, so
 // both arrived as zero events and no EOSE. These assert the information
 // survives to somewhere a person can read it.
+// A relay can end up listed as a source of its own history: the owner's
+// kind-10002 legitimately names it, and seedBackfillRelays can only filter
+// it out once getOwnHost() is non-null -- which it is not on a fresh
+// deployment whose first cron tick beats its first inbound request. The
+// row is harmless while flagged exhausted and becomes nextRelay the moment
+// resetWronglyExhaustedRelays clears every flag.
+describe("purgeSelfRelay", () => {
+  const NOW = 1_800_000_000;
+  const OWN_HOST = "my-relay.example.workers.dev";
+
+  it("removes this relay's own row and leaves every other relay untouched", async () => {
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      recordHost(sql, OWN_HOST);
+      sql.exec(`DELETE FROM backfill_relays`);
+      // Seeded before the host was known, which is the whole scenario.
+      for (const [url, cursor] of [
+        [`wss://${OWN_HOST}/`, 1000],
+        ["wss://relay-a.example", 2000],
+        ["wss://relay-b.example", 3000],
+      ] as const) {
+        sql.exec(
+          `INSERT INTO backfill_relays (relay_url, until_cursor, exhausted) VALUES (?, ?, 0)`,
+          url,
+          cursor,
+        );
+      }
+
+      expect(purgeSelfRelay(sql)).toBe(1);
+
+      const left = sql
+        .exec<{ relay_url: string; until_cursor: number }>(
+          `SELECT relay_url, until_cursor FROM backfill_relays ORDER BY relay_url`,
+        )
+        .toArray();
+      expect(left.map((r) => r.relay_url)).toEqual(["wss://relay-a.example", "wss://relay-b.example"]);
+      // Cursors of the surviving relays are untouched -- purging one row
+      // must not disturb anyone else's progress.
+      expect(left.map((r) => r.until_cursor)).toEqual([2000, 3000]);
+      // And the relay that should be worked on next is a real one.
+      expect(getBackfillStatus(sql).nextRelay).toBe("wss://relay-a.example");
+    });
+  });
+
+  it("matches on host, not on the exact URL string", async () => {
+    // The kind-10002 tag and the recorded host will not be spelled the
+    // same way -- scheme, trailing slash and case all differ.
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      recordHost(sql, OWN_HOST);
+      sql.exec(`DELETE FROM backfill_relays`);
+      sql.exec(
+        `INSERT INTO backfill_relays (relay_url, until_cursor, exhausted) VALUES (?, ?, 0)`,
+        `wss://${OWN_HOST.toUpperCase()}`,
+        1000,
+      );
+      expect(purgeSelfRelay(sql)).toBe(1);
+      expect(sql.exec(`SELECT 1 FROM backfill_relays`).toArray().length).toBe(0);
+    });
+  });
+
+  it("purges the row the exhaustion reset just un-retired", async () => {
+    // The exact production sequence: a self row sitting flagged
+    // exhausted, resetWronglyExhaustedRelays clearing every flag, and the
+    // self row then sorting ahead of the relay with real history left.
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      recordHost(sql, "aaa-relay.example.workers.dev");
+      sql.exec(`DELETE FROM backfill_relays`);
+      sql.exec(
+        `INSERT INTO backfill_relays (relay_url, until_cursor, exhausted) VALUES ('wss://aaa-relay.example.workers.dev/', 1000, 1)`,
+      );
+      sql.exec(
+        `INSERT INTO backfill_relays (relay_url, until_cursor, exhausted) VALUES ('wss://zzz-real.example', 2000, 1)`,
+      );
+      sql.exec(`UPDATE backfill_meta SET exhaust_reset_applied = 0`);
+
+      resetWronglyExhaustedRelays(sql);
+      // Without the purge this is the bug: the relay's own URL is now
+      // what backfill would fetch from next.
+      expect(getBackfillStatus(sql).nextRelay).toBe("wss://aaa-relay.example.workers.dev/");
+
+      purgeSelfRelay(sql);
+      expect(getBackfillStatus(sql).nextRelay).toBe("wss://zzz-real.example");
+    });
+  });
+
+  it("does nothing while the host is still unknown", async () => {
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      sql.exec(`UPDATE relay_meta SET host = NULL`);
+      sql.exec(`DELETE FROM backfill_relays`);
+      sql.exec(`INSERT INTO backfill_relays (relay_url, until_cursor) VALUES ('wss://relay-a.example', 1000)`);
+      expect(purgeSelfRelay(sql)).toBe(0);
+      expect(sql.exec(`SELECT 1 FROM backfill_relays`).toArray().length).toBe(1);
+    });
+  });
+
+  it("marks backfill done when this relay was the only source listed", async () => {
+    // Nothing external to import. Leaving status at 'running' against an
+    // empty table would read as "still working" forever.
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      recordHost(sql, OWN_HOST);
+      sql.exec(`DELETE FROM backfill_relays`);
+      sql.exec(`UPDATE backfill_meta SET status = 'running'`);
+      sql.exec(
+        `INSERT INTO backfill_relays (relay_url, until_cursor) VALUES (?, ?)`,
+        `wss://${OWN_HOST}/`,
+        1000,
+      );
+      expect(purgeSelfRelay(sql)).toBe(1);
+      expect(getBackfillStatus(sql).status).toBe("done");
+    });
+  });
+
+  it("leaves an unseeded relay at 'pending' rather than calling it done", async () => {
+    // An empty table because discovery has not run yet is a different
+    // state from an empty table because everything in it was self.
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      recordHost(sql, OWN_HOST);
+      sql.exec(`DELETE FROM backfill_relays`);
+      sql.exec(`UPDATE backfill_meta SET status = 'pending'`);
+      expect(purgeSelfRelay(sql)).toBe(0);
+      expect(getBackfillStatus(sql).status).toBe("pending");
+    });
+  });
+});
+
 describe("backfill refusals", () => {
   const NOW = 1_800_000_000;
 

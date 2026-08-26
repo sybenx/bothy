@@ -305,6 +305,54 @@ export function applyBackfillPage(
   return { stored, exhausted };
 }
 
+// Removes any backfill_relays row pointing at this deployment itself, and
+// keeps removing it on every cron tick rather than only at seed time.
+//
+// seedBackfillRelays already filters the owner's own relay out of the
+// kind-10002 list -- but only `if (ownHost !== null)`, and the host is
+// learned from inbound traffic (src/host.ts), not known at deploy time.
+// On a fresh deployment whose first cron tick beats its first HTTP
+// request, that filter has nothing to compare against and the relay seeds
+// its own URL as a source of its own history. Every deployment is exposed
+// to that race, not just one that has already hit it.
+//
+// The row then sits flagged exhausted and harmless -- until
+// resetWronglyExhaustedRelays clears every flag unconditionally, at which
+// point it sorts first by URL for many host names and becomes `nextRelay`.
+// Backfill then spends its ticks fetching its own events from itself:
+// every event a duplicate, `stored` stuck at zero, the cursor still
+// advancing, and the relay that actually has history left waiting behind
+// it.
+//
+// Self-healing rather than a stricter guard at seed time, because the
+// host genuinely is unknowable then. The data to fix it arrives later and
+// was simply never consulted again; this consults it.
+export function purgeSelfRelay(sql: SqlStorage): number {
+  const ownHost = getOwnHost(sql);
+  if (ownHost === null) return 0;
+
+  const rows = sql.exec<{ relay_url: string }>(`SELECT relay_url FROM backfill_relays`).toArray();
+  let removed = 0;
+  for (const row of rows) {
+    if (normalizeHost(row.relay_url) === ownHost) {
+      sql.exec(`DELETE FROM backfill_relays WHERE relay_url = ?`, row.relay_url);
+      removed += 1;
+    }
+  }
+
+  // If this relay was the only source listed, there is no external
+  // history to import and status must say so -- otherwise it stays
+  // 'running' forever against an empty table, which reads as "still
+  // working" when nothing will ever happen again. Same conclusion
+  // seedBackfillRelays reaches when every listed write relay was this
+  // relay. Guarded on having actually removed something, so an empty
+  // table that simply has not been seeded yet keeps its 'pending'.
+  if (removed > 0 && sql.exec(`SELECT 1 FROM backfill_relays LIMIT 1`).toArray().length === 0) {
+    sql.exec(`UPDATE backfill_meta SET status = 'done'`);
+  }
+  return removed;
+}
+
 // One-time reset for relays wrongly marked exhausted by the pre-fix
 // short-page heuristic (a relay's own per-REQ cap, or a fetchPage
 // timeout/connection error, could each produce a short page that old
