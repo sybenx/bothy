@@ -413,13 +413,35 @@ export class Relay extends DurableObject<Env> {
   // empty list; already refreshed today), so this stays cheap on most
   // ticks.
   async runCron(): Promise<void> {
-    const sql = this.ctx.storage.sql;
-    const now = nowSeconds();
-    refreshFollows(sql, this.env, now);
-    refreshProfile(sql, this.env, now);
-    // One-time correction for relays the pre-fix short-page exhaustion
-    // heuristic wrongly retired -- see backfill.ts resetWronglyExhaustedRelays.
-    resetWronglyExhaustedRelays(sql);
+    // Logged here, DO-side, and not left to the Worker's own catch in
+    // src/index.ts scheduled(). A Durable Object exception does not
+    // reliably carry its message across the RPC boundary: the Worker's
+    // catch sees the call reject and logs "scheduled: runCron failed"
+    // followed by an empty message and a single stack frame at the await,
+    // which says only that something went wrong in here, not what. This
+    // catch runs on the side that still holds the real Error.
+    //
+    // It rethrows, deliberately: the Worker's fault isolation is what
+    // keeps a failure here from stopping backfill from ever running
+    // (src/index.ts scheduled()), and swallowing the error here would
+    // silently disable that. This adds a log line, not a behaviour
+    // change.
+    try {
+      const sql = this.ctx.storage.sql;
+      const now = nowSeconds();
+      refreshFollows(sql, this.env, now);
+      refreshProfile(sql, this.env, now);
+      // One-time correction for relays the pre-fix short-page exhaustion
+      // heuristic wrongly retired -- see backfill.ts resetWronglyExhaustedRelays.
+      resetWronglyExhaustedRelays(sql);
+    } catch (err) {
+      console.error(
+        "runCron failed (DO-side):",
+        err instanceof Error ? err.message : String(err),
+        err instanceof Error ? err.stack : "",
+      );
+      throw err;
+    }
   }
 
   // One-shot backfill (ROADMAP.md chunk 7), read side. Called once per
