@@ -141,6 +141,13 @@ function relayTagMatchesHost(tagValue: string, host: string): boolean {
 const RATE_LIMIT_WINDOW_MS = 10_000;
 const RATE_LIMIT_MAX_MESSAGES = 50;
 
+// RFC 6455 section 7.4.1: status codes an endpoint may never put in a
+// Close frame. The runtime reports them to describe how a connection
+// ended; sending one back is a protocol error and throws. See
+// webSocketClose below.
+const RESERVED_CLOSE_CODES = new Set([1005, 1006, 1015]);
+const NORMAL_CLOSURE = 1000;
+
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
 }
@@ -447,11 +454,12 @@ export class Relay extends DurableObject<Env> {
     relayUrl: string,
     rawEvents: unknown[],
     eose: boolean,
+    refusals: string[] = [],
   ): Promise<{ stored: number; exhausted: boolean } | null> {
     const sql = this.ctx.storage.sql;
     const owner = getOwnerPubkey(sql, this.env);
     if (owner === null) return null;
-    return applyBackfillPage(sql, owner, relayUrl, rawEvents, eose, nowSeconds());
+    return applyBackfillPage(sql, owner, relayUrl, rawEvents, eose, nowSeconds(), refusals);
   }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -943,7 +951,18 @@ export class Relay extends DurableObject<Env> {
     reason: string,
     _wasClean: boolean,
   ): Promise<void> {
-    ws.close(code, reason);
+    // RFC 6455 section 7.4.1 reserves 1005, 1006 and 1015: they exist to
+    // DESCRIBE how a connection ended and "MUST NOT be set as a status
+    // code in a Close frame by an endpoint." The runtime hands them to
+    // this method for exactly that descriptive purpose -- 1005 when the
+    // peer closed with no status, 1006 when it vanished without a close
+    // frame at all (a dropped connection, a killed tab, a phone leaving
+    // coverage), 1015 for a TLS failure -- so mirroring the code straight
+    // back threw `Invalid WebSocket close code` on every abnormal
+    // disconnect, which on a WebSocket relay is routine rather than
+    // exceptional. Mapped to 1000 (normal closure): this side is closing
+    // deliberately and cleanly in response, whatever happened to the peer.
+    ws.close(RESERVED_CLOSE_CODES.has(code) ? NORMAL_CLOSURE : code, reason);
   }
 
   override async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {

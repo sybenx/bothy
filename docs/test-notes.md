@@ -35,6 +35,8 @@ Notes for whoever implements chunk 3 against the chunk 2 conformance suite.
 
 - `test/nip86-management.test.ts`'s "still stores the value when an environment variable outranks it" case calls `handleManagementCall` directly against real `SqlStorage` with a hand-built `env`, the same exception `claim.test.ts` and `follows.test.ts` document above and for the same reason: the RELAY_NAME binding is fixed for the whole run by vitest.config.ts, so there is no wire path that reaches the state where an environment variable and a stored value are both set. Everything else about the management API is tested over real HTTP through the Worker.
 
+- `test/websocket-close.test.ts` calls `webSocketClose` on the Relay instance directly instead of closing a client socket, for the same reason the fixtures above drop below the wire: RFC 6455's reserved codes (1005/1006/1015) are equally illegal for a client to *send*, so no wire-level close can deliver one. The runtime synthesizes them when a peer disappears, and calling the handler is the only way to reproduce that.
+
 ## Running
 
 ```bash
