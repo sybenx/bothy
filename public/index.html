@@ -23,7 +23,6 @@
   }
   button { padding: 0.5rem 0.9rem; cursor: pointer; }
   .refusal { margin: 0.25rem 0 0; font-size: 0.85rem; opacity: 0.7; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
-  .stat.wide { grid-column: 1 / -1; }
   .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin: 1.5rem 0; }
   .stat { border: 1px solid #8884; border-radius: 0.5rem; padding: 0.75rem; }
   .stat .n { font-size: 1.3rem; font-weight: 600; }
@@ -84,31 +83,24 @@
 
   <div class="stats">
     <div class="stat"><div class="n" id="stat-total">-</div><div class="label">events stored</div></div>
-    <!-- Two different questions, deliberately shown side by side. "Received"
-         is what this relay did; "dated" is what you posted. During a backfill
-         they differ by orders of magnitude, and showing only the second one
-         made this page report single digits on a day it imported thousands. -->
     <div class="stat"><div class="n" id="stat-ingested">-</div><div class="label">events received, last 24h</div></div>
-    <div class="stat"><div class="n" id="stat-24h">-</div><div class="label">events dated in the last 24h</div></div>
     <div class="stat">
       <div class="n" id="stat-storage">-</div><div class="label">storage used (5 GB free limit)</div>
       <div class="bar"><div id="bar-storage"></div></div>
     </div>
-    <div class="stat wide">
+    <div class="stat">
       <div class="n" id="stat-rows">-</div><div class="label">rows written, last 24h (100k/day free limit)</div>
       <div class="bar"><div id="bar-rows"></div></div>
     </div>
   </div>
 
-  <h2>Write access</h2>
   <p id="write-policy-status">-</p>
 
-  <h2>Backfill</h2>
-  <p id="backfill-status">-</p>
+  <p id="backfill-status" hidden></p>
   <p id="backfill-refusal" class="refusal" hidden></p>
 
   <h2>Live feed</h2>
-  <p class="live-status" id="live-status">connecting&hellip;</p>
+  <p class="live-status" id="live-status" hidden></p>
   <ul id="live-list"></ul>
 </div>
 
@@ -158,7 +150,6 @@ async function main() {
 
     document.getElementById("stat-total").textContent = stats.totalEvents;
     document.getElementById("stat-ingested").textContent = stats.ingested24h;
-    document.getElementById("stat-24h").textContent = stats.events24h;
 
     const STORAGE_LIMIT = 5 * 1024 * 1024 * 1024;
     const ROWS_LIMIT = 100000;
@@ -196,6 +187,9 @@ function setBar(statId, barId, value, limit, label) {
   const pct = Math.min(100, (value / limit) * 100);
   const bar = document.getElementById(barId);
   bar.style.width = pct + "%";
+  // A non-zero value below ~1% renders at zero width in a narrow tile --
+  // give it a floor so the fill is visible instead of looking empty.
+  bar.style.minWidth = value > 0 ? "2px" : "0";
   bar.parentElement.classList.toggle("warn", pct > 80);
 }
 
@@ -236,28 +230,28 @@ function renderWritePolicyStatus(stats) {
 // backfill, which runs entirely on the Worker's cron trigger.
 function renderBackfillStatus(backfill) {
   const el = document.getElementById("backfill-status");
-  if (!backfill) {
-    el.textContent = "-";
-    return;
+  // Backfill describes a process, not a state -- once it's done there's
+  // nothing left to report, so the line disappears instead of parking on
+  // "done" forever.
+  el.hidden = !backfill || backfill.status === "done";
+  if (backfill && !el.hidden) {
+    const count = backfill.totalStored + (backfill.totalStored === 1 ? " event" : " events");
+    const lastRun = backfill.lastRunAt
+      ? " (last ran " + new Date(backfill.lastRunAt * 1000).toLocaleString() + ")"
+      : "";
+    switch (backfill.status) {
+      case "pending":
+        el.textContent = "looking for your relay list…";
+        break;
+      case "running":
+        el.textContent = count + " imported so far (" + backfill.exhaustedCount + "/" + backfill.relayCount + " relays done)" + lastRun;
+        break;
+      case "paused-budget":
+        el.textContent = count + " imported -- paused, resumes after today's write limit resets at 00:00 UTC" + lastRun;
+        break;
+    }
   }
-  const count = backfill.totalStored + (backfill.totalStored === 1 ? " event" : " events");
-  const lastRun = backfill.lastRunAt
-    ? " (last ran " + new Date(backfill.lastRunAt * 1000).toLocaleString() + ")"
-    : "";
-  switch (backfill.status) {
-    case "pending":
-      el.textContent = "looking for your relay list…";
-      break;
-    case "running":
-      el.textContent = count + " imported so far (" + backfill.exhaustedCount + "/" + backfill.relayCount + " relays done)" + lastRun;
-      break;
-    case "paused-budget":
-      el.textContent = count + " imported -- paused, resumes after today's write limit resets at 00:00 UTC" + lastRun;
-      break;
-    case "done":
-      el.textContent = count + " imported from your history -- done" + lastRun;
-      break;
-  }
+  if (!backfill) return;
 
   // What the next relay said instead of sending history. Shown as
   // received, because the whole point is that a relay refusing with
@@ -292,8 +286,11 @@ function wireLiveFeed() {
   let reconnectTimer = null;
   let stopped = false;
 
+  // "live" under a heading that already says "Live feed" tells nobody
+  // anything, so that state renders as nothing instead of a redundant line.
   function setStatus(text) {
-    statusEl.textContent = text;
+    statusEl.hidden = text === "live";
+    statusEl.textContent = statusEl.hidden ? "" : text;
   }
 
   function addRow(notice) {
