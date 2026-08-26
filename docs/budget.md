@@ -505,3 +505,44 @@ Phase two adds exactly the per-event lookup phase one deferred, and nothing else
 - **Both lookups are indexed** (`PRIMARY KEY` equality on `pubkey`), same shape as `blocked_ips` in phase one — no new secondary index was added, so the per-event write-cost formula in `schema.ts` is unchanged, and neither table is read more than once per event regardless of table size.
 - **No caching was added.** The two lookups above were shipped as plain `SqlStorage` reads rather than the in-memory caching `relay.ts`'s `rateLimits`/`giftWrapRateLimits` maps use elsewhere, on the reasoning that an unmeasured cache is itself unmeasured cost (cache invalidation logic, memory held across hibernation boundaries) traded for a savings that might not matter. The plan is to compare Durable Object metrics against the phase-one baseline above after this ships: if `banned_pubkeys`/`allowed_pubkeys` lookups show up as a meaningful jump in rows read, add an in-memory cache using the same pattern; if they don't, the plain reads stay.
 - **Both ban and allow entries accept npub or hex** (`nip86.ts pubkeyParam`, reusing `pubkey.ts normalizePubkey` — the same acceptance rule `POST /api/claim` already uses), normalized to hex before it ever reaches storage, so `isPubkeyBanned`/`isPubkeyAllowed`'s equality lookups never have to reason about two representations of the same key.
+
+## What one non-owner author can cost — bounding a follow's writes
+
+`ALLOW_FOLLOWS` shipped in v0.1.0 as an opt-in and became the default in v0.2.0. Every abuse cap in the project at that point — a byte cap, a storage cap, a per-IP throttle — was scoped to kind-1059 gift wraps, on a threat model with exactly one trusted author. Making follows the default moved hundreds of pubkeys onto the write path without moving any of those caps across, so an anonymous stranger sending mail was bounded three ways and someone the owner had merely followed was bounded by one thing: the per-IP message rate limit, 50 messages / 10 seconds.
+
+Two platform figures the arithmetic below needs, both from [developers.cloudflare.com/durable-objects/platform/limits/](https://developers.cloudflare.com/durable-objects/platform/limits/), checked 2026-08-25:
+
+- **Maximum received WebSocket message: 32 MiB.** Nothing near a size limit for a relay.
+- **Maximum SQLite row size: 2 MB.** This, and nothing in bothy, was what actually bounded a single event. It is a limit on what SQLite will store, not a defence — an event above it fails the insert, an event just under it succeeds.
+
+Against the measured 13 rows per stored event ([the corrected figure](#backfills-write-projection-was-wrong-by-26x-corrected-in-v033)) and the free tier's 100,000 rows-written/day and 5GB:
+
+```
+before: 300 events/min (50 msgs / 10s)
+        100,000 rows / 13 = 7,692 events  =>  25.6 minutes to exhaust the daily write budget
+          5 GiB / 2 MB    = 2,560 events  =>   8.5 minutes to fill storage, permanently
+```
+
+The second line is the one that mattered. Rows-written resets at midnight; stored bytes do not. Nine minutes of traffic from one followed pubkey could consume the entire storage ceiling for good, and it only cost a third of that day's write budget to do it.
+
+Three caps now bound that author, all enforced in `relay.ts acceptEvent` ahead of id and signature verification (chunk 5's cheapest-check-first ordering — a refused event must never pay for a schnorr verify):
+
+| | before | after |
+|---|---|---|
+| Bytes per event | ~2 MB (SQLite's row cap, not bothy's) | 64 KB (`MAX_EVENT_BYTES`), owner included |
+| Events/minute from one author | 300, and only while they keep one IP | 20 per **pubkey**, whatever their IP |
+| Time to exhaust 100,000 rows/day | 25.6 min | 6.4 h |
+| Storage one non-owner can consume | all 5 GB | 2.5 GB, then refused |
+| Time to consume it | 8.5 min | 5.3 days of sustained flooding |
+
+The last row is the daily write budget doing the work the storage cap doesn't have to: 7,692 events/day is the most anyone can store at all, and at 64KB each that is 481 MiB/day, so 2.5GB of non-owner content takes over five days of uninterrupted abuse to accumulate — five days during which it is visible on the admin page's storage bar and revocable with an unfollow or a NIP-86 `banpubkey`. And it stops there rather than continuing to 5GB.
+
+Cost of the three checks on the accept path, which is the reason they are ordered the way they are:
+
+- **Size** — one `JSON.stringify().length`, first of all. It bounds the cost of every check after it: `idMatchesContent` re-serializes and hashes the whole event, and `storeEvent` writes every byte of it.
+- **Per-pubkey rate** — a `Map` lookup. No storage read, no rows, so it costs nothing to enforce and nothing to persist. It resets when the object is evicted, which is honestly stated in `limits.ts` rather than papered over: the window it protects is the one where traffic is sustained enough to keep the object awake, which is the only window the cap exists for.
+- **Storage headroom** — `sql.databaseSize`, a property read `getStats` already makes. No new query type, no per-author byte accounting (which would cost a row write per event, exactly what `schema.ts`'s `ingested_at` column exists to avoid).
+
+None of the three adds a row write, a secondary index, or a query the relay wasn't already making. The per-event write cost formula in `schema.ts` is unchanged.
+
+Each is raisable or disablable by env var, because none of these ceilings apply on a paid plan — and each is disabled only by the exact string `off`, never by any truthy value, matching `ALLOW_FOLLOWS=false`. A safety cap should take a deliberate act to remove, not a typo.

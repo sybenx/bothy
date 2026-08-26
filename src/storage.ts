@@ -106,6 +106,16 @@ function deleteAndTombstone(sql: SqlStorage, id: string): void {
   sql.exec(`INSERT OR IGNORE INTO deleted_ids (id) VALUES (?)`, id);
 }
 
+// True while the database is still small enough to accept writes from
+// someone other than the owner -- see limits.ts NON_OWNER_STORAGE_SHARE_LIMIT
+// for why the threshold is measured against total size and what that
+// reserves. `limit` is passed in because it is env-overridable and the
+// caller (relay.ts acceptEvent) has already resolved it. `databaseSize`
+// is a property read, not a query -- getStats reads the same one.
+export function hasNonOwnerStorageHeadroom(sql: SqlStorage, limit: number): boolean {
+  return sql.databaseSize < limit;
+}
+
 // Current count of stored gift wraps -- backs the MAX_GIFT_WRAPS cap
 // (limits.ts) on the write path. A read against the 5,000,000/day
 // rows-read ceiling, not the rows-written one -- see CLAUDE.md "The

@@ -23,6 +23,7 @@ import {
   MAX_GIFT_WRAPS_PER_IP_PER_WINDOW,
   MAX_LIVE_FEED_CONNECTIONS,
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
+  nonOwnerStorageLimit,
   PUBKEY_RATE_LIMIT_MAX_TRACKED,
   PUBKEY_RATE_LIMIT_WINDOW_MS,
 } from "./limits";
@@ -52,6 +53,7 @@ import {
   getRelaySettings,
   countIngested24h,
   giftWrapCount,
+  hasNonOwnerStorageHeadroom,
   isDeleted,
   isIpBlocked,
   queryFilter,
@@ -771,6 +773,18 @@ export class Relay extends DurableObject<Env> {
     const eventCap = maxEventsPerPubkeyPerWindow(this.env);
     if (!isOwner && eventCap !== null && this.isPubkeyRateLimited(event.pubkey, eventCap)) {
       ok(ws, event.id, false, "rate-limited: too many events from this pubkey, slow down");
+      return;
+    }
+
+    // Storage headroom (limits.ts NON_OWNER_STORAGE_SHARE_LIMIT), non-owner
+    // only. Last of the three abuse caps and still ahead of id/signature
+    // verification: `databaseSize` is a property read, cheaper than the
+    // tombstone query below and far cheaper than schnorr. The owner keeps
+    // writing at any size -- reserving the remaining half FOR the owner is
+    // the entire point, so applying it to them would invert it.
+    const storageLimit = nonOwnerStorageLimit(this.env);
+    if (!isOwner && storageLimit !== null && !hasNonOwnerStorageHeadroom(sql, storageLimit)) {
+      ok(ws, event.id, false, "blocked: relay storage is full for writers other than the owner");
       return;
     }
 

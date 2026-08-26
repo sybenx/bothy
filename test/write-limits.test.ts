@@ -8,7 +8,8 @@
 // pubkeys while every abuse cap in the project was still scoped to
 // kind-1059 gift wraps. Each scenario below is named for the abuse it
 // refuses, not for the constant it reads.
-import { describe, expect, it, vi } from "vitest";
+import { env } from "cloudflare:workers";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MAX_EVENT_BYTES, MAX_EVENTS_PER_PUBKEY_PER_WINDOW } from "../src/limits";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
@@ -174,6 +175,67 @@ describe("per-pubkey write throttle", () => {
     );
 
     expect(replies.every(([ok]) => ok)).toBe(true);
+    conn.close();
+  });
+});
+
+// The reserved-share threshold is 2.5GB by default, which no test is
+// going to reach by writing events. It is exercised through its own env
+// override instead -- lowering the threshold and raising the database
+// past it are the same condition from the check's point of view, and the
+// override is a documented, supported configuration rather than a test
+// hook. The DO reads `this.env` from the same object the test mutates.
+const mutableEnv = env as unknown as Record<string, string | undefined>;
+
+describe("non-owner storage headroom", () => {
+  afterEach(() => {
+    delete mutableEnv.NON_OWNER_STORAGE_BYTES;
+  });
+
+  it("refuses a follow's write once storage passes the reserved share, while the owner still writes", async () => {
+    const conn = await connectRelay("203.0.113.50");
+    const friend = await addFollow(conn);
+
+    // One byte of headroom, so any real database is already past it.
+    mutableEnv.NON_OWNER_STORAGE_BYTES = "1";
+
+    const fromFriend = signEvent(friend.secretKeyHex, { kind: 1, content: "no room" });
+    const [, , friendOk, message] = await publish(conn, fromFriend);
+    expect(friendOk).toBe(false);
+    expect(message.startsWith("blocked:")).toBe(true);
+
+    // Same relay, same instant, same storage level: the whole point of
+    // reserving the remaining share is that the owner keeps writing.
+    const fromOwner = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "still mine" });
+    const [, , ownerOk] = await publish(conn, fromOwner);
+    expect(ownerOk).toBe(true);
+    conn.close();
+  });
+
+  it("lets the follow write again once the cap is raised", async () => {
+    // Proves the refusal above is the storage check and not some other
+    // rejection the follow happened to trip on.
+    const conn = await connectRelay("203.0.113.51");
+    const friend = await addFollow(conn);
+
+    mutableEnv.NON_OWNER_STORAGE_BYTES = "1";
+    const blocked = signEvent(friend.secretKeyHex, { kind: 1, content: "blocked" });
+    expect((await publish(conn, blocked))[2]).toBe(false);
+
+    delete mutableEnv.NON_OWNER_STORAGE_BYTES;
+    const allowed = signEvent(friend.secretKeyHex, { kind: 1, content: "allowed" });
+    expect((await publish(conn, allowed))[2]).toBe(true);
+    conn.close();
+  });
+
+  it("stops refusing when the cap is disabled outright", async () => {
+    const conn = await connectRelay("203.0.113.52");
+    const friend = await addFollow(conn);
+
+    mutableEnv.NON_OWNER_STORAGE_BYTES = "off";
+    const note = signEvent(friend.secretKeyHex, { kind: 1, content: "uncapped" });
+
+    expect((await publish(conn, note))[2]).toBe(true);
     conn.close();
   });
 });

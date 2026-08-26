@@ -63,6 +63,7 @@ The deploy button only asks for a project name. Everything else is an optional v
 | `RELAY_NAME` / `RELAY_DESCRIPTION` / `RELAY_ICON` | Set the NIP-11 name/description/icon. These outrank anything set through the management API, which in turn outranks your kind-0 profile — see "Relay management API" below for the full order. |
 | `MAX_EVENT_BYTES` | Largest event this relay will accept, JSON-serialized, for everyone including you. Defaults to `65536` (64KB) — generous for any real note, including long-form. Raise it to a number, or set it to `off` to remove the cap. |
 | `MAX_EVENTS_PER_PUBKEY_PER_MINUTE` | How fast any one non-owner pubkey may publish. Defaults to `20`/minute — far above human posting rates, slow enough that a runaway follow takes hours rather than minutes to spend the daily write budget. You are never throttled. Raise it to a number, or set it to `off`. |
+| `NON_OWNER_STORAGE_BYTES` | Point at which writes from anyone but you are refused, reserving what's left of the 5GB free-tier ceiling for your own archive. Defaults to `2684354560` (half). Raise it to a number, or set it to `off`. |
 | `ALLOW_FOLLOWS` | On by default: writes from your kind-3 follow list are accepted. The cache updates immediately when you publish a new contact list to this relay; hourly cron is just the fallback for when it arrived some other way. Set to `false` to disable and go back to owner-only writes. |
 
 If your Worker is connected to a GitHub repo, Cloudflare may sync `wrangler.jsonc`'s config on every deploy, which can overwrite a variable you added in the dashboard by hand — worth knowing if a dashboard-added variable seems to reset after a deploy.
@@ -82,6 +83,8 @@ Reading them back is restricted to you: an unauthenticated query for gift wraps 
 By default, bothy accepts events from two kinds of author: you (the owner), and the people you follow. Not strangers. It works by reading the follow list (kind 3) you've already published — bothy doesn't ask you to maintain a separate allowlist, it just uses the one your nostr client already keeps.
 
 Why this is the default rather than a limitation: bothy is meant to be one of the 2-4 relays your NIP-65 relay list already tells clients to keep, not your only relay. Pair it with a permissive public relay and you get both — your own filtered archive of people you actually follow, plus a general-purpose inbox that already does the spam filtering you'd otherwise have to build yourself. A reply from someone you don't follow isn't lost; it still lands on your other relay, and on the sender's own.
+
+Following someone is not unlimited trust. Anyone writing here is capped at 64KB per event and 20 events a minute, and writes from anyone but you stop once the relay is half full — so an account that gets compromised or goes haywire slows to something you'll notice and can revoke (unfollow, or `banpubkey` through the management API) long before it can fill your storage or spend a day's write budget. All three limits are adjustable; see "Configuration" above.
 
 If you'd rather bothy only ever accept your own writes, set `ALLOW_FOLLOWS=false` (see "Configuration" above). NIP-11 advertises `restricted_writes: true` either way, so well-behaved clients know not to bother trying before they publish.
 

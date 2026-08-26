@@ -45,8 +45,13 @@ export function clampFilterLimit(filter: Filter): Filter {
 // then bounded only by the per-IP message rate limit in relay.ts: at 300
 // messages/minute and the measured 13 rows/event (docs/budget.md), about
 // 26 minutes to exhaust the daily rows-written ceiling, and -- far worse,
-// because storage does not reset daily -- an afternoon to fill 5GB
-// permanently with events of unbounded size.
+// because storage does not reset daily -- under ten minutes to fill the
+// free tier's whole 5GB permanently. Nothing in this codebase bounded an
+// event's size; the only thing that did was SQLite's own 2MB maximum row
+// size (developers.cloudflare.com/durable-objects/platform/limits/,
+// checked 2026-08-25), which is a limit on what can be stored, not a
+// defence. 5GB / 2MB is 2,560 events, and 2,560 events at 300/minute is
+// eight and a half minutes. See docs/budget.md for the full before/after.
 //
 // Each cap is raisable or disablable through an environment variable
 // (see resolveLimit below), since none of these ceilings apply on a paid
@@ -243,6 +248,44 @@ export const BACKFILL_PAGE_SIZE = 128;
 // profile-lookup.ts's LOOKUP_TIMEOUT_MS shape, scoped to backfill so a
 // slow/unreachable relay can't stall the whole cron invocation.
 export const BACKFILL_FETCH_TIMEOUT_MS = 8000;
+
+// Cloudflare Workers Free's SQLite storage ceiling per Durable Object
+// (5GB -- developers.cloudflare.com/durable-objects/platform/limits/,
+// checked 2026-08-25; the same number public/index.html draws its storage
+// bar against). Named here because the reserved share below needs the
+// actual figure to reason about.
+export const STORAGE_BYTES_LIMIT = 5 * 1024 * 1024 * 1024;
+
+// Non-owner writes stop once the database passes this size, reserving
+// what's left for the owner. Same shape and same reasoning as
+// hasBackfillHeadroom (backfill.ts), which already reserves half the
+// daily write budget on exactly this argument: the relay exists to hold
+// the owner's own archive, so nothing else may consume the last of a
+// ceiling the owner still needs.
+//
+// Half, mirroring BACKFILL_ROWS_SHARE_LIMIT below -- simple to reason
+// about, and the guarantee it buys is stated exactly: at the moment
+// non-owner writes start being refused, at least 2.5GB of the ceiling is
+// still free for the owner.
+//
+// Note what this measures -- total database size, not the non-owner share
+// of it. Attributing stored bytes per author would mean either a running
+// per-pubkey total (a row write per event, the cost schema.ts's
+// `ingested_at` column exists to avoid) or a scan; `sql.databaseSize` is
+// a property read that getStats already makes, so this check costs no new
+// query type at all. The tradeoff is that the owner's own data counts
+// toward the threshold that cuts off everyone else, which is the correct
+// direction: it is the owner's remaining headroom being protected, and
+// it should shrink as they use it.
+//
+// This is the cap that actually stops permanent exhaustion. MAX_EVENT_BYTES
+// bounds what one event costs and the per-pubkey throttle bounds the rate;
+// only this one bounds the total.
+export const NON_OWNER_STORAGE_SHARE_LIMIT = STORAGE_BYTES_LIMIT / 2;
+
+export function nonOwnerStorageLimit(env: Env): number | null {
+  return resolveLimit(env.NON_OWNER_STORAGE_BYTES, NON_OWNER_STORAGE_SHARE_LIMIT);
+}
 
 // Cloudflare Workers Free's daily rows-written ceiling (CLAUDE.md "The
 // budget"). Named here, not just left as the bare `100000` already
