@@ -306,20 +306,20 @@ event already being stored/broadcast, not a new write. What it does add:
   (`env.RELAY.get(id).ingestBackfillPage(...)`, the same mechanism
   `claim()`/`getStats()` already use) counts as one such invocation, not
   as a fetch subject to the Worker's own limit. At the chunk 3 baseline of
-  ~1.1ms/schnorr-verify, `BACKFILL_PAGE_SIZE = 200` (limits.ts) costs
-  roughly 220ms of DO CPU per ingest call — under 1% of the DO's own
-  budget, nowhere near a constraint. This directly changed the design:
+  ~1.1ms/schnorr-verify, a `BACKFILL_PAGE_SIZE` in the low hundreds
+  (limits.ts) costs roughly 150–220ms of DO CPU per ingest call — under 1%
+  of the DO's own budget, nowhere near a constraint. This directly changed the design:
   the original plan assumed small (~10-event) batches to stay under a
   10ms ceiling that turns out not to apply here.
 - **The real constraint is rows-written, not CPU**, so `BACKFILL_PAGE_SIZE`
   is instead sized against the 100,000 rows-written/day ceiling: one page
   from exactly one relay per hourly cron tick (`runBackfillTick` fetches a
   single `nextRelay`, not one page per relay — `getBackfillStatus` hands
-  back only one relay to work on at a time), worst case `200 events * ~5
-  rows/event * 24 ticks/day ≈ 24,000 rows/day` from backfill alone —
-  comfortably under the ceiling with room left for the owner's own live
-  traffic, which this feature must not crowd out (ROADMAP.md chunk 7:
-  "Rate-limited under the daily write budget").
+  back only one relay to work on at a time). **The arithmetic here was
+  wrong from the start and is corrected in the v0.3.3 note at the end of
+  this document** — it assumed ~5 rows/event, where real backfilled history
+  measures 13.0, and the resulting page size overran the reserved share
+  rather than fitting inside it.
 - **Backfill reuses `storeEvent` (storage.ts) rather than reimplementing
   storage semantics**, so replaceable/addressable/ephemeral handling is
   identical to the live write path by construction: several old versions
@@ -451,3 +451,45 @@ What the estimate still does not count: a row written and then deleted inside th
 Existing deployments carry NULL in `ingested_at` for every row written before the migration, and NULL never satisfies `> cutoff`. That undercounts for at most the single 24h window straddling the upgrade, and is exact thereafter. Backfilling the column from `created_at` would have reintroduced the exact conflation being removed.
 
 The admin page changed alongside it. `events24h` counts by `created_at` and now says so — "events dated in the last 24h" — and a second figure, "events received, last 24h", reports what the relay actually ingested. Previously the page carried two headline numbers that both understated the same day's work: 9 events and 729 rows, on a day that saw thousands of events and 33,000 rows.
+
+## Backfill's write projection was wrong by 2.6x (corrected in v0.3.3)
+
+The chunk 7 note above sized `BACKFILL_PAGE_SIZE` against an assumed **~5 rows per stored event**. That number was never measured; it was carried over from the gift-wrap estimate, where a NIP-59 wrap really does carry a single `p` tag. Real backfilled history does not look like that.
+
+The first honest measurement was only possible after v0.3.1, because until then `estimateRowsWritten24h` filtered on `created_at` and could not see a single row backfill wrote. One tick, immediately after that fix landed:
+
+```
+204 events ingested,  2,642 rows written        (/api/stats)
+  4 of those were live writes accounting for 42 rows
+=> 200 backfilled events, 2,600 rows
+=> 13.0 rows per backfilled event
+```
+
+Which reconciles exactly against the per-event cost at the top of `schema.ts`:
+
+```
+13 = 3 base rows + 2 x 5 indexed tags
+```
+
+A real note carries about five single-letter tags — `e` and `p` on replies, plus the rest — not the one or two the old estimate assumed. So the projection was off by a factor of 2.6, and in the direction that matters:
+
+| | rows/event | worst case/day | vs. the 50,000 reserved share |
+|---|---|---|---|
+| assumed | 5 | 24,000 | 48% |
+| measured | 13 | **62,400** | **125%** |
+
+Backfill was sized to overrun its own reserved half by a quarter. It only ever got away with it because the guard meant to stop it — `hasBackfillHeadroom`, which calls the same broken estimate — was equally blind. Two errors that cancelled: an under-projection nobody could check, and a guard that could not see what it was guarding.
+
+Fixing the accounting removed the cancellation. With the guard working, the old page size would not have exceeded the ceiling; it would have tripped the reserved-share limit partway through each day and stalled backfill until the window rolled. Correct behaviour from a correct guard, and a bad way to run a backfill.
+
+**The guard was not changed. The page size was.** `BACKFILL_PAGE_SIZE` drops 200 → 128, sized so the daily worst case lands at about 80% of the reserved share:
+
+```
+128 events x 13 rows x 24 ticks/day = 39,936 rows/day   (80% of 50,000)
+```
+
+The remaining 20% is deliberate margin, not slack: it absorbs history heavier than the measured average, up to ~16 rows/event (about 6.5 indexed tags) before the projection would reach the share at all. Beyond that the guard throttles, which is now the correct outcome rather than a silent overrun.
+
+Backfill gets slower — 128 events/hour instead of 200, about 3,000/day — and that is the right trade. Backfill is a one-shot job that runs unattended for as long as the owner's history requires; the owner's own live writes are not.
+
+The lesson worth keeping: this constant was justified in a comment, in prose, with arithmetic, and was still wrong, because the input to the arithmetic was assumed rather than measured. The comment now shows its measurement and where it came from.

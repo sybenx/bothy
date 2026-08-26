@@ -95,15 +95,42 @@ export const LIVE_FEED_MAX_LIFETIME_MS = 10 * 60 * 1000;
 // Object's own CPU allowance, which defaults to 30 seconds per incoming
 // request/RPC call (developers.cloudflare.com/durable-objects/platform/limits/,
 // checked 2026-08-22) -- at the ~1.1ms/schnorr-verify baseline
-// (docs/baselines.json), even this page size costs ~220ms of DO CPU,
-// nowhere near that ceiling. So CPU is not what bounds this number.
+// (docs/baselines.json), this page size costs ~140ms of DO CPU, nowhere
+// near that ceiling. So CPU is not what bounds this number.
 // What does: backfill runs unattended, for as long as the owner's
 // history requires, and must not crowd out the owner's own live writes
-// against the shared 100,000 rows-written/day ceiling. At ~5 rows/event
-// and one page from exactly one relay per hourly cron tick, worst case is
-// 200 * 5 * 24 = 24,000 rows/day from backfill alone -- see
-// docs/budget.md chunk 7 note.
-export const BACKFILL_PAGE_SIZE = 200;
+// against the shared 100,000 rows-written/day ceiling.
+//
+// This number was originally derived from an assumed ~5 rows per stored
+// event, which was wrong. Measured against real backfilled history (200
+// events ingested in one tick, 2,600 rows written -- the first honest
+// figure available, since the rows-written estimate itself was measuring
+// the wrong clock until v0.3.1):
+//
+//   13.0 rows per backfilled event
+//     = 3 base rows + 2 * 5 indexed tags   (see schema.ts)
+//
+// A real note carries roughly five single-letter tags -- `e` and `p` on
+// replies, plus the rest -- not the one or two the old estimate assumed.
+// At the old page size that projects to:
+//
+//   200 events * 13 rows * 24 ticks/day = 62,400 rows/day
+//
+// which is 125% of BACKFILL_ROWS_SHARE_LIMIT below. Backfill was sized to
+// overrun its own reserved half, and only ever got away with it because
+// hasBackfillHeadroom was measuring by created_at and so could not see a
+// single row backfill wrote. Now that the guard works, the old page size
+// would simply throttle backfill most of the way through each day rather
+// than pacing it -- the guard is right and the page size was wrong.
+//
+// Sized so the daily worst case lands at ~80% of the reserved share,
+// leaving headroom for history heavier than the measured average:
+//
+//   128 events * 13 rows * 24 ticks/day = 39,936 rows/day  (80% of 50,000)
+//
+// The remaining margin absorbs up to ~16 rows/event (about 6.5 indexed
+// tags) before the projection would reach the share at all.
+export const BACKFILL_PAGE_SIZE = 128;
 
 // How long the Worker's cron tick keeps one outbound backfill socket open
 // waiting for EOSE before giving up for this tick -- mirrors
