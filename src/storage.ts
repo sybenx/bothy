@@ -547,3 +547,79 @@ export function setRelaySetting(sql: SqlStorage, key: "name" | "description" | "
     value,
   );
 }
+
+// ---------------------------------------------------------------------
+// NIP-86 phase two (src/nip86.ts): banpubkey/unbanpubkey/listbannedpubkeys
+// and allowpubkey/unallowpubkey/listallowedpubkeys. Unlike everything else
+// in this section, isPubkeyBanned and isPubkeyAllowed below DO run on the
+// per-event write path (ownership.ts isAllowedWriter) -- see schema.ts for
+// the cost accounting.
+// ---------------------------------------------------------------------
+
+export interface BannedPubkey {
+  pubkey: string;
+  reason: string | null;
+}
+
+export function banPubkey(sql: SqlStorage, pubkey: string, reason: string | null, nowSec: number): void {
+  sql.exec(
+    `INSERT INTO banned_pubkeys (pubkey, reason, banned_at) VALUES (?, ?, ?)
+       ON CONFLICT(pubkey) DO UPDATE SET reason = excluded.reason, banned_at = excluded.banned_at`,
+    pubkey,
+    reason,
+    nowSec,
+  );
+}
+
+export function unbanPubkey(sql: SqlStorage, pubkey: string): void {
+  sql.exec(`DELETE FROM banned_pubkeys WHERE pubkey = ?`, pubkey);
+}
+
+export function listBannedPubkeys(sql: SqlStorage): BannedPubkey[] {
+  return sql
+    .exec<{ pubkey: string; reason: string | null }>(
+      `SELECT pubkey, reason FROM banned_pubkeys ORDER BY banned_at DESC`,
+    )
+    .toArray();
+}
+
+// The write-path check -- one indexed lookup per non-owner write, run
+// before the follows check (ownership.ts isAllowedWriter) so a banned
+// pubkey is refused even if it is also a follow.
+export function isPubkeyBanned(sql: SqlStorage, pubkey: string): boolean {
+  return sql.exec(`SELECT 1 FROM banned_pubkeys WHERE pubkey = ?`, pubkey).toArray().length > 0;
+}
+
+export interface AllowedPubkey {
+  pubkey: string;
+  reason: string | null;
+}
+
+export function allowPubkey(sql: SqlStorage, pubkey: string, reason: string | null, nowSec: number): void {
+  sql.exec(
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at) VALUES (?, ?, ?)
+       ON CONFLICT(pubkey) DO UPDATE SET reason = excluded.reason, allowed_at = excluded.allowed_at`,
+    pubkey,
+    reason,
+    nowSec,
+  );
+}
+
+export function unallowPubkey(sql: SqlStorage, pubkey: string): void {
+  sql.exec(`DELETE FROM allowed_pubkeys WHERE pubkey = ?`, pubkey);
+}
+
+export function listAllowedPubkeys(sql: SqlStorage): AllowedPubkey[] {
+  return sql
+    .exec<{ pubkey: string; reason: string | null }>(
+      `SELECT pubkey, reason FROM allowed_pubkeys ORDER BY allowed_at DESC`,
+    )
+    .toArray();
+}
+
+// The write-path check -- ownership.ts isAllowedWriter only calls this on
+// the path already about to reject a write (owner-only mode, or "not a
+// follow"), so it costs nothing on the common accept path.
+export function isPubkeyAllowed(sql: SqlStorage, pubkey: string): boolean {
+  return sql.exec(`SELECT 1 FROM allowed_pubkeys WHERE pubkey = ?`, pubkey).toArray().length > 0;
+}

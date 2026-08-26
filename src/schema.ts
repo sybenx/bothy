@@ -296,6 +296,30 @@ export const TABLES: readonly TableSpec[] = [
     name: "relay_settings",
     columns: [col("key", "TEXT PRIMARY KEY"), col("value", "TEXT NOT NULL")],
   },
+  {
+    // NIP-86 banpubkey/unbanpubkey/listbannedpubkeys (src/nip86.ts,
+    // "phase two" -- docs/budget.md). Unlike banned_events, this table IS
+    // read on the per-event write path: ownership.ts isAllowedWriter
+    // checks it for every non-owner write, before the follows lookup, so
+    // a banned pubkey is refused even if it also appears in the owner's
+    // follow list. That +1 indexed read per non-owner write is exactly
+    // the cost phase one deferred this feature to avoid paying without a
+    // measured baseline first.
+    name: "banned_pubkeys",
+    columns: [col("pubkey", "TEXT PRIMARY KEY"), col("reason", "TEXT"), col("banned_at", "INTEGER NOT NULL")],
+  },
+  {
+    // NIP-86 allowpubkey/unallowpubkey/listallowedpubkeys (src/nip86.ts).
+    // A manual allowlist, distinct from both banned_pubkeys and the
+    // ALLOW_FOLLOWS-derived `follows` table: it grants write access to a
+    // specific pubkey the owner does not follow (or, with follows
+    // disabled entirely, to anyone the owner names individually).
+    // ownership.ts isAllowedWriter only consults this table on the path
+    // already about to reject a write, so it costs nothing on the common
+    // accept path (owner, or an existing follow).
+    name: "allowed_pubkeys",
+    columns: [col("pubkey", "TEXT PRIMARY KEY"), col("reason", "TEXT"), col("allowed_at", "INTEGER NOT NULL")],
+  },
 ];
 
 // Exactly two secondary indexes, and adding a third multiplies the
