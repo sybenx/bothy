@@ -4,20 +4,34 @@
 // the Worker by the time anything here is called, and nothing here opens
 // an outbound connection.
 //
-// Phase one deliberately implements only the methods that cost nothing on
-// the per-event write path. banpubkey/allowpubkey and their list methods
-// are absent because enforcing them means a pubkey lookup per incoming
-// event; supportedmethods reports exactly what is here, which is what
-// makes a partial implementation conformant rather than broken.
+// Phase one deliberately implemented only the methods that cost nothing
+// on the per-event write path. banpubkey/allowpubkey and their list
+// methods (phase two, docs/budget.md) are the one addition that costs a
+// per-event lookup, added only once a metrics baseline existed to compare
+// against. bothy pairs each with its own inverse (unbanpubkey,
+// unallowpubkey) for symmetry with blockip/unblockip, rather than
+// overloading allowpubkey to mean both "grant write access" and "lift a
+// ban" the way allowevent lifts a banevent tombstone -- banned_pubkeys and
+// allowed_pubkeys are two independent lists, not opposite ends of one.
+// supportedmethods reports exactly what is here, which is what makes a
+// partial implementation conformant rather than broken.
 import {
   allowEvent,
+  allowPubkey,
   banEvent,
+  banPubkey,
   blockIp,
+  listAllowedPubkeys,
   listBannedEvents,
+  listBannedPubkeys,
   listBlockedIps,
   setRelaySetting,
+  unallowPubkey,
+  unbanPubkey,
   unblockIp,
 } from "./storage";
+import { getOwnerPubkey } from "./ownership";
+import { normalizePubkey } from "./pubkey";
 
 // nips/86.md: "a JSON-RPC-like request-response protocol over HTTP, on
 // the same URI as the relay's websocket", distinguished by this
@@ -45,6 +59,12 @@ export const SUPPORTED_METHODS = [
   "banevent",
   "allowevent",
   "listbannedevents",
+  "banpubkey",
+  "unbanpubkey",
+  "listbannedpubkeys",
+  "allowpubkey",
+  "unallowpubkey",
+  "listallowedpubkeys",
   "blockip",
   "unblockip",
   "listblockedips",
@@ -75,6 +95,15 @@ function stringParam(params: unknown[], index: number): string | null {
 function optionalReason(params: unknown[], index: number): string | null {
   const value = params[index];
   return typeof value === "string" && value !== "" ? value : null;
+}
+
+// Accepts npub or hex, same as the relay's own claim endpoint (CLAUDE.md
+// "Configuration": "Accept npub1..., and hex, normalize to hex at the
+// boundary, store hex only") -- an operator reaching for these methods
+// most naturally has an npub in hand, not the hex form.
+function pubkeyParam(params: unknown[], index: number): string | null {
+  const value = params[index];
+  return typeof value === "string" ? normalizePubkey(value) : null;
 }
 
 // The advisory note every successful change* call carries back in the
@@ -166,6 +195,51 @@ export function handleManagementCall(
 
     case "listbannedevents":
       return { result: listBannedEvents(sql) };
+
+    case "banpubkey": {
+      const pubkey = pubkeyParam(params, 0);
+      if (pubkey === null) return err("banpubkey takes a pubkey, as npub or 64-character hex");
+      // The one invariant this method can never be allowed to violate --
+      // see ownership.ts isAllowedWriter, which trusts that a banned
+      // pubkey is never the owner and so never checks for that case on
+      // the write path itself.
+      if (pubkey === getOwnerPubkey(sql, env)) {
+        return err("banpubkey: the relay owner's own pubkey can never be banned");
+      }
+      banPubkey(sql, pubkey, optionalReason(params, 1), nowSec);
+      return { result: true };
+    }
+
+    case "unbanpubkey": {
+      const pubkey = pubkeyParam(params, 0);
+      if (pubkey === null) return err("unbanpubkey takes a pubkey, as npub or 64-character hex");
+      unbanPubkey(sql, pubkey);
+      return { result: true };
+    }
+
+    case "listbannedpubkeys":
+      return { result: listBannedPubkeys(sql) };
+
+    // A manual allowlist, independent of banned_pubkeys -- see the header
+    // comment above. Grants write access to a pubkey the owner doesn't
+    // follow (or, with ALLOW_FOLLOWS off, to anyone named individually)
+    // without opening writes more broadly.
+    case "allowpubkey": {
+      const pubkey = pubkeyParam(params, 0);
+      if (pubkey === null) return err("allowpubkey takes a pubkey, as npub or 64-character hex");
+      allowPubkey(sql, pubkey, optionalReason(params, 1), nowSec);
+      return { result: true };
+    }
+
+    case "unallowpubkey": {
+      const pubkey = pubkeyParam(params, 0);
+      if (pubkey === null) return err("unallowpubkey takes a pubkey, as npub or 64-character hex");
+      unallowPubkey(sql, pubkey);
+      return { result: true };
+    }
+
+    case "listallowedpubkeys":
+      return { result: listAllowedPubkeys(sql) };
 
     case "blockip": {
       const ip = stringParam(params, 0);

@@ -14,7 +14,7 @@ import { isAllowedWriter, refreshFollows } from "../src/ownership";
 import { isolateStorage } from "./helpers/isolate";
 import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
 import { publish, connectRelay } from "./helpers/socket";
-import { storeEvent } from "../src/storage";
+import { allowPubkey, banPubkey, storeEvent } from "../src/storage";
 
 isolateStorage();
 
@@ -80,6 +80,45 @@ describe("ALLOW_FOLLOWS write gate", () => {
     const stub = env.RELAY.get(id);
     await runInDurableObject(stub, async (_instance, state) => {
       expect(isAllowedWriter(state.storage.sql, NO_FOLLOWS_ENV, OWNER_PUBKEY_HEX).allowed).toBe(true);
+    });
+  });
+});
+
+describe("NIP-86 banpubkey/allowpubkey write gate (phase two)", () => {
+  it("a banned pubkey is rejected even if it is also a follow, with reason 'banned'", async () => {
+    const friend = randomKeypair();
+    const contacts = signEvent(OWNER_SECRET_KEY_HEX, { kind: 3, tags: [["p", friend.pubkeyHex]] });
+
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      storeEvent(sql, contacts, now);
+      refreshFollows(sql, FOLLOWS_ENV, now);
+      expect(isAllowedWriter(sql, FOLLOWS_ENV, friend.pubkeyHex).allowed).toBe(true);
+
+      // Also allowlisted -- the ban must still win, since banned_pubkeys
+      // is checked before both the follows lookup and allowed_pubkeys.
+      banPubkey(sql, friend.pubkeyHex, "no", now);
+      allowPubkey(sql, friend.pubkeyHex, "yes", now);
+
+      const auth = isAllowedWriter(sql, FOLLOWS_ENV, friend.pubkeyHex);
+      expect(auth.allowed).toBe(false);
+      expect(auth).toMatchObject({ reason: "banned" });
+    });
+  });
+
+  it("an explicitly allowlisted pubkey can write even with ALLOW_FOLLOWS off", async () => {
+    const friend = randomKeypair().pubkeyHex;
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      expect(isAllowedWriter(sql, NO_FOLLOWS_ENV, friend).allowed).toBe(false);
+
+      allowPubkey(sql, friend, "manual grant", Math.floor(Date.now() / 1000));
+      expect(isAllowedWriter(sql, NO_FOLLOWS_ENV, friend).allowed).toBe(true);
     });
   });
 });

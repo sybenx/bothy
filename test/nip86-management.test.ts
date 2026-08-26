@@ -8,7 +8,7 @@ import { describe, expect, it } from "vitest";
 import { handleManagementCall, SELF_BLOCK_CONFIRMATION, SUPPORTED_METHODS } from "../src/nip86";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
-import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX } from "./helpers/keys";
+import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
 import { callManagement } from "./helpers/management";
 import { connectRelay, publish } from "./helpers/socket";
 
@@ -31,16 +31,7 @@ describe("supportedmethods", () => {
     // implementation is just a broken one -- a client that trusts this
     // list will call whatever is in it.
     const listed = (await callManagement("supportedmethods")).result as string[];
-    for (const absent of [
-      "listeventsneedingmoderation",
-      "allowkind",
-      "disallowkind",
-      "listallowedkinds",
-      "banpubkey",
-      "allowpubkey",
-      "listbannedpubkeys",
-      "listallowedpubkeys",
-    ]) {
+    for (const absent of ["listeventsneedingmoderation", "allowkind", "disallowkind", "listallowedkinds"]) {
       expect(listed).not.toContain(absent);
     }
   });
@@ -153,6 +144,108 @@ describe("banevent / allowevent / listbannedevents", () => {
       expect(reply.result).toBeUndefined();
       expect(reply.error).toContain("hex event id");
     }
+  });
+});
+
+describe("banpubkey / unbanpubkey / listbannedpubkeys", () => {
+  it("rejects a pubkey that is neither npub nor 64-character hex", async () => {
+    const reply = await callManagement("banpubkey", ["not-a-pubkey"]);
+    expect(reply.result).toBeUndefined();
+    expect(reply.error).toContain("pubkey");
+  });
+
+  it("refuses to ban the relay owner's own pubkey", async () => {
+    const reply = await callManagement("banpubkey", [OWNER_PUBKEY_HEX]);
+    expect(reply.result).toBeUndefined();
+    expect(reply.error).toContain("owner");
+    expect((await callManagement("listbannedpubkeys")).result).toEqual([]);
+  });
+
+  it("refuses to ban the owner's pubkey given as npub, too", async () => {
+    // bech32("npub", OWNER_PUBKEY_HEX) -- see test/claim.test.ts.
+    const ownerNpub = "npub17vjpx0uj7gp4xlxhl8z0rncs0qpqzkg3rgvy27qfec7pr9gdsl4suwp7ea";
+    const reply = await callManagement("banpubkey", [ownerNpub]);
+    expect(reply.result).toBeUndefined();
+    expect(reply.error).toContain("owner");
+  });
+
+  it("bans a pubkey and lists it with the reason given", async () => {
+    const stranger = randomKeypair().pubkeyHex;
+    const ban = await callManagement("banpubkey", [stranger, "spammer"]);
+    expect(ban.result).toBe(true);
+    expect((await callManagement("listbannedpubkeys")).result).toEqual([{ pubkey: stranger, reason: "spammer" }]);
+  });
+
+  it("unbanpubkey removes it from the list", async () => {
+    const stranger = randomKeypair().pubkeyHex;
+    await callManagement("banpubkey", [stranger]);
+    const unban = await callManagement("unbanpubkey", [stranger]);
+    expect(unban.result).toBe(true);
+    expect((await callManagement("listbannedpubkeys")).result).toEqual([]);
+  });
+
+  it("refuses a write from a banned pubkey even though it is also a follow", async () => {
+    const friend = randomKeypair();
+    const contacts = signEvent(OWNER_SECRET_KEY_HEX, { kind: 3, tags: [["p", friend.pubkeyHex]] });
+
+    const conn = await connectRelay();
+    // acceptEvent refreshes the follow cache immediately on an owner
+    // kind-3 (relay.ts), so friend can write right after this.
+    expect((await publish(conn, contacts))[2]).toBe(true);
+    expect((await publish(conn, signEvent(friend.secretKeyHex, { kind: 1, content: "hi" })))[2]).toBe(true);
+
+    await callManagement("banpubkey", [friend.pubkeyHex, "actually banned"]);
+
+    const rejected = await publish(conn, signEvent(friend.secretKeyHex, { kind: 1, content: "still trying" }));
+    expect(rejected[2]).toBe(false);
+    expect(rejected[3]).toContain("blocked:");
+    conn.close();
+  });
+});
+
+describe("allowpubkey / unallowpubkey / listallowedpubkeys", () => {
+  it("rejects a pubkey that is neither npub nor 64-character hex", async () => {
+    const reply = await callManagement("allowpubkey", ["nope"]);
+    expect(reply.result).toBeUndefined();
+    expect(reply.error).toContain("pubkey");
+  });
+
+  it("allows a pubkey and lists it with the reason given", async () => {
+    const stranger = randomKeypair().pubkeyHex;
+    const allow = await callManagement("allowpubkey", [stranger, "trusted friend"]);
+    expect(allow.result).toBe(true);
+    expect((await callManagement("listallowedpubkeys")).result).toEqual([
+      { pubkey: stranger, reason: "trusted friend" },
+    ]);
+  });
+
+  it("unallowpubkey removes it from the list", async () => {
+    const stranger = randomKeypair().pubkeyHex;
+    await callManagement("allowpubkey", [stranger]);
+    const unallow = await callManagement("unallowpubkey", [stranger]);
+    expect(unallow.result).toBe(true);
+    expect((await callManagement("listallowedpubkeys")).result).toEqual([]);
+  });
+
+  it("lets an allowlisted stranger write even though they are not a follow", async () => {
+    const stranger = randomKeypair();
+    await callManagement("allowpubkey", [stranger.pubkeyHex, "manual grant"]);
+
+    const conn = await connectRelay();
+    const reply = await publish(conn, signEvent(stranger.secretKeyHex, { kind: 1, content: "granted" }));
+    expect(reply[2]).toBe(true);
+    conn.close();
+  });
+
+  it("a ban still wins over an allowlist entry for the same pubkey", async () => {
+    const stranger = randomKeypair();
+    await callManagement("allowpubkey", [stranger.pubkeyHex]);
+    await callManagement("banpubkey", [stranger.pubkeyHex]);
+
+    const conn = await connectRelay();
+    const reply = await publish(conn, signEvent(stranger.secretKeyHex, { kind: 1, content: "blocked anyway" }));
+    expect(reply[2]).toBe(false);
+    conn.close();
   });
 });
 
