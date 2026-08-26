@@ -73,8 +73,12 @@ export function getOwnerProfile(sql: SqlStorage, env: Env): OwnerProfile {
 // an unclaimed relay and a non-follow under follows mode are different
 // situations for the sender, even though they both end in "you may not
 // write here".
+// `isOwner` rides along on the allowed case so relay.ts's write path
+// doesn't have to re-read the owner pubkey to answer "is this the owner?"
+// -- isAllowedWriter has already resolved it, and the abuse caps in
+// acceptEvent (limits.ts) exempt the owner from two of the three.
 export type WriteAuthorization =
-  | { allowed: true }
+  | { allowed: true; isOwner: boolean }
   | { allowed: false; reason: "unclaimed" | "not-follow" | "owner-only" | "banned" };
 
 // Owner writes are always allowed. NIP-86 banpubkey/allowpubkey (phase
@@ -92,14 +96,18 @@ export type WriteAuthorization =
 export function isAllowedWriter(sql: SqlStorage, env: Env, pubkey: string): WriteAuthorization {
   const owner = getOwnerPubkey(sql, env);
   if (owner === null) return { allowed: false, reason: "unclaimed" };
-  if (pubkey === owner) return { allowed: true };
+  if (pubkey === owner) return { allowed: true, isOwner: true };
   if (isPubkeyBanned(sql, pubkey)) return { allowed: false, reason: "banned" };
   if (!allowFollowsEnabled(env)) {
-    return isPubkeyAllowed(sql, pubkey) ? { allowed: true } : { allowed: false, reason: "owner-only" };
+    return isPubkeyAllowed(sql, pubkey)
+      ? { allowed: true, isOwner: false }
+      : { allowed: false, reason: "owner-only" };
   }
   const row = sql.exec(`SELECT 1 FROM follows WHERE pubkey = ?`, pubkey).toArray();
-  if (row.length > 0) return { allowed: true };
-  return isPubkeyAllowed(sql, pubkey) ? { allowed: true } : { allowed: false, reason: "not-follow" };
+  if (row.length > 0) return { allowed: true, isOwner: false };
+  return isPubkeyAllowed(sql, pubkey)
+    ? { allowed: true, isOwner: false }
+    : { allowed: false, reason: "not-follow" };
 }
 
 // Re-derives the follow cache from the owner's own most recent kind-3

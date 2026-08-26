@@ -9,10 +9,10 @@
 // kind-1059 gift wraps. Each scenario below is named for the abuse it
 // refuses, not for the constant it reads.
 import { describe, expect, it, vi } from "vitest";
-import { MAX_EVENT_BYTES } from "../src/limits";
+import { MAX_EVENT_BYTES, MAX_EVENTS_PER_PUBKEY_PER_WINDOW } from "../src/limits";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
-import { OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
+import { type Keypair, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
 import { connectRelay, publish, type RelayConn } from "./helpers/socket";
 
 // relay.ts calls verifySignature through this module, so spying on it is
@@ -28,15 +28,40 @@ isolateStorage();
 // Publishing the owner's kind-3 over the wire refreshes the follow cache
 // immediately (relay.ts acceptEvent), so the returned keypair may write
 // from that point on.
-async function addFollow(conn: RelayConn) {
+async function addFollow(conn: RelayConn): Promise<Keypair> {
   const friend = randomKeypair();
+  await publishFollowList(conn, [friend]);
+  return friend;
+}
+
+// Every follow in one kind-3. A kind-3 is replaceable, so a test wanting
+// two follows has to name both in a single contact list -- publishing a
+// second one would drop the first friend rather than add to them.
+async function publishFollowList(conn: RelayConn, friends: Keypair[]): Promise<void> {
   const contacts = signEvent(OWNER_SECRET_KEY_HEX, {
     kind: 3,
-    tags: [["p", friend.pubkeyHex]],
+    tags: friends.map((f) => ["p", f.pubkeyHex]),
   });
   const [, , ok] = await publish(conn, contacts);
   expect(ok).toBe(true);
-  return friend;
+}
+
+// Publishes `count` distinct notes from one key and returns each reply's
+// [ok, message]. Distinct content per event so none is ever refused as a
+// duplicate.
+async function publishBurst(
+  conn: RelayConn,
+  key: { secretKeyHex: string },
+  count: number,
+  label: string,
+): Promise<Array<[boolean, string]>> {
+  const replies: Array<[boolean, string]> = [];
+  for (let i = 0; i < count; i++) {
+    const note = signEvent(key.secretKeyHex, { kind: 1, content: `${label} ${i}` });
+    const [, , ok, message] = await publish(conn, note);
+    replies.push([ok, message]);
+  }
+  return replies;
 }
 
 // Comfortably past the cap once JSON-serialized, without being so large
@@ -88,6 +113,67 @@ describe("event size cap", () => {
     const [, , ok] = await publish(conn, long);
 
     expect(ok).toBe(true);
+    conn.close();
+  });
+});
+
+describe("per-pubkey write throttle", () => {
+  it("throttles a follow past the per-pubkey rate without touching a different follow on the same IP", async () => {
+    // Both follows share one connection, and therefore one IP. If the
+    // limit were keyed by address -- as every throttle in this project was
+    // before this one -- the second friend would inherit the first's
+    // exhausted budget. Their pubkeys are different, so their budgets are.
+    const conn = await connectRelay("203.0.113.10");
+    const noisy = randomKeypair();
+    const quiet = randomKeypair();
+    await publishFollowList(conn, [noisy, quiet]);
+
+    const replies = await publishBurst(conn, noisy, MAX_EVENTS_PER_PUBKEY_PER_WINDOW + 1, "noisy");
+
+    const refused = replies.filter(([ok]) => !ok);
+    expect(refused.length).toBeGreaterThan(0);
+    expect(refused.every(([, message]) => message.startsWith("rate-limited:"))).toBe(true);
+
+    const quietNote = signEvent(quiet.secretKeyHex, { kind: 1, content: "still allowed" });
+    const [, , quietOk] = await publish(conn, quietNote);
+    expect(quietOk).toBe(true);
+    conn.close();
+  });
+
+  it("keeps throttling the same pubkey across two different IPs", async () => {
+    // The bypass the per-IP limit has and this one closes: a phone on
+    // cellular and a laptop on wifi are two addresses and one author.
+    const cellular = await connectRelay("203.0.113.20");
+    const friend = await addFollow(cellular);
+    const wifi = await connectRelay("198.51.100.30");
+
+    const half = Math.ceil((MAX_EVENTS_PER_PUBKEY_PER_WINDOW + 1) / 2);
+    const first = await publishBurst(cellular, friend, half, "cellular");
+    const second = await publishBurst(wifi, friend, half, "wifi");
+
+    // Neither burst alone exceeds the cap; together they do, and the
+    // change of address buys nothing.
+    expect(first.every(([ok]) => ok)).toBe(true);
+    const refused = second.filter(([ok]) => !ok);
+    expect(refused.length).toBeGreaterThan(0);
+    expect(refused.every(([, message]) => message.startsWith("rate-limited:"))).toBe(true);
+    cellular.close();
+    wifi.close();
+  });
+
+  it("exempts the owner", async () => {
+    // A client catching up after being offline republishes a backlog in
+    // one burst; that is normal for the owner and abnormal for a follow.
+    const conn = await connectRelay("203.0.113.40");
+
+    const replies = await publishBurst(
+      conn,
+      { secretKeyHex: OWNER_SECRET_KEY_HEX },
+      MAX_EVENTS_PER_PUBKEY_PER_WINDOW + 5,
+      "owner",
+    );
+
+    expect(replies.every(([ok]) => ok)).toBe(true);
     conn.close();
   });
 });

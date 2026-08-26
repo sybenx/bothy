@@ -24,7 +24,13 @@ const DEFAULT_TIMEOUT_MS = 2000;
 // hibernation-safe WebSocket to the single relay Durable Object at the
 // given path and wraps it in the same queue/waiter machinery either
 // caller's frame shape can flow through.
-async function connectPath<T>(path: string): Promise<{
+// `ip` sets CF-Connecting-IP, which is what relay.ts keys its per-IP
+// throttles and NIP-86 blockip on. Omitted, the DO sees "unknown" and
+// every test connection shares one bucket -- fine for suites that don't
+// care, and exactly what has to be controlled for the per-pubkey throttle
+// tests, whose whole point is that a pubkey's limit does not move when
+// its address does.
+async function connectPath<T>(path: string, ip?: string): Promise<{
   send(message: unknown): void;
   nextMessage(timeoutMs?: number): Promise<T>;
   close(): void;
@@ -36,9 +42,9 @@ async function connectPath<T>(path: string): Promise<{
 }> {
   const id = env.RELAY.idFromName("relay");
   const stub = env.RELAY.get(id);
-  const response = await stub.fetch(`https://example.com${path}`, {
-    headers: { Upgrade: "websocket" },
-  });
+  const headers: Record<string, string> = { Upgrade: "websocket" };
+  if (ip) headers["CF-Connecting-IP"] = ip;
+  const response = await stub.fetch(`https://example.com${path}`, { headers });
   const socket = response.webSocket;
   if (!socket) throw new Error("expected a websocket response");
   socket.accept();
@@ -89,8 +95,8 @@ async function connectPath<T>(path: string): Promise<{
 
 // Opens a hibernation-safe WebSocket to the single relay Durable Object,
 // the same path exercised in test/hibernation.test.ts.
-export async function connectRelay(): Promise<RelayConn> {
-  return connectPath<Frame>("/");
+export async function connectRelay(ip?: string): Promise<RelayConn> {
+  return connectPath<Frame>("/", ip);
 }
 
 // The redacted notice shape src/relay.ts liveBroadcast sends to the

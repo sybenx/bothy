@@ -114,6 +114,59 @@ export const MAX_GIFT_WRAPS = 2000;
 export const GIFT_WRAP_RATE_LIMIT_WINDOW_MS = 60_000;
 export const MAX_GIFT_WRAPS_PER_IP_PER_WINDOW = 5;
 
+// Per-PUBKEY write throttle. Per pubkey, not per IP, because the two
+// existing throttles (RATE_LIMIT_MAX_MESSAGES in relay.ts, and the gift
+// wrap one above) are both keyed by IP, and an author with several
+// addresses -- a phone on cellular, a laptop on wifi, anything behind a
+// VPN -- walks around an IP-keyed limit entirely. A follow's authority to
+// write here comes from their pubkey, so that is what the limit should
+// be attached to.
+//
+// Sized against rows-written, not intuition. At the measured 13 rows per
+// stored event (docs/budget.md, the corrected figure) and the free tier's
+// 100,000 rows-written/day:
+//
+//   100,000 / 13 = 7,692 events to exhaust the daily write budget
+//
+// Against the per-IP limit as the only bound (50 messages / 10s = 300
+// events/minute):
+//
+//   7,692 / 300 = 25.6 minutes
+//
+// At 20 events/minute per pubkey:
+//
+//   7,692 / (20 * 60) = 6.4 hours
+//
+// The goal is not to make abuse impossible -- a determined attacker with
+// the owner's follow list can still spend the daily budget eventually. It
+// is to make it slow enough that the owner notices and revokes (unfollow,
+// or NIP-86 banpubkey) before the day is gone, while sitting far above
+// any human posting rate: 20 notes a minute, sustained, is not a person.
+//
+// Counted in memory (relay.ts pubkeyRateLimits), like the two throttles
+// above, so it costs no rows to enforce. Be honest about what that means:
+// the counter is lost when the Durable Object is evicted, so an attacker
+// who pauses long enough for hibernation gets a fresh window. It is not
+// airtight and is not claimed to be. What it does cover is the case it
+// exists for -- sustained traffic keeps the object awake, so the window
+// that matters is exactly the one that survives.
+export const PUBKEY_RATE_LIMIT_WINDOW_MS = 60_000;
+export const MAX_EVENTS_PER_PUBKEY_PER_WINDOW = 20;
+
+export function maxEventsPerPubkeyPerWindow(env: Env): number | null {
+  return resolveLimit(env.MAX_EVENTS_PER_PUBKEY_PER_MINUTE, MAX_EVENTS_PER_PUBKEY_PER_WINDOW);
+}
+
+// Ceiling on how many pubkeys the in-memory throttle map tracks at once.
+// Unlike the per-IP maps, this one is keyed by something an attacker can
+// mint for free: every NIP-59 gift wrap is signed by a fresh one-time key
+// (nips/59.md), so a busy inbox would add an entry per message and never
+// reuse one. Stale windows are dropped once the map reaches this size --
+// see relay.ts prunePubkeyRateLimits. Sized so a real relay never reaches
+// it (the owner plus their follows is hundreds of keys, not thousands)
+// while keeping a DO's memory bounded regardless of traffic.
+export const PUBKEY_RATE_LIMIT_MAX_TRACKED = 10_000;
+
 // A filter with none of `ids`, `authors`, `kinds`, or a `#<letter>` tag
 // constraint has no equality condition to bound how much of the table
 // it can scan -- CLAUDE.md "Threat model": "Reject filters with no
