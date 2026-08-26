@@ -14,7 +14,7 @@ import {
   seedBackfillRelays,
 } from "../src/backfill";
 import { recordHost } from "../src/host";
-import { BACKFILL_ROWS_SHARE_LIMIT } from "../src/limits";
+import { BACKFILL_ROWS_SHARE_LIMIT, MAX_CREATED_AT_FUTURE_SECONDS } from "../src/limits";
 import { countIngested24h, estimateRowsWritten24h } from "../src/storage";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
@@ -153,6 +153,30 @@ describe("backfill write accounting", () => {
 // deployment whose first cron tick beats its first inbound request. The
 // row is harmless while flagged exhausted and becomes nextRelay the moment
 // resetWronglyExhaustedRelays clears every flag.
+// limits.ts MAX_CREATED_AT_FUTURE_SECONDS -- backfill must reject a
+// far-future event too, not just the live path in relay.ts acceptEvent,
+// or an old relay serving a mangled/malicious page could still brick a
+// replaceable kind via backfill.
+describe("backfill created_at future limit", () => {
+  const NOW = 1_800_000_000;
+
+  it("rejects a backfilled event dated beyond the future window", async () => {
+    const fromTheFuture = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 1,
+      content: "backfilled from the future",
+      created_at: NOW + MAX_CREATED_AT_FUTURE_SECONDS + 60,
+    });
+
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [fromTheFuture], true, NOW);
+      expect(result.stored).toBe(0);
+      expect(eventRows(sql).some((row) => row.id === fromTheFuture.id)).toBe(false);
+    });
+  });
+});
+
 describe("purgeSelfRelay", () => {
   const NOW = 1_800_000_000;
   const OWN_HOST = "my-relay.example.workers.dev";
@@ -349,7 +373,11 @@ describe("backfill refusals", () => {
 
 describe("backfill ingest", () => {
   it("dedupes an event returned by more than one relay -- checked before signature verification", async () => {
-    const note = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "posted once, seen on two relays" });
+    const note = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 1,
+      content: "posted once, seen on two relays",
+      created_at: 1000,
+    });
 
     const id = env.RELAY.idFromName("relay");
     const stub = env.RELAY.get(id);

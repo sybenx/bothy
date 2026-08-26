@@ -8,7 +8,7 @@ import { getOwnHost, normalizeHost } from "./host";
 import { BACKFILL_ROWS_SHARE_LIMIT } from "./limits";
 import { isEphemeralKind } from "./nostr";
 import { estimateRowsWritten24h, isDeleted, eventExists, storeEvent } from "./storage";
-import { idMatchesContent, parseEventShape, verifySignature } from "./validate";
+import { idMatchesContent, isCreatedAtTooFarInFuture, parseEventShape, verifySignature } from "./validate";
 
 export interface BackfillStatus {
   status: "pending" | "running" | "paused-budget" | "done";
@@ -224,7 +224,15 @@ export function applyBackfillPage(
     const event = parseEventShape(raw);
     if (!event) continue;
 
-    if (event.pubkey === ownerPubkey && !eventExists(sql, event.id) && !isDeleted(sql, event.id)) {
+    if (
+      event.pubkey === ownerPubkey &&
+      !eventExists(sql, event.id) &&
+      !isDeleted(sql, event.id) &&
+      // See limits.ts MAX_CREATED_AT_FUTURE_SECONDS -- checked here,
+      // before id/signature verification, same as the live path in
+      // relay.ts acceptEvent.
+      !isCreatedAtTooFarInFuture(event, nowSec)
+    ) {
       if (idMatchesContent(event) && verifySignature(event)) {
         try {
           // nowSec, not event.created_at -- a backfilled event's own

@@ -1,6 +1,7 @@
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
+import { MAX_CREATED_AT_FUTURE_SECONDS } from "./limits";
 import type { NostrEvent } from "./nostr";
 
 const HEX_ID_RE = /^[0-9a-f]{64}$/;
@@ -44,6 +45,16 @@ export function parseEventShape(raw: unknown): NostrEvent | null {
     content: e.content,
     sig: e.sig,
   };
+}
+
+// See limits.ts MAX_CREATED_AT_FUTURE_SECONDS for why this exists.
+// Deliberately one-sided -- no lower bound, since backfilled and
+// republished history is expected to carry old timestamps forever.
+// Shared by both write paths (relay.ts acceptEvent, backfill.ts
+// applyBackfillPage) and checked before id/signature verification on
+// each, so a rejected event never pays for a schnorr verify.
+export function isCreatedAtTooFarInFuture(event: NostrEvent, nowSec: number): boolean {
+  return event.created_at > nowSec + MAX_CREATED_AT_FUTURE_SECONDS;
 }
 
 export function idMatchesContent(event: NostrEvent): boolean {

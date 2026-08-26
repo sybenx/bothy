@@ -2,7 +2,7 @@
 // actually implemented so far -- update it as later chunks land protocol
 // support, not ahead of them.
 
-import { MAX_FILTER_LIMIT, MAX_SUBSCRIPTIONS_PER_CONNECTION } from "./limits";
+import { MAX_CREATED_AT_FUTURE_SECONDS, MAX_FILTER_LIMIT, MAX_SUBSCRIPTIONS_PER_CONNECTION } from "./limits";
 import type { RelaySettings } from "./storage";
 import { version } from "../package.json";
 
@@ -117,6 +117,13 @@ export function buildRelayInfo(
       // clampFilterLimit (limits.ts) defaults a filter's limit to this
       // when the filter omits one.
       default_limit: MAX_FILTER_LIMIT,
+      // A delta in seconds, not an absolute timestamp -- confirmed
+      // against nips.md's own examples (e.g. nostr.wine's 300), and the
+      // field name has no "seconds" qualifier either way. No
+      // created_at_lower_limit: nothing enforces one (see
+      // MAX_CREATED_AT_FUTURE_SECONDS's comment -- backfill and archive
+      // republishing both need old timestamps to keep working).
+      created_at_upper_limit: MAX_CREATED_AT_FUTURE_SECONDS,
     },
   };
   const icon = resolveIcon(env, stored, profile);

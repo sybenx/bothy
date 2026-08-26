@@ -56,7 +56,7 @@ import {
   type RelaySettings,
   storeEvent,
 } from "./storage";
-import { idMatchesContent, parseEventShape, verifySignature } from "./validate";
+import { idMatchesContent, isCreatedAtTooFarInFuture, parseEventShape, verifySignature } from "./validate";
 
 // Replies to a client-level "ping" with "pong" entirely inside the
 // runtime -- it does not wake this object or count against DO duration.
@@ -685,6 +685,16 @@ export class Relay extends DurableObject<Env> {
   // Used by both the owner-gated path in handleEvent and handleGiftWrap
   // above, whose authorization is entirely different but converges here.
   private acceptEvent(ws: WebSocket, sql: SqlStorage, event: NostrEvent): void {
+    // Cheapest possible check -- a plain integer comparison -- goes
+    // first, ahead of id/signature verification, for the same
+    // cheapest-check-first reason as the tombstone check below (CLAUDE.md
+    // "Conventions", docs/budget.md chunk 5). See limits.ts
+    // MAX_CREATED_AT_FUTURE_SECONDS for why this rejects at all.
+    if (isCreatedAtTooFarInFuture(event, nowSeconds())) {
+      ok(ws, event.id, false, "invalid: created_at is too far in the future");
+      return;
+    }
+
     if (!idMatchesContent(event)) {
       ok(ws, event.id, false, "invalid: id does not match the hash of its contents");
       return;

@@ -15,7 +15,7 @@ import {
   resolveIcon,
   resolveName,
 } from "../src/nip11";
-import { MAX_FILTER_LIMIT, MAX_SUBSCRIPTIONS_PER_CONNECTION } from "../src/limits";
+import { MAX_CREATED_AT_FUTURE_SECONDS, MAX_FILTER_LIMIT, MAX_SUBSCRIPTIONS_PER_CONNECTION } from "../src/limits";
 import type { RelaySettings } from "../src/storage";
 import { version } from "../package.json";
 import { isolateStorage } from "./helpers/isolate";
@@ -165,6 +165,7 @@ describe("buildRelayInfo", () => {
       max_subscriptions: MAX_SUBSCRIPTIONS_PER_CONNECTION,
       max_limit: MAX_FILTER_LIMIT,
       default_limit: MAX_FILTER_LIMIT,
+      created_at_upper_limit: MAX_CREATED_AT_FUTURE_SECONDS,
     });
   });
 });

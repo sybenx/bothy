@@ -145,6 +145,25 @@ export const BACKFILL_FETCH_TIMEOUT_MS = 8000;
 // about, not just a copy used for a progress bar.
 export const DAILY_ROWS_WRITTEN_LIMIT = 100_000;
 
+// Maximum seconds an event's created_at may lead wall-clock now. Every
+// kind sorts by created_at descending, and a replaceable kind (kind-0,
+// kind-3, ...) keeps whichever stored version has the higher created_at
+// -- so a kind-0 or kind-3 dated years ahead can never be superseded: it
+// permanently freezes the owner's profile or follow list, and since the
+// follow list gates writes (ownership.ts), freezing it also freezes who
+// may publish here. That's reachable by accident (a wrong client clock),
+// and the author gate doesn't help since the person doing it is the
+// owner -- this is self-inflicted-damage prevention, not abuse
+// prevention. An hour absorbs genuine client clock skew while admitting
+// nothing intentional. Deliberately no lower bound -- see validate.ts
+// isCreatedAtTooFarInFuture and CLAUDE.md: backfill imports history
+// going back years, and republishing old work with its real date is a
+// first-class use of a personal archive.
+//
+// Unrelated to AUTH_MAX_DRIFT_SECONDS in relay.ts, which is NIP-42's own
+// two-sided window for auth events only.
+export const MAX_CREATED_AT_FUTURE_SECONDS = 3600;
+
 // Backfill (ROADMAP.md chunk 7) must yield to the owner's own live
 // traffic, never compete with it for the shared daily rows-written
 // ceiling -- see backfill.ts hasBackfillHeadroom for the full reasoning.
