@@ -744,8 +744,8 @@ export class Relay extends DurableObject<Env> {
     // comparison below. It is the only check whose result bounds the cost
     // of the rest: idMatchesContent re-serializes the whole event and
     // hashes it, and storeEvent writes every byte of it permanently, so a
-    // 10MB event that is going to be refused should be refused before
-    // anything touches it a second time. Applied to the owner too -- see
+    // multi-megabyte event that is going to be refused should be refused
+    // before anything touches it a second time. Applied to the owner too -- see
     // limits.ts MAX_EVENT_BYTES; a cap the owner can exceed is a cap that
     // does not bound stored bytes.
     const byteCap = maxEventBytes(this.env);
@@ -754,10 +754,10 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
-    // Cheapest possible check -- a plain integer comparison -- goes
-    // first, ahead of id/signature verification, for the same
-    // cheapest-check-first reason as the tombstone check below (CLAUDE.md
-    // "Conventions", docs/budget.md chunk 5). See limits.ts
+    // A plain integer comparison -- the cheapest check here after the
+    // length above, and still well ahead of id/signature verification, for
+    // the same cheapest-check-first reason as the tombstone check below
+    // (CLAUDE.md "Conventions", docs/budget.md chunk 5). See limits.ts
     // MAX_CREATED_AT_FUTURE_SECONDS for why this rejects at all.
     if (isCreatedAtTooFarInFuture(event, nowSeconds())) {
       ok(ws, event.id, false, "invalid: created_at is too far in the future");
