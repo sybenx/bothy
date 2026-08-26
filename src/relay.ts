@@ -17,7 +17,7 @@ import {
   isUnconstrainedFilter,
   LIVE_FEED_MAX_LIFETIME_MS,
   MAX_EVENTS_PER_REQ,
-  MAX_GIFT_WRAP_BYTES,
+  maxEventBytes,
   MAX_GIFT_WRAPS,
   MAX_GIFT_WRAPS_PER_IP_PER_WINDOW,
   MAX_LIVE_FEED_CONNECTIONS,
@@ -609,11 +609,11 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
-    if (JSON.stringify(event).length > MAX_GIFT_WRAP_BYTES) {
-      ok(ws, event.id, false, "blocked: gift wrap exceeds the maximum allowed size");
-      return;
-    }
-
+    // No gift-wrap-specific size check here any more: MAX_GIFT_WRAP_BYTES
+    // became the general MAX_EVENT_BYTES (limits.ts), enforced for every
+    // writer at the top of acceptEvent below. A gift wrap is still size-
+    // capped at the same 64KB, just by a cap that no longer has to be
+    // kept in agreement with a second one.
     if (this.isGiftWrapRateLimited(getState(ws).ip)) {
       ok(ws, event.id, false, "rate-limited: too many gift wraps from this connection, slow down");
       return;
@@ -685,6 +685,20 @@ export class Relay extends DurableObject<Env> {
   // Used by both the owner-gated path in handleEvent and handleGiftWrap
   // above, whose authorization is entirely different but converges here.
   private acceptEvent(ws: WebSocket, sql: SqlStorage, event: NostrEvent): void {
+    // Size first, ahead of every other check including the integer
+    // comparison below. It is the only check whose result bounds the cost
+    // of the rest: idMatchesContent re-serializes the whole event and
+    // hashes it, and storeEvent writes every byte of it permanently, so a
+    // 10MB event that is going to be refused should be refused before
+    // anything touches it a second time. Applied to the owner too -- see
+    // limits.ts MAX_EVENT_BYTES; a cap the owner can exceed is a cap that
+    // does not bound stored bytes.
+    const byteCap = maxEventBytes(this.env);
+    if (byteCap !== null && JSON.stringify(event).length > byteCap) {
+      ok(ws, event.id, false, `invalid: event exceeds the maximum size of ${byteCap} bytes`);
+      return;
+    }
+
     // Cheapest possible check -- a plain integer comparison -- goes
     // first, ahead of id/signature verification, for the same
     // cheapest-check-first reason as the tombstone check below (CLAUDE.md

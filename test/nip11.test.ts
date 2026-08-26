@@ -15,7 +15,12 @@ import {
   resolveIcon,
   resolveName,
 } from "../src/nip11";
-import { MAX_CREATED_AT_FUTURE_SECONDS, MAX_FILTER_LIMIT, MAX_SUBSCRIPTIONS_PER_CONNECTION } from "../src/limits";
+import {
+  MAX_CREATED_AT_FUTURE_SECONDS,
+  MAX_EVENT_BYTES,
+  MAX_FILTER_LIMIT,
+  MAX_SUBSCRIPTIONS_PER_CONNECTION,
+} from "../src/limits";
 import type { RelaySettings } from "../src/storage";
 import { version } from "../package.json";
 import { isolateStorage } from "./helpers/isolate";
@@ -166,7 +171,25 @@ describe("buildRelayInfo", () => {
       max_limit: MAX_FILTER_LIMIT,
       default_limit: MAX_FILTER_LIMIT,
       created_at_upper_limit: MAX_CREATED_AT_FUTURE_SECONDS,
+      max_message_length: MAX_EVENT_BYTES,
     });
+  });
+
+  // max_message_length is the one field in the block that can be absent:
+  // the size cap is the only advertised limit an operator can turn off
+  // (limits.ts MAX_EVENT_BYTES), and the block's rule is that it names
+  // only what is enforced. Advertising 64KB on a relay that no longer
+  // enforces it would tell clients the opposite of the truth.
+  it("omits max_message_length entirely when the size cap is disabled", () => {
+    const disabled = { MAX_EVENT_BYTES: "off" } as unknown as Env;
+    const info = buildRelayInfo(disabled, NO_SETTINGS, null) as { limitation: Record<string, unknown> };
+    expect("max_message_length" in info.limitation).toBe(false);
+  });
+
+  it("advertises a raised size cap rather than the default", () => {
+    const raised = { MAX_EVENT_BYTES: "262144" } as unknown as Env;
+    const info = buildRelayInfo(raised, NO_SETTINGS, null) as { limitation: Record<string, unknown> };
+    expect(info.limitation.max_message_length).toBe(262144);
   });
 });
 

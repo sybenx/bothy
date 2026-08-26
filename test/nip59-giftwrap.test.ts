@@ -70,6 +70,13 @@ describe("NIP-59 gift wrap accept path", () => {
     conn.close();
   });
 
+  // The size cap enforced here is now the general MAX_EVENT_BYTES
+  // (limits.ts), not a gift-wrap-specific one -- MAX_GIFT_WRAP_BYTES was
+  // folded into it at the same 64KB rather than kept as a second constant
+  // that had to agree. Hence "invalid:" rather than the "blocked:" this
+  // path used to answer with. Covered generally in test/write-limits.test.ts;
+  // kept here because a gift wrap is the write path where an unbounded
+  // size costs the most, and this suite should keep proving it is bounded.
   it("rejects a gift wrap larger than the size cap", async () => {
     const conn = await connectRelay();
     const stranger = randomKeypair();
@@ -82,7 +89,7 @@ describe("NIP-59 gift wrap accept path", () => {
     const [, , ok, message] = await publish(conn, giftWrap);
 
     expect(ok).toBe(false);
-    expect(message.startsWith("blocked:")).toBe(true);
+    expect(message.startsWith("invalid:")).toBe(true);
     conn.close();
   });
 

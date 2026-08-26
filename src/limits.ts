@@ -30,20 +30,73 @@ export function clampFilterLimit(filter: Filter): Filter {
   return { ...filter, limit };
 }
 
-// Gift wrap (NIP-59, ROADMAP.md chunk 6) abuse caps -- CLAUDE.md "Threat
-// model" scoped these to kind 1059 specifically: "This is the only
-// unbounded write path" (every other write is owner-authored, so the
-// owner is trusted not to attack their own relay; a gift wrap sender is
-// not).
+// ---------------------------------------------------------------------
+// Write-path abuse caps. Everything below this line bounds what a writer
+// who is *allowed* to write can cost -- a separate concern from the read
+// caps above, and from ownership.ts, which decides who may write at all.
+//
+// The original threat model (CLAUDE.md, chunk 6) had exactly one
+// untrusted write path: kind-1059 gift wraps, "the only unbounded write
+// path", since every other write was the owner's own and the owner is
+// trusted not to attack their own relay. v0.2.0 made ALLOW_FOLLOWS an
+// opt-OUT, which quietly turned "one trusted author" into "hundreds of
+// pubkeys the owner has merely followed" -- without moving any of the
+// gift wrap caps across. A single compromised or malicious follow was
+// then bounded only by the per-IP message rate limit in relay.ts: at 300
+// messages/minute and the measured 13 rows/event (docs/budget.md), about
+// 26 minutes to exhaust the daily rows-written ceiling, and -- far worse,
+// because storage does not reset daily -- an afternoon to fill 5GB
+// permanently with events of unbounded size.
+//
+// Each cap is raisable or disablable through an environment variable
+// (see resolveLimit below), since none of these ceilings apply on a paid
+// plan.
+// ---------------------------------------------------------------------
 
-// Rejects a gift wrap event larger than this many bytes (JSON-serialized
-// wire size). Generous for real NIP-17 DM content (encrypted seal +
-// rumor, typically low single-digit KB) while bounding how much of the
-// 100,000 rows-written/day and 5GB storage ceilings one message can cost.
-export const MAX_GIFT_WRAP_BYTES = 64 * 1024;
+// The exact string that turns a cap off. Same shape as ALLOW_FOLLOWS
+// (ownership.ts allowFollowsEnabled) and for the same reason: removing a
+// safety cap must be a deliberate, spelled-out act, never something any
+// truthy value does by accident. A malformed or empty value falls back
+// to the default rather than resolving to "no limit" -- a typo in the
+// Cloudflare dashboard should cost you the override, not the cap.
+const DISABLE_VALUE = "off";
+
+// Resolves one of the three env-overridable caps below. Null means the
+// cap is disabled; callers skip the check entirely rather than comparing
+// against Infinity. Read defensively (`env.X` may be undefined) because
+// none of these are declared in wrangler.jsonc -- see src/env.d.ts.
+function resolveLimit(raw: string | undefined, fallback: number): number | null {
+  if (raw === undefined) return fallback;
+  if (raw === DISABLE_VALUE) return null;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+// Rejects any event larger than this many bytes (JSON-serialized wire
+// size), applied uniformly to every writer including the owner.
+//
+// This was MAX_GIFT_WRAP_BYTES, scoped to kind 1059 alone, and that
+// constant is gone rather than kept alongside this one: two caps
+// expressing the same idea are two caps that have to agree forever. Its
+// reasoning carries over unchanged and now covers every kind. 64KB is
+// generous for real content -- a NIP-17 DM (encrypted seal + rumor) is
+// typically low single-digit KB, and even long-form (kind 30023) rarely
+// approaches it -- while bounding how much of the 100,000
+// rows-written/day and 5GB storage ceilings any single event can cost.
+//
+// This is the cap that bounds the *permanent* damage. The two below only
+// slow an abuser down; rows-written resets every day, stored bytes never
+// do, so an unbounded event size is the one way a single author can cost
+// the relay something the next morning doesn't undo.
+export const MAX_EVENT_BYTES = 64 * 1024;
+
+export function maxEventBytes(env: Env): number | null {
+  return resolveLimit(env.MAX_EVENT_BYTES, MAX_EVENT_BYTES);
+}
 
 // Total gift wraps this relay will hold at once. At the byte cap above,
-// worst case is MAX_GIFT_WRAPS * MAX_GIFT_WRAP_BYTES = ~128MB, well under
+// worst case is MAX_GIFT_WRAPS * MAX_EVENT_BYTES = ~128MB, well under
 // the 5GB SQLite ceiling even alongside the owner's own data -- generous
 // for a real personal inbox, bounded against storage exhaustion from an
 // anonymous write path. New gift wraps are refused once reached; the

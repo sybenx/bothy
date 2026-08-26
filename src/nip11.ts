@@ -2,7 +2,12 @@
 // actually implemented so far -- update it as later chunks land protocol
 // support, not ahead of them.
 
-import { MAX_CREATED_AT_FUTURE_SECONDS, MAX_FILTER_LIMIT, MAX_SUBSCRIPTIONS_PER_CONNECTION } from "./limits";
+import {
+  MAX_CREATED_AT_FUTURE_SECONDS,
+  MAX_FILTER_LIMIT,
+  MAX_SUBSCRIPTIONS_PER_CONNECTION,
+  maxEventBytes,
+} from "./limits";
 import type { RelaySettings } from "./storage";
 import { version } from "../package.json";
 
@@ -104,11 +109,13 @@ export function buildRelayInfo(
     // "Release step") -- never hardcode this string elsewhere.
     version,
     // Only constraints actually enforced -- imported from limits.ts so
-    // this document can never drift from the real caps. No
-    // max_message_length/max_event_tags/max_content_length/
-    // min_pow_difficulty: none of those are enforced anywhere in this
-    // codebase, and advertising an unenforced limit is worse than
-    // advertising none.
+    // this document can never drift from the real caps. Still no
+    // max_event_tags/max_content_length/min_pow_difficulty: none of those
+    // are enforced anywhere in this codebase, and advertising an
+    // unenforced limit is worse than advertising none. max_message_length
+    // was in that list until limits.ts MAX_EVENT_BYTES made it real; it
+    // is added below rather than left out, which is the same rule applied
+    // in the other direction.
     limitation: {
       // This relay is never fully open -- see ownership.ts isAllowedWriter.
       restricted_writes: true,
@@ -126,6 +133,19 @@ export function buildRelayInfo(
       created_at_upper_limit: MAX_CREATED_AT_FUTURE_SECONDS,
     },
   };
+  // Derived from the enforced cap, never a hardcoded copy of it. Omitted
+  // entirely when MAX_EVENT_BYTES is disabled by env var, since the rule
+  // above is that this block names only what is actually enforced.
+  //
+  // The cap measures the JSON-serialized *event*, while NIP-11 defines
+  // this field as the whole message -- an ["EVENT", {...}] frame is a
+  // dozen bytes longer. Advertising the smaller number is the safe
+  // direction to be wrong in: a client that respects it can never be
+  // refused for size.
+  const byteCap = maxEventBytes(env);
+  if (byteCap !== null) {
+    (info.limitation as Record<string, unknown>).max_message_length = byteCap;
+  }
   const icon = resolveIcon(env, stored, profile);
   if (icon) {
     info.icon = icon;
