@@ -1,5 +1,6 @@
 import type { OwnerProfile } from "./nip11";
 import type { Profile } from "./profile-lookup";
+import { isPubkeyAllowed, isPubkeyBanned } from "./storage";
 
 // Kind-3 is NIP-01/NIP-02's contact list; its `p` tags are the follow set.
 // Exported so relay.ts can recognize an owner kind-3 write and refresh the
@@ -74,16 +75,31 @@ export function getOwnerProfile(sql: SqlStorage, env: Env): OwnerProfile {
 // write here".
 export type WriteAuthorization =
   | { allowed: true }
-  | { allowed: false; reason: "unclaimed" | "not-follow" | "owner-only" };
+  | { allowed: false; reason: "unclaimed" | "not-follow" | "owner-only" | "banned" };
 
-// Owner writes are always allowed.
+// Owner writes are always allowed. NIP-86 banpubkey/allowpubkey (phase
+// two, docs/budget.md) add two lookups beyond the owner/follows check
+// that shipped in phase one:
+//
+//   - banned_pubkeys is checked for every non-owner write, before the
+//     follows lookup, so a banned pubkey is refused even if it is also a
+//     follow -- src/nip86.ts also refuses to ever let the owner's own
+//     pubkey be banned, so there's no owner-lockout case to guard against
+//     here.
+//   - allowed_pubkeys is checked only on the path already about to
+//     reject a write (owner-only mode, or "not a follow"), so it costs
+//     nothing on the common accept path.
 export function isAllowedWriter(sql: SqlStorage, env: Env, pubkey: string): WriteAuthorization {
   const owner = getOwnerPubkey(sql, env);
   if (owner === null) return { allowed: false, reason: "unclaimed" };
   if (pubkey === owner) return { allowed: true };
-  if (!allowFollowsEnabled(env)) return { allowed: false, reason: "owner-only" };
+  if (isPubkeyBanned(sql, pubkey)) return { allowed: false, reason: "banned" };
+  if (!allowFollowsEnabled(env)) {
+    return isPubkeyAllowed(sql, pubkey) ? { allowed: true } : { allowed: false, reason: "owner-only" };
+  }
   const row = sql.exec(`SELECT 1 FROM follows WHERE pubkey = ?`, pubkey).toArray();
-  return row.length > 0 ? { allowed: true } : { allowed: false, reason: "not-follow" };
+  if (row.length > 0) return { allowed: true };
+  return isPubkeyAllowed(sql, pubkey) ? { allowed: true } : { allowed: false, reason: "not-follow" };
 }
 
 // Re-derives the follow cache from the owner's own most recent kind-3

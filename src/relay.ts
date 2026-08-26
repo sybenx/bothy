@@ -165,7 +165,7 @@ function ok(ws: WebSocket, id: string, accepted: boolean, message: string): void
 // client rather than for a developer reading logs. All get the
 // `restricted:` prefix per NIP-01's own worked example (nips/01.md line
 // 173).
-function writeRejectionMessage(reason: "unclaimed" | "not-follow" | "owner-only"): string {
+function writeRejectionMessage(reason: "unclaimed" | "not-follow" | "owner-only" | "banned"): string {
   switch (reason) {
     case "unclaimed":
       return "restricted: relay has not been claimed yet";
@@ -173,6 +173,8 @@ function writeRejectionMessage(reason: "unclaimed" | "not-follow" | "owner-only"
       return "restricted: only the owner and people they follow can publish here";
     case "owner-only":
       return "restricted: writes are limited to the relay owner";
+    case "banned":
+      return "blocked: this pubkey is banned from writing here";
   }
 }
 
