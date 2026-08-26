@@ -29,6 +29,13 @@ export interface BackfillStatus {
   // not moving means it runs but stores nothing (a storage/validation
   // problem) -- a distinction nothing else on this object can make.
   lastRunAt: number | null;
+  // What `nextRelay` last said instead of sending history -- its CLOSED,
+  // NOTICE or AUTH frames, verbatim and truncated (backfill-worker.ts
+  // fetchPage). Null when the last page carried events, or when the relay
+  // genuinely said nothing. That distinction is the point: "stalled" and
+  // "stalled because the relay wants AUTH" are different problems, and
+  // before this field they were the same empty page.
+  nextRefusal: string | null;
 }
 
 // getBackfillStatus is pure over SqlStorage, like the rest of this
@@ -75,8 +82,8 @@ export function getBackfillStatus(sql: SqlStorage): BackfillStatus {
     .toArray()[0] ?? { status: "pending", total_stored: 0, last_run_at: null };
 
   const relays = sql
-    .exec<{ relay_url: string; until_cursor: number; exhausted: number }>(
-      `SELECT relay_url, until_cursor, exhausted FROM backfill_relays ORDER BY relay_url`,
+    .exec<{ relay_url: string; until_cursor: number; exhausted: number; last_refusal: string | null }>(
+      `SELECT relay_url, until_cursor, exhausted, last_refusal FROM backfill_relays ORDER BY relay_url`,
     )
     .toArray();
   const next = relays.find((r) => r.exhausted === 0);
@@ -89,6 +96,7 @@ export function getBackfillStatus(sql: SqlStorage): BackfillStatus {
     nextRelay: next?.relay_url ?? null,
     nextUntil: next?.until_cursor ?? null,
     lastRunAt: meta.last_run_at,
+    nextRefusal: next?.last_refusal ?? null,
   };
 }
 
@@ -187,6 +195,10 @@ export function applyBackfillPage(
   rawEvents: unknown[],
   eose: boolean,
   nowSec: number,
+  // Whatever the relay sent that was not history (backfill-worker.ts
+  // fetchPage). Recorded only when the page is empty -- a page that
+  // carried events explains itself.
+  refusals: string[] = [],
 ): IngestResult {
   // Authoritative yield-to-live-traffic check (see hasBackfillHeadroom's
   // comment) -- the fetched page is discarded unstored and the cursor is
@@ -263,7 +275,19 @@ export function applyBackfillPage(
   // oldestProcessed would silently skip the exhausted flag for exactly
   // the page shape (zero events) that most commonly signals real
   // exhaustion.
-  sql.exec(`UPDATE backfill_relays SET exhausted = ? WHERE relay_url = ?`, exhausted ? 1 : 0, relayUrl);
+  // exhausted and last_refusal move together in one statement rather than
+  // two: both are written on every ingest, so folding them costs one row
+  // write per tick instead of two and keeps the per-ingest cost exactly
+  // what it was before the refusal channel existed. last_refusal is
+  // cleared as soon as a page carries events, so it never reports a
+  // refusal the relay has since stopped making -- a stale explanation is
+  // worse than none.
+  sql.exec(
+    `UPDATE backfill_relays SET exhausted = ?, last_refusal = ? WHERE relay_url = ?`,
+    exhausted ? 1 : 0,
+    rawEvents.length === 0 && refusals.length > 0 ? refusals.join(" | ") : null,
+    relayUrl,
+  );
   if (oldestProcessed !== null) {
     sql.exec(`UPDATE backfill_relays SET until_cursor = ? WHERE relay_url = ?`, oldestProcessed - 1, relayUrl);
   }

@@ -23,7 +23,23 @@ export interface FetchPageResult {
   // collected before termination), but only a real EOSE means the relay
   // actually told us it has nothing more.
   eose: boolean;
+  // Every frame that was neither an EVENT nor an EOSE for this
+  // subscription. NIP-01 gives a relay three ways to refuse a REQ --
+  // CLOSED, NOTICE, and AUTH -- and this function used to drop all three
+  // on the floor. That turned "the relay told us auth-required" into a
+  // result indistinguishable from "the relay said nothing at all": both
+  // arrived as zero events and no EOSE, and the caller had no way to tell
+  // a refusal from a timeout. Keeping them is a correctness fix, not
+  // instrumentation; a refusal is information the relay actually sent us.
+  refusals: string[];
 }
+
+// Bounds what a hostile or broken relay can push into storage through the
+// refusal channel -- these strings are persisted (backfill.ts) and shown
+// on the admin page, so they are capped on both count and length rather
+// than trusted.
+const MAX_REFUSAL_FRAMES = 5;
+const MAX_REFUSAL_LENGTH = 300;
 
 // Collects every EVENT payload a relay sends for one REQ until EOSE or a
 // timeout, then closes the socket -- same short-lived-connection shape as
@@ -32,6 +48,7 @@ export interface FetchPageResult {
 function fetchPage(relayUrl: string, filter: Record<string, unknown>, timeoutMs: number): Promise<FetchPageResult> {
   return new Promise((resolve) => {
     const events: unknown[] = [];
+    const refusals: string[] = [];
     let settled = false;
     let eose = false;
     const done = () => {
@@ -43,14 +60,25 @@ function fetchPage(relayUrl: string, filter: Record<string, unknown>, timeoutMs:
       } catch {
         // already closing/closed
       }
-      resolve({ events, eose });
+      resolve({ events, eose, refusals });
+    };
+
+    const recordRefusal = (frame: unknown[]) => {
+      if (refusals.length >= MAX_REFUSAL_FRAMES) return;
+      refusals.push(JSON.stringify(frame).slice(0, MAX_REFUSAL_LENGTH));
     };
 
     let socket: WebSocket;
     try {
       socket = new WebSocket(relayUrl);
-    } catch {
-      resolve({ events: [], eose: false });
+    } catch (err) {
+      // Even the constructor throwing is something the caller can act on,
+      // and it is not the same as a silent timeout.
+      resolve({
+        events: [],
+        eose: false,
+        refusals: [`connect failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, MAX_REFUSAL_LENGTH)],
+      });
       return;
     }
 
@@ -69,6 +97,22 @@ function fetchPage(relayUrl: string, filter: Record<string, unknown>, timeoutMs:
         } else if (frame[0] === "EOSE" && frame[1] === subId) {
           eose = true;
           done();
+        } else if (frame[0] === "CLOSED" && frame[1] === subId) {
+          // NIP-01: CLOSED ends the subscription. Nothing more is coming,
+          // so waiting out the full timeout buys nothing but delay -- and
+          // resolving now, with the reason recorded, is the difference
+          // between "the relay refused, here is what it said" and "the
+          // relay went quiet for eight seconds". Deliberately does NOT set
+          // eose: a refusal is not "no more history", and must never
+          // retire the relay (see backfill.ts applyBackfillPage).
+          recordRefusal(frame);
+          done();
+        } else {
+          // NOTICE, AUTH, OK, and anything for another subscription id.
+          // Recorded rather than dropped -- an AUTH challenge is the most
+          // likely reason a relay serves history to one client and not
+          // another.
+          recordRefusal(frame);
         }
       } catch {
         // malformed frame from a remote relay -- ignore, let the timeout resolve
@@ -142,6 +186,6 @@ export async function runBackfillTick(env: Env): Promise<void> {
   if (!state.canIngestNow) return;
 
   const filter = { authors: [state.ownerPubkey], until: state.nextUntil, limit: BACKFILL_PAGE_SIZE };
-  const { events, eose } = await fetchPage(state.nextRelay, filter, BACKFILL_FETCH_TIMEOUT_MS);
-  await stub.ingestBackfillPage(state.nextRelay, events, eose);
+  const { events, eose, refusals } = await fetchPage(state.nextRelay, filter, BACKFILL_FETCH_TIMEOUT_MS);
+  await stub.ingestBackfillPage(state.nextRelay, events, eose, refusals);
 }

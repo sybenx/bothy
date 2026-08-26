@@ -154,10 +154,19 @@ CREATE TABLE IF NOT EXISTS relay_meta (
 -- in memory specifically so an hourly cron tick can resume a backfill that
 -- spans days -- see CLAUDE.md "The budget" on why a large history may
 -- genuinely take more than one day against the rows-written ceiling.
+-- last_refusal holds whatever a relay said instead of history: the CLOSED,
+-- NOTICE or AUTH frames backfill-worker.ts fetchPage used to discard. Set
+-- only when a page comes back with no events, and cleared the moment one
+-- arrives, so it always describes the current reason a relay is producing
+-- nothing. Without it an empty page is ambiguous -- a relay that answered
+-- "auth-required" and a relay that answered nothing at all are the same
+-- row -- and that ambiguity is what makes a stalled backfill undiagnosable
+-- from the outside.
 CREATE TABLE IF NOT EXISTS backfill_relays (
   relay_url    TEXT PRIMARY KEY,
   until_cursor INTEGER NOT NULL,
-  exhausted    INTEGER NOT NULL DEFAULT 0
+  exhausted    INTEGER NOT NULL DEFAULT 0,
+  last_refusal TEXT
 );
 
 -- Single-row backfill status (backfill.ts getBackfillStatus/seedBackfillRelays).
@@ -233,6 +242,15 @@ export function initSchema(sql: SqlStorage): void {
       .toArray().length > 0;
   if (!hasResetMarker) {
     sql.exec(`ALTER TABLE backfill_meta ADD COLUMN exhaust_reset_applied INTEGER NOT NULL DEFAULT 0`);
+  }
+  // `backfill_relays.last_refusal` was added in v0.3.2, after fetchPage
+  // stopped discarding the frames a relay uses to refuse a request. Same
+  // pragma_table_info shape as the other column migrations here.
+  const hasRefusal =
+    sql.exec(`SELECT 1 FROM pragma_table_info('backfill_relays') WHERE name = 'last_refusal'`).toArray()
+      .length > 0;
+  if (!hasRefusal) {
+    sql.exec(`ALTER TABLE backfill_relays ADD COLUMN last_refusal TEXT`);
   }
   // `events.ingested_at` was added in v0.3.1; an events table created
   // before that predates the column and CREATE TABLE IF NOT EXISTS above

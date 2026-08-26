@@ -27,6 +27,7 @@
   }
   button { padding: 0.5rem 0.9rem; cursor: pointer; }
   .relay-name { margin: 1.5rem 0 0; font-size: 0.9rem; }
+  .refusal { margin: 0.25rem 0 0; font-size: 0.85rem; opacity: 0.7; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
   .stat.wide { grid-column: 1 / -1; }
   .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin: 1.5rem 0; }
   .stat { border: 1px solid #8884; border-radius: 0.5rem; padding: 0.75rem; }
@@ -112,6 +113,7 @@
 
   <h2>Backfill</h2>
   <p id="backfill-status">-</p>
+  <p id="backfill-refusal" class="refusal" hidden></p>
 
   <h2>Live feed</h2>
   <p class="live-status" id="live-status">connecting&hellip;</p>
@@ -257,6 +259,18 @@ function renderBackfillStatus(backfill) {
     case "done":
       el.textContent = count + " imported from your history -- done" + lastRun;
       break;
+  }
+
+  // What the next relay said instead of sending history. Shown as
+  // received, because the whole point is that a relay refusing with
+  // "auth-required" must not look like a relay that timed out. textContent,
+  // never innerHTML -- this string comes from a remote relay.
+  const refusal = document.getElementById("backfill-refusal");
+  if (backfill.nextRefusal) {
+    refusal.textContent = backfill.nextRelay + " replied: " + backfill.nextRefusal;
+    refusal.hidden = false;
+  } else {
+    refusal.hidden = true;
   }
 }
 

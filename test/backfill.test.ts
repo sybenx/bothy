@@ -141,6 +141,75 @@ describe("backfill write accounting", () => {
   });
 });
 
+// A relay refusing a REQ (NIP-01 gives it CLOSED, NOTICE and AUTH to do
+// that with) used to be indistinguishable from a relay saying nothing:
+// backfill-worker.ts fetchPage discarded every non-EVENT/EOSE frame, so
+// both arrived as zero events and no EOSE. These assert the information
+// survives to somewhere a person can read it.
+describe("backfill refusals", () => {
+  const NOW = 1_800_000_000;
+
+  async function seeded(fn: (sql: SqlStorage) => void | Promise<void>) {
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      seedBackfillRelays(sql, ["wss://refuses.example"], NOW);
+      await fn(sql);
+    });
+  }
+
+  it("records what the relay said when an empty page carried a refusal", async () => {
+    await seeded(async (sql) => {
+      applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://refuses.example", [], false, NOW, [
+        '["CLOSED","backfill","auth-required: we only serve authenticated clients"]',
+      ]);
+      const status = getBackfillStatus(sql);
+      expect(status.nextRefusal).toContain("auth-required");
+      // A refusal is not exhaustion -- the relay still has history, it
+      // just will not give it to us, so it must stay in the rotation.
+      expect(status.exhaustedCount).toBe(0);
+    });
+  });
+
+  it("leaves nextRefusal null when a relay is genuinely silent", async () => {
+    await seeded(async (sql) => {
+      applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://refuses.example", [], false, NOW, []);
+      // The distinction the whole change exists for: silence and refusal
+      // are different answers and must not read the same.
+      expect(getBackfillStatus(sql).nextRefusal).toBeNull();
+    });
+  });
+
+  it("clears a recorded refusal as soon as a page carries events", async () => {
+    const note = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "history, finally" });
+    await seeded(async (sql) => {
+      applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://refuses.example", [], false, NOW, [
+        '["NOTICE","rate-limited"]',
+      ]);
+      expect(getBackfillStatus(sql).nextRefusal).toContain("rate-limited");
+
+      applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://refuses.example", [note], true, NOW, [
+        '["NOTICE","rate-limited"]',
+      ]);
+      // Stale refusals are worse than none -- they describe a problem the
+      // relay has stopped having.
+      expect(getBackfillStatus(sql).nextRefusal).toBeNull();
+    });
+  });
+
+  it("does not treat a refusal as exhaustion even when EOSE follows it", async () => {
+    await seeded(async (sql) => {
+      // An empty page WITH a real EOSE is genuine exhaustion, and stays
+      // so -- the refusal channel must not change that verdict, only
+      // describe it.
+      applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://refuses.example", [], true, NOW, [
+        '["NOTICE","nothing to see here"]',
+      ]);
+      expect(getBackfillStatus(sql).exhaustedCount).toBe(1);
+    });
+  });
+});
+
 describe("backfill ingest", () => {
   it("dedupes an event returned by more than one relay -- checked before signature verification", async () => {
     const note = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "posted once, seen on two relays" });
