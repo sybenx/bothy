@@ -639,15 +639,51 @@ function runFilterQuery(sql: SqlStorage, filter: Filter, nowSec: number): NostrE
 // Still an estimate, and still named one. It sums the cost of rows
 // currently standing for events ingested in the window, which is not
 // quite the same as every row written in it: a row written and then
-// deleted inside the same window drops out, and the deletion's own write,
-// plus any tombstone, is not counted. Rows written before `row_cost`
-// existed carry NULL and are absent from the SUM entirely, which
-// undercounts for at most the one 24h window straddling an upgrade. All
-// three make this a floor rather than a ceiling, which is the safe
-// direction for the budget guard in backfill.ts hasBackfillHeadroom -- it
-// will never believe there is less headroom than there is, only more, and
-// the reserved-half rule (BACKFILL_ROWS_SHARE_LIMIT) is what absorbs the
-// difference.
+// deleted inside the same window drops out. Rows written before
+// `row_cost` existed carry NULL and are absent from the SUM entirely,
+// which undercounts for at most the one 24h window straddling an
+// upgrade. Both make this a floor rather than a ceiling, which is the
+// safe direction for the budget guard in backfill.ts
+// hasBackfillHeadroom -- it will never believe there is less headroom
+// than there is, only more, and the reserved-half rule
+// (BACKFILL_ROWS_SHARE_LIMIT) is what absorbs the difference.
+//
+// IT COUNTS INSERTIONS ONLY. `row_cost` is stamped by insertEventRow and
+// nothing else, so no deletion this relay performs appears in this number
+// -- not the delete half of a replaceable replacement, not NIP-09, not
+// NIP-62 vanish, not NIP-86 banevent, and not the tombstone any of them
+// writes. Every one of those is a real write against the same 100,000/day
+// ceiling this figure exists to describe.
+//
+// That is correct for the guard and wrong for the display, and the two
+// callers want different things from it:
+//
+//   - backfill.ts hasBackfillHeadroom is asking "may backfill write
+//     more", and it compares against BACKFILL_ROWS_SHARE_LIMIT, half the
+//     ceiling. Deletion traffic is bounded by its own reserved share
+//     (limits.ts VANISH_ROWS_SHARE_LIMIT, a quarter) and so cannot eat
+//     into backfill's half however busy it gets. The guard does not need
+//     to see writes that are already bounded away from the budget it is
+//     protecting.
+//
+//   - relay.ts getStats is asking "how much did this relay write today",
+//     and shows the answer on the admin page. There the omission is a
+//     real understatement, and the largest case is a vanish drain: while
+//     one is running this figure misses up to VANISH_ROWS_SHARE_LIMIT --
+//     25,000 rows/day as the drain is paced, ~9,000 as
+//     SqlStorageCursor actually counts a removal (see schema.ts
+//     eventRemovalRowsWritten and eventRemovalBudget for why those two
+//     numbers differ). Ordinary deletion traffic is far smaller -- a
+//     handful of replaceable republishes a day at 8 rows each -- but it
+//     is unbounded in principle, since nothing reserves a share for
+//     NIP-09.
+//
+// So: read this number as "rows written STORING events", not "rows
+// written". `/api/stats` reports draining vanish requests alongside it
+// (`vanishing`), which is the signal that the gap is currently wide.
+// Fixing it would mean stamping deletion cost somewhere, and the only
+// place to stamp it is a counter row -- a row write to measure a row
+// write, which is the trade schema.ts rejected for exactly this column.
 export function estimateRowsWritten24h(sql: SqlStorage, sinceCutoff: number): number {
   return withReadPath("estimateRowsWritten24h", () => estimateRowsWritten24hInner(sql, sinceCutoff));
 }
