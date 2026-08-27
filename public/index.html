@@ -546,19 +546,15 @@ function formatReadWindow(sinceMs) {
 // reads.* is src/read-metrics.ts's in-memory attribution -- it resets
 // whenever the Durable Object hibernates, so `sinceMs` can be a few
 // minutes rather than a day, and that is the normal case rather than a
-// fault. The raw rows-read figure and the window it covers are true
-// regardless of window length and are always shown; the projection and
-// its percentage of the ceiling are only meaningful once the window is
-// long enough to smooth over ordinary bursts, so both are suppressed
-// below READ_WINDOW_MIN_MS instead of dividing a tiny sample by a huge
-// multiplier and presenting the result as if it meant something.
+// fault. The window is kept prominent precisely so the reader can judge
+// the projection themselves -- the five-minute stats cache
+// (limits.ts LIVE_STATS_MAX_AGE_MS) keeps a page load to ~10 rows, so a
+// short window no longer means the projection is dominated by the
+// observer rather than the relay.
 function formatReadBudget(reads) {
   const windowLabel = formatReadWindow(reads.sinceMs);
   const base = reads.totalRowsRead.toLocaleString() + " rows read (sampled over " + windowLabel +
     " -- resets whenever the relay hibernates)";
-  if (reads.projected24h === null) {
-    return base + "; too short a window to project a 24h rate";
-  }
   return (
     base +
     " -> projected " + reads.projected24h.toLocaleString() + " rows/24h (" +

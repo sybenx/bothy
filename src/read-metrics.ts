@@ -230,18 +230,15 @@ export interface ReadMetricsSnapshot {
   sinceMs: number;
   totalRowsRead: number;
   // Extrapolation of totalRowsRead to 24h at the observed rate, against
-  // the 5,000,000/day ceiling. Honest only if the sample is long enough
-  // and representative; null under an hour of uptime, where the
-  // multiplier is large enough (at least 24x) that ordinary burstiness in
-  // traffic reads as a huge swing in the projection -- observed live at
-  // 1,721 rows/2min projecting 1,447,302/24h where the same relay
-  // projected 785,000 from a 14-minute window an hour earlier. Neither
-  // number was wrong, the window was just too short to mean anything.
-  projected24h: number | null;
+  // the 5,000,000/day ceiling. Always computed and rendered -- the
+  // five-minute cache (limits.ts LIVE_STATS_MAX_AGE_MS) took a single
+  // page load from ~1,200 rows to ~10, which is what used to make a short
+  // sample projection swing wildly (the observer dominating the
+  // measurement, not the relay). sinceMs stays alongside it so the reader
+  // can judge how much a given projection should be trusted.
+  projected24h: number;
   paths: ReadPathReport[];
 }
-
-const MIN_SAMPLE_MS = 3_600_000;
 
 export function readMetricsSnapshot(): ReadMetricsSnapshot {
   const sinceMs = startedAtMs === null ? 0 : Math.max(0, Date.now() - startedAtMs);
@@ -266,8 +263,7 @@ export function readMetricsSnapshot(): ReadMetricsSnapshot {
   return {
     sinceMs,
     totalRowsRead,
-    projected24h:
-      sinceMs >= MIN_SAMPLE_MS ? Math.round((totalRowsRead * 86_400_000) / sinceMs) : null,
+    projected24h: sinceMs > 0 ? Math.round((totalRowsRead * 86_400_000) / sinceMs) : 0,
     paths,
   };
 }
