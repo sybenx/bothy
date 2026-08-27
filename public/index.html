@@ -67,8 +67,19 @@
     font-size: 0.85rem;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   }
-  footer { margin-top: 2rem; font-size: 0.8rem; opacity: 0.6; }
+  footer { margin-top: 1rem; font-size: 0.8rem; opacity: 0.6; }
   footer a { color: inherit; }
+  /* Pushed a screen down deliberately -- see the comment in the footer.
+     A viewport-relative gap rather than a fixed one because what counts
+     as "below the fold" is the reader's window, not a number here. */
+  footer details { margin: 50vh 0 0; }
+  footer summary { cursor: pointer; }
+  footer .diag-grid { display: grid; grid-template-columns: auto 1fr; gap: 0.2rem 0.75rem; margin: 0.6rem 0; }
+  footer .diag-grid dt { opacity: 0.7; }
+  footer .diag-grid dd { margin: 0; }
+  footer table { border-collapse: collapse; width: 100%; margin-top: 0.4rem; }
+  footer table th, footer table td { text-align: left; padding: 0.15rem 0.5rem 0.15rem 0; border-bottom: 1px solid #8882; }
+  footer table th { opacity: 0.7; font-weight: 400; }
 </style>
 </head>
 <body>
@@ -82,7 +93,7 @@
   </div>
 
   <div class="stats">
-    <div class="stat"><div class="n" id="stat-total">-</div><div class="label">events stored</div></div>
+    <div class="stat"><div class="n" id="stat-total">-</div><div class="label" id="stat-total-label">events stored</div></div>
     <div class="stat"><div class="n" id="stat-ingested">-</div><div class="label">events received, last 24h</div></div>
     <div class="stat">
       <div class="n" id="stat-storage">-</div><div class="label">storage used (5 GB free limit)</div>
@@ -121,9 +132,37 @@
 
 <footer>
   <a id="version-link" href="https://github.com/sybenx/bothy" target="_blank" rel="noopener"></a>
+
+  <!-- After the version, and a screen below it. The version attribution
+       is what should read as the end of the page on first load, so
+       nothing may sit between it and the fold. This panel is something
+       you go looking for once you already have a budget question -- it
+       earns its place by being findable, not by being seen. -->
+  <details id="diagnostics" hidden>
+    <summary>Diagnostics</summary>
+    <dl class="diag-grid">
+      <dt>Storage used</dt><dd id="diag-storage">-</dd>
+      <dt>Stats snapshot taken</dt><dd id="diag-snapshot-at">-</dd>
+      <dt>Follow list refreshed</dt><dd id="diag-follows-at">-</dd>
+      <dt>Backfill last ran</dt><dd id="diag-backfill-at">-</dd>
+      <dt>Read budget</dt><dd id="diag-read-budget">-</dd>
+      <dt>Write budget</dt><dd id="diag-write-budget">-</dd>
+    </dl>
+    <table>
+      <thead><tr><th>read path</th><th>rows/call</th><th>share</th></tr></thead>
+      <tbody id="diag-read-paths"></tbody>
+    </table>
+  </details>
 </footer>
 
 <script>
+// The three Workers-free-tier ceilings this page displays progress
+// against (CLAUDE.md "The budget"). Shared by the top stat bars and the
+// diagnostics panel so the two can never disagree.
+const STORAGE_LIMIT = 5 * 1024 * 1024 * 1024;
+const ROWS_WRITTEN_LIMIT = 100000;
+const ROWS_READ_LIMIT = 5000000;
+
 async function main() {
   const res = await fetch("/api/stats");
   const stats = await res.json();
@@ -149,20 +188,39 @@ async function main() {
     });
 
     document.getElementById("stat-total").textContent = stats.totalEvents;
+    // "events stored" is read back from a snapshot row refreshed on the
+    // cron tick (src/schema.ts stats_snapshot), not counted per page
+    // load -- counting it costs a full scan of `events`, and doing that
+    // on every visit is what exhausted the rows-read allowance. So the
+    // number can be hours old, and the label says so rather than letting
+    // it read as current. The two figures beside it are live.
+    document.getElementById("stat-total-label").textContent =
+      "events stored" + snapshotAge(stats.snapshotAt);
     document.getElementById("stat-ingested").textContent = stats.ingested24h;
 
-    const STORAGE_LIMIT = 5 * 1024 * 1024 * 1024;
-    const ROWS_LIMIT = 100000;
     setBar("stat-storage", "bar-storage", stats.storageBytes, STORAGE_LIMIT, formatBytes(stats.storageBytes) + " used");
-    setBar("stat-rows", "bar-rows", stats.rowsWrittenEstimate24h, ROWS_LIMIT, stats.rowsWrittenEstimate24h + " rows (est.)");
+    setBar("stat-rows", "bar-rows", stats.rowsWrittenEstimate24h, ROWS_WRITTEN_LIMIT, stats.rowsWrittenEstimate24h + " rows (est.)");
 
     renderWritePolicyStatus(stats);
     renderBackfillStatus(stats.backfill);
+    renderDiagnostics(stats);
     wireLiveFeed();
   } else {
     document.getElementById("unclaimed-view").hidden = false;
     wireClaimForm();
   }
+}
+
+// How stale the snapshotted counts are, in words, or "" when they were
+// computed within the last few minutes -- there is no useful difference
+// between "just now" and "four minutes ago" on a dashboard, and saying
+// so for every load would be noise on the common case.
+function snapshotAge(snapshotAt) {
+  if (!snapshotAt) return "";
+  const minutes = Math.floor(Date.now() / 1000 - snapshotAt) / 60;
+  if (minutes < 5) return "";
+  if (minutes < 90) return " (as of " + Math.round(minutes) + " min ago)";
+  return " (as of " + Math.round(minutes / 60) + " h ago)";
 }
 
 // Sets the browser tab's favicon from the owner's kind-0 picture
@@ -213,12 +271,24 @@ function renderWritePolicyStatus(stats) {
   } else if (stats.followCount === 0) {
     parts.push("Follows are allowed to publish, but the follow list is empty -- no one but the owner can write until the owner's kind-3 contact list is stored on this relay.");
   } else {
-    const refreshed = stats.followsRefreshedAt
-      ? "as of " + new Date(stats.followsRefreshedAt * 1000).toLocaleString()
+    // The count already implies a working refresh -- printing "as of
+    // <time>" on every load just repeats that. The one time the
+    // timestamp is worth a reader's attention is when it's stale enough
+    // to mean the refresh (relay.ts's immediate-on-publish path, or the
+    // hourly cron fallback -- CLAUDE.md "Configuration") may have
+    // silently stopped: a follow list that looks current but hasn't
+    // moved in hours is the failure mode this line exists to catch.
+    const staleAfterSec = 3 * 60 * 60; // "a few hours"
+    const ageSec = stats.followsRefreshedAt ? Math.floor(Date.now() / 1000) - stats.followsRefreshedAt : null;
+    const stale = ageSec === null || ageSec > staleAfterSec;
+    const staleNote = stale
+      ? " (follow list last refreshed " +
+        (stats.followsRefreshedAt ? new Date(stats.followsRefreshedAt * 1000).toLocaleString() : "never") +
+        " -- refresh may be stuck)"
       : "";
     parts.push(
       "Owner plus " + stats.followCount + (stats.followCount === 1 ? " follow" : " follows") +
-      " can publish here" + (refreshed ? ", " + refreshed : "") + ".",
+      " can publish here." + staleNote,
     );
   }
   el.textContent = parts.join(" ");
@@ -264,6 +334,75 @@ function renderBackfillStatus(backfill) {
   } else {
     refusal.hidden = true;
   }
+}
+
+// The numbers behind the dashboard that are only otherwise legible as
+// raw JSON in the network tab -- storage in bytes, timestamps as epoch
+// seconds, and src/read-metrics.ts's in-memory read-attribution
+// breakdown. Collapsed by default: this is a diagnostic panel for
+// someone chasing a budget question, not something every visit needs to
+// see. Reads the same /api/stats response `main()` already fetched, so
+// showing it costs nothing extra.
+function renderDiagnostics(stats) {
+  document.getElementById("diagnostics").hidden = false;
+
+  document.getElementById("diag-storage").textContent = formatMB(stats.storageBytes);
+  document.getElementById("diag-snapshot-at").textContent = new Date(stats.snapshotAt * 1000).toLocaleString();
+  document.getElementById("diag-follows-at").textContent =
+    stats.writePolicy !== "follows"
+      ? "n/a (owner-only writes)"
+      : stats.followsRefreshedAt
+        ? new Date(stats.followsRefreshedAt * 1000).toLocaleString()
+        : "never";
+  document.getElementById("diag-backfill-at").textContent =
+    !stats.backfill ? "n/a" : stats.backfill.lastRunAt ? new Date(stats.backfill.lastRunAt * 1000).toLocaleString() : "not yet run";
+
+  document.getElementById("diag-read-budget").textContent = formatReadBudget(stats.reads);
+  document.getElementById("diag-write-budget").textContent =
+    stats.rowsWrittenEstimate24h.toLocaleString() + " rows / " + ROWS_WRITTEN_LIMIT.toLocaleString() +
+    " (" + formatPercent(stats.rowsWrittenEstimate24h, ROWS_WRITTEN_LIMIT) + ")";
+
+  const tbody = document.getElementById("diag-read-paths");
+  tbody.textContent = "";
+  for (const p of stats.reads.paths) {
+    const tr = document.createElement("tr");
+    const path = document.createElement("td");
+    path.textContent = p.path;
+    const perCall = document.createElement("td");
+    perCall.textContent = p.rowsPerCall === null ? "-" : p.rowsPerCall.toFixed(1);
+    const share = document.createElement("td");
+    share.textContent = (p.share * 100).toFixed(1) + "%";
+    tr.append(path, perCall, share);
+    tbody.appendChild(tr);
+  }
+}
+
+function formatMB(bytes) {
+  return (bytes / (1024 * 1024)).toFixed(2) + " MB";
+}
+
+function formatPercent(value, limit) {
+  return ((value / limit) * 100).toFixed(2) + "%";
+}
+
+// reads.* is src/read-metrics.ts's in-memory attribution -- it resets
+// whenever the Durable Object hibernates, so `sinceMs` can be a few
+// minutes rather than a day. `projected24h` is already null below
+// read-metrics.ts's own MIN_SAMPLE_MS floor; this just renders that
+// honestly instead of dividing a tiny sample by a huge multiplier and
+// presenting the result as if it meant something.
+function formatReadBudget(reads) {
+  const windowLabel =
+    reads.sinceMs < 60000 ? Math.round(reads.sinceMs / 1000) + "s" : Math.round(reads.sinceMs / 60000) + " min";
+  const base = reads.totalRowsRead.toLocaleString() + " rows read (sampled over " + windowLabel + ")";
+  if (reads.projected24h === null) {
+    return base + " -- window too short to project a 24h rate";
+  }
+  return (
+    base +
+    " -> projected " + reads.projected24h.toLocaleString() + " rows/24h (" +
+    formatPercent(reads.projected24h, ROWS_READ_LIMIT) + ")"
+  );
 }
 
 // Debugging tool that doubles as onboarding: turns
