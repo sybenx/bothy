@@ -180,7 +180,19 @@ describe("initSchema against historical table shapes", () => {
       // with no migration beside them.
       create: `CREATE TABLE owner (pubkey TEXT NOT NULL, name TEXT, picture TEXT)`,
       seed: `INSERT INTO owner (pubkey, name, picture) VALUES ('abc', 'Aaro', 'https://example.com/a.png')`,
-      expectAdded: ["about", "profile_synced_at", "icon_refreshed_at"],
+      expectAdded: ["about", "website", "profile_synced_at", "icon_refreshed_at"],
+    },
+    {
+      table: "owner",
+      label: "pre-v0.7.4, before website",
+      // The shape that would leave NIP-11's `contact` permanently absent
+      // without resetsOnAdd: profile_synced_at already holds the created_at
+      // of a kind-0 that has been parsed, so refreshProfile's "is there a
+      // newer one" guard answers no forever and the brand-new column never
+      // gets its first parse. Same failure `about` hit; same fix.
+      create: `CREATE TABLE owner (pubkey TEXT NOT NULL, name TEXT, picture TEXT, about TEXT, profile_synced_at INTEGER, icon_refreshed_at INTEGER)`,
+      seed: `INSERT INTO owner (pubkey, name, profile_synced_at) VALUES ('abc', 'Aaro', 12345)`,
+      expectAdded: ["website"],
     },
     {
       table: "backfill_meta",

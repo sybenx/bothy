@@ -1,4 +1,4 @@
-// TOFU claim flow (CLAUDE.md "Ownership" / "Claim implementation").
+// TOFU claim flow (CLAUDE.md "What it is" / "Claim implementation").
 //
 // The global test env injects a fixed OWNER_PUBKEY binding (see
 // DECISIONS.md's "Test-only OWNER_PUBKEY" entry and
@@ -90,7 +90,7 @@ describe("TOFU claim storage (env.OWNER_PUBKEY unset)", () => {
 });
 
 describe("claim-time profile storage", () => {
-  it("stores the owner's kind-0 name/picture/about passed at claim time", async () => {
+  it("stores the owner's kind-0 name/picture/about/website passed at claim time", async () => {
     const id = env.RELAY.idFromName("relay");
     const stub = env.RELAY.get(id);
     const claimant = randomKeypair().pubkeyHex;
@@ -103,17 +103,20 @@ describe("claim-time profile storage", () => {
           // Backs the kind-0 rung of the NIP-11 description -- see
           // nip11.ts resolveDescription.
           about: "notes and other stuff",
+          // Backs NIP-11's `contact` -- see nip11.ts resolveContact.
+          website: "https://alice.example",
         }),
       ).toBe(true);
       expect(getOwnerProfile(state.storage.sql, UNCLAIMED_ENV)).toEqual({
         name: "alice",
         picture: "https://example.com/a.png",
         about: "notes and other stuff",
+        website: "https://alice.example",
       });
     });
   });
 
-  it("stores null name/picture/about when no profile is given -- lookup failure is not blocking", async () => {
+  it("stores null profile fields when no profile is given -- lookup failure is not blocking", async () => {
     const id = env.RELAY.idFromName("relay");
     const stub = env.RELAY.get(id);
     const claimant = randomKeypair().pubkeyHex;
@@ -124,6 +127,7 @@ describe("claim-time profile storage", () => {
         name: null,
         picture: null,
         about: null,
+        website: null,
       });
     });
   });

@@ -17,7 +17,12 @@ import { version } from "../package.json";
 export const DEFAULT_NAME = "bothy";
 export const DEFAULT_DESCRIPTION = "A single-user nostr relay.";
 
-export type OwnerProfile = { name: string | null; picture: string | null; about: string | null } | null;
+export type OwnerProfile = {
+  name: string | null;
+  picture: string | null;
+  about: string | null;
+  website: string | null;
+} | null;
 
 // ---------------------------------------------------------------------
 // The relay identity chain. Name, description and icon each resolve in
@@ -84,10 +89,38 @@ export function resolveIcon(env: Env, stored: RelaySettings, profile: OwnerProfi
   return env.RELAY_ICON || stored.icon || profile?.picture || null;
 }
 
+// NIP-11's `contact` is "an administrative contact", and the NIP's own
+// examples are URIs -- `mailto:` or `https:`. kind-0 has no field named
+// `contact`, so one of its fields has to be chosen, and `website` is the
+// only one that is already a URI.
+//
+// The other candidates were rejected rather than overlooked. `nip05` is
+// shaped like an email address and is not one: it is an identity
+// verifier at a well-known path, and a great many nip05 identifiers have
+// no mailbox behind them, so publishing one as an administrative contact
+// would send mail into a void. `lud16` is a lightning address -- a
+// payment endpoint, not a contact route -- and advertising it here would
+// invite people to pay the operator when they meant to email them.
+//
+// Omitted entirely when the owner's kind-0 has no website, rather than
+// emitted empty: NIP-11's fields are all optional, and an absent field
+// says "unknown" while an empty one says "deliberately blank."
+//
+// No environment-variable or NIP-86 rung, unlike name/description/icon.
+// Those three have a `change*` method and a RELAY_* variable because an
+// operator may want the relay to present differently from the person; a
+// contact address has no such split -- there is one operator and this is
+// how to reach them. Adding rungs nobody asked for would be three more
+// pieces of resolution order to keep consistent.
+function resolveContact(profile: OwnerProfile): string | null {
+  return profile?.website ?? null;
+}
+
 export function buildRelayInfo(
   env: Env,
   stored: RelaySettings,
   profile: OwnerProfile,
+  ownerPubkey: string | null,
 ): Record<string, unknown> {
   const info: Record<string, unknown> = {
     name: resolveName(env, stored, profile),
@@ -150,11 +183,33 @@ export function buildRelayInfo(
   if (icon) {
     info.icon = icon;
   }
+  // The owner's pubkey, in hex, from the same resolution the rest of the
+  // relay uses (ownership.ts getOwnerPubkey: OWNER_PUBKEY environment
+  // variable, else the TOFU claim in storage). This is the field that
+  // answers "who runs this relay", and without it a client fetching this
+  // document could read the operator's name and see their picture while
+  // having no way to identify them as a nostr user at all.
+  //
+  // Omitted while unclaimed, which is not a degenerate case but the
+  // normal state of a freshly deployed relay: there is genuinely no
+  // owner yet, and emitting an empty string would assert otherwise.
+  if (ownerPubkey) {
+    info.pubkey = ownerPubkey;
+  }
+  const contact = resolveContact(profile);
+  if (contact) {
+    info.contact = contact;
+  }
   return info;
 }
 
-export function nip11Response(env: Env, stored: RelaySettings, profile: OwnerProfile): Response {
-  return new Response(JSON.stringify(buildRelayInfo(env, stored, profile)), {
+export function nip11Response(
+  env: Env,
+  stored: RelaySettings,
+  profile: OwnerProfile,
+  ownerPubkey: string | null,
+): Response {
+  return new Response(JSON.stringify(buildRelayInfo(env, stored, profile, ownerPubkey)), {
     headers: {
       "Content-Type": "application/nostr+json",
       // NIP-11 is fetched cross-origin by web clients before they ever

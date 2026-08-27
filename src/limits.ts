@@ -1,6 +1,6 @@
 import { tagFilterEntries, type Filter } from "./nostr";
 import { expandFilterCount } from "./filters";
-import { eventRowCost, indexesOn } from "./schema";
+import { eventRemovalBudget, eventRowCost, indexesOn } from "./schema";
 
 // Hijacking is not the threat here. Read abuse is. The write path is
 // already owner-gated (ownership.ts isAllowedWriter), so these caps
@@ -530,9 +530,15 @@ const TAGS_PER_REAL_EVENT = 5;
 const BACKFILL_SHARE_UTILISATION = 0.8;
 const CRON_TICKS_PER_DAY = 24;
 
-export const BACKFILL_PAGE_SIZE = Math.floor(
-  (BACKFILL_ROWS_SHARE_LIMIT * BACKFILL_SHARE_UTILISATION) /
-    (eventRowCost(TAGS_PER_REAL_EVENT) * CRON_TICKS_PER_DAY),
+// Never zero. Enough declared indexes would drive the quotient below one
+// and floor() would silently stop backfill entirely -- a derived constant
+// that can collapse to a no-op is worse than the literal it replaced.
+export const BACKFILL_PAGE_SIZE = Math.max(
+  1,
+  Math.floor(
+    (BACKFILL_ROWS_SHARE_LIMIT * BACKFILL_SHARE_UTILISATION) /
+      (eventRowCost(TAGS_PER_REAL_EVENT) * CRON_TICKS_PER_DAY),
+  ),
 );
 
 // How many events one cron tick will remove for a pubkey with a NIP-62
@@ -540,11 +546,9 @@ export const BACKFILL_PAGE_SIZE = Math.floor(
 //
 // Bounded by rows WRITTEN, not rows read -- the index added in v0.7.3
 // made the reads cheap and left the writes exactly where they were.
-// Removing one event costs its row and every index entry behind it, plus
-// the tombstone that stops it being replayed: about
-// eventRowCost(TAGS_PER_REAL_EVENT) + 2 rows. At the free tier's
-// 100,000/day that is roughly 4,500 events before a vanish alone would
-// consume the entire daily write budget.
+// Paced against schema.ts eventRemovalBudget, which is deliberately the
+// pessimistic of the two real figures for a removal; see the comment
+// there for why a budget guard takes the larger number.
 //
 // A quarter of the daily ceiling, which is half of backfill's share and
 // chosen against the two failure modes rather than as a round number.
@@ -554,16 +558,25 @@ export const BACKFILL_PAGE_SIZE = Math.floor(
 // write budget in an afternoon. Too small and the relay takes weeks to
 // do a thing NIP-62 says it MUST do, which is not compliance either.
 //
-// At a quarter, the drain runs at about 47 events per tick, ~1,128 a
-// day. The arithmetic that bounds it is not really this constant, it is
-// the ceiling: at ~22 rows written per removed event, 100,000 rows/day
-// is ~4,500 events/day even if a vanish were given the entire budget and
-// the relay did nothing else. A pubkey with tens of thousands of stored
-// events takes days to vanish at ANY share, so the property worth
+// The arithmetic that bounds this is not really the share, it is the
+// ceiling. A pubkey with tens of thousands of stored events takes days to
+// vanish at ANY share of 100,000 rows/day, so the property worth
 // engineering is that it finishes and stays visible while it does --
 // /api/stats reports every draining request and how far it has got --
 // rather than that it finishes quickly.
 export const VANISH_ROWS_SHARE_LIMIT = DAILY_ROWS_WRITTEN_LIMIT / 4;
-export const VANISH_BATCH_SIZE = Math.floor(
-  VANISH_ROWS_SHARE_LIMIT / ((eventRowCost(TAGS_PER_REAL_EVENT) + 2) * CRON_TICKS_PER_DAY),
+// Derived from eventRemovalBudget, not from `eventRowCost(...) + 2`. The
+// `+ 2` was the tombstone, which is a function of the schema -- so
+// writing it as a number here was the same hand-derived-literal mistake
+// this file removed from BACKFILL_PAGE_SIZE in the very commit that
+// introduced it. schema.ts owns the arithmetic; this file owns the share.
+//
+// Never zero, and here that guard is load-bearing rather than defensive:
+// drainVanish treats "returned fewer rows than the limit" as "nothing
+// left", so a limit of 0 would delete nothing, never report done, and
+// leave the request pending forever -- a vanish that can never complete,
+// which is the exact failure the checkpoint exists to prevent.
+export const VANISH_BATCH_SIZE = Math.max(
+  1,
+  Math.floor(VANISH_ROWS_SHARE_LIMIT / (eventRemovalBudget(TAGS_PER_REAL_EVENT) * CRON_TICKS_PER_DAY)),
 );

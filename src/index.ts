@@ -37,7 +37,7 @@ async function handleClaim(request: Request, env: Env): Promise<Response> {
   const result = await relayStub(env).claim(rawPubkey, profile ?? undefined, new URL(request.url).host);
   switch (result.status) {
     case "disabled":
-      // CLAUDE.md "Claim implementation": "If OWNER_PUBKEY is set in
+      // CLAUDE.md "What it is": "If OWNER_PUBKEY is set in
       // env... return 404 from /api/claim."
       return new Response("not found", { status: 404 });
     case "invalid":
@@ -140,8 +140,8 @@ async function route(request: Request, env: Env): Promise<Response> {
   // Accept headers ("application/nostr+json, */*"), and NIP-11 only
   // requires the media type be present, not that it stand alone.
   if (request.headers.get("Accept")?.includes("application/nostr+json")) {
-    const { profile, settings } = await relayStub(env).getIdentity(url.host);
-    return nip11Response(env, settings, profile);
+    const { profile, settings, ownerPubkey } = await relayStub(env).getIdentity(url.host);
+    return nip11Response(env, settings, profile, ownerPubkey);
   }
 
   if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {

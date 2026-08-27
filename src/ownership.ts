@@ -28,14 +28,14 @@ export function getOwnerPubkey(sql: SqlStorage, env: Env): string | null {
   return row?.pubkey ?? null;
 }
 
-// TOFU claim (CLAUDE.md "Claim implementation"): "the claim handler is
+// TOFU claim (CLAUDE.md "What it is"): "the claim handler is
 // the only writer, and it refuses if a row already exists." The
 // Durable Object is single-threaded per instance, so this
 // check-then-write is atomic without locking -- no other code path may
 // write this row. Returns false if a row already existed (already
 // claimed by an earlier call).
 // `profile` is the owner's kind-0 name/picture, looked up once by the
-// Worker at claim time (CLAUDE.md "Claim implementation"): the NIP-11
+// Worker at claim time (CLAUDE.md "What it is"): the NIP-11
 // name and icon are derived from the owner's kind-0 at claim time and
 // written to DO storage there. Optional and best-effort --
 // undefined fields are stored as null and nip11.ts falls back to
@@ -44,11 +44,12 @@ export function claimOwner(sql: SqlStorage, pubkey: string, profile?: Profile): 
   const existing = sql.exec(`SELECT 1 FROM owner LIMIT 1`).toArray();
   if (existing.length > 0) return false;
   sql.exec(
-    `INSERT INTO owner (pubkey, name, picture, about) VALUES (?, ?, ?, ?)`,
+    `INSERT INTO owner (pubkey, name, picture, about, website) VALUES (?, ?, ?, ?, ?)`,
     pubkey,
     profile?.name ?? null,
     profile?.picture ?? null,
     profile?.about ?? null,
+    profile?.website ?? null,
   );
   return true;
 }
@@ -61,9 +62,12 @@ export function claimOwner(sql: SqlStorage, pubkey: string, profile?: Profile): 
 export function getOwnerProfile(sql: SqlStorage, env: Env): OwnerProfile {
   if (env.OWNER_PUBKEY) return null;
   const row = sql
-    .exec<{ name: string | null; picture: string | null; about: string | null }>(
-      `SELECT name, picture, about FROM owner LIMIT 1`,
-    )
+    .exec<{
+      name: string | null;
+      picture: string | null;
+      about: string | null;
+      website: string | null;
+    }>(`SELECT name, picture, about, website FROM owner LIMIT 1`)
     .toArray()[0];
   return row ?? null;
 }
@@ -160,9 +164,12 @@ export function refreshProfile(sql: SqlStorage, env: Env, nowSec: number): void 
       name: string | null;
       picture: string | null;
       about: string | null;
+      website: string | null;
       profile_synced_at: number | null;
       icon_refreshed_at: number | null;
-    }>(`SELECT name, picture, about, profile_synced_at, icon_refreshed_at FROM owner LIMIT 1`)
+    }>(
+      `SELECT name, picture, about, website, profile_synced_at, icon_refreshed_at FROM owner LIMIT 1`,
+    )
     .toArray()[0];
   // No `owner` row exists when OWNER_PUBKEY skips the claim flow
   // entirely (claimOwner above is the only writer) -- nothing to cache a
@@ -181,6 +188,7 @@ export function refreshProfile(sql: SqlStorage, env: Env, nowSec: number): void 
   let name = row.name;
   let picture = row.picture;
   let about = row.about;
+  let website = row.website;
   let syncedAt = row.profile_synced_at;
   if (latest && (row.profile_synced_at === null || latest.created_at > row.profile_synced_at)) {
     try {
@@ -188,6 +196,9 @@ export function refreshProfile(sql: SqlStorage, env: Env, nowSec: number): void 
       name = typeof content.name === "string" ? content.name : null;
       picture = typeof content.picture === "string" ? content.picture : null;
       about = typeof content.about === "string" ? content.about : null;
+      // Backs NIP-11's `contact` -- see nip11.ts resolveContact for why
+      // `website` and not `nip05` or `lud16`.
+      website = typeof content.website === "string" ? content.website : null;
       syncedAt = latest.created_at;
     } catch {
       // Malformed kind-0 content -- leave the cached profile as-is, but
@@ -198,10 +209,11 @@ export function refreshProfile(sql: SqlStorage, env: Env, nowSec: number): void 
   }
 
   sql.exec(
-    `UPDATE owner SET name = ?, picture = ?, about = ?, profile_synced_at = ?, icon_refreshed_at = ?`,
+    `UPDATE owner SET name = ?, picture = ?, about = ?, website = ?, profile_synced_at = ?, icon_refreshed_at = ?`,
     name,
     picture,
     about,
+    website,
     syncedAt,
     nowSec,
   );

@@ -1,4 +1,4 @@
-// /api/stats and the static admin page (CLAUDE.md "Admin page").
+// /api/stats and the static admin page (CLAUDE.md "What it is").
 import { env, exports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";

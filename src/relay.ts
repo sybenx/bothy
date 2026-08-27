@@ -384,11 +384,20 @@ export class Relay extends DurableObject<Env> {
   // Null when unclaimed, when OWNER_PUBKEY skips storage entirely, or
   // when the claim-time profile lookup failed; the
   // caller (nip11.ts) falls back to hardcoded defaults in all those cases.
-  async getIdentity(host?: string): Promise<{ profile: OwnerProfile; settings: RelaySettings }> {
+  async getIdentity(
+    host?: string,
+  ): Promise<{ profile: OwnerProfile; settings: RelaySettings; ownerPubkey: string | null }> {
     return withReadPath("identity", () => {
       const sql = this.sql;
       if (host) recordHost(sql, host);
-      return { profile: getOwnerProfile(sql, this.env), settings: getRelaySettings(sql) };
+      // The owner pubkey rides along rather than costing a second RPC:
+      // NIP-11 now publishes it (nip11.ts), and getOwnerPubkey is an
+      // env read plus at most one indexed row.
+      return {
+        profile: getOwnerProfile(sql, this.env),
+        settings: getRelaySettings(sql),
+        ownerPubkey: getOwnerPubkey(sql, this.env),
+      };
     });
   }
 
@@ -414,7 +423,7 @@ export class Relay extends DurableObject<Env> {
     );
   }
 
-  // Backs GET /api/stats (src/index.ts) -- see CLAUDE.md "Admin page".
+  // Backs GET /api/stats (src/index.ts) -- see CLAUDE.md "What it is".
   async getStats(host?: string): Promise<{
     version: string;
     claimed: boolean;
@@ -439,7 +448,7 @@ export class Relay extends DurableObject<Env> {
     // changerelayname.
     relayName: string;
     // Whether writes beyond the owner are currently possible at all
-    // (CLAUDE.md "Writes are owner-gated"), plus the numbers that
+    // (CLAUDE.md "What it is"), plus the numbers that
     // back that state -- see the ALLOW_FOLLOWS-gate comment in
     // ownership.ts isAllowedWriter. Surfaced so an owner who enabled
     // ALLOW_FOLLOWS but never published a kind-3 here (an empty allowlist
@@ -1017,7 +1026,7 @@ export class Relay extends DurableObject<Env> {
     if (result.stored) {
       // Refresh the follow cache the instant the owner publishes a new
       // kind-3, rather than waiting up to an hour for the next cron tick
-      // (CLAUDE.md "Owner-only writes"). Gated on `event.pubkey === owner`,
+      // (CLAUDE.md "What it is"). Gated on `event.pubkey === owner`,
       // not just `event.kind` -- under ALLOW_FOLLOWS a follow can publish
       // their own kind-3 through this same accept path, and refreshFollows
       // always re-derives from the *owner's* most recent event regardless
@@ -1221,7 +1230,7 @@ export class Relay extends DurableObject<Env> {
   // Pushes a redacted notice of a newly stored event to every open live
   // feed connection. Gift wraps are never sent here,
   // full stop, regardless of who is connected -- the admin page has no
-  // way to authenticate (CLAUDE.md "Admin page" is static, unsigned), so
+  // way to authenticate (CLAUDE.md "What it is" is static, unsigned), so
   // every live feed viewer is permanently the unauthenticated case NIP-42
   // gates gift wrap reads against elsewhere (handleReq above). Only
   // kind/time/a truncated id go out, never tags or content, so even a

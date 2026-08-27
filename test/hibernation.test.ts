@@ -7,7 +7,22 @@
 import { env } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { EVENT_BASE_ROW_COST, eventRowCost, indexesOn, TAG_ROW_COST } from "../src/schema";
+import {
+  EVENT_BASE_ROW_COST,
+  eventRemovalBudget,
+  eventRemovalRowsWritten,
+  eventRowCost,
+  indexesOn,
+  TAG_ROW_COST,
+  TOMBSTONE_ROW_COST,
+} from "../src/schema";
+import {
+  BACKFILL_PAGE_SIZE,
+  BACKFILL_ROWS_SHARE_LIMIT,
+  VANISH_BATCH_SIZE,
+  VANISH_ROWS_SHARE_LIMIT,
+} from "../src/limits";
+import { applyDeletion, storeEvent as store } from "../src/storage";
 import { storeEvent } from "../src/storage";
 import type { Relay } from "../src/relay";
 import { signEvent } from "./helpers/event";
@@ -155,5 +170,77 @@ describe("rows written per stored event", () => {
       // SQLite actually wrote -- not merely equal the formula.
       expect(stamped).toBe(measured);
     });
+  });
+});
+
+// Removing an event is a write too, and it is the figure the NIP-62
+// vanish drain is paced against. Measured, like the insert cost above,
+// because limits.ts VANISH_BATCH_SIZE divides the vanish share by it --
+// if this derivation is wrong the drain either overruns its share or
+// crawls, and neither is visible from the outside.
+describe("rows written per removed event", () => {
+  it("matches eventRemovalRowsWritten for a reply carrying #e and #p", async () => {
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    const now = Math.floor(Date.now() / 1000);
+    const target = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 1,
+      content: "to be deleted",
+      created_at: now,
+      tags: [
+        ["e", "a".repeat(64)],
+        ["p", "b".repeat(64)],
+      ],
+    });
+    const deletion = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 5,
+      tags: [["e", target.id]],
+      created_at: now + 1,
+    });
+
+    await runInDurableObject(stub, async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      store(sql, target, now);
+      // applyDeletion is the real removal path: it deletes the tag rows,
+      // the event row, and writes the tombstone that stops a replay.
+      const measured = measureRowsWritten(sql, (s) => applyDeletion(s, deletion));
+      // Two tag rows + the event row + the tombstone. NOT
+      // eventRowCost(2) + TOMBSTONE_ROW_COST: the cursor counts index
+      // maintenance on INSERT and not on DELETE, which is why schema.ts
+      // carries two figures for a removal rather than one.
+      expect(measured).toBe(eventRemovalRowsWritten(2));
+      expect(measured).toBeLessThan(eventRemovalBudget(2));
+    });
+  });
+});
+
+// The derived work-per-tick constants are asserted against their SHARE,
+// not against the number they currently resolve to. Asserting the number
+// would just be the hand-derived literal again, one level removed: it
+// would have to be edited by hand every time an index moved, which is the
+// failure both constants exist to end. What must hold is the invariant --
+// each stays inside the fraction of the daily write ceiling it was given,
+// whatever the schema does.
+describe("work-per-tick constants stay inside their share", () => {
+  const TAGS_PER_REAL_EVENT = 5;
+  const CRON_TICKS_PER_DAY = 24;
+
+  it("keeps backfill inside its reserved share", () => {
+    const perDay = BACKFILL_PAGE_SIZE * eventRowCost(TAGS_PER_REAL_EVENT) * CRON_TICKS_PER_DAY;
+    expect(perDay).toBeLessThanOrEqual(BACKFILL_ROWS_SHARE_LIMIT);
+  });
+
+  it("keeps the vanish drain inside its reserved share", () => {
+    const perDay = VANISH_BATCH_SIZE * eventRemovalBudget(TAGS_PER_REAL_EVENT) * CRON_TICKS_PER_DAY;
+    expect(perDay).toBeLessThanOrEqual(VANISH_ROWS_SHARE_LIMIT);
+  });
+
+  it("never derives zero work per tick", () => {
+    // A derived constant that can collapse to a no-op is worse than the
+    // literal it replaced. For the vanish drain it is worse still:
+    // drainVanish reads "fewer rows than the limit" as "nothing left", so
+    // a limit of 0 would delete nothing, never report done, and leave the
+    // request pending forever.
+    expect(BACKFILL_PAGE_SIZE).toBeGreaterThanOrEqual(1);
+    expect(VANISH_BATCH_SIZE).toBeGreaterThanOrEqual(1);
   });
 });

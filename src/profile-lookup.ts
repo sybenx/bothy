@@ -19,6 +19,8 @@ export interface Profile {
   // description (nip11.ts resolveDescription) the way name/picture back
   // the name and icon rungs.
   about?: string;
+  // Backs NIP-11's `contact` (nip11.ts resolveContact).
+  website?: string;
 }
 
 function queryOne(relayUrl: string, pubkey: string): Promise<Profile | null> {
@@ -59,6 +61,7 @@ function queryOne(relayUrl: string, pubkey: string): Promise<Profile | null> {
           if (typeof content.name === "string") profile.name = content.name;
           if (typeof content.picture === "string") profile.picture = content.picture;
           if (typeof content.about === "string") profile.about = content.about;
+          if (typeof content.website === "string") profile.website = content.website;
           done(profile);
         } else if (frame[0] === "EOSE") {
           done(null);

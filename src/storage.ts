@@ -141,7 +141,9 @@ function insertEventRow(
 //
 // The reads are fixed; the WRITES are not, and the index does nothing for
 // them. Removing an event still costs its row, its index entries and a
-// tombstone -- about 22 rows written each -- so a large vanish can still
+// tombstone -- see schema.ts eventRemovalRowsWritten, and
+// eventRemovalBudget for the figure the drain is paced against -- so a
+// large vanish can still
 // exceed a single request's budget partway through. That is why
 // beginVanish/drainVanish below checkpoint the work across cron ticks
 // rather than attempting it all inside the request: NIP-62 requires full
@@ -386,10 +388,11 @@ function applyAddressDeletion(sql: SqlStorage, address: string, deletion: NostrE
 //
 // It is split because a vanish is the one request whose size is chosen by
 // the sender and bounded by nothing this relay controls. Removing an
-// event costs its row, its index entries and a tombstone -- about 22 rows
-// written -- so a pubkey with thousands of stored events cannot be
-// vanished inside one request without exceeding the daily write budget
-// partway through. Doing it inline anyway would leave the pubkey
+// event costs its tag rows, its own row and a tombstone (schema.ts
+// eventRemovalRowsWritten), and the drain is paced against the
+// pessimistic eventRemovalBudget -- so a pubkey with thousands of stored
+// events cannot be vanished inside one request without exceeding the
+// daily write budget partway through. Doing it inline anyway would leave the pubkey
 // half-vanished while the OK frame said it had succeeded, and "fully
 // delete" is the spec's word, so that is a compliance failure rather than
 // a slow query.

@@ -3,7 +3,7 @@
 // "optional", so a clean deploy must declare none (CLAUDE.md
 // "Configuration").
 // OWNER_PUBKEY is deliberately absent so a real deploy stays unclaimed
-// (TOFU) by default, per CLAUDE.md "Ownership" -- it's injected as a
+// (TOFU) by default, per CLAUDE.md "What it is" -- it's injected as a
 // miniflare binding in vitest.config.ts for tests, and set by the claim
 // flow at runtime. RELAY_NAME/RELAY_DESCRIPTION/RELAY_ICON are optional
 // advanced overrides anyone can add in the Cloudflare dashboard; read

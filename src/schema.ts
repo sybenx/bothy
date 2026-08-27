@@ -234,7 +234,7 @@ export const TABLES: readonly TableSpec[] = [
     ],
   },
   {
-    // TOFU ownership (CLAUDE.md "Ownership"). At most one row, ever. The
+    // TOFU ownership (CLAUDE.md "What it is"). At most one row, ever. The
     // claim handler is the only writer and refuses if a row already
     // exists -- see ownership.ts. A one-time write; not part of the
     // per-event budget in the comment above.
@@ -258,6 +258,13 @@ export const TABLES: readonly TableSpec[] = [
       // by clearing the guard the moment this column is actually added to
       // an existing database.
       col("about", "TEXT", ["profile_synced_at"]),
+      // Backs NIP-11's `contact` (nip11.ts resolveContact). Added after
+      // profile_synced_at already existed on deployed relays, so it takes
+      // the same resetsOnAdd treatment `about` documents above: without
+      // it, refreshProfile's "is there a newer kind-0 than
+      // profile_synced_at" guard would answer "no" forever and a
+      // brand-new derived column would never get its first parse.
+      col("website", "TEXT", ["profile_synced_at"]),
       // profile_synced_at/icon_refreshed_at back the icon-refresh cron
       // (ownership.ts refreshProfile): profile_synced_at is the
       // created_at of the locally-stored kind-0 the cached fields were
@@ -296,7 +303,8 @@ export const TABLES: readonly TableSpec[] = [
     // This table exists because a vanish is the one request whose size is
     // chosen by the sender and unbounded by anything this relay controls.
     // Deleting N events costs N tombstone inserts and N row deletions --
-    // roughly 22 rows written each with the current index set -- so a
+    // 8 rows written each as the cursor counts them, and paced against a
+    // pessimistic 22 (see eventRemovalRowsWritten/eventRemovalBudget) -- so a
     // large vanish can exceed a single request's budget partway through.
     // Without a checkpoint it would then stop wherever the ceiling fell,
     // having deleted some of the pubkey's events and reported success,
@@ -587,6 +595,59 @@ export const TAG_ROW_COST = 1 + indexesOn("event_tags").length;
 // instead of rebuilding this from a join.
 export function eventRowCost(indexedTagCount: number): number {
   return EVENT_BASE_ROW_COST + TAG_ROW_COST * indexedTagCount;
+}
+
+// Rows written by tombstoning one id: the `deleted_ids` row, plus the
+// implicit unique index behind its TEXT PRIMARY KEY (same shape as
+// `events.id`), plus any index later declared on that table.
+export const TOMBSTONE_ROW_COST = 2 + indexesOn("deleted_ids").length;
+
+// ---------------------------------------------------------------------
+// Removing one stored event, which costs two different numbers depending
+// on what the number is for.
+//
+// The obvious assumption is that a delete costs what the insert cost:
+// every row and index entry created has to come back out. It does not,
+// and this was assumed here before it was measured. SqlStorageCursor
+// counts index maintenance on INSERT but NOT on DELETE (measured on a
+// two-tag event, workerd, 2026-08-26):
+//
+//   INSERT INTO events ...                 5   (1 row + PK index + 3 indexes)
+//   INSERT INTO event_tags ... x2          3   each (1 row + 2 indexes)
+//   DELETE FROM event_tags (2 rows)        2   <- 2, not 6
+//   DELETE FROM events (1 row)             1   <- 1, not 5
+//   INSERT OR IGNORE INTO deleted_ids      2
+//
+// So a removal reports one row per base row deleted, plus the tombstone.
+// Both functions below are real; which one to use depends on whether you
+// are reporting or budgeting.
+// ---------------------------------------------------------------------
+
+// What SqlStorageCursor actually reports for removing one event: the tag
+// rows, the event row, and the tombstone. Asserted against a real cursor
+// in test/hibernation.test.ts.
+export function eventRemovalRowsWritten(indexedTagCount: number): number {
+  return indexedTagCount + 1 + TOMBSTONE_ROW_COST;
+}
+
+// What the NIP-62 vanish drain is PACED against, and deliberately the
+// pessimistic figure rather than the measured one.
+//
+// The asymmetry above is a property of Cloudflare's instrument, and the
+// instrument is the only thing this project can see. Whether their
+// BILLING also ignores index maintenance on DELETE is not something a
+// cursor can answer. Pacing a budget guard against the smaller of two
+// plausible numbers would mean that if the cursor under-reports, the
+// drain quietly overruns its share -- the unsafe direction, and exactly
+// the class of error that made estimateRowsWritten24h wrong by 45x.
+//
+// So the drain assumes a removal costs what the insertion cost, plus the
+// tombstone. If the cursor is right, the drain simply runs at about a
+// third of its allowance, which costs a vanish some days; if the cursor
+// is under-reporting, the share still holds. That is the correct
+// direction to be wrong in for a guard.
+export function eventRemovalBudget(indexedTagCount: number): number {
+  return eventRowCost(indexedTagCount) + TOMBSTONE_ROW_COST;
 }
 
 function createTableSql(spec: TableSpec): string {
