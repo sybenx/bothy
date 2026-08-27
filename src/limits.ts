@@ -623,6 +623,86 @@ export const MAX_CREATED_AT_FUTURE_SECONDS = 3600;
 // snapshot at all.
 export const STATS_SNAPSHOT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
+// How stale /api/stats' LIVE half may get -- `ingested24h` and
+// `rowsWrittenToday`, the two windowed scans left over once the
+// STATS_SNAPSHOT_MAX_AGE_MS half above was moved into a row (schema.ts
+// `live_stats`, storage.ts computeLiveStats, relay.ts refreshLiveStats).
+//
+// A separate constant from the one above, not a reuse of it, and the
+// separation is the point. Six hours is fine for a total event count and
+// is far too stale for the write-budget meter, which is the one number on
+// this page an operator reads while deciding whether the relay is out of
+// allowance or actually broken. These two figures wanted to stay live for
+// that reason and did, until it turned out what "live" cost.
+//
+// WHAT IT COSTS, and why a cache rather than a freshness preference. Both
+// queries read the ingest window via idx_events_ingested, so neither
+// scales with E -- measured on the live relay at 853 rows
+// (countIngested24h) plus 344 (estimateRowsWrittenSince), ~1,200 per
+// request with the ~11 rows of lookups beside them. GET /api/stats is
+// unauthenticated, reachable before anything gates it, and was billed
+// per request: ~4,100 requests took the 5,000,000 rows-read/day
+// allowance for the rest of the UTC day, from anywhere, at no cost to
+// the caller. That is the same shape as the gift wrap gate probe -- an
+// expensive read on the far side of no gate -- and the fix is the same
+// one the snapshot above already applies: bound the RATE at which the
+// expensive thing runs, so the request count stops being what sets it.
+//
+// A ROW, NOT MEMORY, and the reasoning is worth stating because the
+// obvious argument points the other way: hibernation clears memory, but a
+// flood keeps the object awake, so an in-memory cache would hit exactly
+// during the flood it exists to survive. That is true and it is not
+// enough. A flood is not the cheapest way to spend this budget -- pacing
+// requests slower than eviction is, and it defeats a memory cache
+// completely: at one request every ten seconds, 8,640 requests/day x
+// ~1,200 rows is 10,400,000 rows, twice the ceiling, from a single host
+// making six requests a minute. Storage is the only state in this object
+// that outlives eviction, so the bound has to live there or it is a
+// description of an intention. `stats_snapshot` above learned this the
+// expensive way (see its comment in schema.ts); this is the same lesson
+// applied before rather than after.
+//
+// WHY FIVE MINUTES. A refresh does not cost a constant -- both queries
+// read the ingest window, so one costs roughly 1.5 x D, where D is
+// events ingested per day. The flood floor is therefore
+// (86,400 / T) x 1.5D rows/day, and asking that to stay under the
+// 5,000,000 ceiling gives the admissible D for a given T:
+//
+//   T =  60s   1,440 refreshes/day    D <=  2,315 events/day
+//   T = 300s     288 refreshes/day    D <= 11,574 events/day
+//   T = 600s     144 refreshes/day    D <= 23,148 events/day
+//
+// One minute is the interval the freshness argument alone would pick, and
+// it fails the arithmetic: a relay running a backfill ingests far more
+// than 2,315 events/day -- the 100,000 rows-written ceiling alone admits
+// ~16,600 at the cheapest 6 rows each -- so a 60-second TTL would put the
+// floor back over the ceiling on exactly the busy days the meter is being
+// watched. Five minutes holds for any ingest rate this relay can reach
+// while writing, and costs ~8.6% of the read ceiling at the live relay's
+// ingest rate even under a sustained flood.
+//
+// Five minutes is also finer than the thing it measures. During a
+// backfill `rowsWrittenToday` moves in hourly steps, because backfill
+// writes on the hourly cron tick; live traffic moves it continuously but
+// slowly. /api/stats reports `liveAt` beside these two the way it reports
+// `snapshotAt` beside the snapshotted five, so the age is stated rather
+// than implied.
+//
+// Refreshed ONLY on demand, deliberately -- unlike the snapshot above,
+// the cron tick does not refresh this. The tick fires hourly, which is
+// longer than this TTL, so it could not keep the row warm; all it would
+// add is a fixed 24-refresh/day floor paid on a relay nobody is looking
+// at.
+//
+// THE NEXT STEP, if this stops being enough: hourly bucket counters --
+// one row written per event into a per-hour bucket, and a windowed sum
+// that reads at most 24 rows. That makes both figures cheap outright
+// rather than cheap-on-average, and removes the staleness with them. It
+// is the better long-term shape and it needs a schema change and a write
+// on the per-event path; this cache closes the abuse without either, so
+// it comes first.
+export const LIVE_STATS_MAX_AGE_MS = 5 * 60 * 1000;
+
 // Backfill must yield to the owner's own live
 // traffic, never compete with it for the shared daily rows-written
 // ceiling -- see backfill.ts hasBackfillHeadroom for the full reasoning.

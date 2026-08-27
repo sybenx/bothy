@@ -43,7 +43,7 @@ import {
   TAG_ROWS_READ_PER_MATCH,
 } from "../src/limits";
 import type { Filter } from "../src/nostr";
-import { queryFilter, readStatsSnapshot } from "../src/storage";
+import { queryFilter, readLiveStats, readStatsSnapshot } from "../src/storage";
 import { readMetricsSnapshot, resetReadMetrics } from "../src/read-metrics";
 import type { Relay } from "../src/relay";
 import { signEvent } from "./helpers/event";
@@ -684,6 +684,115 @@ describe("read attribution", () => {
     // point is that this number does not grow with the relay.
     console.log(`MEASURED stats first=${firstCost} secondDelta=${secondCost}`);
     expect(secondCost).toBeLessThan(100);
+  });
+
+  it("does not bill the ingest window to every /api/stats request", async () => {
+    // The other half of the same endpoint, and the one the snapshot row
+    // above left behind. `ingested24h` and `rowsWrittenToday` both seek
+    // idx_events_ingested, so neither scales with E -- but both scale
+    // with the WINDOW, and that is not small on a relay that is actually
+    // doing anything: measured live at 853 + 344 rows, ~1,200 per
+    // request with the lookups beside them. GET /api/stats is
+    // unauthenticated and nothing rate-limits it, so ~4,100 requests
+    // from anywhere took the 5,000,000 rows-read/day allowance for the
+    // rest of the UTC day, at no cost to the caller.
+    //
+    // The seeded window is deliberately widened to every row here. The
+    // rest of this file keeps it at RECENTLY_INGESTED = 10, which is
+    // enough to prove the index engages and far too small to show what
+    // the window costs when it is full -- the distinction this test
+    // exists for.
+    const recentIds = Array.from({ length: RECENTLY_INGESTED }, (_, k) =>
+      (EVENTS - RECENTLY_INGESTED + k).toString(16).padStart(64, "0"),
+    );
+    const widen = async (ingestedAt: number | null) =>
+      runInDurableObject(stub(), async (_instance: Relay, state) => {
+        const sql = state.storage.sql;
+        const now = Math.floor(Date.now() / 1000);
+        if (ingestedAt !== null) {
+          sql.exec(`UPDATE events SET ingested_at = ?`, ingestedAt);
+        } else {
+          // Restore the file's seeded shape by the rule beforeAll used,
+          // so whatever runs next sees the window it was written
+          // against.
+          sql.exec(`UPDATE events SET ingested_at = ?`, now - 200_000);
+          for (const id of recentIds) {
+            sql.exec(`UPDATE events SET ingested_at = ? WHERE id = ?`, now - 100, id);
+          }
+        }
+        // Both caches cleared, not just the live one: a cold snapshot
+        // would otherwise add its own ~3E to the first load and bury the
+        // figure being measured.
+        sql.exec(`DELETE FROM live_stats`);
+        sql.exec(`DELETE FROM stats_snapshot`);
+        resetReadMetrics();
+      });
+
+    try {
+      await widen(Math.floor(Date.now() / 1000) - 100);
+
+      // Both buckets, summed: estimateRowsWrittenSince keeps its own
+      // read-metrics scope (storage.ts), so the getStats bucket alone
+      // would report half of what a request costs.
+      const cost = async () => {
+        const snapshot = await runInDurableObject(stub(), async () => readMetricsSnapshot());
+        const of = (path: string) => snapshot.paths.find((p) => p.path === path)?.rowsRead ?? 0;
+        return of("getStats") + of("estimateRowsWrittenSince");
+      };
+
+      // The snapshot is recomputed on this first load too, so subtract
+      // nothing from it and assert only on the loads after it -- the
+      // claim here is about the marginal cost of a request, which is
+      // what an attacker multiplies.
+      await SELF.fetch("https://example.com/api/stats");
+      const afterFirst = await cost();
+
+      await SELF.fetch("https://example.com/api/stats");
+      const second = (await cost()) - afterFirst;
+
+      await SELF.fetch("https://example.com/api/stats");
+      const third = (await cost()) - afterFirst - second;
+
+      console.log(
+        `MEASURED live-half first=${afterFirst} secondDelta=${second} thirdDelta=${third} window=${EVENTS}`,
+      );
+
+      // The first load computes both caches and pays the window twice
+      // over -- once for the 24h count, once for the since-00:00 UTC
+      // sum. That cost still exists; what changed is how often it can be
+      // incurred (limits.ts LIVE_STATS_MAX_AGE_MS bounds it to once per
+      // five minutes, however many requests arrive).
+      expect(afterFirst).toBeGreaterThan(EVENTS);
+
+      // What every request after it costs: one row for the cache row it
+      // reads back, and no term in the window at all. This is the
+      // property -- a page load costs a bounded small number of rows no
+      // matter how many arrive.
+      expect(second).toBeLessThan(10);
+      expect(third).toBeLessThan(10);
+      // Stated as a ratio as well, because the absolute bound above
+      // would still pass on a relay whose window happened to be tiny.
+      expect(second * 20).toBeLessThan(afterFirst);
+    } finally {
+      await widen(null);
+    }
+  });
+
+  it("keeps the live figures in storage, where they survive eviction", async () => {
+    // Row and not memory, and this is the assertion that decides it. The
+    // case for memory is real -- a flood keeps the Durable Object awake,
+    // so an in-memory cache would hit right through one -- but a flood
+    // is not the cheapest way to spend this budget. One request every
+    // ten seconds misses an in-memory cache every single time, because
+    // the object is evicted between them, and 8,640 such requests a day
+    // at ~1,200 rows each is twice the daily ceiling. Only storage
+    // outlives eviction. See limits.ts LIVE_STATS_MAX_AGE_MS.
+    await SELF.fetch("https://example.com/api/stats");
+    const row = await runInDurableObject(stub(), async (_instance: Relay, state) =>
+      readLiveStats(state.storage.sql),
+    );
+    expect(row).not.toBeNull();
+    expect(row?.computedAt).toBeGreaterThan(0);
   });
 
   it("keeps the stats snapshot in storage, where it survives eviction", async () => {

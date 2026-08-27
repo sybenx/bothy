@@ -83,7 +83,8 @@ insert time so `estimateRowsWrittenSince` can sum a column.
 | Gift wrap gate probe, per filter, only when `kinds` is absent | 1–5 |
 | `estimateRowsWrittenSince` | bounded by today's ingest count, not E (`idx_events_ingested`) |
 | `/api/stats`, snapshot stale (recomputes) | ~3E |
-| `/api/stats`, within `STATS_SNAPSHOT_MAX_AGE_MS` | small, independent of E |
+| `/api/stats`, live half stale (recomputes) | ~2 × today's ingest count |
+| `/api/stats`, both caches warm | ~8–12, independent of E and of the ingest window |
 | Backfill tick | bounded by today's ingest count (headroom check) + ~2 per event in the page |
 | Live write, regular kind | 0–2 |
 | Replaceable/addressable replacement | ~2 per tag on the replaced event |
@@ -147,9 +148,39 @@ The one path left that scales with E is the `/api/stats` snapshot recompute
 refreshes a day is `12E`/day, which does not reach the 5,000,000 ceiling until
 **E ≈ 416,000**.
 
+The rest of `/api/stats` scaled with something else, and closing it took a
+second cache beside the snapshot. `ingested24h` and `rowsWrittenToday` both seek
+`idx_events_ingested`, so neither grows with E — but both read the ingest
+*window*, measured live at 853 + 344 rows, ~1,200 per request with the
+lookups beside them. `GET /api/stats` is unauthenticated and nothing
+rate-limits it, so **~4,100 requests from anywhere took the whole
+5,000,000 rows-read allowance for the rest of the UTC day**, at no cost to
+the caller — the same shape as the gift wrap gate probe, an expensive read
+on the far side of no gate. Both figures now come from the `live_stats`
+row on a five-minute clock (`limits.ts LIVE_STATS_MAX_AGE_MS`), which
+bounds the recompute rate at 288/day however many requests arrive:
+
+```
+flood floor = (86,400 / TTL) × 1.5D   (D = events ingested per day)
+```
+
+That is the arithmetic the TTL was chosen against — at 60s it admits only
+D ≤ 2,315 events/day before the floor alone reaches the ceiling, which a
+backfilling relay exceeds; at 300s it admits D ≤ 11,574, above anything the
+100,000 rows-written ceiling permits this relay to ingest. A warm load
+costs 8 rows measured (`test/read-cost.test.ts`), so the endpoint went from
+~4,100 loads/day to ~387,000. In a row and not in memory for the reason
+`stats_snapshot` is: a flood keeps the object awake, but pacing one request
+every ten seconds misses an in-memory cache every time and still reaches
+twice the ceiling. Hourly bucket counters are the better long-term shape —
+one row written per event, windowed sums reading at most 24 rows, no
+staleness — and are the next step if the cache stops being enough.
+
 Traffic-driven paths are bounded by `limits.ts boundFilter`, which admits a REQ
 filter only at a limit some index can afford, and by the per-IP message throttle
-in `relay.ts`.
+in `relay.ts`. That throttle covers WebSocket messages only: **nothing
+rate-limits the HTTP endpoints**, so `/api/stats`, `/api/profile` and
+`/api/claim` are each defended by their per-request cost alone.
 
 ## Threat model
 
@@ -165,7 +196,11 @@ usefully — what it structurally cannot do.
   `allowpubkey` adjust that set by hand.
 - **Read abuse.** `limits.ts boundFilter` admits a REQ filter only at a limit
   some index can afford, so no filter can scan the table. Plus a
-  per-connection subscription cap and a per-IP message throttle.
+  per-connection subscription cap and a per-IP message throttle. On the HTTP
+  side, where there is no throttle at all, `/api/stats` is defended by cost
+  alone: both halves of it are cached in rows (`stats_snapshot`,
+  `live_stats`) so the recompute rate is set by two TTLs rather than by the
+  request rate.
 - **Write abuse from an authorized writer.** `MAX_EVENT_BYTES` bounds the
   permanent damage one event can do; a per-pubkey rate limit bounds how fast;
   `NON_OWNER_STORAGE_BYTES` reserves half the 5GB ceiling for the owner. Gift

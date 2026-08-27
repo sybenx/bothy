@@ -179,13 +179,26 @@
     <dt>Largest non-owner author</dt><dd id="diag-largest-author">-</dd>
   </dl>
 
+  <!-- These two used to sit under "Live" below, and moving them is the
+       visible half of a budget fix: both read the ingest window
+       (~1,200 rows), GET /api/stats is unauthenticated, and anyone could
+       therefore spend the day's whole rows-read allowance in ~4,100
+       requests. They now come from a row refreshed at most every five
+       minutes (src/limits.ts LIVE_STATS_MAX_AGE_MS), so this panel says
+       when they were taken rather than presenting them as this
+       instant's. -->
+  <p class="diag-group-label">From the five-minute cache</p>
+  <dl class="diag-grid">
+    <dt>Cache taken</dt><dd id="diag-live-at">-</dd>
+    <dt>Events ingested, last 24h</dt><dd id="diag-ingested-24h">-</dd>
+    <dt>Write budget</dt><dd id="diag-write-budget">-</dd>
+  </dl>
+
   <p class="diag-group-label">Live</p>
   <dl class="diag-grid">
     <dt>Storage used</dt><dd id="diag-storage">-</dd>
-    <dt>Events ingested, last 24h</dt><dd id="diag-ingested-24h">-</dd>
     <dt id="diag-vanishing-label" hidden>Vanishing</dt><dd id="diag-vanishing" hidden>-</dd>
     <dt>Backfill</dt><dd id="diag-backfill-at">-</dd>
-    <dt>Write budget</dt><dd id="diag-write-budget">-</dd>
     <dt>Read budget</dt><dd id="diag-read-budget">-</dd>
   </dl>
 
@@ -243,7 +256,15 @@ async function main() {
     // load -- counting it costs a full scan of `events`, and doing that
     // on every visit is what exhausted the rows-read allowance. So the
     // number can be hours old, and the label says so rather than letting
-    // it read as current. The two figures beside it are live.
+    // it read as current.
+    //
+    // Of the three figures beside it, only storage is read live. The
+    // other two -- events received and the write-budget bar -- now come
+    // from a five-minute cache for a smaller version of the same reason
+    // (src/limits.ts LIVE_STATS_MAX_AGE_MS): each read the ingest window
+    // per request on an endpoint nothing gates. Five minutes needs no
+    // label up here, where a dashboard number that old reads as current
+    // to anybody; the diagnostics panel below dates it exactly.
     document.getElementById("stat-total-label").textContent =
       "events stored" + snapshotAge(stats.snapshotAt);
     document.getElementById("stat-ingested").textContent = stats.ingested24h;
@@ -411,8 +432,15 @@ function renderDiagnostics(stats) {
       stats.largestNonOwnerAuthor.events.toLocaleString() + " events)"
     : "none";
 
-  document.getElementById("diag-storage").textContent = formatMB(stats.storageBytes);
+  // The two figures behind the `live_stats` row, with the one age they
+  // share -- relay.ts refreshLiveStats. Five minutes, not the snapshot's
+  // six hours, and a separate line rather than one combined age because
+  // presenting a five-minute number and a six-hour number under one
+  // timestamp would be wrong about one of them.
+  document.getElementById("diag-live-at").textContent = new Date(stats.liveAt * 1000).toLocaleString();
   document.getElementById("diag-ingested-24h").textContent = stats.ingested24h.toLocaleString();
+
+  document.getElementById("diag-storage").textContent = formatMB(stats.storageBytes);
 
   // A vanish drains across cron ticks and can run for days, taking up to
   // a quarter of the write budget the whole time (limits.ts
