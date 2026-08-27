@@ -528,10 +528,17 @@ export interface LargestNonOwnerAuthor {
 // so the GROUP BY is served in index order and needs no sort -- but it
 // still walks every entry, so this is E, not the size of the answer.
 // There is no cheaper form: counting per author means visiting every
-// author's rows. It runs inside getStats' memoized block (relay.ts
-// statsCache), so it is paid once per cache miss rather than per request,
-// which is what makes E acceptable for a number that only has to be
-// roughly current.
+// author's rows.
+//
+// That E is acceptable only because this is computed into the
+// `stats_snapshot` row (computeStatsSnapshot below) rather than per
+// request. It used to say the same thing about relay.ts' in-memory
+// stats cache, and that justification turned out to be false in
+// production: the Durable Object hibernates between admin page visits,
+// so the cache almost never hit and this scan was paid on essentially
+// every page load. Whatever bounds the recomputation rate has to survive
+// eviction, or this comment is describing an intention rather than a
+// cost.
 export function largestNonOwnerAuthor(sql: SqlStorage, owner: string | null): LargestNonOwnerAuthor | null {
   const row = sql
     .exec<{ pubkey: string; n: number }>(
@@ -546,6 +553,131 @@ export function largestNonOwnerAuthor(sql: SqlStorage, owner: string | null): La
     )
     .toArray()[0];
   return row ? { pubkey: row.pubkey, events: row.n } : null;
+}
+
+// ---------------------------------------------------------------------
+// /api/stats' expensive half, persisted (schema.ts `stats_snapshot`).
+//
+// Everything in here costs O(E) or O(F) rows read to produce, and every
+// one of these numbers is a dashboard rather than a gate -- nothing on a
+// correctness path reads them. backfill.ts hasBackfillHeadroom, the one
+// figure on /api/stats that IS a gate, deliberately calls
+// estimateRowsWritten24h directly and is not snapshotted.
+//
+// The membership rule is measured cost, not stale-tolerance: a field is
+// in here because reading it walks a table, not because an hour-old
+// answer would be acceptable. Fields that are merely stale-tolerant but
+// cheap (`sql.databaseSize`, the backfill tables) stay live, because
+// making a free number stale buys nothing.
+// ---------------------------------------------------------------------
+
+export interface StatsSnapshot {
+  // Wall-clock seconds this was computed at. Surfaced on /api/stats so
+  // the age of these numbers is visible rather than implied.
+  computedAt: number;
+  totalEvents: number;
+  events24h: number;
+  followCount: number;
+  followsRefreshedAt: number | null;
+  largestNonOwnerAuthor: LargestNonOwnerAuthor | null;
+}
+
+// Null when nothing has computed one yet -- a relay that has never served
+// a stats request and never run a cron tick. Callers recompute in that
+// case; there is no seeded row, because a zeroed snapshot and a real one
+// would be indistinguishable and the zeroes would be wrong.
+//
+// Rows read: 1.
+export function readStatsSnapshot(sql: SqlStorage): StatsSnapshot | null {
+  const row = sql
+    .exec<{
+      computed_at: number;
+      total_events: number;
+      events_24h: number;
+      follow_count: number;
+      follows_refreshed_at: number | null;
+      largest_author_pubkey: string | null;
+      largest_author_events: number | null;
+    }>(`SELECT * FROM stats_snapshot LIMIT 1`)
+    .toArray()[0];
+  if (row === undefined) return null;
+  return {
+    computedAt: row.computed_at,
+    totalEvents: row.total_events,
+    events24h: row.events_24h,
+    followCount: row.follow_count,
+    followsRefreshedAt: row.follows_refreshed_at,
+    largestNonOwnerAuthor:
+      row.largest_author_pubkey === null || row.largest_author_events === null
+        ? null
+        : { pubkey: row.largest_author_pubkey, events: row.largest_author_events },
+  };
+}
+
+// Rows read: ~3E + 2F. This is the whole cost the snapshot exists to stop
+// paying per page load, gathered in one place so it is obvious what a
+// refresh costs and what raising the refresh rate would cost.
+//
+//   totalEvents            E -- COUNT(*) over the smallest index
+//   events24h              E -- `created_at` leads no index, so a scan
+//   largestNonOwnerAuthor  E -- a GROUP BY visits every author's rows
+//   follows                2F
+//
+// `events24h` is the one that could in principle be indexed away, the way
+// `ingested_at` just was. It is deliberately not: a fourth index on
+// `events` keyed by `created_at` alone would cost another row per stored
+// event to make a number cheaper that is now read four times a day. The
+// snapshot is the cheaper answer to the same problem, and it is worth
+// noticing that it is available whenever the index is not.
+//
+// `owner` is passed in rather than resolved here: ownership.ts imports
+// this module, so reaching the other way would be a cycle.
+export function computeStatsSnapshot(
+  sql: SqlStorage,
+  owner: string | null,
+  nowSec: number,
+): StatsSnapshot {
+  const since = nowSec - 86400;
+  return {
+    computedAt: nowSec,
+    totalEvents: sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events`).toArray()[0]?.n ?? 0,
+    events24h:
+      sql
+        .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events WHERE created_at > ?`, since)
+        .toArray()[0]?.n ?? 0,
+    followCount: sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM follows`).toArray()[0]?.n ?? 0,
+    followsRefreshedAt:
+      sql.exec<{ t: number | null }>(`SELECT MAX(fetched_at) AS t FROM follows`).toArray()[0]?.t ??
+      null,
+    largestNonOwnerAuthor: largestNonOwnerAuthor(sql, owner),
+  };
+}
+
+// Replaced wholesale, never updated in place -- the row is a single
+// consistent reading of the table at one instant, and half-updating it
+// would produce a snapshot describing no moment that ever existed.
+//
+// Rows written: 2 (the DELETE and the INSERT; 1 the very first time,
+// when there is nothing to delete). The table carries no primary key and
+// no index, so neither statement pays for one. Called at most once per
+// STATS_SNAPSHOT_MAX_AGE_MS -- see the table's comment in schema.ts for
+// why a cached number in a row is acceptable here and was not for a
+// per-event counter.
+export function writeStatsSnapshot(sql: SqlStorage, snapshot: StatsSnapshot): void {
+  sql.exec(`DELETE FROM stats_snapshot`);
+  sql.exec(
+    `INSERT INTO stats_snapshot
+       (computed_at, total_events, events_24h, follow_count, follows_refreshed_at,
+        largest_author_pubkey, largest_author_events)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    snapshot.computedAt,
+    snapshot.totalEvents,
+    snapshot.events24h,
+    snapshot.followCount,
+    snapshot.followsRefreshedAt,
+    snapshot.largestNonOwnerAuthor?.pubkey ?? null,
+    snapshot.largestNonOwnerAuthor?.events ?? null,
+  );
 }
 
 export interface PendingVanish {
@@ -628,13 +760,29 @@ function runFilterQuery(sql: SqlStorage, filter: Filter, nowSec: number): NostrE
 // E ~= 17,400 it was the entire 5,000,000/day ceiling on its own with no
 // client connected (CLAUDE.md "The budget").
 //
-// Summing a stamped column removes the join outright and never touches
-// `event_tags` at all. What remains is the scan of `events` itself:
-// `ingested_at` is covered by no index and must not be -- an index there
-// would cost a row write per event, the exact cost the column was chosen
-// to avoid -- so this is E, not the size of the window. Cutting E to the
-// window would take that forbidden index; cutting the ~288E floor to
-// ~48E did not, which is why this is where the line is drawn.
+// Summing a stamped column removed the join outright and never touches
+// `event_tags` at all. What remained was a scan of `events` itself,
+// because `ingested_at` led no index: E rows read to add up the rows in
+// a 24h window. That was left in place deliberately, on the grounds that
+// indexing `ingested_at` would cost a row write per event -- the exact
+// cost stamping the column had been chosen to avoid -- and that cutting
+// the floor from ~288E to ~48E was enough.
+//
+// It was not enough, and the reason is that E is not a constant. A cost
+// proportional to everything ever stored, paid twice per cron tick
+// forever, gets worse as the relay fills whether or not anything else
+// changes; it was the last remaining line in CLAUDE.md "The budget"'s
+// cron floor, binding at E ~= 104,000. Measured live at E = 4,232:
+// 4,224 rows read per call, which is to say it read the entire table to
+// answer a question about roughly a thousand rows.
+//
+// idx_events_ingested (schema.ts, v0.7.6) is (ingested_at, row_cost),
+// covering, so this is now a range seek answered from the index without
+// visiting the table: the size of the WINDOW, not the size of E, and it
+// scales with the day's ingest instead of with the accumulated history.
+// The price is one row written per stored event, ~1,100/day here against
+// 100,000. The reasoning that finally justified paying it is on the
+// index itself.
 //
 // Still an estimate, and still named one. It sums the cost of rows
 // currently standing for events ingested in the window, which is not
@@ -692,9 +840,10 @@ export function estimateRowsWritten24h(sql: SqlStorage, sinceCutoff: number): nu
 // getStats displays this number once per admin page load, but
 // backfill.ts hasBackfillHeadroom calls it twice per cron tick, and
 // nothing in the /api/stats breakdown would distinguish those if this
-// inherited its caller's bucket. It is also the one query here that
-// filters on an unindexed column, which is reason enough to give it its
-// own line in the report.
+// inherited its caller's bucket. It was for a long time the single most
+// expensive line in the fixed daily floor, which is reason enough to
+// keep its own line in the report now that it is not -- a path that
+// stops being expensive is worth being able to see stay that way.
 function estimateRowsWritten24hInner(sql: SqlStorage, sinceCutoff: number): number {
   return (
     sql

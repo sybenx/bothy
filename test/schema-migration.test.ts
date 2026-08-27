@@ -463,6 +463,11 @@ describe("computeSchemaHash", () => {
       indexes: [{ name: "idx_t_a", table: "t", keyColumns: ["a"] }],
     },
     {
+      label: "an index gains a covering column",
+      tables,
+      indexes: [{ ...indexes[0]!, covering: ["a"] }],
+    },
+    {
       label: "an index is added",
       tables,
       indexes: [...indexes, { name: "idx_t_id", table: "t", keyColumns: [], orderedBy: "id" }],

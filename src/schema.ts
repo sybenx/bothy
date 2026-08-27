@@ -13,11 +13,13 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 //   events insert:                    1 base row + 1 implicit PK index
 //                                      (TEXT primary key, not a rowid
 //                                      alias) + 1 per declared index on
-//                                      `events` (3 of them)             = 5
-//   event_tags insert, per tag row:   1 base row + 1 for its index       = 2
+//                                      `events` (4 of them)             = 6
+//   event_tags insert, per tag row:   1 base row + 1 per index on that
+//                                      table (2 of them)                = 3
 //
-//   => 5 + 2 * (single-letter tag count) rows per stored event.
-//      A bare note costs 5 rows; a reply carrying #e and #p costs 9.
+//   => 6 + 3 * (single-letter tag count) rows per stored event.
+//      A bare note costs 6 rows; a reply carrying #e and #p costs 12;
+//      a real note carrying about five tags costs 21.
 //      NIP-09 deletes and replaceable-event replacement cost the same
 //      shape again (a delete is a write too) plus this insert cost.
 //
@@ -25,9 +27,10 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 // test/hibernation.test.ts asserts the computed figure against a real
 // SqlStorageCursor.rowsWritten. Neither number is written down twice.
 //
-// THREE indexes exist on `events`, and the third and fourth rows of the
-// arithmetic above are what they cost. Two of them were added in v0.7.2
-// after the relay went down on rows READ, not rows written -- see
+// FOUR indexes exist on `events`, and the third row of the arithmetic
+// above is what they cost. Two of them were added in v0.7.2 after the
+// relay went down on rows READ, not rows written; the fourth,
+// idx_events_ingested, was added in v0.7.6 for the same reason -- see
 // CLAUDE.md "The budget".
 //
 // This comment twice rejected an index on (kind, created_at), on the
@@ -79,9 +82,22 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 // fights the thing the stats endpoint exists to make visible -- the
 // measurement would consume the budget it reports on. A column added to an INSERT this code already performs
 // costs zero additional rows written: a row write is a row, not a
-// column, and no index covers `ingested_at` (adding one would cost the
-// per-event row this approach exists to avoid). The per-event cost
-// stated above is unchanged.
+// column.
+//
+// `ingested_at` IS indexed, as of v0.7.6, and that decision is the one
+// this comment used to argue the other way. The argument was that an
+// index here would cost a row write per event, which is true, and that
+// the cost bought nothing the column had not already bought, which was
+// not. Without it, estimateRowsWritten24h read every row in `events` to
+// answer a question about the rows in a 24h window: a cost that scales
+// with the accumulated table rather than with the day's traffic, paid
+// twice per cron tick forever. idx_events_ingested is
+// (ingested_at, row_cost) -- covering, so the SUM is answered from the
+// index without touching the table at all -- and it turns that read from
+// E into the size of the window. The price is one row per stored event:
+// the per-event cost above goes 5 -> 6, about 1,100 rows/day at the live
+// relay's ingest rate, against a 100,000/day ceiling. See
+// CLAUDE.md "The budget".
 //
 // Existing deployments get NULL for rows written before the migration
 // below ran, and NULL never satisfies `> cutoff`. That undercounts for at
@@ -192,6 +208,18 @@ export const TABLES: readonly TableSpec[] = [
       // and is exact thereafter. Deliberately not backfilled from
       // `created_at`, which would reintroduce the very conflation the
       // column exists to end.
+      //
+      // That straddle window is not hypothetical: it is what the live
+      // relay showed the day `row_cost` shipped, reporting 221 rows
+      // written over a 24h period in which it had ingested 1,105 events.
+      // Every one of those rows was real and none of the pre-upgrade ones
+      // were countable. It corrected itself within a day, exactly as this
+      // comment said it would, and the reason to record it here is that
+      // the symptom is indistinguishable at a glance from the
+      // created_at/ingested_at conflation this column exists to prevent.
+      //
+      // Indexed since v0.7.6 by idx_events_ingested, jointly with
+      // `row_cost` -- see that index and the header comment above.
       col("ingested_at", "INTEGER"),
       // What this event's INSERT actually cost in rows written, stamped
       // at insert time by eventRowCost() -- base row, implicit PK index,
@@ -210,11 +238,17 @@ export const TABLES: readonly TableSpec[] = [
       // ceiling with no client connected (CLAUDE.md "The budget"). Summing a
       // column reads E and touches `event_tags` not at all.
       //
-      // Costs zero additional rows written: this is one more column on an
-      // INSERT that already happens, and a row write is a row, not a
-      // column. Same argument as `ingested_at` above, and no index covers
-      // it either -- an index here would cost the per-event row the whole
-      // approach exists to avoid.
+      // Costs zero additional rows written as a column: this is one more
+      // column on an INSERT that already happens, and a row write is a
+      // row, not a column.
+      //
+      // It is carried in an index as of v0.7.6, but as the payload of
+      // idx_events_ingested rather than as a key of its own -- the index
+      // exists to bound the `ingested_at` scan, and including `row_cost`
+      // makes it covering so the SUM never touches the table. Widening an
+      // index costs no additional rows written; adding one does, and that
+      // single row per event is charged to `ingested_at` above, where the
+      // argument for paying it is made.
       //
       // Nullable, and NULL rows are simply absent from the SUM. Rows
       // written before this column existed undercount for at most the one
@@ -445,6 +479,55 @@ export const TABLES: readonly TableSpec[] = [
     name: "allowed_pubkeys",
     columns: [col("pubkey", "TEXT PRIMARY KEY"), col("reason", "TEXT"), col("allowed_at", "INTEGER NOT NULL")],
   },
+  {
+    // The expensive half of /api/stats, computed on a cron tick and read
+    // back from here (storage.ts readStatsSnapshot/writeStatsSnapshot,
+    // relay.ts collectStats). At most one row, replaced wholesale; no row
+    // at all until the first computation, which is the correct state for
+    // a relay that has never served a stats request or run a cron tick.
+    //
+    // A row, and this file has twice refused to put a cached number in
+    // one -- rejecting a rows-written counter table, and rejecting it
+    // again for read-metrics.ts's counters. The rule those refusals set
+    // is not "never cache in storage", it is "never pay a row write PER
+    // EVENT to measure something". This row is written on a cron tick,
+    // gated by limits.ts STATS_SNAPSHOT_MAX_AGE_MS: 2 rows written per
+    // refresh, four refreshes a day, 8 rows against a 100,000/day
+    // ceiling. It is not on the per-event write path at all.
+    //
+    // What it replaces was in memory, and that is the whole point. The
+    // 15-second in-memory cache it succeeds was measured on the live
+    // relay never hitting: the Durable Object hibernates between admin
+    // page visits, in-memory state does not survive eviction, and two
+    // page loads therefore paid two full scans of `events` apiece. A
+    // cache whose lifetime is shorter than the gap between the requests
+    // it exists to serve is not a cache. Storage is the only state in
+    // this object that outlives hibernation, so a cache that must span
+    // page loads has to live here or nowhere.
+    //
+    // Every column is a count over `events` or `follows` costing O(E) or
+    // O(F) rows read to produce -- that is the criterion for being in
+    // here, not whether the number looks stale-tolerant. Fields that cost
+    // nothing to read live (`sql.databaseSize`, the owner row, the tiny
+    // backfill tables) are deliberately absent and stay live, so the page
+    // keeps showing a current storage bar and current backfill progress.
+    name: "stats_snapshot",
+    columns: [
+      // Wall-clock seconds when this row was computed. Read by
+      // collectStats to decide whether to recompute, and reported on
+      // /api/stats as `snapshotAt` so the admin page can say how old
+      // these numbers are rather than presenting them as current.
+      col("computed_at", "INTEGER NOT NULL"),
+      col("total_events", "INTEGER NOT NULL"),
+      col("events_24h", "INTEGER NOT NULL"),
+      col("follow_count", "INTEGER NOT NULL"),
+      col("follows_refreshed_at", "INTEGER"),
+      // storage.ts largestNonOwnerAuthor, flattened. Both null when no
+      // non-owner has written anything, which is the normal state.
+      col("largest_author_pubkey", "TEXT"),
+      col("largest_author_events", "INTEGER"),
+    ],
+  },
 ];
 
 // ---------------------------------------------------------------------
@@ -497,6 +580,20 @@ export interface IndexSpec {
   // `events`, so an unordered index is never mistaken for one that can
   // bound a REQ.
   readonly orderedBy?: string;
+  // Extra columns appended to the index purely so a query can be answered
+  // from the index without visiting the table. NOT key columns: nothing
+  // may pin them, order by them, or seek on them, and limits.ts
+  // filterReadCost must never treat them as something a filter can
+  // satisfy -- which is exactly why they are a separate field rather than
+  // more entries in `keyColumns`. Declaring them there would have been
+  // one word shorter and would have told the read-abuse guard that a
+  // filter pinning `row_cost` unlocks an index, which is meaningless.
+  //
+  // Widening an index this way costs no additional rows written -- a row
+  // write is a row, not a column, the same accounting `ingested_at` and
+  // `row_cost` are argued on above. The cost of an index is incurred by
+  // its existence, not its width.
+  readonly covering?: readonly string[];
 }
 
 export const INDEXES: readonly IndexSpec[] = [
@@ -553,13 +650,65 @@ export const INDEXES: readonly IndexSpec[] = [
     table: "event_tags",
     keyColumns: ["event_id"],
   },
+  // Serves `WHERE ingested_at > ?` -- storage.ts estimateRowsWritten24h
+  // and countIngested24h, the two queries that ask what this relay did in
+  // the last 24 hours. Added v0.7.6.
+  //
+  // This is the second index in this file added because a query's cost
+  // tracked the TABLE rather than the WINDOW it was asking about, and the
+  // shape of the mistake was the same both times. `ingested_at` led no
+  // index, so `SUM(row_cost) WHERE ingested_at > ?` scanned every row in
+  // `events` to add up the handful ingested today -- 4,224 rows read
+  // against 4,232 stored, measured live. backfill.ts hasBackfillHeadroom
+  // calls it twice per cron tick, so on an hourly cron that was 48E rows
+  // read per day with no client connected, reaching the 5,000,000 ceiling
+  // at E ~= 104,000. That was the documented cron floor in
+  // CLAUDE.md "The budget"; this index removes it, and what replaces it
+  // scales with the day's ingest rather than with everything ever stored.
+  //
+  // `row_cost` is carried as a covering column, not a key. With it the
+  // SUM is answered from the index alone; without it SQLite would seek
+  // the range in the index and then fetch each row's `row_cost` from the
+  // table, doubling the read for no saving in rows written.
+  //
+  // The price is one row written per stored event -- EVENT_BASE_ROW_COST
+  // 5 -> 6, ~1,100 rows/day at the live relay's ingest rate against a
+  // 100,000/day ceiling. That trade was refused twice in this file's
+  // header on the grounds that the whole point of stamping `row_cost` in
+  // a column was to avoid a per-event row. It buys something different
+  // from what the column bought: the column removed the `event_tags`
+  // join, taking the read from E + T to E, and no rewriting of the query
+  // could take it below E while the scan was unindexed.
+  //
+  // No `orderedBy`. The query is a SUM over a range, not an ordered scan,
+  // and `ingested_at` is not a filterable field -- limits.ts PINS maps
+  // only `pubkey` and `kind` -- so filterReadCost can never mistake this
+  // for an index that bounds a REQ.
+  //
+  // On an existing relay this index is built once, by the
+  // CREATE INDEX IF NOT EXISTS in initSchema, on the first Durable Object
+  // constructor after the upgrade: a one-time write of E rows, ~4,200 at
+  // the live relay's size, against the 100,000/day ceiling. Every wake
+  // from hibernation after that is a no-op. A relay large enough for that
+  // one-time build to matter would have been long past the read ceiling
+  // this index exists to keep it under.
+  {
+    name: "idx_events_ingested",
+    table: "events",
+    keyColumns: ["ingested_at"],
+    covering: ["row_cost"],
+  },
 ];
 
 function createIndexSql(spec: IndexSpec): string {
-  const columns =
-    spec.orderedBy === undefined
-      ? [...spec.keyColumns]
-      : [...spec.keyColumns, `${spec.orderedBy} DESC`];
+  const columns = [
+    ...spec.keyColumns,
+    ...(spec.orderedBy === undefined ? [] : [`${spec.orderedBy} DESC`]),
+    // Last, and unordered: these exist to be read off the index, not to
+    // be seeked or sorted on, so their position after the ordering column
+    // is what keeps them out of the part of the index that does the work.
+    ...(spec.covering ?? []),
+  ];
   return `CREATE INDEX IF NOT EXISTS ${spec.name} ON ${spec.table} (${columns.join(", ")})`;
 }
 
@@ -749,7 +898,7 @@ export function reconcileColumns(sql: SqlStorage, spec: TableSpec): string[] {
 // 1. The hash is DERIVED from TABLES and INDEXES structurally --
 //    `computeSchemaHash` walks every field `reconcileColumns` and
 //    `createIndexSql` actually act on (column name, definition,
-//    resetsOnAdd; index name, table, keyColumns, orderedBy) --
+//    resetsOnAdd; index name, table, keyColumns, orderedBy, covering) --
 //    not a hand-maintained version number, and not a hash of a hand-picked
 //    subset. A hand-maintained number can be forgotten to bump; a
 //    structural hash cannot, because it has no "forgot" state -- it is
@@ -807,6 +956,7 @@ export function computeSchemaHash(tables: readonly TableSpec[], indexes: readonl
       table: i.table,
       keyColumns: i.keyColumns,
       orderedBy: i.orderedBy ?? null,
+      covering: i.covering ?? [],
     })),
   };
   return bytesToHex(sha256(new TextEncoder().encode(JSON.stringify(fingerprint))));

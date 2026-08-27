@@ -480,6 +480,39 @@ export const DAILY_ROWS_WRITTEN_LIMIT = 100_000;
 // two-sided window for auth events only.
 export const MAX_CREATED_AT_FUTURE_SECONDS = 3600;
 
+// How stale /api/stats' expensive counts may get before something
+// recomputes them -- schema.ts `stats_snapshot`, storage.ts
+// computeStatsSnapshot, relay.ts collectStats.
+//
+// This is a READ-budget cap, not a freshness preference, and it is set by
+// the only arithmetic that matters here: a refresh costs ~3E rows read
+// (storage.ts computeStatsSnapshot itemises them), so refreshing every
+// hourly cron tick would cost 72E rows/day with nobody watching. That is
+// larger than the 48E cron floor this same release just deleted by
+// indexing `ingested_at` -- it would have replaced one cost that grows
+// with the accumulated table with a bigger one. At six hours it is
+// 12E/day: four refreshes, ~51,000 rows read/day at the live relay's
+// E = 4,232, and it does not reach the 5,000,000 ceiling until
+// E ~= 416,000.
+//
+// Enforced on both sides, so nothing can outrun it. The cron tick
+// refreshes a snapshot older than this and skips one that is not, the
+// way ownership.ts refreshProfile is gated to once a day regardless of
+// how often the hourly cron fires; a stats request recomputes only if
+// the cron has not, which is what covers a fresh deployment with no
+// snapshot yet. Between them the recomputation rate is bounded by this
+// constant and by nothing else -- in particular not by how often anyone
+// loads the admin page, which is precisely what went wrong with the
+// in-memory cache this replaced.
+//
+// Six hours of staleness is fine for what these numbers are: a total
+// event count, a 24h event count, a follow count. /api/stats reports
+// `snapshotAt` alongside them so their age is stated rather than
+// implied, and the figures that genuinely want to be current --
+// storage used, rows written today, backfill progress -- are not in the
+// snapshot at all.
+export const STATS_SNAPSHOT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
 // Backfill must yield to the owner's own live
 // traffic, never compete with it for the shared daily rows-written
 // ceiling -- see backfill.ts hasBackfillHeadroom for the full reasoning.

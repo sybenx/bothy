@@ -6,6 +6,8 @@ import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
 import { OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
 import { refreshFollows } from "../src/ownership";
+import type { Relay } from "../src/relay";
+import { readStatsSnapshot } from "../src/storage";
 import { connectRelay, publish } from "./helpers/socket";
 import { version } from "../package.json";
 
@@ -164,5 +166,122 @@ describe("largestNonOwnerAuthor", () => {
     };
     expect(body.largestNonOwnerAuthor?.pubkey).toBe(heavy.pubkeyHex);
     expect(body.largestNonOwnerAuthor?.events).toBe(7);
+  });
+});
+
+// The counts above are served from a row (schema.ts `stats_snapshot`)
+// rather than recomputed per request, and the tests in this block are
+// about that arrangement rather than about any individual number.
+//
+// It replaced a 15-second in-memory cache that measurement showed
+// essentially never hit: the Durable Object hibernates between admin page
+// visits, in-memory state does not survive eviction, and two page loads
+// on the live relay produced two full 17,601-row scans and zero cache
+// hits. Storage is the only state in this object that outlives
+// hibernation, so a cache spanning page loads has to live there.
+//
+// Every test above this point passes precisely because isolateStorage()
+// clears that row between tests, which is worth stating: the fresh
+// numbers they assert on are the "no snapshot yet, compute one" path,
+// and the ones below are the "snapshot exists" path.
+describe("/api/stats snapshot", () => {
+  const stub = () => env.RELAY.get(env.RELAY.idFromName("relay"));
+
+  const fetchStats = async () =>
+    (await (await exports.default.fetch("https://example.com/api/stats")).json()) as {
+      snapshotAt: number;
+      totalEvents: number;
+      ingested24h: number;
+      rowsWrittenEstimate24h: number;
+    };
+
+  it("dates the snapshotted counts so their age is stated, not assumed", async () => {
+    const conn = await connectRelay();
+    await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "dated" }));
+    conn.close();
+
+    const body = await fetchStats();
+    // Some fields on this document are up to
+    // limits.ts STATS_SNAPSHOT_MAX_AGE_MS old and the rest are current.
+    // A consumer that cannot tell which is which has to assume the whole
+    // document describes one instant, and it does not.
+    expect(body.snapshotAt).toBeGreaterThan(0);
+    expect(body.snapshotAt).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 1);
+  });
+
+  it("holds the snapshotted counts steady while the live fields move", async () => {
+    const conn = await connectRelay();
+    await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "first" }));
+    conn.close();
+
+    const before = await fetchStats();
+
+    const conn2 = await connectRelay();
+    await publish(conn2, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "second" }));
+    conn2.close();
+
+    const after = await fetchStats();
+
+    // The trade, asserted rather than described. `totalEvents` is a count
+    // over `events` and costs O(E) to produce, so it is snapshotted and
+    // does not move until the snapshot is older than
+    // STATS_SNAPSHOT_MAX_AGE_MS. An hour-old event count on a dashboard
+    // is fine; a full table scan per page load is not.
+    expect(after.totalEvents).toBe(before.totalEvents);
+    expect(after.snapshotAt).toBe(before.snapshotAt);
+
+    // The write-budget meter is NOT snapshotted, and this is the reason
+    // the split exists at all rather than everything going into the row.
+    // `ingested_at` is indexed as of v0.7.6, so both of these read the
+    // 24h window instead of the table -- cheap enough to stay live, and
+    // they are the two numbers an owner watching their daily ceiling
+    // most needs to be current.
+    expect(after.ingested24h).toBe(before.ingested24h + 1);
+    expect(after.rowsWrittenEstimate24h).toBeGreaterThan(before.rowsWrittenEstimate24h);
+  });
+
+  it("computes the snapshot on a cron tick, so a page load does not have to", async () => {
+    const conn = await connectRelay();
+    await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "cron" }));
+    conn.close();
+
+    // No snapshot yet: the relay has served no stats request. This is the
+    // state of a freshly deployed relay, and the cron tick is what is
+    // supposed to fill it so the first admin page load costs nothing.
+    await runInDurableObject(stub(), async (_instance, state) => {
+      expect(readStatsSnapshot(state.storage.sql)).toBeNull();
+    });
+
+    await runInDurableObject(stub(), (instance: Relay) => instance.runCron());
+
+    await runInDurableObject(stub(), async (_instance, state) => {
+      const row = readStatsSnapshot(state.storage.sql);
+      expect(row?.totalEvents).toBe(1);
+      expect(row?.events24h).toBe(1);
+    });
+  });
+
+  it("does not recompute on a cron tick while the snapshot is still fresh", async () => {
+    // The gate that makes the cadence a bound rather than a hope. An
+    // hourly cron recomputing ~3E rows read every tick would be 72E rows
+    // read per day with nobody watching -- larger than the 48E cron floor
+    // v0.7.6 removed by indexing `ingested_at`, which would have been a
+    // trade in the wrong direction. See limits.ts
+    // STATS_SNAPSHOT_MAX_AGE_MS for the arithmetic.
+    const conn = await connectRelay();
+    await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "fresh" }));
+    conn.close();
+
+    const first = await fetchStats();
+
+    const conn2 = await connectRelay();
+    await publish(conn2, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "later" }));
+    conn2.close();
+
+    await runInDurableObject(stub(), (instance: Relay) => instance.runCron());
+
+    const second = await fetchStats();
+    expect(second.snapshotAt).toBe(first.snapshotAt);
+    expect(second.totalEvents).toBe(first.totalEvents);
   });
 });

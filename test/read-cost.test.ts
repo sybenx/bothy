@@ -37,7 +37,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { buildFilterQuery, expandFilter, expandFilterCount } from "../src/filters";
 import { boundFilter, MAX_FILTER_ROWS_READ } from "../src/limits";
 import type { Filter } from "../src/nostr";
-import { queryFilter } from "../src/storage";
+import { queryFilter, readStatsSnapshot } from "../src/storage";
 import { readMetricsSnapshot, resetReadMetrics } from "../src/read-metrics";
 import type { Relay } from "../src/relay";
 import { signEvent } from "./helpers/event";
@@ -54,11 +54,18 @@ const TAGS_PER_EVENT = 5;
 const TAG_ROWS = EVENTS * TAGS_PER_EVENT;
 // How many of the seeded rows carry an `ingested_at` inside the rolling
 // 24h window estimateRowsWritten24h measures. Ten, not zero, and the
-// difference matters: with nothing in the window SQLite scans `events`
-// and stops, never touching `event_tags`; with anything in it, the
-// unindexed join engages and the whole of `event_tags` is read to
-// satisfy ten rows. A relay that ingested even one event today pays the
-// second price, which is the only one worth recording.
+// difference matters twice over.
+//
+// It mattered for the pre-v0.7.2 join: with nothing in the window SQLite
+// scanned `events` and stopped, never touching `event_tags`; with
+// anything in it the unindexed join engaged and the whole of
+// `event_tags` was read to satisfy ten rows.
+//
+// It matters again for idx_events_ingested (v0.7.6), and this is the
+// number the "after" case is now asserted against. The whole claim of
+// that index is that the query costs the size of the WINDOW rather than
+// the size of the table, and a window of zero could not tell a working
+// index from a query that found nothing to add up.
 const RECENTLY_INGESTED = 10;
 
 function stub() {
@@ -232,18 +239,26 @@ describe("rows read by query shape", () => {
     });
   });
 
-  it("reads only `events` for estimateRowsWritten24h, not events + event_tags", async () => {
-    // The single largest line in the fixed daily floor. The old query
-    // derived each event's tag count with a LEFT JOIN, and
-    // idx_event_tags_lookup is (tag_name, tag_value, created_at) with
-    // `event_id` nowhere in it -- so SQLite built an automatic index over
-    // all of `event_tags` on every call, reading E + T to answer a
-    // question about the ten rows in the window. hasBackfillHeadroom
-    // calls this twice per cron tick: ~288E rows/day, the whole 5,000,000
-    // ceiling on its own at E ~= 17,400.
+  it("costs estimateRowsWritten24h the size of the 24h window, not the size of the table", async () => {
+    // The last line of the fixed daily floor, removed in two steps, and
+    // both steps are measured here against the same rows in the same
+    // Durable Object so the before/after in CLAUDE.md "The budget" is a
+    // measurement rather than two runs compared from memory.
     //
-    // Both forms are run here against the same data, so the comparison is
-    // a measurement rather than a claim.
+    // Step one (v0.7.2) removed a LEFT JOIN. The query derived each
+    // event's tag count live, and idx_event_tags_lookup is
+    // (tag_name, tag_value, created_at) with `event_id` nowhere in it --
+    // so SQLite built an automatic index over all of `event_tags` on
+    // every call, reading E + T to answer a question about the ten rows
+    // in the window. Stamping `row_cost` at insert time cut that to E.
+    //
+    // Step two (v0.7.6) removed the scan. E is not a constant, and a
+    // cost proportional to everything ever stored -- paid twice per cron
+    // tick by backfill.ts hasBackfillHeadroom, so 48E rows/day with no
+    // client connected -- gets worse as the relay fills whether or not
+    // anything else changes. idx_events_ingested is
+    // (ingested_at, row_cost): covering, so the SUM is a range seek
+    // answered from the index without visiting the table at all.
     await runInDurableObject(stub(), async (_instance: Relay, state) => {
       const sql = state.storage.sql;
       const since = Math.floor(Date.now() / 1000) - 86_400;
@@ -251,7 +266,7 @@ describe("rows read by query shape", () => {
       // `+t.event_id` suppresses idx_event_tags_event (added v0.7.3),
       // reproducing the plan this join got when no index covered
       // event_id: SQLite builds an automatic index over the whole table.
-      const oldCost = rowsRead(
+      const joinCost = rowsRead(
         sql,
         `SELECT COUNT(t.event_id) AS tag_count
            FROM events e
@@ -260,16 +275,55 @@ describe("rows read by query shape", () => {
           GROUP BY e.id`,
         since,
       );
-      const newCost = rowsRead(sql, `SELECT SUM(row_cost) AS total FROM events WHERE ingested_at > ?`, since);
+      // `+ingested_at` suppresses idx_events_ingested the same way,
+      // reproducing the unindexed scan this query paid between v0.7.2 and
+      // v0.7.6.
+      const scanCost = rowsRead(
+        sql,
+        `SELECT SUM(row_cost) AS total FROM events WHERE +ingested_at > ?`,
+        since,
+      );
+      const indexedCost = rowsRead(
+        sql,
+        `SELECT SUM(row_cost) AS total FROM events WHERE ingested_at > ?`,
+        since,
+      );
 
-      expect(oldCost).toBeGreaterThanOrEqual(EVENTS + TAG_ROWS);
-      // `ingested_at` is covered by no index and must not be -- an index
-      // there would cost a row write per event, the exact cost the column
-      // exists to avoid -- so this is still a scan of `events`. It is E,
-      // not the size of the window, and that is where the line is drawn:
-      // dropping E + T to E took no index, dropping E to the window would.
-      expect(newCost).toBeLessThanOrEqual(EVENTS + 1);
-      expect(newCost * 5).toBeLessThan(oldCost);
+      // Measured at E = 1,000, T = 5,000, window = 10:
+      //   join (pre-v0.7.2)   51,000
+      //   scan (v0.7.2)        1,000   exactly E
+      //   indexed (v0.7.6)        10   exactly the window
+      // The last of those is one row read per row in the window and no
+      // table lookup behind any of them, which is the covering index
+      // doing what it was added for.
+
+      // E + T: the whole of both tables.
+      expect(joinCost).toBeGreaterThanOrEqual(EVENTS + TAG_ROWS);
+      // E: the whole of `events`, however few rows are in the window.
+      expect(scanCost).toBeGreaterThanOrEqual(EVENTS);
+      expect(scanCost).toBeLessThanOrEqual(EVENTS + 1);
+      // The window. A handful of rows off the covering index, with no
+      // table lookup behind them -- which is what makes this the size of
+      // the day's ingest rather than the size of the history. The slack
+      // is for SQLite's seek and terminating probe, not for a per-row
+      // cost: what must not appear here is anything proportional to
+      // EVENTS.
+      console.log(`MEASURED join=${joinCost} scan=${scanCost} indexed=${indexedCost} E=${EVENTS} T=${TAG_ROWS} window=${RECENTLY_INGESTED}`);
+      expect(indexedCost).toBeLessThanOrEqual(RECENTLY_INGESTED + 2);
+      expect(indexedCost * 20).toBeLessThan(scanCost);
+    });
+  });
+
+  it("costs countIngested24h the window too, off the same index", async () => {
+    // The other query keyed on `ingested_at`, and it rides
+    // idx_events_ingested for free -- worth an assertion because it is
+    // the one that would silently keep scanning if the index were ever
+    // narrowed to something `COUNT(*)` could not be answered from.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const since = Math.floor(Date.now() / 1000) - 86_400;
+      const cost = rowsRead(sql, `SELECT COUNT(*) AS n FROM events WHERE ingested_at > ?`, since);
+      expect(cost).toBeLessThanOrEqual(RECENTLY_INGESTED + 2);
     });
   });
 
@@ -444,29 +498,70 @@ describe("read attribution", () => {
     expect(stats.reads.paths.map((p) => p.path)).toContain("getStats");
   });
 
-  it("serves a second /api/stats load from memory instead of rescanning", async () => {
-    // relay.ts statsCache. Four full scans of `events` per load was 28
-    // admin page loads to the entire daily ceiling at E=20,000
-    // (CLAUDE.md "The budget"); the counts behind them are a dashboard, not a
-    // gate, so they are memoized for STATS_CACHE_TTL_MS.
-    await runInDurableObject(stub(), async () => resetReadMetrics());
+  it("serves a second /api/stats load without rescanning `events`", async () => {
+    // The counts behind /api/stats were memoized in memory for 15
+    // seconds (relay.ts statsCache), and measured on the live relay that
+    // cache essentially never hit: the Durable Object hibernates between
+    // admin page visits, in-memory state does not survive eviction, and
+    // two page loads therefore paid two full scans apiece -- 17,601 rows
+    // each at E = 4,232, with zero cache hits recorded. A cache whose
+    // lifetime is shorter than the gap between the requests it exists to
+    // serve is not a cache.
+    //
+    // It is now the `stats_snapshot` row (schema.ts), which is storage
+    // and so outlives eviction by construction. This test can only
+    // observe the in-process half of that, so it asserts the part it can
+    // see -- the second load does not rescan -- and the assertion below
+    // it covers the part that made the old arrangement fail.
+    // Tests in this file share one Durable Object and earlier ones have
+    // already loaded /api/stats, so the snapshot has to be cleared for
+    // "first load" to mean anything. Dropped through storage rather than
+    // through any relay API: nothing in production deletes this row, and
+    // adding a method so a test could would be inventing a code path.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      state.storage.sql.exec(`DELETE FROM stats_snapshot`);
+      resetReadMetrics();
+    });
 
     await SELF.fetch("https://example.com/api/stats");
     const first = await runInDurableObject(stub(), async () => readMetricsSnapshot());
-    const firstCost =
-      (first.paths.find((p) => p.path === "getStats")?.rowsRead ?? 0) +
-      (first.paths.find((p) => p.path === "estimateRowsWritten24h")?.rowsRead ?? 0);
+    const firstCost = first.paths.find((p) => p.path === "getStats")?.rowsRead ?? 0;
 
     await SELF.fetch("https://example.com/api/stats");
     const second = await runInDurableObject(stub(), async () => readMetricsSnapshot());
-    const secondCost =
-      (second.paths.find((p) => p.path === "getStats")?.rowsRead ?? 0) +
-      (second.paths.find((p) => p.path === "estimateRowsWritten24h")?.rowsRead ?? 0);
+    const secondCost = (second.paths.find((p) => p.path === "getStats")?.rowsRead ?? 0) - firstCost;
 
-    expect(firstCost).toBeGreaterThan(0);
-    // The second load adds almost nothing -- recordHost is deliberately
-    // left outside the cache, so "almost" rather than "exactly".
-    expect(secondCost - firstCost).toBeLessThan(10);
+    // Measured at E = 1,000: 3,019 to compute a snapshot, 17 to read one
+    // back. The second figure is the one that matters, and what matters
+    // about it is that it contains no term in E.
+
+    // The first load has no snapshot to read and computes one: ~3E.
+    expect(firstCost).toBeGreaterThan(EVENTS);
+    // The second reads it back. What it still pays is the live half --
+    // the snapshot row, the owner and settings rows, the backfill tables,
+    // pendingVanishes, recordHost -- all of which are bounded by their
+    // own table sizes and none of which is proportional to E. The whole
+    // point is that this number does not grow with the relay.
+    console.log(`MEASURED stats first=${firstCost} secondDelta=${secondCost}`);
+    expect(secondCost).toBeLessThan(100);
+  });
+
+  it("keeps the stats snapshot in storage, where it survives eviction", async () => {
+    // The property the in-memory cache could not have, stated directly
+    // rather than inferred from a cost. A Durable Object that hibernates
+    // loses every field on the instance and keeps every row in SQLite,
+    // so "the cache is a row" IS the fix -- the read costs above are the
+    // consequence, not the claim.
+    await SELF.fetch("https://example.com/api/stats");
+    const row = await runInDurableObject(stub(), async (_instance: Relay, state) =>
+      readStatsSnapshot(state.storage.sql),
+    );
+    expect(row).not.toBeNull();
+    expect(row?.totalEvents).toBe(EVENTS);
+    // Recomputation is bounded by limits.ts STATS_SNAPSHOT_MAX_AGE_MS and
+    // by nothing else -- in particular not by how often anyone loads the
+    // page, which is exactly what set the rate before.
+    expect(row?.computedAt).toBeGreaterThan(0);
   });
 
   it("counts replacements as R, and projects the table size at which that path alone hits the ceiling", async () => {
