@@ -19,7 +19,9 @@ way they do.
 - `test/read-limits.test.ts` — subscription cap, rejection of a filter no index can serve, per-IP throttle.
 - `test/read-cost.test.ts` — rows read per query shape, before and after the v0.7.2 index/split/cache work, plus the `boundFilter` cost model and the read-path attribution buckets.
 - `test/exhaustion.test.ts` — the budget-exhaustion classifier: names the resource when it can, still reports exhaustion when the wording is unfamiliar, and never classifies an ordinary bug as exhaustion.
-- `test/stats.test.ts` — `/api/stats` shape, `/api/profile` validation, admin page fallback.
+- `test/nip62-vanish.test.ts` — also covers resumability: a vanish larger than one batch drains across ticks, keeps its checkpoint, tombstones as it goes, and widens rather than narrows if a second request names a different cutoff.
+- `test/nip09-deletion.test.ts` — also covers the `a`-tag kind restriction: a coordinate naming a regular kind is ignored rather than deleting every event of that kind.
+- `test/stats.test.ts` — `/api/stats` shape, `/api/profile` validation, admin page fallback, and `largestNonOwnerAuthor` — the signal for how exposed a deployment is to a NIP-62 vanish, since the cost of one scales with how many events its sender holds.
 - `test/helpers/` — shared fixtures (see below).
 
 ## Helpers

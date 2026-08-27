@@ -22,6 +22,16 @@ import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
 import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
 import { collectStored, connectRelay, publish } from "./helpers/socket";
+import { eventExists } from "../src/storage";
+
+async function stillExists(id: string): Promise<boolean> {
+  const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+  let result = false;
+  await runInDurableObject(stub, async (_instance, state) => {
+    result = eventExists(state.storage.sql, id);
+  });
+  return result;
+}
 
 isolateStorage();
 
@@ -199,5 +209,81 @@ describe("NIP-09 deletion", () => {
 
     expect(events.map((e) => e.id)).toEqual([deletion.id]);
     conn.close();
+  });
+});
+
+// NIP-09 `a` tags address replaceable and addressable events -- a
+// "<kind>:<pubkey>:<d>" coordinate exists only for kinds that have one.
+// Regular events are deleted by `e` tag, one id at a time.
+//
+// Accepting a regular kind was a conformance bug with a sharp edge:
+// `1:<pubkey>:` names no single event, so it was read as "every kind-1
+// event by that pubkey" and tombstoned all of them. One tag, unbounded N,
+// each removal paying storage.ts deleteEventRow. That made
+// MAX_EVENT_BYTES a bound on nothing for bulk deletion -- the size cap
+// limits a kind-5 to roughly 870 `e` tags, and a single `a` tag reached
+// the same N with none of the effort.
+describe("NIP-09 `a` tag kind restriction", () => {
+  it("ignores an `a` tag naming a regular kind instead of deleting every event of it", async () => {
+    const conn = await connectRelay();
+    const now = Math.floor(Date.now() / 1000);
+
+    const first = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "one", created_at: now });
+    const second = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "two", created_at: now });
+    await publish(conn, first);
+    await publish(conn, second);
+
+    const bulk = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 5,
+      tags: [["a", `1:${OWNER_PUBKEY_HEX}:`]],
+      created_at: now + 1,
+    });
+    await publish(conn, bulk);
+    conn.close();
+
+    // Both survive: a regular kind has no coordinate to address.
+    expect(await stillExists(first.id)).toBe(true);
+    expect(await stillExists(second.id)).toBe(true);
+  });
+
+  it("still honours an `a` tag naming a replaceable kind", async () => {
+    const conn = await connectRelay();
+    const now = Math.floor(Date.now() / 1000);
+
+    const list = signEvent(OWNER_SECRET_KEY_HEX, { kind: 10003, content: "bookmarks", created_at: now });
+    await publish(conn, list);
+
+    const deletion = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 5,
+      tags: [["a", `10003:${OWNER_PUBKEY_HEX}:`]],
+      created_at: now + 1,
+    });
+    await publish(conn, deletion);
+    conn.close();
+
+    expect(await stillExists(list.id)).toBe(false);
+  });
+
+  it("still honours an `a` tag naming an addressable kind", async () => {
+    const conn = await connectRelay();
+    const now = Math.floor(Date.now() / 1000);
+
+    const article = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 30023,
+      content: "long form",
+      tags: [["d", "slug"]],
+      created_at: now,
+    });
+    await publish(conn, article);
+
+    const deletion = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 5,
+      tags: [["a", `30023:${OWNER_PUBKEY_HEX}:slug`]],
+      created_at: now + 1,
+    });
+    await publish(conn, deletion);
+    conn.close();
+
+    expect(await stillExists(article.id)).toBe(false);
   });
 });

@@ -4,7 +4,7 @@
 // .pubkey") every gift wrap p-tagged to that pubkey. Deliberately NOT
 // gated by ownership.ts isAllowedWriter -- nips/62.md: "Paid relays or
 // relays that restrict who can post MUST also follow the request to
-// vanish regardless of the user's status." See storage.ts applyVanish
+// vanish regardless of the user's status." See storage.ts beginVanish
 // and relay.ts handleVanish for the reasoning; test/nip59-giftwrap.test.ts
 // for why a gift wrap p-tagged to anyone but the owner never exists here
 // (so the spec's "any pubkey" clause reduces, in practice, to the owner
@@ -12,7 +12,9 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { eventExists } from "../src/storage";
+import { beginVanish, drainVanish, eventExists, isDeleted, pendingVanishes } from "../src/storage";
+import { VANISH_BATCH_SIZE } from "../src/limits";
+import { eventRowCost } from "../src/schema";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
 import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
@@ -167,5 +169,98 @@ describe("NIP-62 request to vanish", () => {
     expect(ok).toBe(false);
     expect(message.startsWith("invalid:")).toBe(true);
     conn.close();
+  });
+});
+
+// Resumability (v0.7.3). A vanish is the only request whose size the
+// sender chooses and the relay cannot refuse -- NIP-62 binds
+// write-restricted relays "regardless of the user's status" -- so it is
+// recorded first and drained in bounded batches across cron ticks. A
+// vanish that stopped wherever the request ceiling fell while reporting
+// success would be a compliance failure, not a slow query.
+describe("resumable vanish", () => {
+  it("drains a large vanish across ticks and reports it as in progress", async () => {
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    const stranger = randomKeypair();
+    const now = Math.floor(Date.now() / 1000);
+    // One batch plus a remainder, sized off the constant rather than a
+    // literal so a change to the share does not silently stop testing
+    // resumption.
+    const REMAINDER = 5;
+    const total = VANISH_BATCH_SIZE + REMAINDER;
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      for (let i = 0; i < total; i++) {
+        sql.exec(
+          `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost)
+           VALUES (?, ?, ?, 1, '[]', 'x', 's', NULL, ?, ?)`,
+          `v${i}`.padStart(64, "0"),
+          stranger.pubkeyHex,
+          now - 10,
+          now,
+          eventRowCost(0),
+        );
+      }
+
+      beginVanish(sql, stranger.pubkeyHex, now, now);
+      const first = drainVanish(sql, stranger.pubkeyHex, VANISH_BATCH_SIZE);
+      expect(first.deleted).toBe(VANISH_BATCH_SIZE);
+      expect(first.done).toBe(false);
+
+      // The checkpoint survives the partial pass -- this is the whole
+      // point of recording before deleting.
+      const pending = pendingVanishes(sql);
+      expect(pending).toHaveLength(1);
+      expect(pending[0]?.pubkey).toBe(stranger.pubkeyHex);
+      expect(pending[0]?.deletedSoFar).toBe(VANISH_BATCH_SIZE);
+
+      const second = drainVanish(sql, stranger.pubkeyHex, VANISH_BATCH_SIZE);
+      expect(second.deleted).toBe(REMAINDER);
+      expect(second.done).toBe(true);
+      expect(pendingVanishes(sql)).toHaveLength(0);
+
+      const left = sql
+        .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events WHERE pubkey = ?`, stranger.pubkeyHex)
+        .toArray()[0]?.n;
+      expect(left).toBe(0);
+    });
+  });
+
+  it("tombstones what it drains, so a partial vanish cannot be refilled mid-drain", async () => {
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    const stranger = randomKeypair();
+    const now = Math.floor(Date.now() / 1000);
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      const id = "a".repeat(64);
+      sql.exec(
+        `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost)
+         VALUES (?, ?, ?, 1, '[]', 'x', 's', NULL, ?, ?)`,
+        id, stranger.pubkeyHex, now - 10, now, eventRowCost(0),
+      );
+      beginVanish(sql, stranger.pubkeyHex, now, now);
+      drainVanish(sql, stranger.pubkeyHex, 100);
+      expect(isDeleted(sql, id)).toBe(true);
+    });
+  });
+
+  it("widens rather than narrows when a second request names a different cutoff", async () => {
+    // Honouring a later, earlier-cutoff request would narrow a deletion
+    // already promised to the requester.
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    const stranger = randomKeypair();
+    const now = Math.floor(Date.now() / 1000);
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      beginVanish(sql, stranger.pubkeyHex, now, now);
+      beginVanish(sql, stranger.pubkeyHex, now - 5000, now);
+      const cutoff = sql
+        .exec<{ c: number }>(`SELECT cutoff_created_at AS c FROM vanishing WHERE pubkey = ?`, stranger.pubkeyHex)
+        .toArray()[0]?.c;
+      expect(cutoff).toBe(now);
+    });
   });
 });

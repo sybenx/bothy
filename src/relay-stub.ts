@@ -3,7 +3,7 @@
 // to import back from index.ts to get it.
 export function relayStub(env: Env) {
   // Exactly one Relay instance for the whole deployment -- see
-  // CLAUDE.md "Architecture". Do not shard.
+  // CLAUDE.md "Architecture map". Do not shard.
   const id = env.RELAY.idFromName("relay");
   return env.RELAY.get(id);
 }

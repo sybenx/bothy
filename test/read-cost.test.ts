@@ -248,11 +248,14 @@ describe("rows read by query shape", () => {
       const sql = state.storage.sql;
       const since = Math.floor(Date.now() / 1000) - 86_400;
 
+      // `+t.event_id` suppresses idx_event_tags_event (added v0.7.3),
+      // reproducing the plan this join got when no index covered
+      // event_id: SQLite builds an automatic index over the whole table.
       const oldCost = rowsRead(
         sql,
         `SELECT COUNT(t.event_id) AS tag_count
            FROM events e
-           LEFT JOIN event_tags t ON t.event_id = e.id
+           LEFT JOIN event_tags t ON +t.event_id = e.id
           WHERE e.ingested_at > ?
           GROUP BY e.id`,
         since,
@@ -283,24 +286,26 @@ describe("rows read by query shape", () => {
     });
   });
 
-  it("still scans the whole event_tags table to delete one event's tags", async () => {
-    // NOT fixed here, and recorded so it stays visible. `DELETE FROM
-    // event_tags WHERE event_id = ?` (storage.ts deleteEventRow) has no
-    // index to use. Paid on every replaceable/addressable replacement --
-    // every kind-0, kind-3 and kind-10002 the owner republishes -- and on
-    // every NIP-09/NIP-62 deletion and NIP-86 banevent.
+  it("seeks an index to delete one event's tags, where it once scanned the table", async () => {
+    // `DELETE FROM event_tags WHERE event_id = ?` (storage.ts
+    // deleteEventRow), served by idx_event_tags_event since v0.7.3. Paid
+    // on every replaceable/addressable replacement and on every
+    // NIP-09/NIP-62 deletion and NIP-86 banevent.
     //
-    // Fixing it needs an index on event_tags(event_id), which costs a row
-    // write per TAG row (TAG_ROW_COST goes 2 -> 3, i.e. ~5 more rows per
-    // real event) rather than per event. That is a materially bigger
-    // write-side trade than the two indexes added to `events`, and
-    // CLAUDE.md "The budget" names it as its own decision rather than something
-    // to fold in here.
+    // This one is not a budget regression test. NIP-62 forbids gating,
+    // throttling or revoking the vanish path that reaches this DELETE, so
+    // cost is the only control the relay has over it -- an unindexed
+    // scan here is an unrefusable read amplifier, not a slow query. If
+    // this assertion ever fails because the index went away, that is the
+    // finding.
     await runInDurableObject(stub(), async (_instance: Relay, state) => {
       const sql = state.storage.sql;
-      // An id that matches nothing, so the scan is all cost and no work
+      // An id that matches nothing, so the seek is all cost and no work
       // and the seeded rows survive for the tests after this one.
-      expect(rowsRead(sql, `DELETE FROM event_tags WHERE event_id = ?`, "no-such-id")).toBe(TAG_ROWS);
+      const seek = rowsRead(sql, `DELETE FROM event_tags WHERE event_id = ?`, "no-such-id");
+      const scan = rowsRead(sql, `DELETE FROM event_tags WHERE +event_id = ?`, "no-such-id");
+      expect(seek).toBeLessThan(10);
+      expect(scan).toBe(TAG_ROWS);
     });
   });
 });
@@ -523,7 +528,7 @@ describe("read attribution", () => {
     expect(snapshot.replacements.count).toBe(0);
   });
 
-  it("bills a replaceable replacement to the write path, at the cost of a full event_tags scan", async () => {
+  it("bills a replaceable replacement to the write path, now at index-seek cost", async () => {
     await runInDurableObject(stub(), async () => resetReadMetrics());
     const now = Math.floor(Date.now() / 1000);
 
@@ -542,6 +547,9 @@ describe("read attribution", () => {
     const snapshot = await runInDurableObject(stub(), async () => readMetricsSnapshot());
     const write = snapshot.paths.find((p) => p.path === "write");
     expect(write?.calls).toBe(2);
-    expect(write?.rowsRead ?? 0).toBeGreaterThanOrEqual(TAG_ROWS);
+    // Was >= TAG_ROWS before idx_event_tags_event: replacing one kind-0
+    // read every tag row in the table. Now it reads the handful the
+    // replaced event actually carried.
+    expect(write?.rowsRead ?? 0).toBeLessThan(TAG_ROWS / 10);
   });
 });

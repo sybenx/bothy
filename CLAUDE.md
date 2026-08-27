@@ -57,14 +57,15 @@ which carry about five single-letter tags each).
 ### Rows written, per stored event
 
 ```
-5 + 2 × (single-letter tag count)
+5 + 3 × (single-letter tag count)
 ```
 
 Five for the event row: one base row, one for the implicit unique index behind
 `id TEXT PRIMARY KEY` (a TEXT primary key is not a rowid alias), and one for each
-of the three declared indexes on `events`. Two per indexed tag row: the row and
-its index. A bare note costs 5, a reply carrying `#e` and `#p` costs 9. A delete
-is a write too, so a replacement or a NIP-09 deletion costs this shape again.
+of the three declared indexes on `events`. Three per indexed tag row: the row and
+its two indexes. A bare note costs 5, a reply carrying `#e` and `#p` costs 11, a
+real note carrying about five tags costs 20. A delete is a write too, so a
+replacement or a NIP-09 deletion costs this shape again, plus 2 for a tombstone.
 
 `schema.ts eventRowCost` derives this from `INDEXES` rather than restating it, so
 adding an index updates the admin page, backfill's headroom guard and
@@ -80,11 +81,12 @@ insert time so `estimateRowsWritten24h` can sum a column.
 | REQ filter served by an index | combinations × (2 × limit + 1) |
 | Gift wrap gate probe, per filter, only when `kinds` is absent | 1–5 |
 | `estimateRowsWritten24h` | E |
-| `/api/stats`, cache miss | ~4E |
+| `/api/stats`, cache miss | ~5E |
 | `/api/stats`, within `STATS_CACHE_TTL_MS` | ~1 |
 | Backfill tick | 2E + ~2 per event in the page |
 | Live write, regular kind | 0–2 |
-| **Replaceable/addressable replacement** | **T ≈ 5E** |
+| Replaceable/addressable replacement | ~2 per tag on the replaced event |
+| NIP-62 vanish, per event removed | ~2 per tag on that event |
 | `giftWrapCount`, per gift wrap accepted | ~0 |
 | Cron refreshes | ~7 + 2F |
 | WebSocket connect | 1–2 |
@@ -100,28 +102,91 @@ the table row it points at.
 
 ### Where the read ceiling actually binds
 
-Two paths scale with the accumulated table rather than with traffic, so both get
+One path scales with the accumulated table rather than with traffic, so it gets
 worse as the relay fills whether or not anything else changes:
 
 - **The cron floor.** The hourly tick calls `estimateRowsWritten24h` twice, so
   `2E × 24 = 48E` rows/day are spent with no client connected at all. That
   reaches 5,000,000 at **E ≈ 104,000**.
-- **Replaceable replacement.** Each one scans `event_tags` in full: `5E × R`
-  rows/day, where R is replaceable events stored per day that supersede an
-  existing version. That reaches 5,000,000 at **E × R = 1,000,000** — E ≈ 20,000
-  at R = 50/day, E ≈ 100,000 at R = 10/day.
 
-So the replacement path is the binding constraint whenever R exceeds about
-**10/day**, which is inside the range a single active owner produces on their
-own. It is the next thing to fix and it is deliberately not fixed yet — the
-reasoning, the arithmetic and the estimate of R are in the comment on
-`deleteEventRow` in [src/storage.ts](src/storage.ts), beside the query they are
-about. `read-metrics.ts` counts replacements so R can be read off `/api/stats`
-instead of estimated.
+There were two. The second was every operation that removed an event —
+replaceable replacement, NIP-09 deletion, NIP-62 vanish — each of which scanned
+`event_tags` in full because no index covered `event_id`. That cost `5E` per
+removed event and bound at `E × R = 1,000,000`, sooner than the cron floor for
+any meaningful rate. `idx_event_tags_event` closed it in v0.7.3, and the reasoning
+on `deleteEventRow` in [src/storage.ts](src/storage.ts) is why that index is not
+optional: the vanish path that reaches it cannot be gated, throttled or revoked,
+so cost is the only control the relay has over it.
+
+Rows **written** are now the binding side of a vanish, and no index helps there:
+removing an event costs its row, its index entries and a tombstone, about 22 rows.
+That is why vanish requests are checkpointed and drained across cron ticks rather
+than attempted inside the request — see `beginVanish`/`drainVanish`.
 
 Traffic-driven paths are bounded by `limits.ts boundFilter`, which admits a REQ
 filter only at a limit some index can afford, and by the per-IP message throttle
 in `relay.ts`.
+
+## Threat model
+
+Reads are public by design and writes are owner-gated, so the two halves are
+defended differently. What follows is what the relay actually does, and — more
+usefully — what it structurally cannot do.
+
+### What it defends against
+
+- **Unauthorized writes.** TOFU ownership binds one pubkey permanently; every
+  event is signature-verified regardless of who sent it. `ALLOW_FOLLOWS` widens
+  writes to the owner's kind-3 list and nothing else. NIP-86 `banpubkey` and
+  `allowpubkey` adjust that set by hand.
+- **Read abuse.** `limits.ts boundFilter` admits a REQ filter only at a limit
+  some index can afford, so no filter can scan the table. Plus a
+  per-connection subscription cap and a per-IP message throttle.
+- **Write abuse from an authorized writer.** `MAX_EVENT_BYTES` bounds the
+  permanent damage one event can do; a per-pubkey rate limit bounds how fast;
+  `NON_OWNER_STORAGE_BYTES` reserves half the 5GB ceiling for the owner. Gift
+  wraps carry their own count cap and per-IP throttle on top.
+- **Gift wrap disclosure.** Reads of kind-1059 require NIP-42 AUTH as the
+  p-tagged recipient, checked by re-running the filter against real storage
+  rather than by pattern-matching its shape.
+- **Replay of deleted events.** `deleted_ids` tombstones every id removed by
+  NIP-09, NIP-62 or `banevent`, so a sender holding a signed copy cannot put it
+  back.
+- **Self-inflicted lockout.** An event dated far in the future would freeze a
+  replaceable kind permanently — including the kind-3 that gates writes — so
+  `MAX_CREATED_AT_FUTURE_SECONDS` refuses it.
+- **Connection-level abuse.** NIP-86 `blockip`, checked once per WebSocket
+  connection and never on the management endpoint, so blocking your own address
+  cannot lock you out of the API that unblocks it.
+
+### What it structurally cannot defend against
+
+- **NIP-62 vanish.** The spec binds write-restricted relays to honour a vanish
+  "regardless of the user's status", so the path is dispatched before the write
+  gate and pays none of the abuse caps. It cannot be gated, it cannot be
+  throttled below "eventually completes", and it cannot be revoked — `banpubkey`
+  and unfollowing both act through `isAllowedWriter`, which this path never
+  calls, so an ex-follow keeps both their stored events and the ability to
+  trigger it. Cost is the only available control, which is why
+  `idx_event_tags_event` exists and why the drain is checkpointed. `/api/stats`
+  reports the largest number of events any single non-owner pubkey holds, since
+  that is the worst case a given deployment is actually exposed to.
+- **Anyone reading anything that is not a gift wrap.** There is no read
+  authentication and none is planned; a personal relay's contents are as public
+  as the notes in it.
+- **A compromised follow.** Follows are trusted with writes. The caps bound what
+  one can cost, they do not prevent it, and the owner is expected to notice and
+  revoke.
+- **In-memory limits across eviction.** The per-IP, per-pubkey and gift wrap
+  throttles are held in memory so they cost no rows to enforce. A Durable Object
+  that hibernates loses them, so an attacker who paces themselves around
+  eviction gets a fresh window. This is a deliberate trade, not an oversight.
+- **The owner.** Nothing here defends the relay against its own owner, and the
+  storage and rate caps deliberately exempt them.
+- **Account-wide exhaustion.** The Cloudflare ceilings are per account, not per
+  Worker. Another Worker in the same account can consume them, and when they are
+  consumed every Durable Object path fails at once — see `src/exhaustion.ts`
+  for how that is made visible rather than silent.
 
 ## Architecture map
 
@@ -152,7 +217,7 @@ in `relay.ts`.
 - Protocol errors go back as `["OK", id, false, "reason: message"]` or `["CLOSED", subid, "reason: message"]` with the NIP-01 machine-readable prefix (`invalid:`, `restricted:`, `blocked:`, `rate-limited:`, `auth-required:`, `duplicate:`). Never fail silently.
 - Comments explain *why*, especially anything hibernation- or budget-related — most modules carry inline notes on their row-write cost or CPU cost and point at CLAUDE.md "The budget" for the measured baseline.
 - Cheapest/most-certain rejections run before expensive ones on every write path: ownership check and tombstone check both precede schnorr verification.
-- Indexes are declared once, as data, in `schema.ts INDEXES`, and two things read that declaration: `limits.ts boundFilter` (which filters are affordable) and `schema.ts eventRowCost` (what an event costs to write). Three on `events` — `(pubkey, kind, created_at)`, `(kind, created_at)`, `(pubkey, created_at)` — and one on `event_tags` — `(tag_name, tag_value, created_at)`. A fourth index therefore changes both the guard and the write accounting on its own; what it must NOT change silently is the measured baseline, so re-run `test/hibernation.test.ts`'s rows-written assertions and update the schema.ts comment and CLAUDE.md "The budget". Every accepted read filter must be answerable from one of these — that is enforced by cost, not by requiring a particular field.
+- Indexes are declared once, as data, in `schema.ts INDEXES`, and three things read that declaration: `limits.ts boundFilter` (which filters are affordable), `schema.ts eventRowCost` (what an event costs to write), and `limits.ts BACKFILL_PAGE_SIZE`/`VANISH_BATCH_SIZE` (how much work fits in a cron tick). Three on `events` — `(pubkey, kind, created_at)`, `(kind, created_at)`, `(pubkey, created_at)` — and two on `event_tags` — `(tag_name, tag_value, created_at)` and `(event_id)`. A fourth index therefore changes both the guard and the write accounting on its own; what it must NOT change silently is the measured baseline, so re-run `test/hibernation.test.ts`'s rows-written assertions and update the schema.ts comment and CLAUDE.md "The budget". Every accepted read filter must be answerable from one of these — that is enforced by cost, not by requiring a particular field.
 - Verify Cloudflare's own platform limits against live docs before relying on a number in a file — they change between compatibility dates. CLAUDE.md "The budget" cites the source and date at each point of use rather than assuming a cached number still holds.
 - Pin dependency versions; don't float to `latest` mid-project.
 

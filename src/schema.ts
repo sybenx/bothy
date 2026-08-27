@@ -288,6 +288,37 @@ export const TABLES: readonly TableSpec[] = [
     columns: [col("id", "TEXT PRIMARY KEY")],
   },
   {
+    // NIP-62 vanish requests that have not finished draining
+    // (storage.ts beginVanish/drainVanish, relay.ts handleVanish and
+    // runCron). One row per pubkey with a vanish in progress; the row is
+    // deleted once nothing is left to remove.
+    //
+    // This table exists because a vanish is the one request whose size is
+    // chosen by the sender and unbounded by anything this relay controls.
+    // Deleting N events costs N tombstone inserts and N row deletions --
+    // roughly 22 rows written each with the current index set -- so a
+    // large vanish can exceed a single request's budget partway through.
+    // Without a checkpoint it would then stop wherever the ceiling fell,
+    // having deleted some of the pubkey's events and reported success,
+    // which is a compliance failure rather than a performance problem:
+    // NIP-62 says "fully delete", and a half-vanished pubkey is
+    // indistinguishable from a finished one.
+    //
+    // `cutoff_created_at` is stored, not recomputed, because resumption
+    // must use the ORIGINAL request's created_at. Re-deriving it later
+    // would silently widen or narrow the set of events the requester
+    // actually asked to remove.
+    name: "vanishing",
+    columns: [
+      col("pubkey", "TEXT PRIMARY KEY"),
+      col("cutoff_created_at", "INTEGER NOT NULL"),
+      col("requested_at", "INTEGER NOT NULL"),
+      // Purely diagnostic: how many rows have been removed so far, so a
+      // stalled drain is visible on /api/stats rather than inferred.
+      col("deleted_so_far", "INTEGER NOT NULL DEFAULT 0"),
+    ],
+  },
+  {
     // This deployment's own host (see src/host.ts) -- recorded from
     // inbound request traffic, not known at deploy time. Single row, like
     // backfill_meta below.
@@ -445,7 +476,16 @@ export interface IndexSpec {
   readonly keyColumns: readonly string[];
   // The column the index is then sorted by, matching buildFilterQuery's
   // `ORDER BY created_at DESC`. Declared DESC in the SQL below.
-  readonly orderedBy: string;
+  //
+  // Optional, because not every index exists to serve an ordered scan.
+  // An index whose only job is to make an equality lookup cheap --
+  // idx_event_tags_event below, which exists so a DELETE can find a
+  // handful of rows without reading the table -- has nothing to sort by,
+  // and giving it a fake ordering column would cost a wider index for
+  // nothing. limits.ts filterReadCost only ever considers indexes on
+  // `events`, so an unordered index is never mistaken for one that can
+  // bound a REQ.
+  readonly orderedBy?: string;
 }
 
 export const INDEXES: readonly IndexSpec[] = [
@@ -485,11 +525,31 @@ export const INDEXES: readonly IndexSpec[] = [
     keyColumns: ["tag_name", "tag_value"],
     orderedBy: "created_at",
   },
+  // Serves `DELETE FROM event_tags WHERE event_id = ?` (storage.ts
+  // deleteEventRow), which without it scans the whole table to remove a
+  // handful of rows. No ordering column: this exists for an equality
+  // seek, not for a sorted scan.
+  //
+  // This index was deferred twice on write cost and is the most
+  // expensive one here -- a row per TAG row rather than per event, so
+  // TAG_ROW_COST goes 2 -> 3 and a real five-tag note costs five more
+  // rows to store. The reasoning that finally justified it is on
+  // deleteEventRow in storage.ts, beside the query, and it is not a
+  // budget argument: NIP-62 forbids gating the path that pays this cost,
+  // so cost is the only control left.
+  {
+    name: "idx_event_tags_event",
+    table: "event_tags",
+    keyColumns: ["event_id"],
+  },
 ];
 
 function createIndexSql(spec: IndexSpec): string {
-  const columns = [...spec.keyColumns, `${spec.orderedBy} DESC`].join(", ");
-  return `CREATE INDEX IF NOT EXISTS ${spec.name} ON ${spec.table} (${columns})`;
+  const columns =
+    spec.orderedBy === undefined
+      ? [...spec.keyColumns]
+      : [...spec.keyColumns, `${spec.orderedBy} DESC`];
+  return `CREATE INDEX IF NOT EXISTS ${spec.name} ON ${spec.table} (${columns.join(", ")})`;
 }
 
 // Indexes declared on one table. Exported because limits.ts needs the

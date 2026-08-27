@@ -96,89 +96,61 @@ function insertEventRow(
 }
 
 // ---------------------------------------------------------------------
-// The most expensive read left in this codebase, and deliberately still
-// here. Read this before "optimising" anything else.
+// `DELETE FROM event_tags WHERE event_id = ?` is served by
+// idx_event_tags_event (schema.ts), added in v0.7.3. Before it, this was
+// a full scan of `event_tags` -- T rows, about 5E, to remove a handful --
+// and it was the most expensive read in the codebase.
 //
-// `DELETE FROM event_tags WHERE event_id = ?` has no index to use.
-// `idx_event_tags_lookup` is (tag_name, tag_value, created_at) and
-// `event_id` appears nowhere in it, so this scans the whole table: T
-// rows, about 5E, to delete a handful. The `DELETE FROM events` beside
-// it is a primary-key seek and costs ~1.
+// It was deferred once on a budget argument, and the budget argument was
+// the wrong frame. It priced the index (a row write per TAG row:
+// TAG_ROW_COST 2 -> 3, about five more rows per real note, ~15,000
+// rows/day here, moving the meter from ~44,000 to ~59,000 of 100,000)
+// against the reads it saved, concluded that a fixed daily flow was
+// expensive, and treated the path as a performance question to revisit
+// when a counter said it was worth it.
 //
-// It is paid on every replaceable/addressable REPLACEMENT -- every
-// kind-0, kind-3, kind-10002, NIP-51 list and addressable event the
-// owner republishes -- and on every NIP-09 deletion, NIP-62 vanish and
-// NIP-86 banevent.
+// WHY IT IS NOT A BUDGET QUESTION
 //
-// WHY IT IS STILL HERE, AND WHY THAT IS A DEBT AND NOT A DECISION
+// This DELETE is reached by NIP-62 vanish, and NIP-62 says a relay
+// honours a vanish request "regardless of the user's status" -- it binds
+// write-restricted relays explicitly. relay.ts handleVanish is therefore
+// dispatched BEFORE ownership.ts isAllowedWriter and pays none of
+// acceptEvent's abuse caps. That is not an oversight; it is what the spec
+// requires. The consequences are:
 //
-// The fix is an index on event_tags(event_id). Pricing only the fix gets
-// this wrong, and it did once: the fix costs a row write per TAG row
-// rather than per event -- TAG_ROW_COST 2 -> 3, about five more rows per
-// real note, roughly 15,000 rows/day at this relay's rate -- and stopping
-// there makes it look like the expensive option. It is a FIXED DAILY
-// FLOW against a ceiling that resets every morning.
+//   - It cannot be gated. Any pubkey with a valid signature reaches it.
+//   - It cannot be throttled below "eventually completes", because the
+//     spec requires completion.
+//   - It cannot be revoked. banpubkey and unfollowing both go through
+//     isAllowedWriter, which this path never calls -- so neither of the
+//     owner's two revocation tools touches it, and an EX-follow keeps
+//     both their stored events and the ability to trigger this.
 //
-// What it buys is the removal of a cost that SCALES WITH THE ACCUMULATED
-// TABLE, which is the property that took this relay down. This path
-// spends 5E rows read per replacement, so:
+// Cost is therefore the only control available. Not the preferred one,
+// the only one. An unindexed DELETE here meant a single request from one
+// ex-follow holding N stored events read N x 5E rows: at E = 4,000 and
+// N = 500 that is 10,000,000 rows, two days of the read ceiling, from one
+// message the relay is obliged to accept. The threshold for a single
+// request to consume an entire day was N x E > 1,000,000 -- N = 250 at
+// today's table size, which is not a large number of events for one
+// pubkey to have accumulated.
 //
-//   5E x R = 5,000,000   =>   E x R = 1,000,000
+// So the index is what makes an operation the relay cannot refuse
+// affordable to perform. ~15,000 rows/day written is the price of not
+// having an unrefusable, unrevocable read amplifier in the write path.
 //
-// where R is replaceable events stored per day that supersede an
-// existing version. The cron floor (CLAUDE.md "The budget") reaches
-// 5,000,000 at E ~= 104,000. This path reaches it at:
+// The reads are fixed; the WRITES are not, and the index does nothing for
+// them. Removing an event still costs its row, its index entries and a
+// tombstone -- about 22 rows written each -- so a large vanish can still
+// exceed a single request's budget partway through. That is why
+// beginVanish/drainVanish below checkpoint the work across cron ticks
+// rather than attempting it all inside the request: NIP-62 requires full
+// deletion, and a vanish that stopped wherever the ceiling fell while
+// reporting success would be a compliance failure, not a slow query.
 //
-//   R =   5/day  ->  E = 200,000
-//   R =  10/day  ->  E = 100,000     <- crossover with the cron floor
-//   R =  25/day  ->  E =  40,000
-//   R =  50/day  ->  E =  20,000
-//   R = 100/day  ->  E =  10,000
-//   R = 250/day  ->  E =   4,000     <- today's table size
-//
-// So this is the binding constraint for any R above about 10/day, and
-// the cron floor -- the thing v0.7.2 spent two indexes fixing -- stops
-// being the limit that matters at all.
-//
-// ESTIMATING R
-//
-// The replaceable kinds this relay accepts are kind 0, kind 3, 10000-19999
-// and the addressable range 30000-39999 (nostr.ts). Three sources, and
-// only two of them matter:
-//
-//  - The OWNER's own clients, which is the sustained term. kind-3 is
-//    republished on every follow and unfollow, and some clients republish
-//    it on every launch; NIP-51 lists (10000-10030: mutes, pins,
-//    bookmarks, interests) are republished on every edit; addressable
-//    kinds are the volatile ones, since a client autosaving a kind-30023
-//    draft republishes the same address repeatedly. kind-0 and kind-10002
-//    are rare. For one active owner this lands at roughly 5-20/day, with
-//    the drafting case able to spike it by an order of magnitude for an
-//    afternoon.
-//
-//  - FOLLOWS, when ALLOW_FOLLOWS is on (the default) AND a follow's
-//    client actually writes to this relay -- which needs bothy in their
-//    own write set, so it is normally zero and is entirely outside the
-//    owner's control when it is not. Bounded by F x their republish rate,
-//    so a single follow whose client re-blasts kind-3 aggressively can
-//    contribute more than the owner does.
-//
-//  - BACKFILL contributes ~zero, which is worth stating because it looks
-//    like it should dominate. Backfill walks time BACKWARD, so the newest
-//    version of any replaceable address arrives first and every older one
-//    is superseded -- storeEvent returns early on isSupersededBy without
-//    calling this function at all. The cost is one replacement per
-//    distinct (pubkey, kind, d), once, not one per ingested event.
-//
-// That estimate is a range spanning the crossover, which is exactly why
-// it is not good enough to act on: read-metrics.ts counts replacements so
-// R can be READ off /api/stats after deploy instead of guessed at. Fix
-// this once that number is real -- the same rule that produced
-// read-metrics.ts in the first place, and the same one hasBackfillHeadroom
-// broke by guarding a number nobody had measured.
-//
-// test/read-cost.test.ts asserts this cost as "scales with the table"
-// rather than "stays under N", so it stays visible while it stays here.
+// test/read-cost.test.ts asserts the seek cost, so a regression that
+// dropped the index would fail rather than quietly restore the
+// amplifier.
 // ---------------------------------------------------------------------
 function deleteEventRow(sql: SqlStorage, id: string): void {
   sql.exec(`DELETE FROM event_tags WHERE event_id = ?`, id);
@@ -359,10 +331,30 @@ export function applyDeletion(sql: SqlStorage, deletion: NostrEvent): void {
   }
 }
 
+// NIP-09 `a` tags address replaceable and addressable events only --
+// "<kind>:<pubkey>:<d-identifier>" names a coordinate that exists solely
+// for kinds that have one. Regular events have no coordinate and are
+// deleted by `e` tag, one id at a time.
+//
+// Accepting a regular kind here was a conformance bug with a sharp edge.
+// `1:<pubkey>:` names no single event, so the branch below treated it as
+// "every kind-1 event by that pubkey at or before the cutoff" and
+// tombstoned all of them. One tag, unbounded N. That made
+// MAX_EVENT_BYTES a bound on nothing for bulk deletion: the size cap
+// limits a kind-5 to roughly 870 `e` tags, but a single `a` tag reached
+// the same N with none of the effort, and each removal pays the DELETE
+// above.
+//
+// Restricted to the kinds NIP-09 actually addresses, N per `a` tag is at
+// most one stored event -- replaceable kinds keep one version per
+// (pubkey, kind), addressable ones keep one per (pubkey, kind, d) -- so
+// the byte cap becomes a real bound on what one deletion request can
+// cost.
 function applyAddressDeletion(sql: SqlStorage, address: string, deletion: NostrEvent): void {
   const [kindStr, pubkey, d = ""] = address.split(":");
   const kind = Number(kindStr);
   if (!Number.isInteger(kind) || pubkey !== deletion.pubkey) return;
+  if (!isReplaceableKind(kind) && !isAddressableKind(kind)) return;
 
   if (isAddressableKind(kind)) {
     const candidates = sql
@@ -389,63 +381,189 @@ function applyAddressDeletion(sql: SqlStorage, address: string, deletion: NostrE
   }
 }
 
-// NIP-62 (nips/62.md) Request to Vanish. Two clauses, both applied
-// unconditionally against `requester` (the vanish event's own pubkey),
-// matching the spec text rather than special-casing "if requester is the
-// owner": "Relays MUST fully delete any events from the .pubkey" (the
-// first loop) and "Relays SHOULD delete all NIP-59 Gift Wraps that
-// p-tagged the .pubkey" (the second). Both clauses naturally do nothing
-// for a requester who has no matching rows -- the relay doesn't need to
-// know in advance whether the requester is the owner, a follow, or a
-// stranger, since bothy's own write gate already ensures the only
-// pubkeys ever found by the first clause are the owner or a follow (a
-// gift wrap's own pubkey is a random one-time key, never a real
-// identity someone could coordinate a vanish request around). Deliberately
-// NOT routed through ownership.ts's isAllowedWriter -- unlike every other
-// write path, a vanish request's authority comes from the requester
-// vanishing their *own* data, not from relay-write permission, and the
-// spec is explicit that write-restricted relays "MUST also follow the
-// request to vanish regardless of the user's status."
-export function applyVanish(
+// NIP-62 (nips/62.md) Request to Vanish, in two halves: this one records
+// the request, and drainVanish below does the work.
+//
+// It is split because a vanish is the one request whose size is chosen by
+// the sender and bounded by nothing this relay controls. Removing an
+// event costs its row, its index entries and a tombstone -- about 22 rows
+// written -- so a pubkey with thousands of stored events cannot be
+// vanished inside one request without exceeding the daily write budget
+// partway through. Doing it inline anyway would leave the pubkey
+// half-vanished while the OK frame said it had succeeded, and "fully
+// delete" is the spec's word, so that is a compliance failure rather than
+// a slow query.
+//
+// Recording first also makes the request durable: once this row exists,
+// the drain resumes on the next cron tick whether or not the socket, the
+// request or the Durable Object survived.
+//
+// Applied unconditionally against `requester` (the vanish event's own
+// pubkey), matching the spec text rather than special-casing "if
+// requester is the owner": "Relays MUST fully delete any events from the
+// .pubkey" and "Relays SHOULD delete all NIP-59 Gift Wraps that p-tagged
+// the .pubkey". Both clauses naturally do nothing for a requester who has
+// no matching rows. Deliberately NOT routed through ownership.ts's
+// isAllowedWriter -- unlike every other write path, a vanish request's
+// authority comes from the requester vanishing their *own* data, not from
+// relay-write permission, and the spec is explicit that write-restricted
+// relays "MUST also follow the request to vanish regardless of the user's
+// status." See deleteEventRow above for what that costs and why the index
+// exists.
+//
+// `cutoffCreatedAt` is stored rather than recomputed on resume: it is the
+// original request's created_at, and re-deriving it later would silently
+// change which events the requester actually asked to remove.
+export function beginVanish(
   sql: SqlStorage,
   requester: string,
   cutoffCreatedAt: number,
-): { deletedAuthored: number; deletedGiftWraps: number } {
-  const authored = sql
-    .exec<{ id: string }>(
-      `SELECT id FROM events WHERE pubkey = ? AND created_at <= ?`,
-      requester,
-      cutoffCreatedAt,
-    )
-    .toArray();
-  for (const row of authored) deleteAndTombstone(sql, row.id);
-
-  const giftWraps = sql
-    .exec<{ id: string }>(
-      `SELECT id FROM events WHERE kind = ? AND created_at <= ?
-       AND id IN (SELECT event_id FROM event_tags WHERE tag_name = 'p' AND tag_value = ?)`,
-      GIFT_WRAP_KIND,
-      cutoffCreatedAt,
-      requester,
-    )
-    .toArray();
-  for (const row of giftWraps) deleteAndTombstone(sql, row.id);
-
-  return { deletedAuthored: authored.length, deletedGiftWraps: giftWraps.length };
+  nowSec: number,
+): void {
+  // ON CONFLICT keeps the WIDEST request rather than the newest. Two
+  // vanish requests from one pubkey are unusual, but if the second names
+  // an earlier cutoff, honouring it would narrow a deletion already
+  // promised -- so the cutoff only ever moves outward.
+  sql.exec(
+    `INSERT INTO vanishing (pubkey, cutoff_created_at, requested_at) VALUES (?, ?, ?)
+       ON CONFLICT(pubkey) DO UPDATE SET
+         cutoff_created_at = MAX(cutoff_created_at, excluded.cutoff_created_at),
+         requested_at = excluded.requested_at`,
+    requester,
+    cutoffCreatedAt,
+    nowSec,
+  );
 }
 
-// Runs one filter, splitting it into per-(author, kind) queries first
-// (filters.ts expandFilter) so each one pins its index key columns to a
-// single value and stops at `limit` instead of sorting the table.
+export interface VanishProgress {
+  deleted: number;
+  // True once nothing is left to remove for this pubkey, at which point
+  // the `vanishing` row is gone and the request is complete.
+  done: boolean;
+}
+
+// Removes up to `limit` of one pubkey's events, newest first, and clears
+// the checkpoint once nothing is left. Safe to call repeatedly; calling
+// it for a pubkey with no `vanishing` row is a no-op.
 //
-// The split is invisible from the outside. Each sub-filter carries the
-// original `limit`, so the union may hold more events than the client
-// asked for; re-sorting by the same rule buildFilterQuery's ORDER BY
-// uses and slicing back to `limit` yields exactly the rows the unsplit
-// query would have returned. Dedupe by id first -- `authors` and `kinds`
-// are disjoint dimensions, so no event can appear twice, but the
-// single-query path fed a Map for the same reason and the guarantee is
-// cheap to keep.
+// Both NIP-62 clauses drain through one query so a single limit bounds
+// the whole operation: events the requester authored, and gift wraps
+// p-tagging them. Deleting the union in one pass also means the caller
+// cannot finish the first clause, report done, and leave the second.
+export function drainVanish(sql: SqlStorage, requester: string, limit: number): VanishProgress {
+  const row = sql
+    .exec<{ cutoff_created_at: number; deleted_so_far: number }>(
+      `SELECT cutoff_created_at, deleted_so_far FROM vanishing WHERE pubkey = ?`,
+      requester,
+    )
+    .toArray()[0];
+  if (!row) return { deleted: 0, done: true };
+
+  const targets = sql
+    .exec<{ id: string }>(
+      `SELECT id FROM events WHERE pubkey = ? AND created_at <= ?
+       UNION
+       SELECT id FROM events WHERE kind = ? AND created_at <= ?
+         AND id IN (SELECT event_id FROM event_tags WHERE tag_name = 'p' AND tag_value = ?)
+       LIMIT ?`,
+      requester,
+      row.cutoff_created_at,
+      GIFT_WRAP_KIND,
+      row.cutoff_created_at,
+      requester,
+      limit,
+    )
+    .toArray();
+
+  for (const target of targets) deleteAndTombstone(sql, target.id);
+
+  // Fewer than asked for means the set is exhausted. Checked against the
+  // limit rather than by re-running the query, which would cost a second
+  // pass over the same index for an answer this already implies.
+  const done = targets.length < limit;
+  if (done) {
+    sql.exec(`DELETE FROM vanishing WHERE pubkey = ?`, requester);
+  } else {
+    sql.exec(
+      `UPDATE vanishing SET deleted_so_far = ? WHERE pubkey = ?`,
+      row.deleted_so_far + targets.length,
+      requester,
+    );
+  }
+  return { deleted: targets.length, done };
+}
+
+export interface LargestNonOwnerAuthor {
+  pubkey: string;
+  events: number;
+}
+
+// The largest number of stored events held by any single pubkey that is
+// not the owner, and whose pubkey that is.
+//
+// This is the signal for whether the vanish exposure is live or latent.
+// A vanish request removes every event its sender authored, and the cost
+// of doing so scales with how many that is -- so the worst case this
+// relay is actually exposed to is not a hypothetical N, it is this
+// number. Reported on /api/stats rather than reasoned about, because
+// "I'd expect non-owner events to be spread thin" is a guess, and the
+// last three problems in this codebase were all things nobody had
+// measured.
+//
+// Null when no non-owner has written anything, which is the normal state
+// for a relay with ALLOW_FOLLOWS on but no follow actually publishing
+// here.
+//
+// Gift wraps are excluded deliberately, and their exclusion is the whole
+// reason this reads the way it does. Every gift wrap is signed by a fresh
+// one-time key (NIP-59), so counting them would report thousands of
+// pubkeys holding exactly one event each -- true, useless, and it would
+// bury the number being looked for. A gift wrap sender also cannot use
+// their key to vanish anything but that single event.
+//
+// Cost: E rows read, measured. `pubkey` leads idx_events_pubkey_created,
+// so the GROUP BY is served in index order and needs no sort -- but it
+// still walks every entry, so this is E, not the size of the answer.
+// There is no cheaper form: counting per author means visiting every
+// author's rows. It runs inside getStats' memoized block (relay.ts
+// statsCache), so it is paid once per cache miss rather than per request,
+// which is what makes E acceptable for a number that only has to be
+// roughly current.
+export function largestNonOwnerAuthor(sql: SqlStorage, owner: string | null): LargestNonOwnerAuthor | null {
+  const row = sql
+    .exec<{ pubkey: string; n: number }>(
+      `SELECT pubkey, COUNT(*) AS n FROM events
+        WHERE kind != ? AND pubkey != ?
+        GROUP BY pubkey ORDER BY n DESC LIMIT 1`,
+      GIFT_WRAP_KIND,
+      // An unclaimed relay has no owner to exclude; a pubkey that cannot
+      // exist excludes nothing, which is the correct answer rather than a
+      // special case.
+      owner ?? "",
+    )
+    .toArray()[0];
+  return row ? { pubkey: row.pubkey, events: row.n } : null;
+}
+
+export interface PendingVanish {
+  pubkey: string;
+  deletedSoFar: number;
+  requestedAt: number;
+}
+
+// Vanish requests still draining -- read by relay.ts runCron to resume
+// them, and surfaced on /api/stats so a stalled one is visible rather
+// than inferred. Oldest first, so a request cannot be starved by newer
+// ones arriving.
+export function pendingVanishes(sql: SqlStorage): PendingVanish[] {
+  return sql
+    .exec<{ pubkey: string; deleted_so_far: number; requested_at: number }>(
+      `SELECT pubkey, deleted_so_far, requested_at FROM vanishing ORDER BY requested_at ASC`,
+    )
+    .toArray()
+    .map((r) => ({ pubkey: r.pubkey, deletedSoFar: r.deleted_so_far, requestedAt: r.requested_at }));
+}
+
 export function queryFilter(sql: SqlStorage, filter: Filter, nowSec: number): NostrEvent[] {
   const parts = expandFilter(filter);
   const only = parts[0];

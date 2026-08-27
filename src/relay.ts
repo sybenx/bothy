@@ -22,6 +22,7 @@ import {
   MAX_GIFT_WRAPS_PER_IP_PER_WINDOW,
   MAX_LIVE_FEED_CONNECTIONS,
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
+  VANISH_BATCH_SIZE,
   nonOwnerStorageLimit,
   PUBKEY_RATE_LIMIT_MAX_TRACKED,
   PUBKEY_RATE_LIMIT_WINDOW_MS,
@@ -46,7 +47,10 @@ import { instrumentSql, readMetricsSnapshot, type ReadMetricsSnapshot, withReadP
 import { initSchema } from "./schema";
 import {
   applyDeletion,
-  applyVanish,
+  beginVanish,
+  drainVanish,
+  largestNonOwnerAuthor,
+  pendingVanishes,
   estimateRowsWritten24h,
   eventExists,
   expirationOf,
@@ -65,7 +69,7 @@ import { idMatchesContent, isCreatedAtTooFarInFuture, parseEventShape, verifySig
 
 // Replies to a client-level "ping" with "pong" entirely inside the
 // runtime -- it does not wake this object or count against DO duration.
-// See CLAUDE.md "Architecture".
+// See CLAUDE.md "Architecture map".
 const PING_PONG = new WebSocketRequestResponsePair("ping", "pong");
 
 // Tag on the hibernation API's own connection registry (getWebSockets)
@@ -321,7 +325,7 @@ export class Relay extends DurableObject<Env> {
 
       // acceptWebSocket (not server.accept()) is what makes this
       // connection hibernatable -- same reasoning as the tagged branch
-      // below, see CLAUDE.md "Architecture".
+      // below, see CLAUDE.md "Architecture map".
       this.ctx.acceptWebSocket(server, [LIVE_FEED_TAG]);
       server.serializeAttachment({ connectedAt: Date.now() } satisfies LiveFeedState);
       await this.scheduleLiveFeedAlarm();
@@ -331,7 +335,7 @@ export class Relay extends DurableObject<Env> {
     // acceptWebSocket (not server.accept()) is what makes this connection
     // hibernatable. Calling accept() instead pins the object in memory
     // and bills DO duration for the connection's entire lifetime -- see
-    // CLAUDE.md "Architecture".
+    // CLAUDE.md "Architecture map".
     this.ctx.acceptWebSocket(server);
     setState(server, {
       ip: request.headers.get("CF-Connecting-IP") ?? "unknown",
@@ -444,6 +448,15 @@ export class Relay extends DurableObject<Env> {
     writePolicy: "owner" | "follows";
     followCount: number;
     followsRefreshedAt: number | null;
+    // The largest number of stored events held by one non-owner pubkey,
+    // and NIP-62 vanish requests still draining. Both are here for the
+    // same reason: a vanish removes every event its sender authored, the
+    // relay cannot refuse one, and the cost scales with how many that is
+    // -- so this is the worst case the deployment is actually exposed to,
+    // reported rather than assumed. See storage.ts largestNonOwnerAuthor
+    // and the comment on deleteEventRow.
+    largestNonOwnerAuthor: { pubkey: string; events: number } | null;
+    vanishing: { pubkey: string; deletedSoFar: number; requestedAt: number }[];
     // DIAGNOSTIC, and expected to be removed with src/read-metrics.ts.
     // Rows read attributed to the code path that caused them, since the
     // relay's last outage was the 5,000,000 rows-read/day ceiling and
@@ -526,6 +539,8 @@ export class Relay extends DurableObject<Env> {
       writePolicy: allowFollowsEnabled(this.env) ? "follows" : "owner",
       followCount,
       followsRefreshedAt,
+      largestNonOwnerAuthor: largestNonOwnerAuthor(sql, owner),
+      vanishing: pendingVanishes(sql),
     };
   }
 
@@ -563,6 +578,10 @@ export class Relay extends DurableObject<Env> {
       // be what happens last or backfill would spend the next tick
       // fetching its own history from itself. See purgeSelfRelay.
         purgeSelfRelay(sql);
+        // Last, and deliberately so: this is the only step whose cost is
+        // set by a stranger's request rather than by the relay's own
+        // state, and everything above gates the owner's own writes.
+        this.drainPendingVanishes(sql);
       });
     } catch (err) {
       console.error(
@@ -858,8 +877,48 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
-    applyVanish(this.sql, event.pubkey, event.created_at);
-    ok(ws, event.id, true, "");
+    // Recorded before anything is deleted, then drained one bounded batch
+    // at a time -- see storage.ts beginVanish. A vanish is the only
+    // request whose size the sender chooses and this relay cannot refuse
+    // (NIP-62 binds write-restricted relays "regardless of the user's
+    // status"), so doing all of it inline would let one request run past
+    // the daily write budget partway through, leaving the pubkey
+    // half-vanished while this OK frame claimed success. "Fully delete"
+    // is the spec's requirement; finishing across cron ticks meets it,
+    // stopping wherever the ceiling fell does not.
+    beginVanish(this.sql, event.pubkey, event.created_at, nowSeconds());
+    const progress = drainVanish(this.sql, event.pubkey, VANISH_BATCH_SIZE);
+
+    // The OK message distinguishes finished from in-progress rather than
+    // reporting bare success for both. NIP-01 gives no machine-readable
+    // prefix for "accepted and still working", and inventing one would be
+    // worse than plain words -- but a requester who is told only "true"
+    // has no way to tell a completed vanish from one with thousands of
+    // events left to drain, and that difference is the entire point of
+    // the checkpoint.
+    ok(
+      ws,
+      event.id,
+      true,
+      progress.done
+        ? ""
+        : `vanish accepted and in progress: ${progress.deleted} events removed, ` +
+          `the rest will be removed on subsequent cron ticks`,
+    );
+  }
+
+  // Resumes every vanish request that has not finished draining. Called
+  // from runCron, after the refreshes: a vanish is the heaviest thing a
+  // tick can do, and letting it run first would mean a large drain
+  // starved the follow-cache refresh that gates writes.
+  //
+  // Each pubkey gets one bounded batch per tick rather than one pubkey
+  // being drained to completion, so several concurrent vanish requests
+  // make progress together instead of the oldest blocking the rest.
+  private drainPendingVanishes(sql: SqlStorage): void {
+    for (const pending of pendingVanishes(sql)) {
+      drainVanish(sql, pending.pubkey, VANISH_BATCH_SIZE);
+    }
   }
 
   // Shared tail of the write path once authorization is settled --

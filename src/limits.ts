@@ -1,6 +1,6 @@
 import { tagFilterEntries, type Filter } from "./nostr";
 import { expandFilterCount } from "./filters";
-import { indexesOn } from "./schema";
+import { eventRowCost, indexesOn } from "./schema";
 
 // Hijacking is not the threat here. Read abuse is. The write path is
 // already owner-gated (ownership.ts isAllowedWriter), so these caps
@@ -408,48 +408,7 @@ export function boundFilter(filter: Filter): FilterBound {
 export const MAX_LIVE_FEED_CONNECTIONS = 5;
 export const LIVE_FEED_MAX_LIFETIME_MS = 10 * 60 * 1000;
 
-// One-shot backfill -- events requested per relay
-// per cron tick. Cloudflare's own docs distinguish the Worker's 10ms/
-// request CPU limit (CLAUDE.md "The budget" table) from a Durable
-// Object's own CPU allowance, which defaults to 30 seconds per incoming
-// request/RPC call (developers.cloudflare.com/durable-objects/platform/limits/,
-// checked 2026-08-22) -- at the ~1.1ms/schnorr-verify baseline
-// (src/validate.ts), this page size costs ~140ms of DO CPU, nowhere
-// near that ceiling. So CPU is not what bounds this number.
-// What does: backfill runs unattended, for as long as the owner's
-// history requires, and must not crowd out the owner's own live writes
-// against the shared 100,000 rows-written/day ceiling.
-//
-// This number was originally derived from an assumed ~5 rows per stored
-// event, which was wrong. Measured against real backfilled history (200
-// events ingested in one tick, 2,600 rows written -- the first honest
-// figure available, since the rows-written estimate itself was measuring
-// the wrong clock until v0.3.1):
-//
-//   13.0 rows per backfilled event
-//     = 3 base rows + 2 * 5 indexed tags   (see schema.ts)
-//
-// A real note carries roughly five single-letter tags -- `e` and `p` on
-// replies, plus the rest -- not the one or two the old estimate assumed.
-// At the old page size that projects to:
-//
-//   200 events * 13 rows * 24 ticks/day = 62,400 rows/day
-//
-// which is 125% of BACKFILL_ROWS_SHARE_LIMIT below. Backfill was sized to
-// overrun its own reserved half, and only ever got away with it because
-// hasBackfillHeadroom was measuring by created_at and so could not see a
-// single row backfill wrote. Now that the guard works, the old page size
-// would simply throttle backfill most of the way through each day rather
-// than pacing it -- the guard is right and the page size was wrong.
-//
-// Sized so the daily worst case lands at ~80% of the reserved share,
-// leaving headroom for history heavier than the measured average:
-//
-//   128 events * 13 rows * 24 ticks/day = 39,936 rows/day  (80% of 50,000)
-//
-// The remaining margin absorbs up to ~16 rows/event (about 6.5 indexed
-// tags) before the projection would reach the share at all.
-export const BACKFILL_PAGE_SIZE = 128;
+
 
 // How long the Worker's cron tick keeps one outbound backfill socket open
 // waiting for EOSE before giving up for this tick -- mirrors
@@ -529,3 +488,82 @@ export const MAX_CREATED_AT_FUTURE_SECONDS = 3600;
 // own relay that day regardless of how much of backfill's own reserved
 // half it has already used earlier in the same rolling 24h window.
 export const BACKFILL_ROWS_SHARE_LIMIT = DAILY_ROWS_WRITTEN_LIMIT / 2;
+
+// One-shot backfill -- events requested per relay per cron tick.
+// Cloudflare's own docs distinguish the Worker's 10ms/request CPU limit
+// (CLAUDE.md "The budget" table) from a Durable Object's own CPU
+// allowance, which defaults to 30 seconds per incoming request/RPC call
+// (developers.cloudflare.com/durable-objects/platform/limits/, checked
+// 2026-08-22) -- at the ~1.1ms/schnorr-verify baseline (src/validate.ts),
+// this page size costs well under that ceiling. So CPU is not what
+// bounds this number.
+//
+// What does: backfill runs unattended, for as long as the owner's
+// history requires, and must not crowd out the owner's own live writes
+// against the shared 100,000 rows-written/day ceiling. It gets half
+// (BACKFILL_ROWS_SHARE_LIMIT) and is sized to use about 80% of that half,
+// leaving margin for history heavier than the measured average.
+//
+// COMPUTED, not written down, and that is the point. This constant has
+// been wrong twice, both times silently, because it was a literal derived
+// by hand from a per-event row cost that later changed underneath it:
+//
+//   - it was sized against an assumed ~5 rows/event when the real figure
+//     was 13, so it was set to 200 and projected 62,400 rows/day, 125% of
+//     the share it was supposed to stay inside;
+//   - it was then re-derived by hand as 128 against 13 rows/event, and
+//     v0.7.2's two `events` indexes took the real figure to 15 without
+//     anyone revisiting the arithmetic. The event_tags index in v0.7.3
+//     takes it to 20, at which 128 would project 61,440 rows/day -- 123%
+//     of the share, overrunning it again in exactly the same way.
+//
+// So it is derived from eventRowCost, which is itself derived from the
+// index set. Add an index and this shrinks to stay inside the share,
+// with nothing to remember.
+//
+// TAGS_PER_REAL_EVENT is measured, not assumed: 200 backfilled events
+// wrote 2,600 rows at a 13-rows/event schema, which is 3 base + 2 * 5
+// indexed tags. A real note carries about five single-letter tags -- `e`
+// and `p` on replies, plus the rest -- not the one or two the original
+// estimate assumed.
+const TAGS_PER_REAL_EVENT = 5;
+const BACKFILL_SHARE_UTILISATION = 0.8;
+const CRON_TICKS_PER_DAY = 24;
+
+export const BACKFILL_PAGE_SIZE = Math.floor(
+  (BACKFILL_ROWS_SHARE_LIMIT * BACKFILL_SHARE_UTILISATION) /
+    (eventRowCost(TAGS_PER_REAL_EVENT) * CRON_TICKS_PER_DAY),
+);
+
+// How many events one cron tick will remove for a pubkey with a NIP-62
+// vanish in progress (storage.ts drainVanish).
+//
+// Bounded by rows WRITTEN, not rows read -- the index added in v0.7.3
+// made the reads cheap and left the writes exactly where they were.
+// Removing one event costs its row and every index entry behind it, plus
+// the tombstone that stops it being replayed: about
+// eventRowCost(TAGS_PER_REAL_EVENT) + 2 rows. At the free tier's
+// 100,000/day that is roughly 4,500 events before a vanish alone would
+// consume the entire daily write budget.
+//
+// A quarter of the daily ceiling, which is half of backfill's share and
+// chosen against the two failure modes rather than as a round number.
+//
+// Too large and one stranger's request -- arriving without warning, at a
+// size the relay does not choose and cannot refuse -- spends the owner's
+// write budget in an afternoon. Too small and the relay takes weeks to
+// do a thing NIP-62 says it MUST do, which is not compliance either.
+//
+// At a quarter, the drain runs at about 47 events per tick, ~1,128 a
+// day. The arithmetic that bounds it is not really this constant, it is
+// the ceiling: at ~22 rows written per removed event, 100,000 rows/day
+// is ~4,500 events/day even if a vanish were given the entire budget and
+// the relay did nothing else. A pubkey with tens of thousands of stored
+// events takes days to vanish at ANY share, so the property worth
+// engineering is that it finishes and stays visible while it does --
+// /api/stats reports every draining request and how far it has got --
+// rather than that it finishes quickly.
+export const VANISH_ROWS_SHARE_LIMIT = DAILY_ROWS_WRITTEN_LIMIT / 4;
+export const VANISH_BATCH_SIZE = Math.floor(
+  VANISH_ROWS_SHARE_LIMIT / ((eventRowCost(TAGS_PER_REAL_EVENT) + 2) * CRON_TICKS_PER_DAY),
+);
