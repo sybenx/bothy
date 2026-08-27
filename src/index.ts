@@ -1,5 +1,6 @@
 import { runBackfillTick } from "./backfill-worker";
 import { logExhaustion } from "./exhaustion";
+import { secondsUntilUtcMidnight } from "./limits";
 import { MANAGEMENT_CONTENT_TYPE } from "./nip86";
 import { nip11Response } from "./nip11";
 import { verifyNip98 } from "./nip98";
@@ -153,13 +154,6 @@ async function route(request: Request, env: Env): Promise<Response> {
   if (url.pathname === "/api/profile") return handleProfile(request);
 
   return env.ASSETS.fetch(request);
-}
-
-// Cloudflare's free-tier allowances reset at 00:00 UTC, so this is a real
-// retry time rather than a guess -- see CLAUDE.md "The budget".
-function secondsUntilUtcMidnight(nowMs: number): number {
-  const msPerDay = 86_400_000;
-  return Math.ceil((msPerDay - (nowMs % msPerDay)) / 1000);
 }
 
 export default {

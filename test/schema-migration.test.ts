@@ -30,7 +30,7 @@ import {
   type IndexSpec,
   type TableSpec,
 } from "../src/schema";
-import { estimateRowsWritten24h } from "../src/storage";
+import { estimateRowsWrittenSince } from "../src/storage";
 import { refreshProfile } from "../src/ownership";
 import { isolateStorage } from "./helpers/isolate";
 import { OWNER_PUBKEY_HEX } from "./helpers/keys";
@@ -623,7 +623,7 @@ describe("row_cost across the migration boundary", () => {
         now,
         now,
       );
-      expect(estimateRowsWritten24h(sql, now - 86400)).toBe(0);
+      expect(estimateRowsWrittenSince(sql, now - 86400)).toBe(0);
 
       // A row written by the current code counts in full, so the estimate
       // becomes exact again as the legacy rows age out of the window.
@@ -634,7 +634,7 @@ describe("row_cost across the migration boundary", () => {
         now,
         eventRowCost(0),
       );
-      expect(estimateRowsWritten24h(sql, now - 86400)).toBe(eventRowCost(0));
+      expect(estimateRowsWrittenSince(sql, now - 86400)).toBe(eventRowCost(0));
     });
   });
 });

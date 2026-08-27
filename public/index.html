@@ -117,7 +117,7 @@
       <div class="bar"><div id="bar-storage"></div></div>
     </div>
     <div class="stat">
-      <div class="n" id="stat-rows">-</div><div class="label">rows written, last 24h (100k/day free limit)</div>
+      <div class="n" id="stat-rows">-</div><div class="label">rows written today, UTC (100k/day free limit)</div>
       <div class="bar"><div id="bar-rows"></div></div>
     </div>
   </div>
@@ -218,7 +218,7 @@ async function main() {
     document.getElementById("stat-ingested").textContent = stats.ingested24h;
 
     setBar("stat-storage", "bar-storage", stats.storageBytes, STORAGE_LIMIT, formatBytes(stats.storageBytes) + " used");
-    setBar("stat-rows", "bar-rows", stats.rowsWrittenEstimate24h, ROWS_WRITTEN_LIMIT, stats.rowsWrittenEstimate24h + " rows (est.)");
+    setBar("stat-rows", "bar-rows", stats.rowsWrittenToday, ROWS_WRITTEN_LIMIT, stats.rowsWrittenToday + " rows (est.)");
 
     renderWritePolicyStatus(stats);
     renderBackfillStatus(stats.backfill);
@@ -385,9 +385,13 @@ function renderDiagnostics(stats) {
         " (pulls " + backfill.pageSize + " events)";
 
   document.getElementById("diag-read-budget").textContent = formatReadBudget(stats.reads);
+  // Since the last 00:00 UTC, which is when the allowance itself resets
+  // -- not a rolling 24 hours. This line used to be able to read 85% at
+  // 00:05 UTC on a budget that was empty, which is precisely the hour
+  // someone reads this panel during a recovery.
   document.getElementById("diag-write-budget").textContent =
-    stats.rowsWrittenEstimate24h.toLocaleString() + " rows / " + ROWS_WRITTEN_LIMIT.toLocaleString() +
-    " (" + formatPercent(stats.rowsWrittenEstimate24h, ROWS_WRITTEN_LIMIT) + ")";
+    stats.rowsWrittenToday.toLocaleString() + " rows / " + ROWS_WRITTEN_LIMIT.toLocaleString() +
+    " (" + formatPercent(stats.rowsWrittenToday, ROWS_WRITTEN_LIMIT) + ") since 00:00 UTC";
 
   const tbody = document.getElementById("diag-read-paths");
   tbody.textContent = "";

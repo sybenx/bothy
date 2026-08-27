@@ -220,6 +220,33 @@ export const PUBKEY_RATE_LIMIT_MAX_TRACKED = 10_000;
 // filters.ts TAG_SCAN_DEPTH.
 // ---------------------------------------------------------------------
 
+// The second the current allowance window began: the most recent 00:00
+// UTC. Cloudflare's free-tier allowances reset then
+// (developers.cloudflare.com/durable-objects/platform/limits/, checked
+// 2026-08-26), so this -- not "now minus 24 hours" -- is the cutoff that
+// answers "how much of today's budget has been spent".
+//
+// The two are not interchangeable and the difference is worst exactly
+// when it matters most. A rolling window carries yesterday's traffic
+// across the reset: at 00:05 UTC the write-budget meter on the admin page
+// could read 85% against a ceiling that had been empty for five minutes,
+// and backfill.ts hasBackfillHeadroom would keep refusing to write for
+// most of a day on the strength of rows the account had already been
+// forgiven. The panel exists to be read during an outage, and a rolling
+// window makes it wrong during the recovery from one.
+export function utcDayStartSeconds(nowMs: number): number {
+  const msPerDay = 86_400_000;
+  return Math.floor((nowMs - (nowMs % msPerDay)) / 1000);
+}
+
+// The other end of the same window: how long until the allowances reset.
+// Used for the Retry-After on the 503 an exhausted allowance produces
+// (src/index.ts) -- a real retry time rather than a guess.
+export function secondsUntilUtcMidnight(nowMs: number): number {
+  const msPerDay = 86_400_000;
+  return Math.ceil((msPerDay - (nowMs % msPerDay)) / 1000);
+}
+
 // Cloudflare Workers Free's daily rows-READ ceiling, the companion to
 // DAILY_ROWS_WRITTEN_LIMIT below (developers.cloudflare.com/durable-objects/platform/limits/,
 // checked 2026-08-26). Named here because it is the number the relay

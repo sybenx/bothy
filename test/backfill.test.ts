@@ -14,9 +14,14 @@ import {
   seedBackfillRelays,
 } from "../src/backfill";
 import { recordHost } from "../src/host";
-import { BACKFILL_ROWS_SHARE_LIMIT, MAX_CREATED_AT_FUTURE_SECONDS } from "../src/limits";
+import {
+  BACKFILL_ROWS_SHARE_LIMIT,
+  MAX_CREATED_AT_FUTURE_SECONDS,
+  secondsUntilUtcMidnight,
+  utcDayStartSeconds,
+} from "../src/limits";
 import { eventRowCost } from "../src/schema";
-import { countIngested24h, estimateRowsWritten24h } from "../src/storage";
+import { countIngested24h, estimateRowsWrittenSince } from "../src/storage";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
 import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
@@ -36,7 +41,7 @@ function eventRows(sql: SqlStorage, extra = ""): { id: string; kind: number; con
 // rows-written estimate over BACKFILL_ROWS_SHARE_LIMIT without actually
 // signing and storing tens of thousands of events.
 // `ingestedAt` is what hasBackfillHeadroom actually measures (storage.ts
-// estimateRowsWritten24h), so these rows have to carry it -- setting only
+// estimateRowsWrittenSince), so these rows have to carry it -- setting only
 // created_at would make them invisible to the very guard this fixture
 // exists to push over its limit. Both are set to the same second here
 // because these stand in for the owner's own live writes, where the two
@@ -54,7 +59,7 @@ function insertSyntheticLiveRows(sql: SqlStorage, idPrefix: string, count: numbe
     for (let i = 0; i < batchCount; i++) {
       // row_cost stamped exactly as storage.ts insertEventRow would --
       // these stand in for real live writes, and a row with a NULL
-      // row_cost is invisible to estimateRowsWritten24h by design (the
+      // row_cost is invisible to estimateRowsWrittenSince by design (the
       // pre-migration case, covered separately below).
       params.push(
         `${idPrefix}-${inserted + i}`, "f".repeat(64), at, 1, "[]", "", "0".repeat(128), at,
@@ -71,7 +76,7 @@ function insertSyntheticLiveRows(sql: SqlStorage, idPrefix: string, count: numbe
 }
 
 // Regression coverage for the write-accounting bug this guard depends on.
-// estimateRowsWritten24h used to filter on `created_at`, so a backfilled
+// estimateRowsWrittenSince used to filter on `created_at`, so a backfilled
 // event -- which carries the timestamp its author signed it with, often
 // years ago -- contributed nothing to the number that decides whether
 // backfill may keep writing. The guard protecting the daily write budget
@@ -94,7 +99,7 @@ describe("backfill write accounting", () => {
     await runInDurableObject(stub, async (_instance, state) => {
       const sql = state.storage.sql;
       const since = NOW - 86400;
-      expect(estimateRowsWritten24h(sql, since)).toBe(0);
+      expect(estimateRowsWrittenSince(sql, since)).toBe(0);
 
       const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [oldNote], true, NOW);
       expect(result.stored).toBe(1);
@@ -106,7 +111,7 @@ describe("backfill write accounting", () => {
       // here would have to be found and changed by hand every time the
       // index set moves. test/hibernation.test.ts is what checks
       // eventRowCost against SQLite's real rowsWritten.
-      expect(estimateRowsWritten24h(sql, since)).toBe(eventRowCost(0));
+      expect(estimateRowsWrittenSince(sql, since)).toBe(eventRowCost(0));
 
       // The old behaviour, shown to be the wrong question rather than
       // just a wrong number: by created_at this event is invisible in the
@@ -135,7 +140,7 @@ describe("backfill write accounting", () => {
       const sql = state.storage.sql;
       applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [reply], true, NOW);
       // Base cost plus TAG_ROW_COST per indexed tag, per schema.ts.
-      expect(estimateRowsWritten24h(sql, NOW - 86400)).toBe(eventRowCost(2));
+      expect(estimateRowsWrittenSince(sql, NOW - 86400)).toBe(eventRowCost(2));
     });
   });
 
@@ -146,10 +151,10 @@ describe("backfill write accounting", () => {
     await runInDurableObject(stub, async (_instance, state) => {
       const sql = state.storage.sql;
       applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [oldNote], true, NOW);
-      expect(estimateRowsWritten24h(sql, NOW - 86400)).toBe(eventRowCost(0));
+      expect(estimateRowsWrittenSince(sql, NOW - 86400)).toBe(eventRowCost(0));
       // A day and a half later the same row no longer counts against the
       // budget -- the window rolls rather than accumulating forever.
-      expect(estimateRowsWritten24h(sql, NOW + 86400 / 2)).toBe(0);
+      expect(estimateRowsWrittenSince(sql, NOW + 86400 / 2)).toBe(0);
     });
   });
 });
@@ -662,6 +667,62 @@ describe("backfill ingest", () => {
       // it needs to be retried once the daily quota resets, not skipped.
       expect(status.nextUntil).toBe(5000);
     });
+  });
+
+  it("forgets yesterday's writes at 00:00 UTC, when the allowance does", async () => {
+    // hasBackfillHeadroom used to measure a rolling 24 hours against a
+    // ceiling that empties at midnight UTC, so writes the account had
+    // already been forgiven kept backfill paused for up to a day after
+    // the reset. The window is now the allowance's own (limits.ts
+    // utcDayStartSeconds).
+    //
+    // Five past midnight, exactly: the hour when the two windows disagree
+    // most, and the hour a stalled backfill is least explicable.
+    const justAfterMidnight = Date.UTC(2026, 7, 27, 0, 5, 0) / 1000;
+    const yesterday = utcDayStartSeconds(justAfterMidnight * 1000) - 3600;
+
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      // More than the whole reserved share, all of it written before the
+      // reset.
+      insertSyntheticLiveRows(
+        sql,
+        "yesterday",
+        Math.floor(BACKFILL_ROWS_SHARE_LIMIT / eventRowCost(0)) + 100,
+        yesterday,
+      );
+
+      // A rolling window still sees every one of those rows.
+      expect(estimateRowsWrittenSince(sql, justAfterMidnight - 86400)).toBeGreaterThan(
+        BACKFILL_ROWS_SHARE_LIMIT,
+      );
+      // The allowance does not, and neither does the guard.
+      expect(estimateRowsWrittenSince(sql, utcDayStartSeconds(justAfterMidnight * 1000))).toBe(0);
+      expect(hasBackfillHeadroom(sql, justAfterMidnight)).toBe(true);
+    });
+  });
+
+  it("bounds the allowance window from both ends at the same instant", () => {
+    // The two halves of the same boundary: what has been spent is
+    // measured from the last reset, and the Retry-After on an exhausted
+    // allowance (src/index.ts) counts to the next one. A day apart, and
+    // neither is allowed to drift from midnight.
+    const noon = Date.UTC(2026, 7, 27, 12, 0, 0);
+    expect(utcDayStartSeconds(noon)).toBe(Date.UTC(2026, 7, 27, 0, 0, 0) / 1000);
+    expect(secondsUntilUtcMidnight(noon)).toBe(12 * 60 * 60);
+    // Both name the same next reset, reached from opposite directions.
+    expect(utcDayStartSeconds(noon) + 86_400).toBe(
+      noon / 1000 + secondsUntilUtcMidnight(noon),
+    );
+    expect(utcDayStartSeconds(noon) + 86_400).toBe(Date.UTC(2026, 7, 28, 0, 0, 0) / 1000);
+
+    // Exactly midnight belongs to the day it opens, not the one it
+    // closes: nothing has been spent yet, and a full day remains.
+    const midnight = Date.UTC(2026, 7, 27, 0, 0, 0);
+    expect(utcDayStartSeconds(midnight)).toBe(midnight / 1000);
+    expect(secondsUntilUtcMidnight(midnight)).toBe(86_400);
   });
 
   it("yields to live traffic once it already holds more than its reserved share of the daily write budget", async () => {

@@ -27,6 +27,7 @@ import {
   PUBKEY_RATE_LIMIT_MAX_TRACKED,
   PUBKEY_RATE_LIMIT_WINDOW_MS,
   STATS_SNAPSHOT_MAX_AGE_MS,
+  utcDayStartSeconds,
 } from "./limits";
 import { handleManagementCall, type ManagementResponse } from "./nip86";
 import { resolveIcon, resolveName, type OwnerProfile } from "./nip11";
@@ -62,7 +63,7 @@ import {
   readStatsSnapshot,
   type StatsSnapshot,
   writeStatsSnapshot,
-  estimateRowsWritten24h,
+  estimateRowsWrittenSince,
   eventExists,
   expirationOf,
   getRelaySettings,
@@ -423,7 +424,12 @@ export class Relay extends DurableObject<Env> {
     // included (storage.ts countIngested24h). Live, not snapshotted.
     ingested24h: number;
     storageBytes: number;
-    rowsWrittenEstimate24h: number;
+    // Rows written storing events since the last 00:00 UTC, when the
+    // free tier's allowances reset -- the write-budget meter, and the
+    // only figure here measured against a window the platform chose
+    // rather than one this relay chose. See storage.ts
+    // estimateRowsWrittenSince for what it does not count.
+    rowsWrittenToday: number;
     backfill: BackfillStatus | null;
     icon: string | null;
     // The name actually in effect, resolved through the same chain the
@@ -465,7 +471,7 @@ export class Relay extends DurableObject<Env> {
     reads: ReadMetricsSnapshot;
   }> {
     // Scoped to "getStats" rather than measured per query: the nested
-    // estimateRowsWritten24h declares its own scope and so reports
+    // estimateRowsWrittenSince declares its own scope and so reports
     // separately -- it was for a long time the most expensive call in
     // here, and keeping it separately billed is how that stays visible.
     const stats = withReadPath("getStats", () => this.collectStats(host));
@@ -482,7 +488,15 @@ export class Relay extends DurableObject<Env> {
 
     const sql = this.sql;
     const owner = getOwnerPubkey(sql, this.env);
-    const since = nowSeconds() - 86400;
+    const nowMs = Date.now();
+    // Two windows, deliberately, because two different questions are
+    // being asked. `since` is a rolling 24 hours and answers "how much
+    // has this relay done lately", which has no reset to respect.
+    // `budgetSince` is the last 00:00 UTC, because the rows-written
+    // ceiling it measures against is an allowance that empties then --
+    // see limits.ts utcDayStartSeconds.
+    const since = Math.floor(nowMs / 1000) - 86400;
+    const budgetSince = utcDayStartSeconds(nowMs);
 
     // The expensive half, read back from `stats_snapshot` rather than
     // recomputed. Recomputed here only when the cron tick has not done it
@@ -513,7 +527,7 @@ export class Relay extends DurableObject<Env> {
       // meter.
       ingested24h: countIngested24h(sql, since),
       storageBytes: sql.databaseSize,
-      rowsWrittenEstimate24h: estimateRowsWritten24h(sql, since),
+      rowsWrittenToday: estimateRowsWrittenSince(sql, budgetSince),
       // Live: the backfill tables hold one row per relay in the owner's
       // kind-10002 list, so this is ~20 rows read, not O(E). Snapshotting
       // it would save nothing and would make "last ran" and the refusal

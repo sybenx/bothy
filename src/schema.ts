@@ -66,7 +66,7 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 // `ingested_at` is the wall-clock second this relay wrote the row, which
 // is a different thing from `created_at`, the second the author says they
 // signed it. The distinction is the whole reason the column exists.
-// storage.ts estimateRowsWritten24h originally derived "rows written in
+// storage.ts estimateRowsWrittenSince originally derived "rows written in
 // the last 24h" from `created_at`, which silently measured something
 // else: rows attributable to events *timestamped* in the last 24h. A
 // backfilled event carries its original timestamp, often years old, so
@@ -88,7 +88,7 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 // this comment used to argue the other way. The argument was that an
 // index here would cost a row write per event, which is true, and that
 // the cost bought nothing the column had not already bought, which was
-// not. Without it, estimateRowsWritten24h read every row in `events` to
+// not. Without it, estimateRowsWrittenSince read every row in `events` to
 // answer a question about the rows in a 24h window: a cost that scales
 // with the accumulated table rather than with the day's traffic, paid
 // twice per cron tick forever. idx_events_ingested is
@@ -190,7 +190,7 @@ export const TABLES: readonly TableSpec[] = [
       // `ingested_at` is the wall-clock second this relay wrote the row,
       // which is a different thing from `created_at`, the second the
       // author says they signed it. The distinction is the whole reason
-      // the column exists. storage.ts estimateRowsWritten24h originally
+      // the column exists. storage.ts estimateRowsWrittenSince originally
       // derived "rows written in the last 24h" from `created_at`, which
       // silently measured something else: rows attributable to events
       // *timestamped* in the last 24h. A backfilled event carries its
@@ -228,7 +228,7 @@ export const TABLES: readonly TableSpec[] = [
       //
       // Stored rather than recomputed because recomputing it was the
       // single most expensive read in the codebase.
-      // estimateRowsWritten24h used to derive it from a
+      // estimateRowsWrittenSince used to derive it from a
       // `LEFT JOIN event_tags` and a per-row COUNT, and `event_tags` has
       // no index on `event_id` -- so SQLite built an automatic index over
       // the whole table on every call, reading E + T rows to answer a
@@ -662,7 +662,7 @@ export const INDEXES: readonly IndexSpec[] = [
     table: "event_tags",
     keyColumns: ["event_id"],
   },
-  // Serves `WHERE ingested_at > ?` -- storage.ts estimateRowsWritten24h
+  // Serves `WHERE ingested_at > ?` -- storage.ts estimateRowsWrittenSince
   // and countIngested24h, the two queries that ask what this relay did in
   // the last 24 hours. Added v0.7.6.
   //
@@ -755,7 +755,7 @@ export const TAG_ROW_COST = 1 + indexesOn("event_tags").length;
 
 // Rows written by storing one event carrying `indexedTagCount`
 // single-letter tags. Stamped into `events.row_cost` at insert time
-// (storage.ts insertEventRow) so estimateRowsWritten24h can sum a column
+// (storage.ts insertEventRow) so estimateRowsWrittenSince can sum a column
 // instead of rebuilding this from a join.
 export function eventRowCost(indexedTagCount: number): number {
   return EVENT_BASE_ROW_COST + TAG_ROW_COST * indexedTagCount;
@@ -803,7 +803,7 @@ export function eventRemovalRowsWritten(indexedTagCount: number): number {
 // cursor can answer. Pacing a budget guard against the smaller of two
 // plausible numbers would mean that if the cursor under-reports, the
 // drain quietly overruns its share -- the unsafe direction, and exactly
-// the class of error that made estimateRowsWritten24h wrong by 45x.
+// the class of error that made estimateRowsWrittenSince wrong by 45x.
 //
 // So the drain assumes a removal costs what the insertion cost, plus the
 // tombstone. If the cursor is right, the drain simply runs at about a

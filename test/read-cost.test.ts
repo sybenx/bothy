@@ -59,7 +59,7 @@ const EVENTS = 1000;
 const TAGS_PER_EVENT = 5;
 const TAG_ROWS = EVENTS * TAGS_PER_EVENT;
 // How many of the seeded rows carry an `ingested_at` inside the rolling
-// 24h window estimateRowsWritten24h measures. Ten, not zero, and the
+// 24h window estimateRowsWrittenSince measures. Ten, not zero, and the
 // difference matters twice over.
 //
 // It mattered for the pre-v0.7.2 join: with nothing in the window SQLite
@@ -379,7 +379,7 @@ describe("rows read by query shape", () => {
     });
   });
 
-  it("costs estimateRowsWritten24h the size of the 24h window, not the size of the table", async () => {
+  it("costs estimateRowsWrittenSince the size of the 24h window, not the size of the table", async () => {
     // The last line of the fixed daily floor, removed in two steps, and
     // both steps are measured here against the same rows in the same
     // Durable Object so the before/after in CLAUDE.md "The budget" is a
@@ -614,11 +614,11 @@ describe("read attribution", () => {
     expect(byPath.get("req")?.rowsRead ?? 0).toBeGreaterThan(0);
     expect(byPath.get("req")?.rowsRead ?? 0).toBeLessThan(EVENTS);
 
-    // estimateRowsWritten24h reports separately from the getStats call
+    // estimateRowsWrittenSince reports separately from the getStats call
     // that invoked it -- the whole reason it declares its own scope. It
     // no longer touches `event_tags` at all, so its bucket must now sit
     // at or below E rather than above E + T.
-    expect(byPath.get("estimateRowsWritten24h")?.rowsRead ?? 0).toBeLessThanOrEqual(EVENTS + 1);
+    expect(byPath.get("estimateRowsWrittenSince")?.rowsRead ?? 0).toBeLessThanOrEqual(EVENTS + 1);
     expect(byPath.get("getStats")?.rowsRead ?? 0).toBeGreaterThan(0);
 
     expect(snapshot.totalRowsRead).toBeGreaterThan(0);

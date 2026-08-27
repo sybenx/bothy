@@ -47,12 +47,12 @@ export const READ_PATHS = [
   // own filter omits `kinds` (relay.ts handleReq, CLAUDE.md "The budget").
   "giftWrapGate",
   // GET /api/stats (relay.ts getStats), excluding the nested
-  // estimateRowsWritten24h below, which reports separately.
+  // estimateRowsWrittenSince below, which reports separately.
   "getStats",
-  // storage.ts estimateRowsWritten24h, on its own wherever it is called
+  // storage.ts estimateRowsWrittenSince, on its own wherever it is called
   // from -- getStats displays it, and backfill.ts hasBackfillHeadroom
   // calls it on every cron tick AND again inside every ingest.
-  "estimateRowsWritten24h",
+  "estimateRowsWrittenSince",
   // backfill.ts applyBackfillPage: the per-event eventExists/isDeleted
   // pair, plus the cursor/exhaustion bookkeeping.
   "backfillIngest",
@@ -119,7 +119,7 @@ let currentPath: ReadPath = "unattributed";
 
 // Attributes every read performed by `fn` to `path`, restoring the
 // previous scope afterwards. Nesting is innermost-wins, which is what
-// keeps estimateRowsWritten24h reporting separately from the getStats
+// keeps estimateRowsWrittenSince reporting separately from the getStats
 // and backfill scopes that call it.
 export function withReadPath<T>(path: ReadPath, fn: () => T): T {
   const previous = currentPath;

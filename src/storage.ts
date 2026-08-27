@@ -59,7 +59,7 @@ function isIndexedTag(tag: string[]): boolean {
 // `row_cost` is stamped here for the same reason and at the same price:
 // this INSERT is the only place that knows both how many indexed tag rows
 // are about to follow and what the schema charges for each, and
-// estimateRowsWritten24h below then reads a column instead of rebuilding
+// estimateRowsWrittenSince below then reads a column instead of rebuilding
 // the figure from a table-wide join. eventRowCost is derived from
 // schema.ts INDEXES, so the number stamped here tracks the real index set
 // rather than a constant somebody has to remember to update.
@@ -562,7 +562,7 @@ export function largestNonOwnerAuthor(sql: SqlStorage, owner: string | null): La
 // one of these numbers is a dashboard rather than a gate -- nothing on a
 // correctness path reads them. backfill.ts hasBackfillHeadroom, the one
 // figure on /api/stats that IS a gate, deliberately calls
-// estimateRowsWritten24h directly and is not snapshotted.
+// estimateRowsWrittenSince directly and is not snapshotted.
 //
 // The membership rule is measured cost, not stale-tolerance: a field is
 // in here because reading it walks a table, not because an hour-old
@@ -738,7 +738,7 @@ function runFilterQuery(sql: SqlStorage, filter: Filter, nowSec: number): NostrE
 // column each INSERT stamps (schema.ts eventRowCost, storage.ts
 // insertEventRow). A read-only estimate, not a tracked counter -- see
 // limits.ts/relay.ts comments on why this relay avoids extra writes just
-// to measure itself. Backs /api/stats's `rowsWrittenEstimate24h`
+// to measure itself. Backs /api/stats's `rowsWrittenToday`
 // (relay.ts getStats) and backfill's own headroom check (backfill.ts
 // hasBackfillHeadroom: backfill must yield to the owner's live traffic
 // rather than compete with it for the same daily ceiling) -- both need
@@ -855,8 +855,8 @@ function runFilterQuery(sql: SqlStorage, filter: Filter, nowSec: number): NostrE
 // Fixing it would mean stamping deletion cost somewhere, and the only
 // place to stamp it is a counter row -- a row write to measure a row
 // write, which is the trade schema.ts rejected for exactly this column.
-export function estimateRowsWritten24h(sql: SqlStorage, sinceCutoff: number): number {
-  return withReadPath("estimateRowsWritten24h", () => estimateRowsWritten24hInner(sql, sinceCutoff));
+export function estimateRowsWrittenSince(sql: SqlStorage, sinceCutoff: number): number {
+  return withReadPath("estimateRowsWrittenSince", () => estimateRowsWrittenSinceInner(sql, sinceCutoff));
 }
 
 // Scoped separately from whichever path called it (read-metrics.ts):
@@ -867,7 +867,7 @@ export function estimateRowsWritten24h(sql: SqlStorage, sinceCutoff: number): nu
 // expensive line in the fixed daily floor, which is reason enough to
 // keep its own line in the report now that it is not -- a path that
 // stops being expensive is worth being able to see stay that way.
-function estimateRowsWritten24hInner(sql: SqlStorage, sinceCutoff: number): number {
+function estimateRowsWrittenSinceInner(sql: SqlStorage, sinceCutoff: number): number {
   return (
     sql
       .exec<{ total: number | null }>(

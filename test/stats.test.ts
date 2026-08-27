@@ -35,7 +35,7 @@ describe("GET /api/stats", () => {
       totalEvents: expect.any(Number),
       events24h: expect.any(Number),
       storageBytes: expect.any(Number),
-      rowsWrittenEstimate24h: expect.any(Number),
+      rowsWrittenToday: expect.any(Number),
       ingested24h: expect.any(Number),
       backfill: { status: "pending", totalStored: 0, relayCount: 0, exhaustedCount: 0 },
     });
@@ -188,7 +188,7 @@ describe("/api/stats snapshot", () => {
       snapshotAt: number;
       totalEvents: number;
       ingested24h: number;
-      rowsWrittenEstimate24h: number;
+      rowsWrittenToday: number;
     };
 
   it("dates the snapshotted counts so their age is stated, not assumed", async () => {
@@ -233,7 +233,7 @@ describe("/api/stats snapshot", () => {
     // they are the two numbers an owner watching their daily ceiling
     // most needs to be current.
     expect(after.ingested24h).toBe(before.ingested24h + 1);
-    expect(after.rowsWrittenEstimate24h).toBeGreaterThan(before.rowsWrittenEstimate24h);
+    expect(after.rowsWrittenToday).toBeGreaterThan(before.rowsWrittenToday);
   });
 
   it("computes the snapshot on a cron tick, so a page load does not have to", async () => {

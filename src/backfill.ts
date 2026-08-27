@@ -5,9 +5,9 @@
 // Worker-side half (outbound sockets, never here -- CLAUDE.md "The
 // budget") lives in backfill-worker.ts.
 import { getOwnHost, normalizeHost } from "./host";
-import { BACKFILL_PAGE_SIZE, BACKFILL_ROWS_SHARE_LIMIT } from "./limits";
+import { BACKFILL_PAGE_SIZE, BACKFILL_ROWS_SHARE_LIMIT, utcDayStartSeconds } from "./limits";
 import { isEphemeralKind } from "./nostr";
-import { estimateRowsWritten24h, isDeleted, eventExists, storeEvent } from "./storage";
+import { estimateRowsWrittenSince, isDeleted, eventExists, storeEvent } from "./storage";
 import { idMatchesContent, isCreatedAtTooFarInFuture, parseEventShape, verifySignature } from "./validate";
 
 export interface BackfillStatus {
@@ -68,10 +68,16 @@ export type BackfillState = BackfillStatus & { ownerPubkey: string; canIngestNow
 // Backfill must yield to the owner's own live traffic, not compete with
 // it for the shared 100,000 rows-written/day ceiling -- a relay that
 // can't accept the owner's new note because it's busy importing 2023 has
-// the priority backwards. True once today's rolling
-// rows-written estimate (storage.ts estimateRowsWritten24h, the same
-// number /api/stats already displays) still leaves backfill its reserved
-// share (BACKFILL_ROWS_SHARE_LIMIT, limits.ts) of the daily ceiling.
+// the priority backwards. True once what this relay has written SINCE THE
+// LAST 00:00 UTC (storage.ts estimateRowsWrittenSince, the same number
+// /api/stats already displays) still leaves backfill its reserved share
+// (BACKFILL_ROWS_SHARE_LIMIT, limits.ts) of the daily ceiling.
+//
+// Since midnight, not a rolling 24 hours. The ceiling this defends resets
+// at 00:00 UTC, and a rolling window carries yesterday's writes across
+// that reset -- which meant backfill stalling for up to a full day
+// against a budget the account had already been given back. See
+// limits.ts utcDayStartSeconds.
 // Checked twice, for two different reasons: getBackfillState (relay.ts)
 // checks it so the Worker's cron tick can skip opening an outbound
 // socket at all on a day live traffic already dominates, and
@@ -82,7 +88,7 @@ export type BackfillState = BackfillStatus & { ownerPubkey: string; canIngestNow
 // share; the first is purely to avoid wasted outbound connections on a
 // day backfill isn't going to be allowed to write anyway.
 export function hasBackfillHeadroom(sql: SqlStorage, nowSec: number): boolean {
-  return estimateRowsWritten24h(sql, nowSec - 86400) < BACKFILL_ROWS_SHARE_LIMIT;
+  return estimateRowsWrittenSince(sql, utcDayStartSeconds(nowSec * 1000)) < BACKFILL_ROWS_SHARE_LIMIT;
 }
 
 // Backs Relay.getBackfillState (relay.ts), read by the Worker's cron tick
