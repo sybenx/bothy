@@ -540,6 +540,56 @@ export const TABLES: readonly TableSpec[] = [
       col("largest_author_events", "INTEGER"),
     ],
   },
+  {
+    // The other half of /api/stats: the two figures that stayed live when
+    // `stats_snapshot` above was introduced, cached here on a much
+    // shorter clock (limits.ts LIVE_STATS_MAX_AGE_MS, five minutes
+    // against that one's six hours). At most one row, replaced wholesale,
+    // absent until the first stats request computes one.
+    //
+    // They stayed live because they are the write-budget meter and an
+    // owner reading it during an outage needs it current -- a good
+    // reason, costed wrong. Neither query scales with E (both seek
+    // idx_events_ingested), but both scale with the ingest WINDOW, which
+    // measured ~1,200 rows read per request on the live relay. Multiplied
+    // by an unauthenticated GET with nothing in front of it, that is
+    // ~4,100 requests to spend the whole 5,000,000 rows-read/day
+    // allowance -- so what was billed per page load is now billed per
+    // five minutes, and the request count no longer sets the rate.
+    //
+    // A row for the reason the row above it is a row, and the argument
+    // has to be made again rather than inherited: the case for memory is
+    // stronger here, since a flood keeps the object awake and an
+    // in-memory cache would hit throughout one. It still loses, because a
+    // flood is not the cheap attack -- one request every ten seconds
+    // misses an in-memory cache every single time (the object is evicted
+    // between them) and still reaches twice the daily ceiling. See
+    // limits.ts LIVE_STATS_MAX_AGE_MS for that arithmetic. Storage is the
+    // only state here that outlives eviction.
+    //
+    // Writes: 2 rows per refresh (DELETE + INSERT; 1 the first time),
+    // capped at 288 refreshes/day by the TTL, so 576 rows/day against a
+    // 100,000/day ceiling in the worst case and near zero in the normal
+    // one. Not on the per-event write path -- which is the line this file
+    // has twice refused to cross, and does not cross here either.
+    name: "live_stats",
+    columns: [
+      // Wall-clock seconds this row was computed at, reported on
+      // /api/stats as `liveAt` so these two numbers carry their age the
+      // way the snapshotted five carry `snapshotAt`.
+      col("computed_at", "INTEGER NOT NULL"),
+      // The 00:00 UTC boundary `rows_written_today` was measured from,
+      // stored because age alone cannot invalidate this row correctly.
+      // The allowance resets at midnight UTC (limits.ts
+      // utcDayStartSeconds); a value computed at 23:59 is only seconds
+      // old at 00:01 and is describing the wrong day entirely, so the
+      // read below discards a row whose boundary is not the current one
+      // regardless of how fresh it looks.
+      col("budget_since", "INTEGER NOT NULL"),
+      col("ingested_24h", "INTEGER NOT NULL"),
+      col("rows_written_today", "INTEGER NOT NULL"),
+    ],
+  },
 ];
 
 // ---------------------------------------------------------------------

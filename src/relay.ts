@@ -17,6 +17,7 @@ import {
   DAILY_ROWS_WRITTEN_LIMIT,
   GIFT_WRAP_RATE_LIMIT_WINDOW_MS,
   LIVE_FEED_MAX_LIFETIME_MS,
+  LIVE_STATS_MAX_AGE_MS,
   MAX_EVENTS_PER_REQ,
   maxEventBytes,
   maxEventsPerPubkeyPerWindow,
@@ -60,17 +61,19 @@ import { initSchema } from "./schema";
 import {
   applyDeletion,
   beginVanish,
+  computeLiveStats,
   computeStatsSnapshot,
   drainVanish,
   pendingVanishes,
   readStatsSnapshot,
   type StatsSnapshot,
   writeStatsSnapshot,
-  estimateRowsWrittenSince,
   eventExists,
   expirationOf,
   getRelaySettings,
-  countIngested24h,
+  readLiveStats,
+  type LiveStats,
+  writeLiveStats,
   giftWrapCount,
   hasNonOwnerStorageHeadroom,
   isDeleted,
@@ -424,7 +427,8 @@ export class Relay extends DurableObject<Env> {
     // apart instead of assuming the whole document describes one instant.
     snapshotAt: number;
     // Events this relay actually wrote in the last 24h, backfill
-    // included (storage.ts countIngested24h). Live, not snapshotted.
+    // included (storage.ts countIngested24h). Cached for
+    // limits.ts LIVE_STATS_MAX_AGE_MS -- see `liveAt` below.
     ingested24h: number;
     storageBytes: number;
     // Rows written storing events since the last 00:00 UTC, when the
@@ -433,6 +437,14 @@ export class Relay extends DurableObject<Env> {
     // rather than one this relay chose. See storage.ts
     // estimateRowsWrittenSince for what it does not count.
     rowsWrittenToday: number;
+    // When `ingested24h` and `rowsWrittenToday` were computed (unix
+    // seconds). Those two come from the `live_stats` row and are up to
+    // limits.ts LIVE_STATS_MAX_AGE_MS old -- five minutes, not the six
+    // hours `snapshotAt` above describes. Two ages on one document
+    // because there are two caches on two clocks, and a consumer that
+    // cannot tell them apart would have to assume the stalest one
+    // applies to everything.
+    liveAt: number;
     // The three Workers-free-tier ceilings limits.ts declares, transported
     // rather than left for public/index.html to hardcode a second copy of
     // -- see CLAUDE.md "The budget". Static per deployment (none of these
@@ -486,6 +498,9 @@ export class Relay extends DurableObject<Env> {
     // estimateRowsWrittenSince declares its own scope and so reports
     // separately -- it was for a long time the most expensive call in
     // here, and keeping it separately billed is how that stays visible.
+    // It now runs only on a `live_stats` cache miss, so a run of stats
+    // requests that leaves its bucket flat is the cache working, and a
+    // bucket climbing with the request count is that cache broken.
     const stats = withReadPath("getStats", () => this.collectStats(host));
     // Snapshotted after the scope closes so this call's own reads are
     // included in what it reports -- a breakdown that excluded the
@@ -501,13 +516,14 @@ export class Relay extends DurableObject<Env> {
     const sql = this.sql;
     const owner = getOwnerPubkey(sql, this.env);
     const nowMs = Date.now();
-    // Two windows, deliberately, because two different questions are
-    // being asked. `since` is a rolling 24 hours and answers "how much
-    // has this relay done lately", which has no reset to respect.
-    // `budgetSince` is the last 00:00 UTC, because the rows-written
-    // ceiling it measures against is an allowance that empties then --
-    // see limits.ts utcDayStartSeconds.
-    const since = Math.floor(nowMs / 1000) - 86400;
+    // The last 00:00 UTC, because the rows-written ceiling this measures
+    // against is an allowance that empties then -- see limits.ts
+    // utcDayStartSeconds. Computed here rather than inside
+    // refreshLiveStats because it is also the cache key: a cached figure
+    // measured from yesterday's boundary is invalid however fresh it
+    // looks. The other window in play, the rolling 24 hours behind
+    // `ingested24h`, has no reset to respect and so is derived where it
+    // is used (storage.ts computeLiveStats).
     const budgetSince = utcDayStartSeconds(nowMs);
 
     // The expensive half, read back from `stats_snapshot` rather than
@@ -517,6 +533,9 @@ export class Relay extends DurableObject<Env> {
     // for why the bound is where it is, and schema.ts `stats_snapshot`
     // for why this lives in a row rather than in memory.
     const snapshot = this.refreshStatsSnapshot(owner);
+    // The cheap half -- but only relative to the snapshot above. See
+    // refreshLiveStats.
+    const live = this.refreshLiveStats(budgetSince);
 
     const profile = getOwnerProfile(sql, this.env);
     const settings = getRelaySettings(sql);
@@ -532,14 +551,18 @@ export class Relay extends DurableObject<Env> {
       // current, so the age is reported rather than left to be assumed --
       // the admin page shows it next to the total.
       snapshotAt: snapshot.computedAt,
-      // Live, and cheap enough to stay that way: `ingested_at` is indexed
-      // as of v0.7.6 (schema.ts idx_events_ingested), so both of these
-      // read the 24h window rather than the table. They are also the two
-      // numbers most worth being current -- the second is the write-budget
-      // meter.
-      ingested24h: countIngested24h(sql, since),
+      // Cached on a five-minute clock (schema.ts `live_stats`), not read
+      // per request. `ingested_at` is indexed as of v0.7.6
+      // (schema.ts idx_events_ingested) so neither of these reads the
+      // table, but both read the ingest WINDOW, which is ~1,200 rows on a
+      // working relay and was billed to every anonymous GET of this
+      // endpoint. They are still the two numbers most worth being current
+      // -- the second is the write-budget meter -- which is why their TTL
+      // is five minutes and not the snapshot's six hours.
+      ingested24h: live.ingested24h,
       storageBytes: sql.databaseSize,
-      rowsWrittenToday: estimateRowsWrittenSince(sql, budgetSince),
+      rowsWrittenToday: live.rowsWrittenToday,
+      liveAt: live.computedAt,
       storageBytesLimit: STORAGE_BYTES_LIMIT,
       dailyRowsWrittenLimit: DAILY_ROWS_WRITTEN_LIMIT,
       dailyRowsReadLimit: DAILY_ROWS_READ_LIMIT,
@@ -588,6 +611,46 @@ export class Relay extends DurableObject<Env> {
     }
     const fresh = computeStatsSnapshot(sql, owner, nowSec);
     writeStatsSnapshot(sql, fresh);
+    return fresh;
+  }
+
+  // The same gate as refreshStatsSnapshot above, on the five-minute clock
+  // of limits.ts LIVE_STATS_MAX_AGE_MS, over `ingested24h` and
+  // `rowsWrittenToday` (schema.ts `live_stats`).
+  //
+  // It exists for a different reason than that one does. The snapshot
+  // caches a cost that grows with the accumulated table; this caches a
+  // cost that is modest per request and was multiplied by an
+  // unauthenticated GET nothing rate-limits -- ~1,200 rows each, ~4,100
+  // requests to spend the day's entire rows-read allowance from anywhere,
+  // for free. What is bounded here is not the size of one read but the
+  // number of times per day the expensive one can happen at all, which is
+  // the only property that survives an attacker choosing the request
+  // rate.
+  //
+  // Only reached from a stats request; the cron tick deliberately does
+  // not refresh this (limits.ts LIVE_STATS_MAX_AGE_MS). And no `force`,
+  // for the reason refreshStatsSnapshot has none: a bypass would be a way
+  // to spend the cost this gate exists to bound.
+  private refreshLiveStats(budgetSince: number): LiveStats {
+    const sql = this.sql;
+    const existing = readLiveStats(sql);
+    const nowSec = nowSeconds();
+    // Two conditions, and the second is not a refinement of the first.
+    // `budgetSince` is the 00:00 UTC boundary the rows-written figure was
+    // measured from; the allowance resets there, so a row computed at
+    // 23:59 is 120 seconds old at 00:01 and is reporting yesterday's
+    // consumption as today's -- the one moment an owner is most likely to
+    // be looking. Age cannot catch that, only the boundary can.
+    if (
+      existing !== null &&
+      existing.budgetSince === budgetSince &&
+      (nowSec - existing.computedAt) * 1000 < LIVE_STATS_MAX_AGE_MS
+    ) {
+      return existing;
+    }
+    const fresh = computeLiveStats(sql, nowSec, budgetSince);
+    writeLiveStats(sql, fresh);
     return fresh;
   }
 

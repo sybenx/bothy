@@ -485,6 +485,57 @@ export const MAX_LIVE_FEED_CONNECTIONS = 5;
 export const LIVE_FEED_MAX_LIFETIME_MS = 10 * 60 * 1000;
 
 
+// ---------------------------------------------------------------------
+// HTTP rate limiting.
+//
+// The per-IP throttle in relay.ts covers WebSocket *messages* only.
+// Nothing bounded the HTTP side at all, so every HTTP path that reaches
+// the Durable Object -- /api/stats, /api/claim, the NIP-11 document, the
+// NIP-86 management POST, and the WebSocket upgrade itself -- was
+// defended by its per-request cost alone, against a caller who pays
+// nothing per request.
+//
+// The cap itself is NOT declared here, and that is the one exception to
+// this file being where every numeric cap lives. It is enforced by
+// Cloudflare's Rate Limiting binding, which reads its limit and period
+// from wrangler.jsonc's `ratelimits` block and applies them in the
+// runtime *before* the Worker's own code runs -- so a number here would
+// be decorative, and worse, could silently disagree with the number
+// actually in force. wrangler.jsonc is the source of truth; the reasoning
+// for the values chosen is in the comment there.
+//
+// Chosen over a hand-rolled limiter for the reason that shapes every
+// other decision in this project: a counter of our own would have to live
+// somewhere, and the only two places available are the Durable Object
+// (a row write per request, to measure a request -- the mistake CLAUDE.md
+// "The budget" already rejected once for read-metrics.ts) or isolate
+// memory (which the flood evicts). The binding runs outside the thing it
+// protects and costs neither.
+// ---------------------------------------------------------------------
+
+// The Retry-After the 429 carries, in seconds. Must match `period` in
+// wrangler.jsonc's ratelimits block -- a caller told to come back sooner
+// than the window resets just spends another rejected request.
+export const HTTP_RATE_LIMIT_PERIOD_SECONDS = 60;
+
+// ---------------------------------------------------------------------
+// /api/profile's kind-0 cache (profile-lookup.ts lookupProfileCached).
+//
+// The TTL is set by how often the answer changes, not by how often it is
+// asked for: a kind-0 is a profile, edited a handful of times a year. Five
+// minutes is far shorter than that and still collapses every realistic
+// burst -- the endpoint's whole traffic pattern is one person typing a
+// pubkey into a form once, so a stale entry costs nothing and a fresh
+// fetch buys nothing.
+export const PROFILE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+// Entries held before the oldest is evicted. Sized for the shape the
+// endpoint actually has -- a single relay's single claim -- with enough
+// headroom that ordinary use never evicts; the number exists to bound
+// isolate memory under a flood of distinct pubkeys, not to serve one.
+export const PROFILE_CACHE_MAX_ENTRIES = 256;
+
+
 
 // How long the Worker's cron tick keeps one outbound backfill socket open
 // waiting for EOSE before giving up for this tick -- mirrors
@@ -622,6 +673,86 @@ export const MAX_CREATED_AT_FUTURE_SECONDS = 3600;
 // storage used, rows written today, backfill progress -- are not in the
 // snapshot at all.
 export const STATS_SNAPSHOT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+// How stale /api/stats' LIVE half may get -- `ingested24h` and
+// `rowsWrittenToday`, the two windowed scans left over once the
+// STATS_SNAPSHOT_MAX_AGE_MS half above was moved into a row (schema.ts
+// `live_stats`, storage.ts computeLiveStats, relay.ts refreshLiveStats).
+//
+// A separate constant from the one above, not a reuse of it, and the
+// separation is the point. Six hours is fine for a total event count and
+// is far too stale for the write-budget meter, which is the one number on
+// this page an operator reads while deciding whether the relay is out of
+// allowance or actually broken. These two figures wanted to stay live for
+// that reason and did, until it turned out what "live" cost.
+//
+// WHAT IT COSTS, and why a cache rather than a freshness preference. Both
+// queries read the ingest window via idx_events_ingested, so neither
+// scales with E -- measured on the live relay at 853 rows
+// (countIngested24h) plus 344 (estimateRowsWrittenSince), ~1,200 per
+// request with the ~11 rows of lookups beside them. GET /api/stats is
+// unauthenticated, reachable before anything gates it, and was billed
+// per request: ~4,100 requests took the 5,000,000 rows-read/day
+// allowance for the rest of the UTC day, from anywhere, at no cost to
+// the caller. That is the same shape as the gift wrap gate probe -- an
+// expensive read on the far side of no gate -- and the fix is the same
+// one the snapshot above already applies: bound the RATE at which the
+// expensive thing runs, so the request count stops being what sets it.
+//
+// A ROW, NOT MEMORY, and the reasoning is worth stating because the
+// obvious argument points the other way: hibernation clears memory, but a
+// flood keeps the object awake, so an in-memory cache would hit exactly
+// during the flood it exists to survive. That is true and it is not
+// enough. A flood is not the cheapest way to spend this budget -- pacing
+// requests slower than eviction is, and it defeats a memory cache
+// completely: at one request every ten seconds, 8,640 requests/day x
+// ~1,200 rows is 10,400,000 rows, twice the ceiling, from a single host
+// making six requests a minute. Storage is the only state in this object
+// that outlives eviction, so the bound has to live there or it is a
+// description of an intention. `stats_snapshot` above learned this the
+// expensive way (see its comment in schema.ts); this is the same lesson
+// applied before rather than after.
+//
+// WHY FIVE MINUTES. A refresh does not cost a constant -- both queries
+// read the ingest window, so one costs roughly 1.5 x D, where D is
+// events ingested per day. The flood floor is therefore
+// (86,400 / T) x 1.5D rows/day, and asking that to stay under the
+// 5,000,000 ceiling gives the admissible D for a given T:
+//
+//   T =  60s   1,440 refreshes/day    D <=  2,315 events/day
+//   T = 300s     288 refreshes/day    D <= 11,574 events/day
+//   T = 600s     144 refreshes/day    D <= 23,148 events/day
+//
+// One minute is the interval the freshness argument alone would pick, and
+// it fails the arithmetic: a relay running a backfill ingests far more
+// than 2,315 events/day -- the 100,000 rows-written ceiling alone admits
+// ~16,600 at the cheapest 6 rows each -- so a 60-second TTL would put the
+// floor back over the ceiling on exactly the busy days the meter is being
+// watched. Five minutes holds for any ingest rate this relay can reach
+// while writing, and costs ~8.6% of the read ceiling at the live relay's
+// ingest rate even under a sustained flood.
+//
+// Five minutes is also finer than the thing it measures. During a
+// backfill `rowsWrittenToday` moves in hourly steps, because backfill
+// writes on the hourly cron tick; live traffic moves it continuously but
+// slowly. /api/stats reports `liveAt` beside these two the way it reports
+// `snapshotAt` beside the snapshotted five, so the age is stated rather
+// than implied.
+//
+// Refreshed ONLY on demand, deliberately -- unlike the snapshot above,
+// the cron tick does not refresh this. The tick fires hourly, which is
+// longer than this TTL, so it could not keep the row warm; all it would
+// add is a fixed 24-refresh/day floor paid on a relay nobody is looking
+// at.
+//
+// THE NEXT STEP, if this stops being enough: hourly bucket counters --
+// one row written per event into a per-hour bucket, and a windowed sum
+// that reads at most 24 rows. That makes both figures cheap outright
+// rather than cheap-on-average, and removes the staleness with them. It
+// is the better long-term shape and it needs a schema change and a write
+// on the per-event path; this cache closes the abuse without either, so
+// it comes first.
+export const LIVE_STATS_MAX_AGE_MS = 5 * 60 * 1000;
 
 // Backfill must yield to the owner's own live
 // traffic, never compete with it for the shared daily rows-written

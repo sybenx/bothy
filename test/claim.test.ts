@@ -21,6 +21,8 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { normalizePubkey } from "../src/pubkey";
 import { claimOwner, getOwnerPubkey, getOwnerProfile } from "../src/ownership";
+import { profileCacheSize, resetProfileCache } from "../src/profile-lookup";
+import type { Relay } from "../src/relay";
 import { isolateStorage } from "./helpers/isolate";
 import { OWNER_PUBKEY_HEX, randomKeypair } from "./helpers/keys";
 
@@ -50,6 +52,50 @@ describe("POST /api/claim (OWNER_PUBKEY set in env)", () => {
       body: "not json",
     });
     expect(response.status).toBe(400);
+  });
+
+  it("refuses without reaching the network", async () => {
+    // /api/claim had the same shape /api/profile did: it opened two
+    // outbound WebSockets to well-known relays to resolve the pubkey's
+    // kind-0 *before* anything had established the claim could succeed,
+    // and it stayed open to anyone long after the one claim it exists for
+    // had happened. A relay that answers "already claimed" -- or 404,
+    // here -- must not make two connections on somebody else's behalf to
+    // say so.
+    //
+    // As in test/stats.test.ts, the status code cannot show this and a
+    // cache entry is the only trace a lookup leaves.
+    resetProfileCache();
+    const response = await exports.default.fetch("https://example.com/api/claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pubkey: OWNER_PUBKEY_HEX }),
+    });
+
+    expect(response.status).toBe(404);
+    expect(profileCacheSize()).toBe(0);
+  });
+
+  it("answers a malformed pubkey the same way claim() would, not the way the checks are cheapest", async () => {
+    // The Worker's three pre-checks are in claim()'s order --
+    // disabled, then invalid, then conflict -- and not in cost order,
+    // which would have put the free format check first. That matters: an
+    // env-disabled relay must look identical whatever you send it, and
+    // answering 400 here would tell a caller their pubkey was the problem
+    // on a relay that was never going to accept any pubkey at all. Same
+    // status, either side of the RPC boundary.
+    const response = await exports.default.fetch("https://example.com/api/claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pubkey: "not-a-pubkey" }),
+    });
+    expect(response.status).toBe(404);
+
+    const direct = await runInDurableObject(
+      env.RELAY.get(env.RELAY.idFromName("relay")) as DurableObjectStub<Relay>,
+      async (instance) => instance.claim("not-a-pubkey"),
+    );
+    expect(direct.status).toBe("disabled");
   });
 });
 

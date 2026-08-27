@@ -70,25 +70,43 @@ function decodeAuthHeader(header: string | null): string | null {
   }
 }
 
-// Verifies the request carries a NIP-98 event signed by `expectedPubkey`
-// over this exact method, URL, and body. `body` is the raw request bytes,
-// already read by the caller -- the payload tag binds the bytes that were
-// actually sent, so they are hashed as received rather than after a
-// decode-and-reencode round trip that could normalize them.
-//
-// The checks run cheapest-first, matching the write path's ordering rule
-// (CLAUDE.md "Conventions"): everything structural, then the ownership
-// comparison, and only then the schnorr verify.
-export function verifyNip98(
-  request: Request,
-  body: Uint8Array,
-  expectedPubkey: string | null,
-  nowSec: number,
-): Nip98Result {
-  if (expectedPubkey === null) {
-    return { ok: false, reason: "this relay has no owner yet -- claim it before using the management API" };
-  }
+// The reason returned when a management call arrives at a relay nobody
+// has claimed. Lives here rather than at the call site so the two halves
+// of the check -- this file proving *who* signed, index.ts comparing that
+// to the owner -- still speak with one voice. See ownerReason below.
+export const UNCLAIMED_REASON =
+  "this relay has no owner yet -- claim it before using the management API";
 
+// The reason returned when the signature is valid but belongs to someone
+// other than the owner.
+export const WRONG_SIGNER_REASON = "Authorization event is not signed by the relay owner";
+
+// Verifies the request carries a well-formed, correctly signed NIP-98
+// event over this exact method, URL, and body, and returns the pubkey
+// that signed it. `body` is the raw request bytes, already read by the
+// caller -- the payload tag binds the bytes that were actually sent, so
+// they are hashed as received rather than after a decode-and-reencode
+// round trip that could normalize them.
+//
+// It deliberately does NOT know who the owner is. Establishing that costs
+// a Durable Object round trip, and a round trip is the single most
+// expensive thing an unauthenticated caller can provoke here: it wakes the
+// object from hibernation, spends one of the day's 100,000 requests, and
+// reads rows -- all before anything has shown the caller is even holding a
+// signature. So this function answers the question that can be answered
+// from the request alone, and index.ts asks the DO only once the answer is
+// yes. Confirming the signer is the owner is index.ts's job (ownerReason
+// below), not this file's.
+//
+// The checks still run cheapest-first (CLAUDE.md "Conventions"), but the
+// schnorr verify now sits at the end of the *whole* chain rather than
+// behind a free string comparison against the owner. That comparison used
+// to come first precisely because it was free -- it is not free any more,
+// because obtaining the owner is what costs. ~1.1ms of Worker CPU
+// (validate.ts), out of a 10ms per-request budget, is the cheaper of the
+// two, and it is spent only by a caller who produced a valid signature
+// over this exact request.
+export function verifyNip98(request: Request, body: Uint8Array, nowSec: number): Nip98Result {
   const json = decodeAuthHeader(request.headers.get("Authorization"));
   if (json === null) {
     return { ok: false, reason: "missing or malformed Authorization header (expected: Nostr <base64-event>)" };
@@ -135,15 +153,19 @@ export function verifyNip98(
     return { ok: false, reason: "Authorization event 'payload' tag is not the SHA256 of the request body" };
   }
 
-  // Checked before the schnorr verify: a stranger's perfectly valid
-  // signature is still not authorized here, and comparing two strings is
-  // free next to ~1.1ms of curve math (src/validate.ts).
-  if (event.pubkey !== expectedPubkey) {
-    return { ok: false, reason: "Authorization event is not signed by the relay owner" };
-  }
-
   if (!idMatchesContent(event)) return { ok: false, reason: "Authorization event id does not match its content" };
   if (!verifySignature(event)) return { ok: false, reason: "Authorization event signature is invalid" };
 
   return { ok: true, pubkey: event.pubkey };
+}
+
+// The second half of the check, split out so it stays beside the first:
+// given a verified signer and the owner the Durable Object reported,
+// answer whether this caller is authorized, and if not, why. Returns null
+// when they are. A stranger's perfectly valid signature is still not
+// authorized here.
+export function ownerReason(signer: string, owner: string | null): string | null {
+  if (owner === null) return UNCLAIMED_REASON;
+  if (signer !== owner) return WRONG_SIGNER_REASON;
+  return null;
 }

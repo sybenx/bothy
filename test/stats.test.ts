@@ -4,13 +4,19 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
-import { OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
+import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
 import { refreshFollows } from "../src/ownership";
+import { profileCacheSize, resetProfileCache } from "../src/profile-lookup";
 import type { Relay } from "../src/relay";
-import { readStatsSnapshot } from "../src/storage";
+import { readLiveStats, readStatsSnapshot } from "../src/storage";
 import { connectRelay, publish } from "./helpers/socket";
 import { version } from "../package.json";
-import { DAILY_ROWS_READ_LIMIT, DAILY_ROWS_WRITTEN_LIMIT, STORAGE_BYTES_LIMIT } from "../src/limits";
+import {
+  DAILY_ROWS_READ_LIMIT,
+  DAILY_ROWS_WRITTEN_LIMIT,
+  STORAGE_BYTES_LIMIT,
+  utcDayStartSeconds,
+} from "../src/limits";
 
 isolateStorage();
 
@@ -109,10 +115,49 @@ describe("GET /api/stats", () => {
   });
 });
 
+// The claim form's courtesy profile preview (src/index.ts handleProfile),
+// which is a setup endpoint and is now scoped to setup.
+//
+// The whole suite runs with OWNER_PUBKEY bound (see vitest.config.ts), so
+// every relay these tests see is claimed -- which is exactly the state
+// this endpoint must refuse in, and the one a real deployment spends all
+// but the first few minutes of its life in. The unclaimed half is
+// unreachable over HTTP under this config for the reason
+// test/claim.test.ts documents at length.
 describe("GET /api/profile", () => {
   it("rejects a request with no pubkey", async () => {
     const response = await exports.default.fetch("https://example.com/api/profile");
     expect(response.status).toBe(400);
+  });
+
+  it("rejects a pubkey that is not 64 hex characters", async () => {
+    const response = await exports.default.fetch("https://example.com/api/profile?pubkey=npub1nope");
+    expect(response.status).toBe(400);
+  });
+
+  it("is gone once the relay is claimed", async () => {
+    // 404, matching /api/claim's disabled branch rather than inventing a
+    // second vocabulary for an endpoint that is no longer part of this
+    // relay.
+    const response = await exports.default.fetch(
+      "https://example.com/api/profile?pubkey=" + OWNER_PUBKEY_HEX,
+    );
+    expect(response.status).toBe(404);
+  });
+
+  it("refuses a claimed relay's request without reaching the network", async () => {
+    // The status code alone would not prove this: a 404 returned after
+    // opening two outbound WebSockets to relay.damus.io and nos.lol would
+    // look identical from the outside, and the outbound connection is the
+    // entire cost being removed. A lookup leaves exactly one visible
+    // trace -- a cache entry (src/profile-lookup.ts) -- so an untouched
+    // cache is the proof that the ownership check ran first.
+    resetProfileCache();
+    const response = await exports.default.fetch(
+      "https://example.com/api/profile?pubkey=" + "b".repeat(64),
+    );
+    expect(response.status).toBe(404);
+    expect(profileCacheSize()).toBe(0);
   });
 });
 
@@ -193,10 +238,21 @@ describe("/api/stats snapshot", () => {
   const fetchStats = async () =>
     (await (await exports.default.fetch("https://example.com/api/stats")).json()) as {
       snapshotAt: number;
+      liveAt: number;
       totalEvents: number;
       ingested24h: number;
       rowsWrittenToday: number;
     };
+
+  // Nothing in production clears this row -- it expires on its own after
+  // limits.ts LIVE_STATS_MAX_AGE_MS, and adding a method so a test could
+  // clear it would be inventing a code path. Dropped through storage
+  // directly instead, the same exception test/read-cost.test.ts already
+  // takes for `stats_snapshot`.
+  const expireLiveStats = async () =>
+    runInDurableObject(stub(), async (_instance: Relay, state) => {
+      state.storage.sql.exec(`DELETE FROM live_stats`);
+    });
 
   it("dates the snapshotted counts so their age is stated, not assumed", async () => {
     const conn = await connectRelay();
@@ -212,7 +268,7 @@ describe("/api/stats snapshot", () => {
     expect(body.snapshotAt).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 1);
   });
 
-  it("holds the snapshotted counts steady while the live fields move", async () => {
+  it("holds both cached halves steady between requests, on their own two clocks", async () => {
     const conn = await connectRelay();
     await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "first" }));
     conn.close();
@@ -233,14 +289,86 @@ describe("/api/stats snapshot", () => {
     expect(after.totalEvents).toBe(before.totalEvents);
     expect(after.snapshotAt).toBe(before.snapshotAt);
 
-    // The write-budget meter is NOT snapshotted, and this is the reason
-    // the split exists at all rather than everything going into the row.
-    // `ingested_at` is indexed as of v0.7.6, so both of these read the
-    // 24h window instead of the table -- cheap enough to stay live, and
-    // they are the two numbers an owner watching their daily ceiling
-    // most needs to be current.
-    expect(after.ingested24h).toBe(before.ingested24h + 1);
-    expect(after.rowsWrittenToday).toBeGreaterThan(before.rowsWrittenToday);
+    // The write-budget meter holds still too, and used to be the
+    // counter-example here: it was read live precisely because an owner
+    // watching their daily ceiling needs it current. It is cached now
+    // because live meant ~1,200 rows read on an unauthenticated GET with
+    // nothing in front of it -- ~4,100 requests to spend the entire
+    // 5,000,000/day rows-read allowance. The concession to what it is
+    // for is the CLOCK, not an exemption: five minutes
+    // (LIVE_STATS_MAX_AGE_MS) against the snapshot's six hours.
+    expect(after.ingested24h).toBe(before.ingested24h);
+    expect(after.rowsWrittenToday).toBe(before.rowsWrittenToday);
+    expect(after.liveAt).toBe(before.liveAt);
+
+    // And it is a cache, not a freeze: once the row is gone the next
+    // request recomputes and both figures pick up the second event.
+    await expireLiveStats();
+    const refreshed = await fetchStats();
+    expect(refreshed.ingested24h).toBe(before.ingested24h + 1);
+    expect(refreshed.rowsWrittenToday).toBeGreaterThan(before.rowsWrittenToday);
+    // The snapshotted half is untouched by any of that -- two caches,
+    // two clocks, one document. `liveAt` and `snapshotAt` are both
+    // reported so a consumer can tell which age applies to which field.
+    expect(refreshed.snapshotAt).toBe(before.snapshotAt);
+  });
+
+  it("dates the live figures separately from the snapshotted ones", async () => {
+    const conn = await connectRelay();
+    await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "two ages" }));
+    conn.close();
+
+    const body = await fetchStats();
+    expect(body.liveAt).toBeGreaterThan(0);
+    expect(body.liveAt).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 1);
+  });
+
+  it("discards a cached write-budget figure measured from a previous UTC day", async () => {
+    // The one invalidation age cannot do. The rows-written allowance
+    // empties at 00:00 UTC, so a figure computed at 23:59 is two minutes
+    // old at 00:01 -- comfortably inside the five-minute TTL -- and is
+    // reporting yesterday's consumption as today's, at exactly the hour
+    // someone reads this page during a recovery. relay.ts
+    // refreshLiveStats keys on the boundary as well as the age.
+    const conn = await connectRelay();
+    await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "yesterday" }));
+    conn.close();
+
+    await fetchStats();
+
+    // Backdate the stored boundary by a day, leaving `computed_at`
+    // current: a row that looks fresh by every test except the one that
+    // matters.
+    const stale = await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      state.storage.sql.exec(
+        `UPDATE live_stats SET budget_since = budget_since - 86400, rows_written_today = 999999`,
+      );
+      return readLiveStats(state.storage.sql);
+    });
+    expect(stale?.rowsWrittenToday).toBe(999999);
+
+    const body = await fetchStats();
+    expect(body.rowsWrittenToday).not.toBe(999999);
+    const rewritten = await runInDurableObject(stub(), async (_instance: Relay, state) =>
+      readLiveStats(state.storage.sql),
+    );
+    expect(rewritten?.budgetSince).toBe(utcDayStartSeconds(Date.now()));
+  });
+
+  it("keeps the live figures in storage, where they survive eviction", async () => {
+    // The property that decides row-versus-memory, stated directly. An
+    // in-memory cache would hit under a flood, since a flood keeps the
+    // object awake -- but a flood is not the cheap attack. One request
+    // every ten seconds misses an in-memory cache every time and still
+    // reaches twice the daily rows-read ceiling; see limits.ts
+    // LIVE_STATS_MAX_AGE_MS. Only storage outlives eviction.
+    await fetchStats();
+    const row = await runInDurableObject(stub(), async (_instance: Relay, state) =>
+      readLiveStats(state.storage.sql),
+    );
+    expect(row).not.toBeNull();
+    expect(row?.computedAt).toBeGreaterThan(0);
+    expect(row?.budgetSince).toBe(utcDayStartSeconds(Date.now()));
   });
 
   it("computes the snapshot on a cron tick, so a page load does not have to", async () => {

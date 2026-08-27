@@ -690,6 +690,94 @@ export function writeStatsSnapshot(sql: SqlStorage, snapshot: StatsSnapshot): vo
   );
 }
 
+// ---------------------------------------------------------------------
+// /api/stats' live half, also persisted (schema.ts `live_stats`), on the
+// five-minute clock of limits.ts LIVE_STATS_MAX_AGE_MS rather than the
+// six-hour one above.
+//
+// Two tables and two TTLs rather than one of each, because the two halves
+// answer to different constraints. The snapshot's cost is ~3E and its
+// contents tolerate a stale hour; these two cost the size of the ingest
+// window and are the write-budget meter, which does not. Merging them
+// would mean either paying 3E every five minutes or reading a six-hour-old
+// budget line during an outage, and both are worse than a second row.
+// ---------------------------------------------------------------------
+
+export interface LiveStats {
+  // Wall-clock seconds this was computed at -- /api/stats `liveAt`.
+  computedAt: number;
+  // The 00:00 UTC boundary `rowsWrittenToday` was measured from. See
+  // readLiveStats' caller: a row from yesterday is invalid however fresh.
+  budgetSince: number;
+  ingested24h: number;
+  rowsWrittenToday: number;
+}
+
+// Null when nothing has computed one yet. Same reasoning as
+// readStatsSnapshot: no seeded row, because a zeroed cache and a real one
+// would be indistinguishable and the zeroes would be a lie about the
+// relay's budget rather than a harmless placeholder.
+//
+// Rows read: 1.
+export function readLiveStats(sql: SqlStorage): LiveStats | null {
+  const row = sql
+    .exec<{
+      computed_at: number;
+      budget_since: number;
+      ingested_24h: number;
+      rows_written_today: number;
+    }>(`SELECT * FROM live_stats LIMIT 1`)
+    .toArray()[0];
+  if (row === undefined) return null;
+  return {
+    computedAt: row.computed_at,
+    budgetSince: row.budget_since,
+    ingested24h: row.ingested_24h,
+    rowsWrittenToday: row.rows_written_today,
+  };
+}
+
+// Rows read: the ingest window twice over -- roughly (events ingested in
+// the last 24h) + (events ingested since 00:00 UTC), both served by
+// idx_events_ingested and neither proportional to E. Measured at ~1,200
+// on the live relay. This is the whole cost the row exists to stop paying
+// per request; limits.ts LIVE_STATS_MAX_AGE_MS is the arithmetic for how
+// often paying it is affordable.
+//
+// estimateRowsWrittenSince keeps its own read-metrics scope inside here,
+// so the diagnostics on /api/stats still bill it separately -- which now
+// also means its bucket only moves on a cache MISS, and a run of stats
+// requests that leaves it flat is the cache working.
+export function computeLiveStats(
+  sql: SqlStorage,
+  nowSec: number,
+  budgetSince: number,
+): LiveStats {
+  return {
+    computedAt: nowSec,
+    budgetSince,
+    ingested24h: countIngested24h(sql, nowSec - 86400),
+    rowsWrittenToday: estimateRowsWrittenSince(sql, budgetSince),
+  };
+}
+
+// Replaced wholesale, like the snapshot above and for the same reason.
+//
+// Rows written: 2 (1 the first time, when there is nothing to delete).
+// The table carries no primary key and no index, so neither statement
+// pays for one.
+export function writeLiveStats(sql: SqlStorage, live: LiveStats): void {
+  sql.exec(`DELETE FROM live_stats`);
+  sql.exec(
+    `INSERT INTO live_stats (computed_at, budget_since, ingested_24h, rows_written_today)
+     VALUES (?, ?, ?, ?)`,
+    live.computedAt,
+    live.budgetSince,
+    live.ingested24h,
+    live.rowsWrittenToday,
+  );
+}
+
 export interface PendingVanish {
   pubkey: string;
   deletedSoFar: number;

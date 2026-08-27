@@ -41,6 +41,59 @@
     "run_worker_first": true
   },
 
+  // Per-IP HTTP rate limits (src/index.ts). Cloudflare's Rate Limiting
+  // binding, chosen because it runs in the runtime BEFORE the Worker's
+  // code -- and therefore before the Durable Object -- rather than inside
+  // the thing being protected, and because it needs no account resource
+  // to provision and no user input, so a clean deploy still asks for
+  // nothing (CLAUDE.md "Configuration").
+  //
+  // Two namespaces, because the two paths are expensive in different
+  // currencies:
+  //
+  //   API     -- one shared counter for every HTTP path that wakes the
+  //              Durable Object: /api/stats, /api/claim, the NIP-11
+  //              document, the NIP-86 management POST, and the WebSocket
+  //              upgrade. Shared deliberately: the guarantee worth having
+  //              is "one address cannot wake the object more than 60
+  //              times a minute", and per-path counters would multiply
+  //              that by the number of paths. 60/minute is far above any
+  //              real client -- the admin page loads /api/stats once per
+  //              page load and the live feed reconnects with capped
+  //              exponential backoff -- and far below what it takes to
+  //              matter against the day's 100,000 requests.
+  //
+  //   PROFILE -- /api/profile only, at a sixth of that, because it is the
+  //              one endpoint whose cost lands on somebody else: it opens
+  //              outbound WebSockets to relay.damus.io and nos.lol
+  //              (src/profile-lookup.ts). 10/minute is generous for its
+  //              actual use, which is one person typing one pubkey into
+  //              the claim form once, ever.
+  //
+  // Keyed by CF-Connecting-IP. Cloudflare's own guidance prefers a stable
+  // user identifier over an IP "since many users may share a single IP"
+  // (developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/,
+  // checked 2026-08-27), but there is no user here to identify: every
+  // path above is either pre-ownership or unauthenticated by design. The
+  // shared-IP failure mode is a NAT'd household sharing one allowance on
+  // one person's relay, which is not a real cost.
+  //
+  // period must be 10 or 60 (same source); limits are per Cloudflare
+  // location and eventually consistent, so this bounds the shape of a
+  // flood rather than counting it exactly -- which is all it needs to do.
+  // namespace_id is a positive integer unique within the Cloudflare
+  // account, not a resource that gets created; if you already run another
+  // Worker in this account using 1001 or 1002, change these.
+  //
+  // Both bindings are read defensively in src/index.ts (`env.X?.limit`):
+  // the Cloudflare docs do not state which plans the binding is available
+  // on, so if it turns out to be unavailable here, the relay serves
+  // requests unlimited rather than failing closed on every one of them.
+  "ratelimits": [
+    { "name": "RATE_LIMIT_API", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } },
+    { "name": "RATE_LIMIT_PROFILE", "namespace_id": "1002", "simple": { "limit": 10, "period": 60 } }
+  ],
+
   // Drives the ALLOW_FOLLOWS refresh (a no-op when unset) -- see
   // src/index.ts scheduled(). One of the account-wide 5 cron triggers on
   // Workers Free.
