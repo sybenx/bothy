@@ -1,3 +1,6 @@
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
+
 // Per-event write cost against the Workers Free plan's 100,000
 // rows-written/day ceiling — see CLAUDE.md "The budget". Rows written is
 // the binding constraint, not storage or requests, so this is the number
@@ -729,7 +732,117 @@ export function reconcileColumns(sql: SqlStorage, spec: TableSpec): string[] {
   return added;
 }
 
+// ---------------------------------------------------------------------
+// initSchema runs in the Relay constructor, i.e. on every wake from
+// hibernation, not once per deploy -- see relay.ts. Reconciling the full
+// TABLES/INDEXES declaration on every one of those wakes measured at 55
+// rows read live, ~94,000 rows/day at the relay's wake rate, to do
+// nothing on the overwhelming majority of them: nobody deployed a schema
+// change between this wake and the last one.
+//
+// So the reconcile pass only runs when the schema actually changed.
+// `schemaHash` fingerprints the declaration; `schema_meta` stores the
+// fingerprint the database was last reconciled to; a match short-circuits
+// the whole pass down to the one row read that fetches it. Two properties
+// make that short-circuit safe rather than a trap:
+//
+// 1. The hash is DERIVED from TABLES and INDEXES structurally --
+//    `computeSchemaHash` walks every field `reconcileColumns` and
+//    `createIndexSql` actually act on (column name, definition,
+//    resetsOnAdd; index name, table, keyColumns, orderedBy) --
+//    not a hand-maintained version number, and not a hash of a hand-picked
+//    subset. A hand-maintained number can be forgotten to bump; a
+//    structural hash cannot, because it has no "forgot" state -- it is
+//    just a function of the declaration. That is the same lesson TABLES
+//    itself already teaches (see the header comment above): the owner
+//    table went weeks with two columns missing because a hand-written
+//    ALTER TABLE was the thing that had to be remembered, and half the
+//    time it wasn't. A field this hash doesn't cover would be a field
+//    whose change silently skips its own migration -- exactly that bug
+//    again, one layer up.
+// 2. The hash is stored only AFTER the reconcile below completes without
+//    throwing -- see the end of this function. Storing it before, or
+//    alongside, the ALTER TABLE/CREATE INDEX statements would mean a
+//    migration that dies partway (reconcileColumns throws on an
+//    un-addable column -- see whyNotAddable) leaves the NEW hash in
+//    place with an OLD table shape underneath it: the next wake would see
+//    a match, skip the reconcile it still needs, and the object would be
+//    permanently stuck half-migrated. Writing the hash last means a
+//    throw here leaves the PREVIOUS hash (or none) in storage, so the
+//    next wake retries the whole pass -- safe because every statement in
+//    it is idempotent (CREATE TABLE/INDEX IF NOT EXISTS,
+//    reconcileColumns only touches columns it does not already find).
+//
+// The first wake after a deploy that changes the schema -- including the
+// very first wake after upgrading to this hashing scheme itself, since no
+// pre-existing database has a `schema_meta` row -- finds no match and
+// pays the full reconcile. That is correct, not a regression to optimise
+// away: it is the one wake that actually has work to do.
+// ---------------------------------------------------------------------
+
+// Deliberately not a TABLES entry, and not reconciled by reconcileColumns:
+// this table has to exist and be readable BEFORE initSchema can decide
+// whether TABLES itself needs reconciling, so it is created directly by
+// ensureSchemaMetaTable below rather than through the declarative pass it
+// exists to gate. Its own shape (one column, no migrations ever) is fixed
+// deliberately so it never needs that pass either.
+const SCHEMA_META_TABLE = "schema_meta";
+
+// Structural fingerprint of a TABLES/INDEXES declaration. Exported (rather
+// than closed over the module-level TABLES/INDEXES) so tests can hash two
+// different declarations and assert they differ, instead of only being
+// able to assert something about the one true schema.
+export function computeSchemaHash(tables: readonly TableSpec[], indexes: readonly IndexSpec[]): string {
+  const fingerprint = {
+    tables: tables.map((t) => ({
+      name: t.name,
+      columns: t.columns.map((c) => ({
+        name: c.name,
+        definition: c.definition,
+        resetsOnAdd: c.resetsOnAdd ?? [],
+      })),
+    })),
+    indexes: indexes.map((i) => ({
+      name: i.name,
+      table: i.table,
+      keyColumns: i.keyColumns,
+      orderedBy: i.orderedBy ?? null,
+    })),
+  };
+  return bytesToHex(sha256(new TextEncoder().encode(JSON.stringify(fingerprint))));
+}
+
+function currentSchemaHash(): string {
+  return computeSchemaHash(TABLES, INDEXES);
+}
+
+function ensureSchemaMetaTable(sql: SqlStorage): void {
+  sql.exec(`CREATE TABLE IF NOT EXISTS ${SCHEMA_META_TABLE} (hash TEXT NOT NULL)`);
+}
+
+function readStoredSchemaHash(sql: SqlStorage): string | null {
+  const row = sql.exec<{ hash: string }>(`SELECT hash FROM ${SCHEMA_META_TABLE} LIMIT 1`).toArray()[0];
+  return row?.hash ?? null;
+}
+
+function writeSchemaHash(sql: SqlStorage, hash: string): void {
+  sql.exec(`DELETE FROM ${SCHEMA_META_TABLE}`);
+  sql.exec(`INSERT INTO ${SCHEMA_META_TABLE} (hash) VALUES (?)`, hash);
+}
+
+// TEST ONLY: discards the stored fingerprint so the next initSchema() call
+// runs a full reconcile, as if this were the first wake after a deploy
+// that changed the schema. Real code never calls this -- the hash is
+// meant to persist across wakes, that being the entire point.
+export function forgetSchemaHash(sql: SqlStorage): void {
+  sql.exec(`DROP TABLE IF EXISTS ${SCHEMA_META_TABLE}`);
+}
+
 export function initSchema(sql: SqlStorage): void {
+  ensureSchemaMetaTable(sql);
+  const hash = currentSchemaHash();
+  if (readStoredSchemaHash(sql) === hash) return;
+
   for (const spec of TABLES) {
     // Creates the table with every declared column on a fresh database,
     // and is a no-op on an existing one -- which is exactly why the
@@ -752,4 +865,9 @@ export function initSchema(sql: SqlStorage): void {
   // getOwnHost/recordHost (src/host.ts) never have to special-case "no
   // row yet".
   sql.exec(`INSERT INTO relay_meta (host) SELECT NULL WHERE NOT EXISTS (SELECT 1 FROM relay_meta)`);
+
+  // Stored only now that every statement above has run without throwing --
+  // see the header comment on this function for why that ordering is the
+  // whole safety property.
+  writeSchemaHash(sql, hash);
 }

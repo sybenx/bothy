@@ -7,6 +7,7 @@ way they do.
 
 - `test/skeleton.test.ts` — Worker/Durable Object skeleton smoke tests. Don't add protocol assertions here.
 - `test/hibernation.test.ts` — the hibernation smoke test, and the rows-**written** baseline: `eventRowCost`'s derivation from `schema.ts INDEXES` asserted against real `SqlStorageCursor.rowsWritten` on the real `storeEvent` path. That pairing is the point — the figure is derived so a new index updates every consumer of it at once, and measured so the derivation cannot be quietly wrong. This project shipped a rows-written figure that was off by 45× because nobody measured it.
+- `test/schema-migration.test.ts` — column/table reconciliation (`reconcileColumns`/`initSchema`) against real historical table shapes, plus `computeSchemaHash`'s two load-bearing properties: every field the reconciler acts on changes the hash, and a migration that throws partway leaves the previously stored hash untouched. Also the rows-read baseline for the schema-hash short-circuit itself — `initSchema` costing O(1) on a wake where nothing changed, versus the full reconcile pass on the wake that actually needs it — the same measure-don't-estimate discipline `hibernation.test.ts` applies to rows written.
 - `test/nip01-write.test.ts` — EVENT/OK: accept, duplicate, bad signature, id/content mismatch.
 - `test/nip01-subscriptions.test.ts` — REQ/EOSE/CLOSE lifecycle, real-time delivery, sub replacement.
 - `test/nip01-filters.test.ts` — ids/authors/kinds/`#tag`/since/until/limit, AND-within, OR-across, ordering.

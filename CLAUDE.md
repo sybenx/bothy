@@ -92,10 +92,25 @@ insert time so `estimateRowsWritten24h` can sum a column.
 | Cron refreshes | ~7 + 2F |
 | WebSocket connect | 1–2 |
 | NIP-11 document / NIP-98 owner lookup | 2 |
-| `initSchema`, per Durable Object constructor | ~66 |
+| `initSchema`, per Durable Object constructor, schema hash matches | 1 |
+| `initSchema`, per Durable Object constructor, schema hash mismatch | ~66 |
 
 F is the follow count. `initSchema` runs in the constructor, so it is paid per
-wake from hibernation, not once per deploy.
+wake from hibernation, not once per deploy — which is why the row above is
+split in two. It used to reconcile the full `TABLES`/`INDEXES` declaration
+unconditionally on every wake: measured live, 55 rows read/wake, ~94,000
+rows/day at the relay's wake rate, to redeclare a schema that had not changed
+since the wake before. It now instead compares one stored row — a hash of
+the declaration (`schema.ts computeSchemaHash`) against the hash the
+database was last reconciled to (`schema_meta`) — and only runs the reconcile
+pass on a mismatch: a real schema change, or the first wake after upgrading
+to this. The hash is derived from every field `reconcileColumns` and
+`createIndexSql` act on, not hand-maintained, so a changed column or index
+cannot silently skip its own migration; and it is written only after the
+reconcile completes without throwing, so a migration that dies partway
+leaves the previous hash in place for the next wake to retry rather than
+being mistaken for one that finished. See the header comment on `initSchema`
+in [src/schema.ts](src/schema.ts).
 
 `combinations` is the number of queries `filters.ts expandFilter` runs for a
 filter — its `authors` × `kinds` cross-product. The `2` is the index entry plus

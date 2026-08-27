@@ -19,7 +19,17 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { eventRowCost, initSchema, reconcileColumns, TABLES, type TableSpec } from "../src/schema";
+import {
+  computeSchemaHash,
+  eventRowCost,
+  forgetSchemaHash,
+  INDEXES,
+  initSchema,
+  reconcileColumns,
+  TABLES,
+  type IndexSpec,
+  type TableSpec,
+} from "../src/schema";
 import { estimateRowsWritten24h } from "../src/storage";
 import { refreshProfile } from "../src/ownership";
 import { isolateStorage } from "./helpers/isolate";
@@ -232,6 +242,14 @@ describe("initSchema against historical table shapes", () => {
         sql.exec(seed);
         const before = sql.exec(`SELECT COUNT(*) AS n FROM ${table}`).toArray()[0] as { n: number };
 
+        // The DO's real constructor already ran initSchema once for this
+        // isolated database, storing today's fingerprint -- which would
+        // make this second call a no-op match and skip the very
+        // reconcile this test exists to exercise. A real relay in this
+        // historical shape never wrote that fingerprint in the first
+        // place, so simulate that honestly rather than relying on a
+        // stale match to happen to skip nothing relevant.
+        forgetSchemaHash(sql);
         initSchema(sql);
 
         const after = columnsOf(sql, table);
@@ -259,6 +277,7 @@ describe("initSchema against historical table shapes", () => {
       sql.exec(`CREATE TABLE owner (pubkey TEXT NOT NULL, name TEXT, picture TEXT)`);
       sql.exec(`INSERT INTO owner (pubkey, name) VALUES ('abc', 'Aaro')`);
 
+      forgetSchemaHash(sql);
       initSchema(sql);
 
       const row = sql
@@ -293,6 +312,7 @@ describe("initSchema against historical table shapes", () => {
         JSON.stringify({ name: "Aaro", picture: "https://example.com/a.png", about: "Aaro's relay" }),
       );
 
+      forgetSchemaHash(sql);
       initSchema(sql);
       // icon_refreshed_at gates refreshProfile's whole body to at most
       // once/day (ownership.ts), so `now` has to clear that window too --
@@ -310,6 +330,7 @@ describe("initSchema against historical table shapes", () => {
       for (const spec of TABLES) {
         sql.exec(`DROP TABLE IF EXISTS ${spec.name}`);
       }
+      forgetSchemaHash(sql);
       initSchema(sql);
       for (const spec of TABLES) {
         expect(columnsOf(sql, spec.name).sort()).toEqual(spec.columns.map((c) => c.name).sort());
@@ -329,6 +350,7 @@ describe("initSchema against historical table shapes", () => {
       );
       sql.exec(`INSERT INTO backfill_meta (status, total_stored, last_run_at) VALUES ('done', 42, 999)`);
 
+      forgetSchemaHash(sql);
       initSchema(sql);
 
       const row = sql
@@ -347,13 +369,228 @@ describe("initSchema against historical table shapes", () => {
     });
   });
 
-  it("is idempotent across repeated cold starts", async () => {
+  it("is idempotent across repeated cold starts, hash match or not", async () => {
     await withSql((sql) => {
       initSchema(sql);
+      // Same fingerprint as last time -- this call should hit the
+      // short-circuit and do nothing.
+      expect(() => initSchema(sql)).not.toThrow();
+      // Forced back into the full reconcile pass, as a genuine schema
+      // change would -- CREATE TABLE/INDEX IF NOT EXISTS and
+      // reconcileColumns finding every column already present must be
+      // just as harmless as the fast path above.
+      forgetSchemaHash(sql);
       expect(() => initSchema(sql)).not.toThrow();
       for (const spec of TABLES) {
         expect(columnsOf(sql, spec.name).sort()).toEqual(spec.columns.map((c) => c.name).sort());
       }
+    });
+  });
+});
+
+// The schema-hash short-circuit that replaced reconciling the full
+// declaration on every wake from hibernation (src/schema.ts initSchema).
+// Measured live before this existed: 55 rows read per wake, ~94,000
+// rows/day at the relay's wake rate, to do nothing on the overwhelming
+// majority of wakes -- see CLAUDE.md "The budget". Two properties are
+// load-bearing, per the header comment on initSchema, and each gets its
+// own describe block below: the hash must be a structural function of the
+// declaration (a hand-picked subset is a field that silently stops being
+// migrated), and it must only be stored after a full reconcile succeeds (a
+// migration that throws partway must not be mistaken for one that
+// finished).
+describe("computeSchemaHash", () => {
+  const tables: readonly TableSpec[] = [
+    {
+      name: "t",
+      columns: [
+        { name: "id", definition: "TEXT PRIMARY KEY" },
+        { name: "a", definition: "TEXT" },
+      ],
+    },
+  ];
+  const indexes: readonly IndexSpec[] = [{ name: "idx_t_a", table: "t", keyColumns: ["a"], orderedBy: "id" }];
+  const baseline = computeSchemaHash(tables, indexes);
+
+  it("is a pure function of the declaration -- the same declaration hashes the same", () => {
+    expect(computeSchemaHash(tables, indexes)).toBe(baseline);
+  });
+
+  // Each case changes exactly one field reconcileColumns or createIndexSql
+  // actually reads. A hash that missed one of these would be a field whose
+  // change silently skips its own migration -- the owner.profile_synced_at
+  // gap (see the header comment on TABLES) one layer up.
+  const MUTATIONS: Array<{ label: string; tables: readonly TableSpec[]; indexes: readonly IndexSpec[] }> = [
+    {
+      label: "a column is added",
+      tables: [{ name: "t", columns: [...tables[0]!.columns, { name: "b", definition: "INTEGER" }] }],
+      indexes,
+    },
+    {
+      label: "a column's definition changes",
+      tables: [
+        {
+          name: "t",
+          columns: [
+            { name: "id", definition: "TEXT PRIMARY KEY" },
+            { name: "a", definition: "INTEGER" },
+          ],
+        },
+      ],
+      indexes,
+    },
+    {
+      label: "a column gains resetsOnAdd",
+      tables: [
+        {
+          name: "t",
+          columns: [
+            { name: "id", definition: "TEXT PRIMARY KEY" },
+            { name: "a", definition: "TEXT", resetsOnAdd: ["id"] },
+          ],
+        },
+      ],
+      indexes,
+    },
+    {
+      label: "an index's key columns change",
+      tables,
+      indexes: [{ name: "idx_t_a", table: "t", keyColumns: ["id", "a"], orderedBy: "id" }],
+    },
+    {
+      label: "an index's ordering column is removed",
+      tables,
+      indexes: [{ name: "idx_t_a", table: "t", keyColumns: ["a"] }],
+    },
+    {
+      label: "an index is added",
+      tables,
+      indexes: [...indexes, { name: "idx_t_id", table: "t", keyColumns: [], orderedBy: "id" }],
+    },
+  ];
+
+  for (const { label, tables: mutatedTables, indexes: mutatedIndexes } of MUTATIONS) {
+    it(`changes when ${label}`, () => {
+      expect(computeSchemaHash(mutatedTables, mutatedIndexes)).not.toBe(baseline);
+    });
+  }
+
+  it("the real declaration hashes deterministically", () => {
+    expect(computeSchemaHash(TABLES, INDEXES)).toBe(computeSchemaHash(TABLES, INDEXES));
+  });
+});
+
+// Sums SqlStorageCursor.rowsRead across every statement `fn` issues.
+// Deliberately does NOT force-drain each cursor inline the way
+// hibernation.test.ts's measureRowsWritten does for rowsWritten -- rowsRead
+// only settles once a SELECT cursor is drained, and initSchema's own code
+// (reconcileColumns, readStoredSchemaHash) already drains every cursor it
+// opens before returning. Draining a second time here would hand callers a
+// cursor that looks empty on ITS OWN drain, which is exactly the kind of
+// interference that would make reconcileColumns think every column is
+// missing. So this only collects the cursor references and sums
+// `rowsRead` after `fn` returns, by which point real production code has
+// already consumed each one.
+function measureRowsRead(sql: SqlStorage, fn: (sql: SqlStorage) => void): number {
+  const cursors: SqlStorageCursor<Record<string, SqlStorageValue>>[] = [];
+  const proxy = new Proxy(sql, {
+    get(target, property) {
+      if (property === "exec") {
+        return (query: string, ...bindings: unknown[]) => {
+          const cursor = target.exec(query, ...bindings);
+          cursors.push(cursor);
+          return cursor;
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+    },
+  }) as SqlStorage;
+  fn(proxy);
+  return cursors.reduce((sum, c) => sum + c.rowsRead, 0);
+}
+
+// The before/after this whole file exists to prove -- see CLAUDE.md "The
+// budget"'s `initSchema` row in the reads table.
+describe("initSchema's rows-read cost", () => {
+  it("costs O(1) rows read on a wake where the schema hash already matches", async () => {
+    await withSql((sql) => {
+      initSchema(sql);
+      const cost = measureRowsRead(sql, (proxied) => initSchema(proxied));
+      // One row: the `schema_meta` lookup. Nothing else runs.
+      expect(cost).toBe(1);
+    });
+  });
+
+  it("costs the full reconcile pass only on the wake that actually needs it", async () => {
+    await withSql((sql) => {
+      forgetSchemaHash(sql);
+      const cost = measureRowsRead(sql, (proxied) => initSchema(proxied));
+      // Not a hardcoded figure -- that would be exactly the kind of
+      // number this whole feature exists to stop hand-maintaining.
+      // reconcileColumns' presence check reads one pragma_table_info row
+      // per column TABLES already declares, so the full pass costs at
+      // least the size of the declaration and grows automatically as
+      // TABLES does. CLAUDE.md "The budget" cites the one number that
+      // matters operationally -- 55 rows read/wake, measured live, before
+      // this existed -- and this assertion only needs to show the full
+      // pass is real work, dwarfing the O(1) steady-state cost above,
+      // paid only on a schema change (or the very first wake after
+      // upgrading to this).
+      const declaredColumns = TABLES.reduce((n, t) => n + t.columns.length, 0);
+      expect(cost).toBeGreaterThanOrEqual(declaredColumns);
+    });
+  });
+});
+
+describe("initSchema's schema-hash short-circuit", () => {
+  it("skips the reconcile pass entirely on a wake with no schema change", async () => {
+    await withSql((sql) => {
+      initSchema(sql);
+      const before = sql.exec<{ hash: string }>(`SELECT hash FROM schema_meta`).toArray();
+
+      // Break a real table in a way the reconciler would normally fix --
+      // if the second initSchema call below actually ran the reconcile
+      // pass, this column would come back.
+      sql.exec(`ALTER TABLE owner RENAME COLUMN about TO about_renamed`);
+      initSchema(sql);
+
+      const after = sql.exec<{ hash: string }>(`SELECT hash FROM schema_meta`).toArray();
+      expect(after).toEqual(before);
+      expect(columnsOf(sql, "owner")).not.toContain("about");
+      expect(columnsOf(sql, "owner")).toContain("about_renamed");
+    });
+  });
+
+  it("leaves the previously stored hash unmodified when a migration throws partway", async () => {
+    await withSql((sql) => {
+      // A known-good migration establishes a real hash first.
+      initSchema(sql);
+
+      // Simulate a genuine upgrade: the stored fingerprint is stale, which
+      // is what makes initSchema attempt the reconcile pass below instead
+      // of short-circuiting on a match.
+      sql.exec(`UPDATE schema_meta SET hash = 'stale-hash-from-a-real-upgrade'`);
+
+      // Corrupt deleted_ids so its declared PRIMARY KEY column looks
+      // missing to the reconciler -- reconcileColumns cannot add a
+      // PRIMARY KEY to an existing table (see whyNotAddable), so this
+      // makes the full reconcile throw partway through, exactly as a
+      // genuinely un-migratable schema change would.
+      sql.exec(`DROP TABLE deleted_ids`);
+      sql.exec(`CREATE TABLE deleted_ids (wrong_name TEXT PRIMARY KEY)`);
+
+      expect(() => initSchema(sql)).toThrow(/cannot add deleted_ids\.id/);
+
+      // The stale hash is still there -- not the new hash (the migration
+      // never finished, so believing it succeeded would leave this table
+      // broken forever) and not cleared either. The next wake retries with
+      // the same stale hash and hits the same throw, loudly, every time,
+      // until a human fixes the table -- which is the point: a schema
+      // this reconciler cannot bring up to date must never be silently
+      // accepted as current.
+      const row = sql.exec<{ hash: string }>(`SELECT hash FROM schema_meta`).toArray();
+      expect(row).toEqual([{ hash: "stale-hash-from-a-real-upgrade" }]);
     });
   });
 });
