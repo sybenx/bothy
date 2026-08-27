@@ -5,7 +5,7 @@
 // Worker-side half (outbound sockets, never here -- CLAUDE.md "The
 // budget") lives in backfill-worker.ts.
 import { getOwnHost, normalizeHost } from "./host";
-import { BACKFILL_ROWS_SHARE_LIMIT } from "./limits";
+import { BACKFILL_PAGE_SIZE, BACKFILL_ROWS_SHARE_LIMIT } from "./limits";
 import { isEphemeralKind } from "./nostr";
 import { estimateRowsWritten24h, isDeleted, eventExists, storeEvent } from "./storage";
 import { idMatchesContent, isCreatedAtTooFarInFuture, parseEventShape, verifySignature } from "./validate";
@@ -29,6 +29,20 @@ export interface BackfillStatus {
   // not moving means it runs but stores nothing (a storage/validation
   // problem) -- a distinction nothing else on this object can make.
   lastRunAt: number | null;
+  // Events one run asks each relay for -- limits.ts BACKFILL_PAGE_SIZE,
+  // reported rather than restated. Reading it off the wire is what keeps
+  // the admin page honest when the constant moves: it is derived from
+  // the declared index set (CLAUDE.md "The budget"), so adding an index
+  // shrinks it, and that comment records it having been silently wrong
+  // twice already as a hand-copied literal. A second copy in the page
+  // would be a third.
+  //
+  // A constant, not persisted state, so unlike every field above it does
+  // not describe what backfill has done -- it describes what the next
+  // run will ask for. It lives here because it is what the `lastRunAt`
+  // beside it is a run OF, and because this object is already the whole
+  // wire contract for backfill.
+  pageSize: number;
   // What `nextRelay` last said instead of sending history -- its CLOSED,
   // NOTICE or AUTH frames, verbatim and truncated (backfill-worker.ts
   // fetchPage). Null when the last page carried events, or when the relay
@@ -97,6 +111,7 @@ export function getBackfillStatus(sql: SqlStorage): BackfillStatus {
     nextUntil: next?.until_cursor ?? null,
     lastRunAt: meta.last_run_at,
     nextRefusal: next?.last_refusal ?? null,
+    pageSize: BACKFILL_PAGE_SIZE,
   };
 }
 

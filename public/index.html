@@ -10,7 +10,11 @@
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     max-width: 40rem;
-    margin: 3rem auto;
+    /* No bottom margin: it would sit below .page and push the document
+       48px past the window, giving the claim page a scrollbar with
+       nothing under it. The breathing room it provided moves onto
+       #diagnostics, which is the only thing that ever renders down there. */
+    margin: 3rem auto 0;
     padding: 0 1.25rem;
     line-height: 1.5;
   }
@@ -69,20 +73,33 @@
   }
   footer { margin-top: 1rem; font-size: 0.8rem; opacity: 0.6; }
   footer a { color: inherit; }
-  /* Pushed a screen down deliberately -- see the comment in the footer.
-     A viewport-relative gap rather than a fixed one because what counts
-     as "below the fold" is the reader's window, not a number here. */
-  footer details { margin: 50vh 0 0; }
-  footer summary { cursor: pointer; }
-  footer .diag-grid { display: grid; grid-template-columns: auto 1fr; gap: 0.2rem 0.75rem; margin: 0.6rem 0; }
-  footer .diag-grid dt { opacity: 0.7; }
-  footer .diag-grid dd { margin: 0; }
-  footer table { border-collapse: collapse; width: 100%; margin-top: 0.4rem; }
-  footer table th, footer table td { text-align: left; padding: 0.15rem 0.5rem 0.15rem 0; border-bottom: 1px solid #8882; }
-  footer table th { opacity: 0.7; font-weight: 400; }
+  /* Everything down to and including the version attribution, held to
+     exactly one viewport tall. That is what puts #diagnostics -- the one
+     element deliberately outside this wrapper -- at the fold precisely,
+     rather than a guessed distance past it: the gap is whatever the
+     window has left over, computed by layout instead of by a constant.
+     `- 3rem` is body's own top margin, which sits above this box.
+     When the content is already taller than the window this does
+     nothing and the panel simply follows on, which is the best available
+     answer for a window too short to hold the page anyway. */
+  .page { min-height: calc(100vh - 3rem); }
+  /* Out of .page, so it starts where .page ends. It inherits none of
+     footer's styling any more, hence the repetition. */
+  #diagnostics { font-size: 0.8rem; opacity: 0.6; margin-bottom: 3rem; }
+  #diagnostics summary { cursor: pointer; }
+  #diagnostics .diag-grid { display: grid; grid-template-columns: auto 1fr; gap: 0.2rem 0.75rem; margin: 0.6rem 0; }
+  #diagnostics .diag-grid dt { opacity: 0.7; }
+  #diagnostics .diag-grid dd { margin: 0; }
+  #diagnostics table { border-collapse: collapse; width: 100%; margin-top: 0.4rem; }
+  #diagnostics th, #diagnostics td { text-align: left; padding: 0.15rem 0.5rem 0.15rem 0; border-bottom: 1px solid #8882; }
+  #diagnostics th { opacity: 0.7; font-weight: 400; }
 </style>
 </head>
 <body>
+<!-- Held to one viewport tall by .page, so that whatever follows it
+     begins exactly at the fold. Everything the page is actually for
+     lives in here; only the diagnostics panel sits outside. -->
+<div class="page">
 <h1 id="relay-name">bothy</h1>
 
 <div id="claimed-view" hidden>
@@ -132,28 +149,30 @@
 
 <footer>
   <a id="version-link" href="https://github.com/sybenx/bothy" target="_blank" rel="noopener"></a>
-
-  <!-- After the version, and a screen below it. The version attribution
-       is what should read as the end of the page on first load, so
-       nothing may sit between it and the fold. This panel is something
-       you go looking for once you already have a budget question -- it
-       earns its place by being findable, not by being seen. -->
-  <details id="diagnostics" hidden>
-    <summary>Diagnostics</summary>
-    <dl class="diag-grid">
-      <dt>Storage used</dt><dd id="diag-storage">-</dd>
-      <dt>Stats snapshot taken</dt><dd id="diag-snapshot-at">-</dd>
-      <dt>Follow list refreshed</dt><dd id="diag-follows-at">-</dd>
-      <dt>Backfill last ran</dt><dd id="diag-backfill-at">-</dd>
-      <dt>Read budget</dt><dd id="diag-read-budget">-</dd>
-      <dt>Write budget</dt><dd id="diag-write-budget">-</dd>
-    </dl>
-    <table>
-      <thead><tr><th>read path</th><th>rows/call</th><th>share</th></tr></thead>
-      <tbody id="diag-read-paths"></tbody>
-    </table>
-  </details>
 </footer>
+</div>
+
+<!-- Outside .page, and therefore starting exactly where the window ends:
+     one scroll ratchet away, with nothing in between. The version
+     attribution above is what reads as the end of the page on first
+     load; this is something you go looking for once you already have a
+     budget question, and it earns its place by being findable rather
+     than by being seen. -->
+<details id="diagnostics" hidden>
+  <summary>Diagnostics</summary>
+  <dl class="diag-grid">
+    <dt>Storage used</dt><dd id="diag-storage">-</dd>
+    <dt>Stats snapshot taken</dt><dd id="diag-snapshot-at">-</dd>
+    <dt>Follow list refreshed</dt><dd id="diag-follows-at">-</dd>
+    <dt>Backfill last ran</dt><dd id="diag-backfill-at">-</dd>
+    <dt>Read budget</dt><dd id="diag-read-budget">-</dd>
+    <dt>Write budget</dt><dd id="diag-write-budget">-</dd>
+  </dl>
+  <table>
+    <thead><tr><th>read path</th><th>rows/call</th><th>share</th></tr></thead>
+    <tbody id="diag-read-paths"></tbody>
+  </table>
+</details>
 
 <script>
 // The three Workers-free-tier ceilings this page displays progress
@@ -354,8 +373,17 @@ function renderDiagnostics(stats) {
       : stats.followsRefreshedAt
         ? new Date(stats.followsRefreshedAt * 1000).toLocaleString()
         : "never";
+  // "<when> (pulls N events)" -- N is limits.ts BACKFILL_PAGE_SIZE, read
+  // off the wire rather than written here. It is derived from the
+  // declared index set, so a fifth index shrinks it; a literal in this
+  // file would be a copy to forget, which is the exact way that constant
+  // went wrong twice before it was made derived.
+  const backfill = stats.backfill;
   document.getElementById("diag-backfill-at").textContent =
-    !stats.backfill ? "n/a" : stats.backfill.lastRunAt ? new Date(stats.backfill.lastRunAt * 1000).toLocaleString() : "not yet run";
+    !backfill
+      ? "n/a"
+      : (backfill.lastRunAt ? new Date(backfill.lastRunAt * 1000).toLocaleString() : "not yet run") +
+        " (pulls " + backfill.pageSize + " events)";
 
   document.getElementById("diag-read-budget").textContent = formatReadBudget(stats.reads);
   document.getElementById("diag-write-budget").textContent =
