@@ -1,6 +1,6 @@
 // NIP-98 HTTP Auth (nips/98.md), as NIP-86 requires it. Runs in the
 // Worker, never inside the Durable Object -- schnorr verification is the
-// CPU-expensive step (validate.ts, docs/baselines.json) and there is no
+// CPU-expensive step (validate.ts) and there is no
 // reason to spend DO time on a request that may turn out to be forged.
 // The DO only ever sees a management call that already passed this gate.
 //
@@ -137,7 +137,7 @@ export function verifyNip98(
 
   // Checked before the schnorr verify: a stranger's perfectly valid
   // signature is still not authorized here, and comparing two strings is
-  // free next to ~1.1ms of curve math (docs/baselines.json).
+  // free next to ~1.1ms of curve math (src/validate.ts).
   if (event.pubkey !== expectedPubkey) {
     return { ok: false, reason: "Authorization event is not signed by the relay owner" };
   }

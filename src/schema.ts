@@ -3,7 +3,7 @@
 // the binding constraint, not storage or requests, so this is the number
 // that decides how much headroom a single owner actually has.
 //
-// Measured via SqlStorageCursor.rowsWritten (chunk 3, docs/baselines.json)
+// Measured via SqlStorageCursor.rowsWritten (test/hibernation.test.ts)
 // rather than estimated, since `id TEXT PRIMARY KEY` isn't a rowid alias
 // and costs its own implicit unique index on top of the declared ones:
 //

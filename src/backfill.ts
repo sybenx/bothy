@@ -152,7 +152,7 @@ interface IngestResult {
 //
 // Ordering mirrors relay.ts's own accept path (acceptEvent) and its
 // stated reasoning: cheapest/most-certain rejections first, schnorr
-// verification (the expensive step, docs/baselines.json) last and only
+// verification (the expensive step, src/validate.ts) last and only
 // once nothing cheaper has already ruled the event out.
 //   1. author mismatch -- a relay returning events under a pubkey other
 //      than the one asked for is either buggy or hostile; free to check,

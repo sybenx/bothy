@@ -69,7 +69,7 @@ describe("hibernation", () => {
   });
 });
 
-// The rows-written baseline (docs/baselines.json, CLAUDE.md "Testing").
+// The rows-written baseline (CLAUDE.md "The budget").
 //
 // These assert the DERIVATION in schema.ts against what SQLite actually
 // does, which is the only reason it is safe for eventRowCost to compute

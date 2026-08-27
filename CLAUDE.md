@@ -45,11 +45,14 @@ what shape the design. Per day, per account: **100,000 rows written**,
 Worker CPU per request. Allowances reset at 00:00 UTC. Rows written and rows
 read are the two that bind; storage and CPU are not close.
 
-Measured figures live in [docs/baselines.json](docs/baselines.json) and are
-asserted by [test/hibernation.test.ts](test/hibernation.test.ts) (rows written)
-and [test/read-cost.test.ts](test/read-cost.test.ts) (rows read). Below, **E**
-is rows in `events` and **T** is rows in `event_tags` (≈ 5E for real notes, which
-carry about five single-letter tags each).
+Every figure below is asserted by the suite — [test/hibernation.test.ts](test/hibernation.test.ts)
+for rows written, [test/read-cost.test.ts](test/read-cost.test.ts) for rows read —
+so the tests are the record and a change that moves one fails rather than
+drifting. The one cost the suite cannot assert is schnorr verification, because
+the workerd test harness does not expose isolate CPU time; that number and its
+caveat sit on `verifySignature` in [src/validate.ts](src/validate.ts). Below,
+**E** is rows in `events` and **T** is rows in `event_tags` (≈ 5E for real notes,
+which carry about five single-letter tags each).
 
 ### Rows written, per stored event
 
@@ -169,7 +172,7 @@ npm run cf-typegen   # regenerate worker-configuration.d.ts
 Two kinds of assertion live in the same suite ([test/](test)):
 
 1. **Protocol conformance** — NIP-01 REQ/EVENT/CLOSE/EOSE, filters, replaceable/addressable/ephemeral storage rules, NIP-09/40/42/59/62, and NIP-86/98 management. Reject paths are asserted as carefully as accept paths.
-2. **Budget/hibernation regression** — [test/hibernation.test.ts](test/hibernation.test.ts) asserts the object becomes eligible to hibernate after the last message; write-cost and CPU-cost baselines are recorded in [docs/baselines.json](docs/baselines.json) and explained in CLAUDE.md "The budget".
+2. **Budget/hibernation regression** — [test/hibernation.test.ts](test/hibernation.test.ts) asserts the object becomes eligible to hibernate after the last message, and pins the per-event rows-written cost against a real `SqlStorageCursor.rowsWritten`; [test/read-cost.test.ts](test/read-cost.test.ts) pins rows read per query shape. These assertions are the budget baseline — there is no separate file of recorded numbers to fall out of step with them.
 
 See [docs/test-notes.md](docs/test-notes.md) for suite layout, fixture rationale, and the couple of places tests drop below the wire protocol to real storage (documented exceptions, not the norm).
 

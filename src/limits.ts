@@ -414,7 +414,7 @@ export const LIVE_FEED_MAX_LIFETIME_MS = 10 * 60 * 1000;
 // Object's own CPU allowance, which defaults to 30 seconds per incoming
 // request/RPC call (developers.cloudflare.com/durable-objects/platform/limits/,
 // checked 2026-08-22) -- at the ~1.1ms/schnorr-verify baseline
-// (docs/baselines.json), this page size costs ~140ms of DO CPU, nowhere
+// (src/validate.ts), this page size costs ~140ms of DO CPU, nowhere
 // near that ceiling. So CPU is not what bounds this number.
 // What does: backfill runs unattended, for as long as the owner's
 // history requires, and must not crowd out the owner's own live writes

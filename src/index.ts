@@ -54,7 +54,7 @@ async function handleClaim(request: Request, env: Env): Promise<Response> {
 // Object (src/nip86.ts handleManagementCall) to actually touch storage.
 //
 // Verification lives here rather than in the DO because the schnorr
-// verify is the expensive step (src/validate.ts, docs/baselines.json) and
+// verify is the expensive step (src/validate.ts) and
 // a forged request should never cost Durable Object time at all. The DO's
 // manage() RPC does no authentication of its own -- this function is the
 // only caller, and it must stay that way.

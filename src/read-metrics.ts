@@ -32,7 +32,7 @@
 // Cost of the instrument itself: one Proxy allocation per `sql.exec`
 // and a Map lookup per consumed cursor. No storage, no query of its
 // own. Measurable against the ~1.1ms/schnorr-verify baseline only in
-// the sense of being far below it (docs/baselines.json).
+// the sense of being far below it (src/validate.ts).
 // ---------------------------------------------------------------------
 
 // Every path is named here rather than passed as a free string, so a

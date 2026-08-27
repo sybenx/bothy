@@ -61,9 +61,23 @@ export function idMatchesContent(event: NostrEvent): boolean {
   return computeEventId(event) === event.id;
 }
 
-// The CPU-expensive step -- see docs/baselines.json for the measured
-// cost per call and CLAUDE.md "The budget" for the 10ms/request ceiling
-// it's measured against.
+// The CPU-expensive step, and the reason every cheap rejection on the
+// write path runs ahead of it (relay.ts acceptEvent, CLAUDE.md
+// "Conventions").
+//
+// Measured at ~1.11ms per verification, averaged over 5,000 calls to
+// @noble/curves' schnorr.verify(), against the 10ms of Worker CPU per
+// request that CLAUDE.md "The budget" records. Roughly nine verifies to
+// the ceiling.
+//
+// Read that with its caveat, which is why the number lives here rather
+// than in a file of its own: it was measured in Node, not in workerd.
+// The miniflare/workerd harness does not expose isolate CPU time to test
+// code, so nothing in the suite can assert this the way
+// test/hibernation.test.ts asserts rows written. workerd's engine is also
+// V8, so it is a reasonable proxy and not a measurement -- re-measure
+// against real `wrangler dev` or production logs before treating the 10ms
+// ceiling as comfortably clear rather than merely plausible.
 export function verifySignature(event: NostrEvent): boolean {
   try {
     return schnorr.verify(hexToBytes(event.sig), hexToBytes(event.id), hexToBytes(event.pubkey));
