@@ -4,7 +4,7 @@ A single-user nostr relay that deploys in one click and runs on the Cloudflare W
 
 ## What it is
 
-- One Worker ([src/index.ts](src/index.ts)) routes requests: NIP-86 on `Content-Type: application/nostr+json+rpc` (checked first — that string contains `application/nostr+json`, so checking NIP-11 first would swallow it), NIP-11 on `Accept: application/nostr+json`, WebSocket upgrades to the Durable Object, `/api/claim`, `/api/stats`, `/api/profile`, everything else to the static `public/` admin page.
+- One Worker ([src/index.ts](src/index.ts)) routes requests: NIP-86 on `Content-Type: application/nostr+json+rpc` (checked first — that string contains `application/nostr+json`, so checking NIP-11 first would swallow it), NIP-11 on `Accept: application/nostr+json`, WebSocket upgrades to the Durable Object, `/api/claim`, `/api/stats`, `/api/profile` (a setup endpoint: it answers only while the relay is unclaimed, and 404s once it is), everything else to the static `public/` admin page. Every route that reaches the Durable Object is rate limited per IP by Cloudflare's Rate Limiting binding before the Worker's own code runs; static assets are not.
 - Exactly one Durable Object (`Relay`, [src/relay.ts](src/relay.ts)), addressed by `idFromName("relay")`. SQLite-backed. All protocol state, storage, and subscriptions live here.
 - WebSocket Hibernation API throughout (`acceptWebSocket`, `webSocketMessage`/`webSocketClose`/`alarm`), `setWebSocketAutoResponse` for ping/pong. The Durable Object must never open an outbound connection — doing so breaks hibernation. The Worker owns every outbound connection (claim-time profile lookup, backfill fetches) on the DO's behalf.
 - TOFU ownership: unclaimed until `POST /api/claim` binds a pubkey, permanently, with no signature required (`OWNER_PUBKEY` env var skips this and disables the endpoint). Every event is still signature-verified regardless of owner.
@@ -26,7 +26,7 @@ No payments/zaps, no multi-region/D1/read-replica scaling, no NIP-05 hosting, no
 
 ## Configuration
 
-Everything optional is read defensively (`env.X ?? fallback`) and declared nowhere in `wrangler.jsonc`'s `vars` block — a clean deploy must ask for nothing but a project name. Env vars, all added by hand in the Cloudflare dashboard if wanted: `OWNER_PUBKEY`, `RELAY_NAME`, `RELAY_DESCRIPTION`, `RELAY_ICON`, `ALLOW_FOLLOWS`, `MAX_EVENT_BYTES`, `MAX_EVENTS_PER_PUBKEY_PER_MINUTE`, `NON_OWNER_STORAGE_BYTES`. See [src/env.d.ts](src/env.d.ts).
+Everything optional is read defensively (`env.X ?? fallback`) and declared nowhere in `wrangler.jsonc`'s `vars` block — a clean deploy must ask for nothing but a project name. The `ratelimits` block is the one binding added to `wrangler.jsonc` since, and it fits that rule: its namespace ids are ours to pick, nothing is provisioned, and nothing is prompted for. Both bindings are still read as `env.X?.limit(...)` — the Cloudflare docs do not state which plans the binding is available on (checked 2026-08-27), so an absent binding means "allowed" rather than an exception on every request. Env vars, all added by hand in the Cloudflare dashboard if wanted: `OWNER_PUBKEY`, `RELAY_NAME`, `RELAY_DESCRIPTION`, `RELAY_ICON`, `ALLOW_FOLLOWS`, `MAX_EVENT_BYTES`, `MAX_EVENTS_PER_PUBKEY_PER_MINUTE`, `NON_OWNER_STORAGE_BYTES`. See [src/env.d.ts](src/env.d.ts).
 
 The three identity variables sit at the top of the resolution chain described above — they outrank a value stored through NIP-86, which outranks the owner's kind-0.
 
@@ -178,9 +178,88 @@ staleness — and are the next step if the cache stops being enough.
 
 Traffic-driven paths are bounded by `limits.ts boundFilter`, which admits a REQ
 filter only at a limit some index can afford, and by the per-IP message throttle
-in `relay.ts`. That throttle covers WebSocket messages only: **nothing
-rate-limits the HTTP endpoints**, so `/api/stats`, `/api/profile` and
-`/api/claim` are each defended by their per-request cost alone.
+in `relay.ts`.
+
+### The HTTP side
+
+That message throttle covers WebSocket messages only — it starts counting once
+a connection exists, so it never saw a connect-and-drop loop at all, and it saw
+no HTTP request of any kind. For most of this project's life **nothing
+rate-limited the HTTP endpoints**, and each was defended by its per-request cost
+alone against callers who pay nothing per request. Cloudflare's Rate Limiting
+binding now bounds them
+per IP, declared in `wrangler.jsonc` and applied in `index.ts` (`rateLimited`):
+60/minute shared across every HTTP path that wakes the Durable Object, and
+10/minute for `/api/profile` alone. It runs in the runtime before the Worker's
+code, so a refused request never reaches the object at all — which is the whole
+reason for choosing it over a counter of our own, since the only two places such
+a counter could live are DO storage (a row write per request, to measure a
+request) or isolate memory (which a flood evicts). Static assets are outside it:
+they never touch the DO and are free and unmetered.
+
+The per-request cost of each HTTP path, after the pass that added it:
+
+| Path | Reaches the DO? | Outbound? | Rows read | Per-IP limit |
+|---|---|---|---|---|
+| `GET /` and other static assets | no | no | 0 | none — free and unmetered |
+| `GET /api/stats`, both caches warm | yes | no | ~8–12 | 60/min |
+| `GET /api/stats`, a cache stale | yes | no | ~3E or ~2 × today's ingest | 60/min |
+| `POST /api/claim`, `OWNER_PUBKEY` set | **no** | **no** | 0 | 60/min |
+| `POST /api/claim`, malformed pubkey | no | no | 0 | 60/min |
+| `POST /api/claim`, already claimed | yes | **no** | 1–2 | 60/min |
+| `POST /api/claim`, unclaimed | yes | 2 sockets, cached | 3–4 | 60/min |
+| `GET /api/profile`, claimed | yes | **no** | 1–2 | 10/min |
+| `GET /api/profile`, malformed pubkey | no | no | 0 | 10/min |
+| `GET /api/profile`, unclaimed, cache hit | yes | no | 1–2 | 10/min |
+| `GET /api/profile`, unclaimed, cache miss | yes | 2 sockets | 1–2 | 10/min |
+| NIP-11 document | yes | no | 2 | 60/min |
+| `POST /` (NIP-86), auth fails | **no** | no | 0 | 60/min |
+| `POST /` (NIP-86), signature valid, not the owner | yes | no | 2 | 60/min |
+| `POST /` (NIP-86), authorized | yes | no | 2 + the method's own | 60/min |
+| WebSocket upgrade | yes | no | 1–2 | 60/min |
+| Rate-limited, any path | no | no | 0 | — |
+
+Four of those rows are the pass itself. `POST /` used to fetch the owner from
+the DO *before* looking at the Authorization header, so a POST carrying nothing
+but the management content type still woke the object and spent one of the day's
+100,000 requests — the same shape as the gift wrap gate probe, an expensive
+operation on the far side of no gate. `nip98.ts verifyNip98` no longer knows who
+the owner is; `index.ts` asks the DO only once a valid schnorr signature over
+this exact request exists. The schnorr verify moving ahead of the owner
+comparison inverts that file's old ordering note, and deliberately: the
+comparison came first because it was free, and it is not free any more —
+obtaining the owner is what costs. ~1.1ms of Worker CPU out of 10ms is the
+cheaper of the two.
+
+`POST /api/claim` is the third, and it was the same defect wearing different
+clothes: it resolved the pubkey's kind-0 over two outbound WebSockets *before*
+anything had established the claim could succeed, so a relay that was going to
+answer "already claimed" made two connections on a stranger's behalf to say so —
+and unlike the claim itself, that stayed reachable forever. The checks that can
+refuse now all run first, in `claim()`'s own order rather than in cost order, so
+the status does not depend on which side of the RPC boundary answered.
+`claim()` is still the authority: the Durable Object is single-threaded, and the
+check-then-write inside it is what actually makes TOFU atomic.
+
+`GET /api/profile` is the last. It is the claim form's courtesy profile preview
+and nothing else — a typo guard for a one-time, irreversible setup step — and it
+was permanently open, unauthenticated, uncached, and opening two outbound
+WebSockets to `relay.damus.io` and `nos.lol` per request. That is worse than an
+expensive read, because the cost lands on infrastructure that is not ours and
+that this relay depends on: a flood pointed at it made this deployment an
+amplifier toward the same two relays backfill and the claim-time lookup use, and
+getting throttled or blocked by them for a stranger's traffic is a failure the
+relay cannot fix from its own side. It cannot be authenticated — during a TOFU
+claim there is by definition no owner to authenticate against — so the available
+scope is time rather than identity: it answers while the relay is unclaimed and
+404s the moment it is not, which is the same window the claim form is rendered
+in. On a claimed relay, which is every relay for all but the first few minutes
+of its life, the path no longer reaches the network at all. The kind-0 cache
+(`profile-lookup.ts lookupProfileCached`, five minutes, negative results
+included, concurrent lookups for one pubkey coalesced) is what keeps even that
+window from amplifying. In-isolate rather than `caches.default`, because the
+Cache API needs a custom domain and bothy's premise is a one-click deploy that
+lands on `workers.dev`.
 
 ## Threat model
 
@@ -197,10 +276,15 @@ usefully — what it structurally cannot do.
 - **Read abuse.** `limits.ts boundFilter` admits a REQ filter only at a limit
   some index can afford, so no filter can scan the table. Plus a
   per-connection subscription cap and a per-IP message throttle. On the HTTP
-  side, where there is no throttle at all, `/api/stats` is defended by cost
-  alone: both halves of it are cached in rows (`stats_snapshot`,
-  `live_stats`) so the recompute rate is set by two TTLs rather than by the
-  request rate.
+  side, Cloudflare's Rate Limiting binding bounds every path that wakes the
+  Durable Object, per IP, before the Worker's code runs; underneath it
+  `/api/stats` is still defended by cost, with both halves cached in rows
+  (`stats_snapshot`, `live_stats`) so the recompute rate is set by two TTLs
+  rather than by the request rate.
+- **Being made into an amplifier.** `/api/profile` is the only path whose cost
+  lands on somebody else's infrastructure — two outbound WebSockets to
+  well-known relays per uncached miss. It is scoped to the pre-claim window,
+  cached, and rate limited at a sixth of everything else.
 - **Write abuse from an authorized writer.** `MAX_EVENT_BYTES` bounds the
   permanent damage one event can do; a per-pubkey rate limit bounds how fast;
   `NON_OWNER_STORAGE_BYTES` reserves half the 5GB ceiling for the owner. Gift
@@ -259,14 +343,14 @@ usefully — what it structurally cannot do.
 - [src/ownership.ts](src/ownership.ts) — owner pubkey resolution, TOFU claim, follow-list cache, profile/icon refresh.
 - [src/host.ts](src/host.ts) — this deployment's own host, learned from request traffic; lets backfill skip self-seeding.
 - [src/pubkey.ts](src/pubkey.ts) / [src/bech32.ts](src/bech32.ts) — npub/hex normalization.
-- [src/profile-lookup.ts](src/profile-lookup.ts) — best-effort kind-0 lookup from well-known relays, runs in the Worker only.
+- [src/profile-lookup.ts](src/profile-lookup.ts) — best-effort kind-0 lookup from well-known relays, runs in the Worker only, plus the isolate-local cache in front of it (`lookupProfileCached`). The cache is not `caches.default`: the Cache API needs a custom domain (developers.cloudflare.com/workers/runtime-apis/cache/, checked 2026-08-27) and bothy deploys to `workers.dev`, so it would silently no-op on the deployment shape this project exists for. Negative results are cached and concurrent lookups for one pubkey are coalesced — without both, the cache would miss on exactly the traffic it exists to absorb.
 - [src/backfill.ts](src/backfill.ts) / [src/backfill-worker.ts](src/backfill-worker.ts) — backfill state machine (DO-side, pure) and outbound fetch orchestration (Worker-side).
-- [src/limits.ts](src/limits.ts) — every numeric abuse/budget cap in the project, each commented with what it bounds. The three write-path caps (event size, per-pubkey rate, non-owner storage share) are enforced in `relay.ts acceptEvent` before id/signature verification, exempt the owner from two of the three, and are each raisable or disablable by env var — disabled only by the exact string `"off"`, never by any truthy value. Also `boundFilter`, the read-abuse guard: it prices a REQ filter (`combinations × (2 × limit + 1)`, where `combinations` comes from `expandFilter` itself) against the index set declared in `schema.ts`, clamps the limit until the query is affordable, and refuses only what no limit can fix. It replaced `isUnconstrainedFilter`, which asked whether a field was *present* rather than what the query *cost* and so admitted the two shapes that read the whole table.
+- [src/limits.ts](src/limits.ts) — every numeric abuse/budget cap in the project, each commented with what it bounds. The three write-path caps (event size, per-pubkey rate, non-owner storage share) are enforced in `relay.ts acceptEvent` before id/signature verification, exempt the owner from two of the three, and are each raisable or disablable by env var — disabled only by the exact string `"off"`, never by any truthy value. Also `boundFilter`, the read-abuse guard: it prices a REQ filter (`combinations × (2 × limit + 1)`, where `combinations` comes from `expandFilter` itself) against the index set declared in `schema.ts`, clamps the limit until the query is affordable, and refuses only what no limit can fix. It replaced `isUnconstrainedFilter`, which asked whether a field was *present* rather than what the query *cost* and so admitted the two shapes that read the whole table. The one cap NOT declared here is the HTTP rate limit: Cloudflare's runtime enforces it from `wrangler.jsonc` before any of this code runs, so a number here would be decorative and could silently disagree with the one in force — `limits.ts` carries the pointer and the reasoning instead.
 - [src/exhaustion.ts](src/exhaustion.ts) — classifies a Cloudflare free-tier allowance being consumed and names which one; `index.ts` wraps both `fetch` and `scheduled` with it. Exists because the last outage's only symptom was an admin page that loaded the word "bothy" and no numbers — `public/` is served from `env.ASSETS` and never touches the DO, so the one part still working was the part that proved nothing. Matching is substring signatures against error text Cloudflare does not document as stable, so it fails useful rather than silent: the raw message is always logged, the resource name only added when a signature matches. Non-exhaustion errors are logged and rethrown, never converted into a quiet 503.
 - [src/read-metrics.ts](src/read-metrics.ts) — **diagnostic, and expected to be removed**: in-memory attribution of rows *read* to the code path that caused them, surfaced as `reads` on `/api/stats`. Added after the live relay exhausted the 5,000,000 rows-read/day allowance under ordinary operation and nothing here could say which path spent it. Counters live in memory, never in storage — a counter costing a row write to measure a row read repeats the mistake CLAUDE.md "The budget" already rejected — so they reset on eviction and describe proportions, not daily totals. Every `SqlStorage` access in the DO goes through `instrumentSql`, so a query can be mislabelled into `unattributed` but never missed. See CLAUDE.md "The budget" for the per-call costs and the arithmetic against the ceiling.
 - [src/nip11.ts](src/nip11.ts) — relay info document, and the name/description/icon resolution chain shared with `/api/stats`.
 - [src/nip86.ts](src/nip86.ts) — management API method dispatch (runs in the DO; touches storage, opens nothing).
-- [src/nip98.ts](src/nip98.ts) — HTTP auth verification for the management API (runs in the Worker only).
+- [src/nip98.ts](src/nip98.ts) — HTTP auth verification for the management API (runs in the Worker only). Deliberately does not know who the owner is: establishing that costs a Durable Object round trip, which is the most expensive thing an unauthenticated caller can provoke on this path, so `verifyNip98` answers only what the request itself can answer and `index.ts` asks the DO afterwards (`ownerReason`).
 - [public/index.html](public/index.html) — the static admin page (claim form, stats, live feed).
 
 ## Conventions

@@ -8,8 +8,12 @@
 // The owner here is the OWNER_PUBKEY binding from vitest.config.ts (see
 // test/helpers/keys.ts), so "the owner" and "a stranger" are just two
 // keypairs.
+import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { HTTP_AUTH_KIND, HTTP_AUTH_MAX_DRIFT_SECONDS } from "../src/nip98";
+import { readMetricsSnapshot, resetReadMetrics } from "../src/read-metrics";
+import type { Relay } from "../src/relay";
 import { callManagement, MANAGEMENT_URL, nip98Header } from "./helpers/management";
 import { isolateStorage } from "./helpers/isolate";
 import { randomKeypair } from "./helpers/keys";
@@ -164,5 +168,75 @@ describe("NIP-98 authentication of management requests", () => {
     expect(response.headers.get("Content-Type")).toBe("application/nostr+json+rpc");
     const parsed = (await response.json()) as { result?: unknown };
     expect(Array.isArray(parsed.result)).toBe(true);
+  });
+});
+
+// The ordering of the gate, which is a budget property rather than a
+// protocol one and is asserted the way the rest of the budget is: by
+// measurement.
+//
+// handleManagement used to fetch the owner from the Durable Object before
+// looking at the Authorization header at all, so a POST carrying the
+// management content type and nothing else still woke the object from
+// hibernation and spent one of the day's 100,000 requests. An
+// unauthenticated flood therefore cost a DO wake each, at no cost to the
+// sender -- the same shape as the gift wrap gate probe (CLAUDE.md
+// "The budget"): an expensive operation on the far side of no gate.
+//
+// getOwner is the only thing in this path that touches storage, and it
+// declares the read path "identity" (relay.ts), so read-metrics.ts can
+// answer the question directly: did the Durable Object read anything on
+// behalf of this request?
+describe("management auth ordering", () => {
+  function stub(): DurableObjectStub<Relay> {
+    return env.RELAY.get(env.RELAY.idFromName("relay")) as DurableObjectStub<Relay>;
+  }
+
+  async function identityCalls(): Promise<number> {
+    const snapshot = await runInDurableObject(stub(), async () => readMetricsSnapshot());
+    return snapshot.paths.find((p) => p.path === "identity")?.calls ?? 0;
+  }
+
+  it("answers an unauthenticated management POST without waking the Durable Object", async () => {
+    await runInDurableObject(stub(), async () => resetReadMetrics());
+
+    for (let i = 0; i < 5; i++) {
+      const reply = await callManagement("supportedmethods", [], { omitAuthHeader: true });
+      expect(reply.status).toBe(401);
+    }
+
+    expect(await identityCalls()).toBe(0);
+  });
+
+  it("still refuses a signature that is valid but not the owner's, and that one does cost a lookup", async () => {
+    // The positive control for the test above: a metric that reads zero
+    // because nothing is instrumented is indistinguishable from one that
+    // reads zero because nothing happened. A stranger's *valid* signature
+    // is the cheapest request that legitimately has to ask who the owner
+    // is -- there is no way to answer it without knowing -- so this is
+    // where the lookup is supposed to appear.
+    await runInDurableObject(stub(), async () => resetReadMetrics());
+
+    const stranger = randomKeypair();
+    const reply = await callManagement("supportedmethods", [], { secretKeyHex: stranger.secretKeyHex });
+    expect(reply.status).toBe(401);
+    expect(reply.error).toContain("owner");
+
+    expect(await identityCalls()).toBeGreaterThan(0);
+  });
+
+  it("charges nothing for a body whose payload hash does not match", async () => {
+    // The payload tag is checked before the schnorr verify and long
+    // before the owner lookup, so a caller replaying a valid header
+    // against a different body is refused on string comparison alone.
+    await runInDurableObject(stub(), async () => resetReadMetrics());
+
+    const reply = await callManagement("banpubkey", ["deadbeef"], {
+      payload: "0".repeat(64),
+    });
+    expect(reply.status).toBe(401);
+    expect(reply.error).toContain("payload");
+
+    expect(await identityCalls()).toBe(0);
   });
 });

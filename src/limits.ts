@@ -485,6 +485,57 @@ export const MAX_LIVE_FEED_CONNECTIONS = 5;
 export const LIVE_FEED_MAX_LIFETIME_MS = 10 * 60 * 1000;
 
 
+// ---------------------------------------------------------------------
+// HTTP rate limiting.
+//
+// The per-IP throttle in relay.ts covers WebSocket *messages* only.
+// Nothing bounded the HTTP side at all, so every HTTP path that reaches
+// the Durable Object -- /api/stats, /api/claim, the NIP-11 document, the
+// NIP-86 management POST, and the WebSocket upgrade itself -- was
+// defended by its per-request cost alone, against a caller who pays
+// nothing per request.
+//
+// The cap itself is NOT declared here, and that is the one exception to
+// this file being where every numeric cap lives. It is enforced by
+// Cloudflare's Rate Limiting binding, which reads its limit and period
+// from wrangler.jsonc's `ratelimits` block and applies them in the
+// runtime *before* the Worker's own code runs -- so a number here would
+// be decorative, and worse, could silently disagree with the number
+// actually in force. wrangler.jsonc is the source of truth; the reasoning
+// for the values chosen is in the comment there.
+//
+// Chosen over a hand-rolled limiter for the reason that shapes every
+// other decision in this project: a counter of our own would have to live
+// somewhere, and the only two places available are the Durable Object
+// (a row write per request, to measure a request -- the mistake CLAUDE.md
+// "The budget" already rejected once for read-metrics.ts) or isolate
+// memory (which the flood evicts). The binding runs outside the thing it
+// protects and costs neither.
+// ---------------------------------------------------------------------
+
+// The Retry-After the 429 carries, in seconds. Must match `period` in
+// wrangler.jsonc's ratelimits block -- a caller told to come back sooner
+// than the window resets just spends another rejected request.
+export const HTTP_RATE_LIMIT_PERIOD_SECONDS = 60;
+
+// ---------------------------------------------------------------------
+// /api/profile's kind-0 cache (profile-lookup.ts lookupProfileCached).
+//
+// The TTL is set by how often the answer changes, not by how often it is
+// asked for: a kind-0 is a profile, edited a handful of times a year. Five
+// minutes is far shorter than that and still collapses every realistic
+// burst -- the endpoint's whole traffic pattern is one person typing a
+// pubkey into a form once, so a stale entry costs nothing and a fresh
+// fetch buys nothing.
+export const PROFILE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+// Entries held before the oldest is evicted. Sized for the shape the
+// endpoint actually has -- a single relay's single claim -- with enough
+// headroom that ordinary use never evicts; the number exists to bound
+// isolate memory under a flood of distinct pubkeys, not to serve one.
+export const PROFILE_CACHE_MAX_ENTRIES = 256;
+
+
 
 // How long the Worker's cron tick keeps one outbound backfill socket open
 // waiting for EOSE before giving up for this tick -- mirrors

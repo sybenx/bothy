@@ -21,7 +21,17 @@
 // accident (limits.ts resolveLimit).
 // The generated Env type (worker-configuration.d.ts) never declares any
 // of these, so this merges the optional fields onto the global `Env`.
+// RATE_LIMIT_API/RATE_LIMIT_PROFILE are the two Rate Limiting bindings
+// declared in wrangler.jsonc (see the comment there for the values and
+// why there are two). Optional for the same defensive reason every var
+// above is read with `?? fallback`: Cloudflare's docs do not say which
+// plans the binding is available on, and a relay that throws on every
+// request because a binding is missing would be a far worse failure than
+// one that serves them unlimited. src/index.ts calls them as
+// `env.X?.limit(...)` and treats an absent binding as "allowed".
 interface Env {
+  RATE_LIMIT_API?: RateLimit;
+  RATE_LIMIT_PROFILE?: RateLimit;
   OWNER_PUBKEY?: string;
   RELAY_NAME?: string;
   RELAY_DESCRIPTION?: string;

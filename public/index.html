@@ -679,6 +679,12 @@ function wireClaimForm() {
     // Courtesy lookup only -- the hex/npub the user typed is what gets
     // claimed regardless of whether this succeeds (CLAUDE.md "Claim
     // implementation": "If the lookup fails, allow the claim anyway").
+    //
+    // /api/profile answers only while the relay is unclaimed and 404s
+    // once it is (src/index.ts handleProfile), which is the same window
+    // this form is rendered in -- so it is never called against a
+    // claimed relay from here. The catch below would swallow it either
+    // way; nothing about the claim depends on this succeeding.
     try {
       const res = await fetch("/api/profile?pubkey=" + encodeURIComponent(value));
       const { profile } = await res.json();

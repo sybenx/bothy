@@ -4,8 +4,9 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
-import { OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
+import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
 import { refreshFollows } from "../src/ownership";
+import { profileCacheSize, resetProfileCache } from "../src/profile-lookup";
 import type { Relay } from "../src/relay";
 import { readLiveStats, readStatsSnapshot } from "../src/storage";
 import { connectRelay, publish } from "./helpers/socket";
@@ -114,10 +115,49 @@ describe("GET /api/stats", () => {
   });
 });
 
+// The claim form's courtesy profile preview (src/index.ts handleProfile),
+// which is a setup endpoint and is now scoped to setup.
+//
+// The whole suite runs with OWNER_PUBKEY bound (see vitest.config.ts), so
+// every relay these tests see is claimed -- which is exactly the state
+// this endpoint must refuse in, and the one a real deployment spends all
+// but the first few minutes of its life in. The unclaimed half is
+// unreachable over HTTP under this config for the reason
+// test/claim.test.ts documents at length.
 describe("GET /api/profile", () => {
   it("rejects a request with no pubkey", async () => {
     const response = await exports.default.fetch("https://example.com/api/profile");
     expect(response.status).toBe(400);
+  });
+
+  it("rejects a pubkey that is not 64 hex characters", async () => {
+    const response = await exports.default.fetch("https://example.com/api/profile?pubkey=npub1nope");
+    expect(response.status).toBe(400);
+  });
+
+  it("is gone once the relay is claimed", async () => {
+    // 404, matching /api/claim's disabled branch rather than inventing a
+    // second vocabulary for an endpoint that is no longer part of this
+    // relay.
+    const response = await exports.default.fetch(
+      "https://example.com/api/profile?pubkey=" + OWNER_PUBKEY_HEX,
+    );
+    expect(response.status).toBe(404);
+  });
+
+  it("refuses a claimed relay's request without reaching the network", async () => {
+    // The status code alone would not prove this: a 404 returned after
+    // opening two outbound WebSockets to relay.damus.io and nos.lol would
+    // look identical from the outside, and the outbound connection is the
+    // entire cost being removed. A lookup leaves exactly one visible
+    // trace -- a cache entry (src/profile-lookup.ts) -- so an untouched
+    // cache is the proof that the ownership check ran first.
+    resetProfileCache();
+    const response = await exports.default.fetch(
+      "https://example.com/api/profile?pubkey=" + "b".repeat(64),
+    );
+    expect(response.status).toBe(404);
+    expect(profileCacheSize()).toBe(0);
   });
 });
 
