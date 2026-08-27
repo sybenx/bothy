@@ -231,13 +231,17 @@ export interface ReadMetricsSnapshot {
   totalRowsRead: number;
   // Extrapolation of totalRowsRead to 24h at the observed rate, against
   // the 5,000,000/day ceiling. Honest only if the sample is long enough
-  // and representative; null under a minute of uptime, where it would
-  // be noise multiplied by 1,440.
+  // and representative; null under an hour of uptime, where the
+  // multiplier is large enough (at least 24x) that ordinary burstiness in
+  // traffic reads as a huge swing in the projection -- observed live at
+  // 1,721 rows/2min projecting 1,447,302/24h where the same relay
+  // projected 785,000 from a 14-minute window an hour earlier. Neither
+  // number was wrong, the window was just too short to mean anything.
   projected24h: number | null;
   paths: ReadPathReport[];
 }
 
-const MIN_SAMPLE_MS = 60_000;
+const MIN_SAMPLE_MS = 3_600_000;
 
 export function readMetricsSnapshot(): ReadMetricsSnapshot {
   const sinceMs = startedAtMs === null ? 0 : Math.max(0, Date.now() - startedAtMs);

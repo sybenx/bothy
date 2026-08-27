@@ -87,7 +87,12 @@
      footer's styling any more, hence the repetition. */
   #diagnostics { font-size: 0.8rem; opacity: 0.6; margin-bottom: 3rem; }
   #diagnostics summary { cursor: pointer; }
-  #diagnostics .diag-grid { display: grid; grid-template-columns: auto 1fr; gap: 0.2rem 0.75rem; margin: 0.6rem 0; }
+  /* Same weight/opacity vocabulary the panel already uses for dt --
+     groups the snapshot-derived rows from the live ones without a new
+     heading level or a new colour. */
+  #diagnostics .diag-group-label { font-weight: 600; opacity: 0.7; margin: 0.8rem 0 0.1rem; }
+  #diagnostics .diag-group-label:first-of-type { margin-top: 0.6rem; }
+  #diagnostics .diag-grid { display: grid; grid-template-columns: auto 1fr; gap: 0.2rem 0.75rem; margin: 0.2rem 0; }
   #diagnostics .diag-grid dt { opacity: 0.7; }
   #diagnostics .diag-grid dd { margin: 0; }
   #diagnostics table { border-collapse: collapse; width: 100%; margin-top: 0.4rem; }
@@ -160,16 +165,34 @@
      than by being seen. -->
 <details id="diagnostics" hidden>
   <summary>Diagnostics</summary>
+
+  <!-- These five come from the stats_snapshot row and share one age,
+       shown on the first line -- CLAUDE.md "The budget" / relay.ts
+       getStats. During a heavy backfill totalStored (live, top of page)
+       can visibly run ahead of these, which is expected staleness, not
+       a bug. -->
+  <p class="diag-group-label">From the stats snapshot</p>
+  <dl class="diag-grid">
+    <dt>Snapshot taken</dt><dd id="diag-snapshot-at">-</dd>
+    <dt>Events, last 24h (by created_at)</dt><dd id="diag-events-24h">-</dd>
+    <dt>Follow list published</dt><dd id="diag-follows-at">-</dd>
+    <dt>Largest non-owner author</dt><dd id="diag-largest-author">-</dd>
+  </dl>
+
+  <p class="diag-group-label">Live</p>
   <dl class="diag-grid">
     <dt>Storage used</dt><dd id="diag-storage">-</dd>
-    <dt>Stats snapshot taken</dt><dd id="diag-snapshot-at">-</dd>
-    <dt>Follow list published</dt><dd id="diag-follows-at">-</dd>
-    <dt>Backfill last ran</dt><dd id="diag-backfill-at">-</dd>
-    <dt>Read budget</dt><dd id="diag-read-budget">-</dd>
+    <dt>Events ingested, last 24h</dt><dd id="diag-ingested-24h">-</dd>
+    <dt id="diag-vanishing-label" hidden>Vanishing</dt><dd id="diag-vanishing" hidden>-</dd>
+    <dt>Backfill</dt><dd id="diag-backfill-at">-</dd>
     <dt>Write budget</dt><dd id="diag-write-budget">-</dd>
+    <dt>Read budget</dt><dd id="diag-read-budget">-</dd>
   </dl>
+
   <table>
-    <thead><tr><th>read path</th><th>rows/call</th><th>share</th></tr></thead>
+    <thead><tr><th id="diag-read-paths-heading" colspan="3">read paths</th></tr>
+      <tr><th>path</th><th>rows/call</th><th id="diag-share-heading">share</th></tr>
+    </thead>
     <tbody id="diag-read-paths"></tbody>
   </table>
 </details>
@@ -368,8 +391,11 @@ function renderBackfillStatus(backfill) {
 function renderDiagnostics(stats) {
   document.getElementById("diagnostics").hidden = false;
 
-  document.getElementById("diag-storage").textContent = formatMB(stats.storageBytes);
+  // The five stats_snapshot fields, one age line for all of them --
+  // relay.ts getStats: totalEvents, events24h, followCount,
+  // followsListAt and largestNonOwnerAuthor are all computed together.
   document.getElementById("diag-snapshot-at").textContent = new Date(stats.snapshotAt * 1000).toLocaleString();
+  document.getElementById("diag-events-24h").textContent = stats.events24h.toLocaleString();
   // The contact list's own created_at, not a refresh time -- see
   // storage.ts StatsSnapshot.followsListAt. "none stored" rather than
   // "never" because the absence being reported is a missing kind-3, not
@@ -380,17 +406,54 @@ function renderDiagnostics(stats) {
       : stats.followsListAt
         ? new Date(stats.followsListAt * 1000).toLocaleString()
         : "none stored";
+  document.getElementById("diag-largest-author").textContent = stats.largestNonOwnerAuthor
+    ? stats.largestNonOwnerAuthor.pubkey.slice(0, 12) + "… (" +
+      stats.largestNonOwnerAuthor.events.toLocaleString() + " events)"
+    : "none";
+
+  document.getElementById("diag-storage").textContent = formatMB(stats.storageBytes);
+  document.getElementById("diag-ingested-24h").textContent = stats.ingested24h.toLocaleString();
+
+  // A vanish drains across cron ticks and can run for days, taking up to
+  // a quarter of the write budget the whole time (limits.ts
+  // BACKFILL_ROWS_SHARE_LIMIT's sibling on the vanish side) -- there was
+  // previously nowhere on this page it showed at all. Hidden entirely
+  // when nothing is draining, which is the common case.
+  const vanishing = stats.vanishing;
+  const vanishingLabel = document.getElementById("diag-vanishing-label");
+  const vanishingEl = document.getElementById("diag-vanishing");
+  vanishingLabel.hidden = vanishingEl.hidden = vanishing.length === 0;
+  if (vanishing.length > 0) {
+    vanishingEl.textContent = vanishing
+      .map((v) =>
+        v.pubkey.slice(0, 12) + "… (" + v.deletedSoFar.toLocaleString() + " deleted so far, requested " +
+        new Date(v.requestedAt * 1000).toLocaleDateString() + ")",
+      )
+      .join("; ");
+  }
+
   // "<when> (pulls N events)" -- N is limits.ts BACKFILL_PAGE_SIZE, read
   // off the wire rather than written here. It is derived from the
   // declared index set, so a fifth index shrinks it; a literal in this
   // file would be a copy to forget, which is the exact way that constant
-  // went wrong twice before it was made derived.
+  // went wrong twice before it was made derived. relayCount/exhaustedCount
+  // and nextRelay/nextRefusal are appended because "last ran" alone can't
+  // say that one of three relays is exhausted or why the next one stalled.
   const backfill = stats.backfill;
-  document.getElementById("diag-backfill-at").textContent =
-    !backfill
-      ? "n/a"
-      : (backfill.lastRunAt ? new Date(backfill.lastRunAt * 1000).toLocaleString() : "not yet run") +
-        " (pulls " + backfill.pageSize + " events)";
+  if (!backfill) {
+    document.getElementById("diag-backfill-at").textContent = "n/a";
+  } else {
+    const lastRun = backfill.lastRunAt ? new Date(backfill.lastRunAt * 1000).toLocaleString() : "not yet run";
+    let text = lastRun + " (pulls " + backfill.pageSize + " events; " +
+      backfill.exhaustedCount + "/" + backfill.relayCount + " relays exhausted";
+    if (backfill.nextRelay) {
+      text += ", next: " + backfill.nextRelay;
+      // textContent below, never innerHTML -- nextRefusal is a string a
+      // remote relay chose, same rule as #backfill-refusal above.
+      if (backfill.nextRefusal) text += " (said: " + backfill.nextRefusal + ")";
+    }
+    document.getElementById("diag-backfill-at").textContent = text + ")";
+  }
 
   document.getElementById("diag-read-budget").textContent = formatReadBudget(stats.reads);
   // Since the last 00:00 UTC, which is when the allowance itself resets
@@ -401,6 +464,18 @@ function renderDiagnostics(stats) {
     stats.rowsWrittenToday.toLocaleString() + " rows / " + ROWS_WRITTEN_LIMIT.toLocaleString() +
     " (" + formatPercent(stats.rowsWrittenToday, ROWS_WRITTEN_LIMIT) + ") since 00:00 UTC";
 
+  // The read-path breakdown is sampled over the same in-memory window as
+  // the read-budget line above (reads.sinceMs resets whenever the
+  // Durable Object hibernates) -- its "share" column inherits the same
+  // distortion a short window gives the projection, so both the table's
+  // heading and its share column carry the window instead of asserting a
+  // percentage the sample can't support.
+  const windowLabel = formatReadWindow(stats.reads.sinceMs);
+  const readPathsHeading = document.getElementById("diag-read-paths-heading");
+  const longEnough = stats.reads.sinceMs >= READ_WINDOW_MIN_MS;
+  readPathsHeading.textContent = "read paths (sampled over " + windowLabel + ")";
+  document.getElementById("diag-share-heading").textContent = longEnough ? "share" : "share (n/a, window too short)";
+
   const tbody = document.getElementById("diag-read-paths");
   tbody.textContent = "";
   for (const p of stats.reads.paths) {
@@ -410,7 +485,7 @@ function renderDiagnostics(stats) {
     const perCall = document.createElement("td");
     perCall.textContent = p.rowsPerCall === null ? "-" : p.rowsPerCall.toFixed(1);
     const share = document.createElement("td");
-    share.textContent = (p.share * 100).toFixed(1) + "%";
+    share.textContent = longEnough ? (p.share * 100).toFixed(1) + "%" : "-";
     tr.append(path, perCall, share);
     tbody.appendChild(tr);
   }
@@ -424,18 +499,37 @@ function formatPercent(value, limit) {
   return ((value / limit) * 100).toFixed(2) + "%";
 }
 
+// Matches src/read-metrics.ts's own MIN_SAMPLE_MS: below an hour, the
+// 24h multiplier is at least 24x, which turns ordinary burstiness into a
+// huge swing in the projected rate -- observed live at 1,721 rows over 2
+// minutes projecting 1,447,302/24h (28.95%) where the same relay had
+// projected 785,000 from a 14-minute window an hour earlier. Both
+// readings were accurate; the window just couldn't support either
+// conclusion. Kept in sync with the server constant by hand since this
+// file has no import of its own.
+const READ_WINDOW_MIN_MS = 3_600_000;
+
+function formatReadWindow(sinceMs) {
+  if (sinceMs < 60000) return Math.round(sinceMs / 1000) + "s";
+  if (sinceMs < READ_WINDOW_MIN_MS) return Math.round(sinceMs / 60000) + " min";
+  return (sinceMs / 3_600_000).toFixed(1) + " h";
+}
+
 // reads.* is src/read-metrics.ts's in-memory attribution -- it resets
 // whenever the Durable Object hibernates, so `sinceMs` can be a few
-// minutes rather than a day. `projected24h` is already null below
-// read-metrics.ts's own MIN_SAMPLE_MS floor; this just renders that
-// honestly instead of dividing a tiny sample by a huge multiplier and
-// presenting the result as if it meant something.
+// minutes rather than a day, and that is the normal case rather than a
+// fault. The raw rows-read figure and the window it covers are true
+// regardless of window length and are always shown; the projection and
+// its percentage of the ceiling are only meaningful once the window is
+// long enough to smooth over ordinary bursts, so both are suppressed
+// below READ_WINDOW_MIN_MS instead of dividing a tiny sample by a huge
+// multiplier and presenting the result as if it meant something.
 function formatReadBudget(reads) {
-  const windowLabel =
-    reads.sinceMs < 60000 ? Math.round(reads.sinceMs / 1000) + "s" : Math.round(reads.sinceMs / 60000) + " min";
-  const base = reads.totalRowsRead.toLocaleString() + " rows read (sampled over " + windowLabel + ")";
+  const windowLabel = formatReadWindow(reads.sinceMs);
+  const base = reads.totalRowsRead.toLocaleString() + " rows read (sampled over " + windowLabel +
+    " -- resets whenever the relay hibernates)";
   if (reads.projected24h === null) {
-    return base + " -- window too short to project a 24h rate";
+    return base + "; too short a window to project a 24h rate";
   }
   return (
     base +
