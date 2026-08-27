@@ -200,7 +200,7 @@ function formatBytes(n) {
   return (n / 1024 ** 3).toFixed(2) + " GB";
 }
 
-// Write access policy (ROADMAP.md chunk 4: ALLOW_FOLLOWS). A bare follow
+// Write access policy (ALLOW_FOLLOWS). A bare follow
 // count of 0 while writePolicy is "follows" reads as healthy at a glance
 // -- it isn't, it means the allowlist is empty and every follow is being
 // silently rejected -- so that case gets its own plain-language sentence
@@ -224,7 +224,7 @@ function renderWritePolicyStatus(stats) {
   el.textContent = parts.join(" ");
 }
 
-// One-shot backfill progress (ROADMAP.md chunk 7: "visible progress on
+// One-shot backfill progress (visible progress on
 // the admin page"). Purely a render of whatever src/relay.ts getStats()
 // last reported -- this page has no way to trigger or influence
 // backfill, which runs entirely on the Worker's cron trigger.
@@ -266,14 +266,14 @@ function renderBackfillStatus(backfill) {
   }
 }
 
-// Debugging tool that doubles as onboarding (ROADMAP.md chunk 7): turns
+// Debugging tool that doubles as onboarding: turns
 // the abstract wss:// URL into something visibly alive. Kind/time/
 // truncated id only -- the server (src/relay.ts liveBroadcast) never
 // sends tags or content, and never sends gift wraps at all, so there's
 // nothing here to redact client-side.
 const LIVE_MAX_ROWS = 20;
 // Closed whenever the tab isn't visible, and only reopened when it is --
-// this is the idle timeout ROADMAP.md chunk 7 requires: a background tab
+// this is the live feed's idle timeout: a background tab
 // left open for hours must not hold a live DO connection the whole time
 // (CLAUDE.md "The budget": duration only stays cheap if hibernation
 // actually works, and a socket nobody is looking at is exactly the kind

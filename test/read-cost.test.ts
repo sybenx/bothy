@@ -66,7 +66,7 @@ function stub() {
 }
 
 // Rows read by one query, straight off the cursor -- the same mechanism
-// CLAUDE.md "The budget" used for rowsWritten in chunk 3.
+// test/hibernation.test.ts uses for rowsWritten.
 function rowsRead(sql: SqlStorage, query: string, ...bindings: unknown[]): number {
   const cursor = sql.exec(query, ...bindings);
   cursor.toArray();

@@ -1,10 +1,11 @@
 # Test notes
 
-Notes for whoever implements chunk 3 against the chunk 2 conformance suite.
+Notes on how this suite is laid out and why a few of its fixtures look the
+way they do.
 
 ## Layout
 
-- `test/skeleton.test.ts` — chunk 1 smoke tests. Don't add protocol assertions here.
+- `test/skeleton.test.ts` — Worker/Durable Object skeleton smoke tests. Don't add protocol assertions here.
 - `test/hibernation.test.ts` — the hibernation smoke test, and the rows-**written** baseline: `eventRowCost`'s derivation from `schema.ts INDEXES` asserted against real `SqlStorageCursor.rowsWritten` on the real `storeEvent` path. That pairing is the point — the figure is derived so a new index updates every consumer of it at once, and measured so the derivation cannot be quietly wrong. This project shipped a rows-written figure that was off by 45× because nobody measured it.
 - `test/nip01-write.test.ts` — EVENT/OK: accept, duplicate, bad signature, id/content mismatch.
 - `test/nip01-subscriptions.test.ts` — REQ/EOSE/CLOSE lifecycle, real-time delivery, sub replacement.
@@ -13,7 +14,7 @@ Notes for whoever implements chunk 3 against the chunk 2 conformance suite.
 - `test/nostr-kinds.test.ts` — kind-classifier boundary values (44/45, 999/1000, 9999/10000, 19999/20000, 29999/30000, 39999/40000), asserted directly against `isReplaceableKind`/`isEphemeralKind`/`isAddressableKind` rather than over the wire.
 - `test/nip09-deletion.test.ts`, `test/nip40-expiration.test.ts`, `test/nip42-auth.test.ts` — one file per optional NIP.
 - `test/ownership.test.ts` — owner-only write gate (fixed OWNER_PUBKEY binding).
-- `test/claim.test.ts` — TOFU claim flow: HTTP behavior with OWNER_PUBKEY set (chunk 4's actual test env), plus claim atomicity and pubkey normalization tested directly against real storage.
+- `test/claim.test.ts` — TOFU claim flow: HTTP behavior with OWNER_PUBKEY set, plus claim atomicity and pubkey normalization tested directly against real storage.
 - `test/follows.test.ts` — ALLOW_FOLLOWS write gate, tested directly against real storage.
 - `test/read-limits.test.ts` — subscription cap, rejection of a filter no index can serve, per-IP throttle.
 - `test/read-cost.test.ts` — rows read per query shape, before and after the v0.7.2 index/split/cache work, plus the `boundFilter` cost model and the read-path attribution buckets.

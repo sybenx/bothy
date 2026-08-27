@@ -1,6 +1,7 @@
-// Smoke tests for chunk 1's "Done when" criteria (see ROADMAP.md):
+// Smoke tests for the Worker/Durable Object skeleton:
 // NIP-11 returns valid JSON, and the relay accepts and holds a WebSocket
-// connection. Full NIP-01 protocol conformance is chunk 2/3's job, not
+// connection. Full NIP-01 protocol conformance is the nip01-*.test.ts
+// suites' job, not
 // this file's -- do not add protocol assertions here.
 import { exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";

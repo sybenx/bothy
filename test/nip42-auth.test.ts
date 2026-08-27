@@ -1,6 +1,6 @@
 // NIP-42 Authentication of clients to relays (nips/42.md).
 //
-// Gift wrap reads (ROADMAP.md chunk 6, relay.ts handleReq) are this
+// Gift wrap reads (relay.ts handleReq) are this
 // relay's first auth-gated resource, so the full challenge/response
 // round trip (lines 61-99) is now reachable and tested below, alongside
 // what NIP-42 makes unconditional regardless of whether a real challenge
@@ -94,7 +94,7 @@ describe("NIP-42 AUTH", () => {
   });
 });
 
-describe("NIP-42 gift wrap read gate (ROADMAP.md chunk 6)", () => {
+describe("NIP-42 gift wrap read gate", () => {
   it("issues an AUTH challenge and closes an unauthenticated REQ for gift wraps", async () => {
     const conn = await connectRelay();
     conn.send(["REQ", "subGiftWraps", { kinds: [1059] }]);
@@ -198,7 +198,7 @@ describe("NIP-42 gift wrap read gate (ROADMAP.md chunk 6)", () => {
 // missed the ids-only case below: an id is an unguessable content hash,
 // so "an ids-only filter can't be a discovery vector" is true for anyone
 // who doesn't already have the event -- but that's not the rule this
-// relay actually promises (ROADMAP.md chunk 6: "Serve gift wraps only to
+// relay actually promises (CLAUDE.md "What it is": serve gift wraps only to
 // the authenticated p-tagged recipient", no carve-out for "unless you
 // already know the id"), and the old gate let it through unauthenticated.
 // These four lock in the shapes that matter: two that must be gated

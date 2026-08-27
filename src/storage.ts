@@ -314,7 +314,7 @@ function isSupersededBy(
 // addressable versions at or before the deletion's created_at.
 //
 // Authorization on the `e`-tag path branches on the target's kind
-// (ROADMAP.md chunk 6):
+//:
 //   - target is a gift wrap (kind 1059): authorized iff the deletion's
 //     pubkey appears in the target's `p` tags. NIP-59 gift wraps are
 //     signed by a random one-time key, so the ordinary "same pubkey"
@@ -474,9 +474,9 @@ function runFilterQuery(sql: SqlStorage, filter: Filter, nowSec: number): NostrE
 // limits.ts/relay.ts comments on why this relay avoids extra writes just
 // to measure itself. Backs /api/stats's `rowsWrittenEstimate24h`
 // (relay.ts getStats) and backfill's own headroom check (backfill.ts
-// hasBackfillHeadroom, ROADMAP.md chunk 7: backfill must yield to the
-// owner's live traffic rather than compete with it for the same daily
-// ceiling) -- both need the same number, so it lives here once rather
+// hasBackfillHeadroom: backfill must yield to the owner's live traffic
+// rather than compete with it for the same daily ceiling) -- both need
+// the same number, so it lives here once rather
 // than being computed twice and risking drift between what the admin page
 // displays and what backfill actually throttles against.
 //

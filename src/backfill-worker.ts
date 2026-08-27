@@ -1,4 +1,4 @@
-// One-shot backfill (ROADMAP.md chunk 7), Worker-side half. Every
+// One-shot backfill, Worker-side half. Every
 // outbound WebSocket this feature ever opens lives here, in the
 // stateless Worker's scheduled() handler -- never inside the Relay
 // Durable Object. CLAUDE.md "The budget": "an outbound connection keeps

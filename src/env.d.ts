@@ -1,6 +1,7 @@
-// None of these are declared in wrangler.jsonc's `vars` (ROADMAP.md
-// chunk 5: the Cloudflare deploy button prompts for every declared var
-// with no notion of "optional", so a clean deploy must declare none).
+// None of these are declared in wrangler.jsonc's `vars`: the Cloudflare
+// deploy button prompts for every declared var with no notion of
+// "optional", so a clean deploy must declare none (CLAUDE.md
+// "Configuration").
 // OWNER_PUBKEY is deliberately absent so a real deploy stays unclaimed
 // (TOFU) by default, per CLAUDE.md "Ownership" -- it's injected as a
 // miniflare binding in vitest.config.ts for tests, and set by the claim

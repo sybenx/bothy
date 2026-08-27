@@ -1,6 +1,6 @@
 // NIP-59 (nips/59.md) Gift Wrap: kind 1059, signed by a random one-time
-// key, `p`-tagged to its recipient. ROADMAP.md chunk 6's one deliberate
-// exception to owner-only writes -- CLAUDE.md "Threat model" calls it
+// key, `p`-tagged to its recipient. The one deliberate exception to
+// owner-only writes -- CLAUDE.md "Threat model" calls it
 // "the only unauthenticated write path in the project" and "the only
 // unbounded write path", hence the extra abuse controls (limits.ts)
 // exercised here alongside the accept/reject rules. Recipient-authorized

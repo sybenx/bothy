@@ -1,5 +1,4 @@
-// /api/stats and the static admin page (CLAUDE.md "Admin page";
-// ROADMAP.md chunk 4).
+// /api/stats and the static admin page (CLAUDE.md "Admin page").
 import { env, exports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";

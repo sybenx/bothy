@@ -1,6 +1,5 @@
-// Chunk 1's "Done when" criteria (ROADMAP.md) requires a hibernation test
-// that confirms the Relay object becomes eligible to hibernate after the
-// last message. evictDurableObject() tears down the in-memory instance
+// Confirms the Relay object becomes eligible to hibernate after the last
+// message. evictDurableObject() tears down the in-memory instance
 // while (by default) hibernating rather than closing any accepted
 // WebSockets -- if this object were using ws.accept() instead of
 // ctx.acceptWebSocket(), the socket would not survive eviction, and

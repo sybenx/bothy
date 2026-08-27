@@ -1,4 +1,4 @@
-// One-shot backfill (ROADMAP.md chunk 7). backfill.ts is pure over
+// One-shot backfill. backfill.ts is pure over
 // SqlStorage, like ownership.ts/storage.ts, so it's exercised directly
 // via runInDurableObject against real storage rather than over the wire
 // -- see test/follows.test.ts for the same pattern.

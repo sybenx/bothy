@@ -1,4 +1,4 @@
-// Admin page live feed (ROADMAP.md chunk 7) -- a push-only, unauthenticated
+// Admin page live feed -- a push-only, unauthenticated
 // WebSocket channel at "/live", separate from the nostr protocol
 // connection ("/"), that notifies whoever has the admin page open of
 // newly stored events. CLAUDE.md "Admin page": "Never render gift wrap

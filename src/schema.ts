@@ -28,9 +28,9 @@
 // CLAUDE.md "The budget".
 //
 // This comment twice rejected an index on (kind, created_at), on the
-// grounds that "chunk 4's read-abuse rules reject any filter lacking
-// both `authors` and `kinds`, so every accepted query filters by
-// pubkey." Both halves were wrong. `isUnconstrainedFilter` accepted
+// grounds that the read-abuse guard rejected any filter lacking both
+// `authors` and `kinds`, so every accepted query filtered by pubkey.
+// Both halves were wrong. `isUnconstrainedFilter` accepted
 // `authors` OR `kinds`, not both, so a kinds-only filter was always
 // admissible; and filtering by pubkey buys nothing on a single-owner
 // relay, where every row shares one pubkey. The reasoning was never
@@ -91,7 +91,7 @@
 // still stored verbatim in `events.tags` for the client, just never
 // indexed.
 //
-// `deleted_ids` (ROADMAP.md chunk 6) is a tombstone set, not part of the
+// `deleted_ids` is a tombstone set, not part of the
 // per-event write cost above. NIP-09/NIP-62 both require that a deleted
 // event cannot be re-stored by re-sending the same signed copy -- without
 // this, deleting a gift wrap is meaningless, since the sender still holds
@@ -242,7 +242,7 @@ export const TABLES: readonly TableSpec[] = [
     columns: [
       col("pubkey", "TEXT NOT NULL"),
       // name/picture/about cache the owner's kind-0 profile as resolved
-      // at claim time (ROADMAP.md chunk 5), backing the NIP-11
+      // at claim time, backing the NIP-11
       // document's name/description/icon instead of a deploy-time var --
       // null when the claim-time lookup found nothing. See nip11.ts
       // resolveName/resolveDescription/resolveIcon.
@@ -295,7 +295,7 @@ export const TABLES: readonly TableSpec[] = [
     columns: [col("host", "TEXT")],
   },
   {
-    // One-shot backfill (ROADMAP.md chunk 7): one row per relay pulled
+    // One-shot backfill: one row per relay pulled
     // from the owner's kind-10002 relay list, tracking how far back this
     // relay has already fetched. Persisted rather than kept in memory
     // specifically so an hourly cron tick can resume a backfill that

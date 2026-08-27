@@ -1,5 +1,4 @@
-// TOFU claim flow (CLAUDE.md "Ownership" / "Claim implementation";
-// ROADMAP.md chunk 4).
+// TOFU claim flow (CLAUDE.md "Ownership" / "Claim implementation").
 //
 // The global test env injects a fixed OWNER_PUBKEY binding (see
 // DECISIONS.md's "Test-only OWNER_PUBKEY" entry and
@@ -90,7 +89,7 @@ describe("TOFU claim storage (env.OWNER_PUBKEY unset)", () => {
   });
 });
 
-describe("claim-time profile storage (ROADMAP.md chunk 5)", () => {
+describe("claim-time profile storage", () => {
   it("stores the owner's kind-0 name/picture/about passed at claim time", async () => {
     const id = env.RELAY.idFromName("relay");
     const stub = env.RELAY.get(id);

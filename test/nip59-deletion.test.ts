@@ -1,5 +1,5 @@
-// NIP-59 (nips/59.md) Gift Wrap deletion -- ROADMAP.md chunk 6's
-// recipient-authorized carve-out to NIP-09 (nips/09.md): a gift wrap is
+// NIP-59 (nips/59.md) Gift Wrap deletion -- the recipient-authorized
+// carve-out to NIP-09 (nips/09.md): a gift wrap is
 // signed by a random one-time key, so the ordinary "same pubkey" rule
 // can never fire for it. NIP-59 authorizes the tagged recipient instead
 // (always the owner, on this relay -- see test/nip59-giftwrap.test.ts,

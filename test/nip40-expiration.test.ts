@@ -12,7 +12,7 @@
 // already covered by (1), and there is no wire-protocol way to store an
 // event that is expired only *by the time it's queried* without
 // controlling wall-clock time. So (2) seeds the row directly into the
-// `events` table (schema.ts, chunk 1's frozen schema) to simulate "stored
+// `events` table (schema.ts) to simulate "stored
 // while valid, expired by query time" -- the one deliberate exception to
 // this suite's black-box-over-the-wire rule.
 import { env } from "cloudflare:workers";

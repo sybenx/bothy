@@ -13,9 +13,9 @@ const PROFILE_KIND = 0;
 // regardless of how often the hourly cron fires.
 const ICON_REFRESH_INTERVAL_SECONDS = 86400;
 
-// ALLOW_FOLLOWS is not declared in wrangler.jsonc's `vars` (ROADMAP.md
-// chunk 5), so it's undefined unless someone adds it in the Cloudflare
-// dashboard -- it's an opt-OUT, per CLAUDE.md "Configuration": enabled
+// ALLOW_FOLLOWS is not declared in wrangler.jsonc's `vars`, so it's
+// undefined unless someone adds it in the Cloudflare dashboard -- it's
+// an opt-OUT, per CLAUDE.md "Configuration": enabled
 // unless explicitly set to the exact string "false". An unset, empty, or
 // malformed value all resolve to enabled -- only "false" disables it.
 export function allowFollowsEnabled(env: Env): boolean {
@@ -35,9 +35,9 @@ export function getOwnerPubkey(sql: SqlStorage, env: Env): string | null {
 // write this row. Returns false if a row already existed (already
 // claimed by an earlier call).
 // `profile` is the owner's kind-0 name/picture, looked up once by the
-// Worker at claim time (CLAUDE.md "Claim implementation"; ROADMAP.md
-// chunk 5: "Derive NIP-11 name and icon from the owner's kind 0 at claim
-// time... Write to DO storage at claim."). Optional and best-effort --
+// Worker at claim time (CLAUDE.md "Claim implementation"): the NIP-11
+// name and icon are derived from the owner's kind-0 at claim time and
+// written to DO storage there. Optional and best-effort --
 // undefined fields are stored as null and nip11.ts falls back to
 // hardcoded defaults.
 export function claimOwner(sql: SqlStorage, pubkey: string, profile?: Profile): boolean {

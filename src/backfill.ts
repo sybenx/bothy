@@ -1,4 +1,4 @@
-// One-shot backfill (ROADMAP.md chunk 7): "Fetch the owner's own events
+// One-shot backfill: fetch the owner's own events
 // from the write relays in their kind 10002 and store them." This module
 // is the DO-storage-facing half -- pure functions over SqlStorage, called
 // from relay.ts's RPC methods, exactly like ownership.ts/storage.ts. The
@@ -52,9 +52,9 @@ export interface BackfillStatus {
 export type BackfillState = BackfillStatus & { ownerPubkey: string; canIngestNow: boolean };
 
 // Backfill must yield to the owner's own live traffic, not compete with
-// it for the shared 100,000 rows-written/day ceiling (ROADMAP.md chunk
-// 7: "a relay that can't accept the owner's new note because it's busy
-// importing 2023 has the priority backwards"). True once today's rolling
+// it for the shared 100,000 rows-written/day ceiling -- a relay that
+// can't accept the owner's new note because it's busy importing 2023 has
+// the priority backwards. True once today's rolling
 // rows-written estimate (storage.ts estimateRowsWritten24h, the same
 // number /api/stats already displays) still leaves backfill its reserved
 // share (BACKFILL_ROWS_SHARE_LIMIT, limits.ts) of the daily ceiling.
@@ -156,8 +156,8 @@ interface IngestResult {
 // once nothing cheaper has already ruled the event out.
 //   1. author mismatch -- a relay returning events under a pubkey other
 //      than the one asked for is either buggy or hostile; free to check,
-//      and "owner's events only" is the roadmap's own scope for this
-//      feature, not just an artifact of the REQ filter.
+//      and "owner's events only" is this feature's own scope (CLAUDE.md
+//      "What it is"), not just an artifact of the REQ filter.
 //   2. exact-id duplicate (eventExists) -- the same event will come back
 //      from every relay that has it, and re-verifying + re-storing an id
 //      this relay already has wastes the write budget this whole feature
@@ -246,7 +246,7 @@ export function applyBackfillPage(
           // still returned so relay.ts's live path can broadcast it).
           // Backfill never broadcasts, so counting an ephemeral kind here
           // would report progress that doesn't correspond to anything in
-          // `events` -- ROADMAP.md/CLAUDE.md's storage-semantics
+          // `events` -- CLAUDE.md's storage-semantics
           // requirement is "dropped rather than stored," and that has to
           // hold for the counter too, not just the row.
           if (result.stored && !isEphemeralKind(event.kind)) stored++;

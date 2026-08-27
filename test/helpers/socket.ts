@@ -100,7 +100,7 @@ export async function connectRelay(ip?: string): Promise<RelayConn> {
 }
 
 // The redacted notice shape src/relay.ts liveBroadcast sends to the
-// admin page's live feed (ROADMAP.md chunk 7) -- kind/time/truncated id
+// admin page's live feed -- kind/time/truncated id
 // only, never tags or content.
 export interface LiveNotice {
   kind: number;

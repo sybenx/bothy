@@ -201,12 +201,11 @@ export default {
     }
   },
 
-  // ALLOW_FOLLOWS refresh (ROADMAP.md chunk 4) -- a no-op when the env
-  // var is unset, see Relay.runCron(). One-shot backfill (ROADMAP.md
-  // chunk 7) shares this same trigger rather than requesting a second of
-  // the account's 5 available cron triggers -- see backfill-worker.ts for
-  // why its outbound sockets are opened here, in the Worker, and not
-  // inside runCron().
+  // ALLOW_FOLLOWS refresh -- a no-op when the env var is unset, see
+  // Relay.runCron(). One-shot backfill shares this same trigger rather
+  // than requesting a second of the account's 5 available cron triggers
+  // -- see backfill-worker.ts for why its outbound sockets are opened
+  // here, in the Worker, and not inside runCron().
   //
   // These two do unrelated jobs and must not share a failure: each is
   // caught and logged independently, so an exception in runCron (e.g. a

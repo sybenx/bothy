@@ -69,8 +69,8 @@ import { idMatchesContent, isCreatedAtTooFarInFuture, parseEventShape, verifySig
 const PING_PONG = new WebSocketRequestResponsePair("ping", "pong");
 
 // Tag on the hibernation API's own connection registry (getWebSockets)
-// that marks a socket as the admin page's live feed (ROADMAP.md chunk
-// 7) rather than a nostr protocol client -- see handleLiveFeed below.
+// that marks a socket as the admin page's live feed rather than a nostr
+// protocol client -- see handleLiveFeed below.
 // Using acceptWebSocket's built-in tagging means broadcast() can find
 // these sockets with ctx.getWebSockets(LIVE_FEED_TAG) without keeping a
 // second, memory-only registry that would need reconstructing after
@@ -108,7 +108,7 @@ const AUTH_MAX_DRIFT_SECONDS = 600;
 // time from the upgrade request's URL), used to check NIP-42 AUTH and
 // NIP-62 vanish `relay` tags against -- see relayTagMatchesHost below.
 // `challenge`/`authedPubkey` back the real NIP-42 challenge/response flow
-// gating gift wrap reads (ROADMAP.md chunk 6): a challenge is issued
+// gating gift wrap reads: a challenge is issued
 // lazily, the first time a REQ needs one, not proactively at connect.
 type Subscriptions = Record<string, Filter[]>;
 interface ConnState {
@@ -298,7 +298,7 @@ export class Relay extends DurableObject<Env> {
     const client = pair[0];
     const server = pair[1];
 
-    // The admin page's live feed (ROADMAP.md chunk 7) is a distinct,
+    // The admin page's live feed is a distinct,
     // push-only, unauthenticated channel -- not a nostr protocol
     // connection -- so it's routed to its own path rather than reusing
     // REQ/EVENT semantics. Keeping it separate means it never has to
@@ -377,8 +377,8 @@ export class Relay extends DurableObject<Env> {
 
   // Backs the NIP-11 document's name/icon (src/nip11.ts) -- derived from
   // the owner's kind 0 at claim time rather than a deploy-time var, see
-  // ROADMAP.md chunk 5. Null when unclaimed, when OWNER_PUBKEY skips
-  // storage entirely, or when the claim-time profile lookup failed; the
+  // Null when unclaimed, when OWNER_PUBKEY skips storage entirely, or
+  // when the claim-time profile lookup failed; the
   // caller (nip11.ts) falls back to hardcoded defaults in all those cases.
   async getIdentity(host?: string): Promise<{ profile: OwnerProfile; settings: RelaySettings }> {
     return withReadPath("identity", () => {
@@ -574,7 +574,7 @@ export class Relay extends DurableObject<Env> {
     }
   }
 
-  // One-shot backfill (ROADMAP.md chunk 7), read side. Called once per
+  // One-shot backfill, read side. Called once per
   // cron tick by backfill-worker.ts (the Worker, never this object,
   // opens the outbound sockets -- see that file's header comment) to
   // decide whether to discover relays, fetch a page, or do nothing. Null
@@ -701,7 +701,7 @@ export class Relay extends DurableObject<Env> {
 
     // NIP-62 vanish requests and NIP-59 gift wraps each have their own,
     // entirely different authorization -- neither goes through
-    // isAllowedWriter below (ROADMAP.md chunk 6). See handleVanish and
+    // isAllowedWriter below. See handleVanish and
     // handleGiftWrap.
     if (event.kind === VANISH_KIND) {
       this.handleVanish(ws, event);
@@ -730,8 +730,8 @@ export class Relay extends DurableObject<Env> {
     this.acceptEvent(ws, sql, event, auth.isOwner);
   }
 
-  // NIP-59 (nips/59.md) Gift Wrap accept path -- ROADMAP.md chunk 6's one
-  // deliberate exception to owner-only writes: any pubkey may write a
+  // NIP-59 (nips/59.md) Gift Wrap accept path -- the one deliberate
+  // exception to owner-only writes: any pubkey may write a
   // kind-1059 event as long as it p-tags the owner. CLAUDE.md "Threat
   // model" calls this out as "the only unauthenticated write path in the
   // project" and "the only unbounded write path" -- hence the extra
@@ -1017,7 +1017,7 @@ export class Relay extends DurableObject<Env> {
       filters.push(bound.filter);
     }
 
-    // NIP-42 gate on gift wrap reads (ROADMAP.md chunk 6, CLAUDE.md
+    // NIP-42 gate on gift wrap reads (CLAUDE.md
     // "Threat model": "an anonymous query returns every DM envelope the
     // owner has received, leaking volume and timing"). Rather than
     // guessing which filter shapes (kinds/authors/ids/tags, in whatever
@@ -1028,9 +1028,10 @@ export class Relay extends DurableObject<Env> {
     // pubkey is unguessable without already possessing it") and missed
     // that an ids-only filter naming a real, already-known gift wrap id
     // sailed straight through ungated -- true that nothing *new* leaks to
-    // someone who already has the event, but that's not the rule ROADMAP.md
-    // states ("Serve gift wraps only to the authenticated p-tagged
-    // recipient", no exception for "unless you already know the id").
+    // someone who already has the event, but that's not the rule this
+    // relay promises: gift wraps go only to the authenticated p-tagged
+    // recipient, with no exception for "unless you already know the id"
+    // (CLAUDE.md "What it is").
     // Reusing the real query engine here means the gate can't drift out
     // of sync with whatever storage.ts actually considers a match, the
     // way the hand-rolled version did. Cheap: one extra rows-read query
@@ -1079,7 +1080,7 @@ export class Relay extends DurableObject<Env> {
   }
 
   // NIP-42 (nips/42.md): AUTH MUST be answered with OK. Gift wrap reads
-  // (ROADMAP.md chunk 6, handleReq) are this relay's first auth-gated
+  // (handleReq) are this relay's first auth-gated
   // resource, so this now checks against a challenge actually issued to
   // this connection (state.challenge, set lazily in handleReq) rather
   // than always failing. On success, the authenticated pubkey is stored
@@ -1159,7 +1160,7 @@ export class Relay extends DurableObject<Env> {
   }
 
   // Pushes a redacted notice of a newly stored event to every open live
-  // feed connection (ROADMAP.md chunk 7). Gift wraps are never sent here,
+  // feed connection. Gift wraps are never sent here,
   // full stop, regardless of who is connected -- the admin page has no
   // way to authenticate (CLAUDE.md "Admin page" is static, unsigned), so
   // every live feed viewer is permanently the unauthenticated case NIP-42
@@ -1179,8 +1180,8 @@ export class Relay extends DurableObject<Env> {
   }
 
   // Ensures a DO alarm is scheduled no later than this connection's own
-  // expiry (ROADMAP.md chunk 7 follow-up: "close them after a fixed
-  // duration regardless of client behavior"). Alarms -- unlike a JS
+  // expiry: live feed sockets are closed after a fixed duration
+  // regardless of client behavior. Alarms -- unlike a JS
   // timer -- are hibernation-compatible: the platform wakes the object
   // at the scheduled time even if it evicted in the meantime, runs
   // alarm() below, and lets it hibernate again afterward, so this never

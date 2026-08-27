@@ -29,7 +29,7 @@ export const MAX_EVENTS_PER_REQ = 500;
 // who is *allowed* to write can cost -- a separate concern from the read
 // caps above, and from ownership.ts, which decides who may write at all.
 //
-// The original threat model (CLAUDE.md, chunk 6) had exactly one
+// The original threat model had exactly one
 // untrusted write path: kind-1059 gift wraps, "the only unbounded write
 // path", since every other write was the owner's own and the owner is
 // trusted not to attack their own relay. v0.2.0 made ALLOW_FOLLOWS an
@@ -396,7 +396,7 @@ export function boundFilter(filter: Filter): FilterBound {
   };
 }
 
-// Live feed (ROADMAP.md chunk 7) caps -- unlike the nostr protocol path
+// Live feed caps -- unlike the nostr protocol path
 // above, /live has no filters, no auth, and no per-message rate limit to
 // bound it with, so it gets its own two caps in relay.ts: a ceiling on
 // how many can be open at once (rejected at the WebSocket upgrade, before
@@ -408,7 +408,7 @@ export function boundFilter(filter: Filter): FilterBound {
 export const MAX_LIVE_FEED_CONNECTIONS = 5;
 export const LIVE_FEED_MAX_LIFETIME_MS = 10 * 60 * 1000;
 
-// One-shot backfill (ROADMAP.md chunk 7) -- events requested per relay
+// One-shot backfill -- events requested per relay
 // per cron tick. Cloudflare's own docs distinguish the Worker's 10ms/
 // request CPU limit (CLAUDE.md "The budget" table) from a Durable
 // Object's own CPU allowance, which defaults to 30 seconds per incoming
@@ -521,7 +521,7 @@ export const DAILY_ROWS_WRITTEN_LIMIT = 100_000;
 // two-sided window for auth events only.
 export const MAX_CREATED_AT_FUTURE_SECONDS = 3600;
 
-// Backfill (ROADMAP.md chunk 7) must yield to the owner's own live
+// Backfill must yield to the owner's own live
 // traffic, never compete with it for the shared daily rows-written
 // ceiling -- see backfill.ts hasBackfillHeadroom for the full reasoning.
 // Set at half the daily ceiling: simple to reason about, and it reserves

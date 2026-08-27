@@ -12,7 +12,7 @@
 // request's pubkey, so the "same pubkey" requirement in NIP-09 is
 // trivially satisfied for this suite's fixtures. storage.ts applyDeletion
 // checks it explicitly anyway (see its comment), since gift wraps
-// (ROADMAP.md chunk 6) broke that invariant relay-wide -- the gift-wrap
+// broke that invariant relay-wide -- the gift-wrap
 // carve-out (authorized by `p` tag, not pubkey) and its own tombstone
 // durability are tested in test/nip59-deletion.test.ts.
 import { env } from "cloudflare:workers";

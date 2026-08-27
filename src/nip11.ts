@@ -11,7 +11,7 @@ import {
 import type { RelaySettings } from "./storage";
 import { version } from "../package.json";
 
-// Hardcoded fallbacks (ROADMAP.md chunk 5: "Hardcoded fallbacks in code
+// Hardcoded fallbacks (the last rung of the identity chain: fallbacks in code
 // for when the lookup fails"). The bottom rung of the chain below: used
 // when nothing else in it resolved.
 export const DEFAULT_NAME = "bothy";
@@ -92,7 +92,7 @@ export function buildRelayInfo(
   const info: Record<string, unknown> = {
     name: resolveName(env, stored, profile),
     description: resolveDescription(env, stored, profile),
-    // NIP-42 (ROADMAP.md chunk 6): real as of gift wrap reads being the
+    // NIP-42: real as of gift wrap reads being the
     // first auth-gated resource -- relay.ts issues an actual challenge
     // and checks it, not just the unconditional AUTH-message checklist.
     // NIP-59/62: gift wrap accept/read/delete and vanish requests, same

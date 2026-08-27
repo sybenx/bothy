@@ -45,7 +45,7 @@ export function dTagValue(tags: string[][]): string {
 }
 
 // NIP-65 (nips/65.md) Relay List Metadata -- the owner's own outbox/inbox
-// relay set. Backfill (ROADMAP.md chunk 7) reads this to know which
+// relay set. Backfill reads this to know which
 // relays hold the owner's history; it is never written by this relay.
 export const RELAY_LIST_KIND = 10002;
 

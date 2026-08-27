@@ -1,4 +1,4 @@
-// Owner-gated writes (ROADMAP.md chunk 2; CLAUDE.md "Threat model": "Writes
+// Owner-gated writes (CLAUDE.md "Threat model": "Writes
 // are owner-only and signature-verified" for anyone not the owner or,
 // under the ALLOW_FOLLOWS default, one of the owner's follows).
 //
@@ -11,7 +11,8 @@
 // The OWNER_PUBKEY fixture here is injected as a miniflare binding in
 // vitest.config.ts, matching CLAUDE.md's documented env-override path:
 // "If OWNER_PUBKEY is set in env, skip storage entirely, use the env
-// value." The TOFU claim flow itself is chunk 4's job, not this suite's.
+// value." The TOFU claim flow itself is test/claim.test.ts's job, not
+// this suite's.
 import { describe, expect, it, vi } from "vitest";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
