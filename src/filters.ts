@@ -1,5 +1,61 @@
 import { type Filter, type NostrEvent, tagFilterEntries } from "./nostr";
 
+// How many tag rows one `#<letter>` condition is allowed to look at, per
+// event the client asked for.
+//
+// A tag condition is resolved as `id IN (SELECT event_id FROM event_tags
+// WHERE ...)`, and until v0.7.7 that subquery was bounded by nothing at
+// all: it read every row carrying a named tag value, whatever the
+// filter's `limit`. Measured at E=1,000 with every event p-tagging the
+// owner, `{"#p":[owner],"limit":20}` read 4,000 rows -- and 4,000 again
+// at `limit: 1`. Flat in the limit, linear in the table. That made
+// limits.ts boundFilter structurally inert on the shape: halving a limit
+// that the cost does not depend on can neither clamp the filter nor ever
+// refuse it, so the one filter shape the read guard could not price was
+// also the one NIP-17 clients send on every connect (relay.ts
+// handleGiftWrap requires every gift wrap to p-tag the owner, which by
+// construction makes `#p:<owner>` the highest-cardinality tag value in
+// the table).
+//
+// Bounding the subquery is what makes the cost model in limits.ts true
+// rather than aspirational: `ORDER BY created_at DESC LIMIT n` against
+// idx_event_tags_lookup (tag_name, tag_value, created_at) streams the
+// index in the order the outer query already wants and stops, so the
+// cost becomes 4 x n and falls with the limit like every other admitted
+// shape. Measured, same fixture: 400 rows at `limit: 20`, 4 at
+// `limit: 1`.
+//
+// The depth is DERIVED, not chosen: at MAX_FILTER_LIMIT a single-value
+// tag filter should cost exactly the per-filter ceiling and no more, so
+//
+//   TAG_SCAN_DEPTH = MAX_FILTER_ROWS_READ / (TAG_ROWS_READ_PER_MATCH x MAX_FILTER_LIMIT)
+//                  = 10,000 / (4 x 500) = 5
+//
+// It lives here rather than in limits.ts with the other caps only because
+// limits.ts already imports this module; test/read-cost.test.ts asserts
+// the identity above against those three constants so the number cannot
+// go stale when one of them moves.
+//
+// What this trades away, stated plainly: completeness in one page. The
+// subquery returns the newest TAG_SCAN_DEPTH x limit tag rows, and any
+// other condition in the filter -- `kinds` most of all -- then narrows
+// what survives, so a client can be handed fewer events than it asked
+// for even though more exist. NIP-01 makes `limit` a maximum rather than
+// a quota (nips/01.md), so a short page is legal; what makes it workable
+// is the `since`/`until` pushdown below, which slides the window, so a
+// client paginating with `until` still walks the whole history, just in
+// smaller steps. The assumption underneath is density: a `#p:<owner>`
+// filter for kind 1059 is short-paged in proportion to how few of the
+// owner's p-tagged events are gift wraps, and on a personal relay whose
+// non-owner write traffic is mostly gift wraps that ratio is high. If it
+// ever is not, this constant is the dial -- and paying for it means
+// paying rows read, which is the ceiling that took this relay down.
+export const TAG_SCAN_DEPTH = 5;
+
+export function tagScanLimit(limit: number): number {
+  return limit * TAG_SCAN_DEPTH;
+}
+
 // Turns one REQ filter into a SQL query against the frozen schema
 // (schema.ts). Every query also excludes events whose `expiration` has
 // passed -- NIP-40 "SHOULD NOT send expired events to clients, even if
@@ -41,10 +97,30 @@ export function buildFilterQuery(
   }
   for (const [letter, values] of tagFilterEntries(filter)) {
     if (values.length === 0) return null;
-    conditions.push(
-      `id IN (SELECT event_id FROM event_tags WHERE tag_name = ? AND tag_value IN (${placeholders(values.length)}))`,
-    );
-    params.push(letter, ...values);
+    const subConditions = [`tag_name = ? AND tag_value IN (${placeholders(values.length)})`];
+    const subParams: unknown[] = [letter, ...values];
+    // `since`/`until` are pushed down into the subquery, not left to the
+    // outer query. `event_tags.created_at` IS the event's own created_at
+    // (storage.ts insertEventRow copies it), so this is the same bound
+    // expressed against the index that serves the lookup -- it narrows
+    // the range scanned rather than discarding rows after they have been
+    // read, and it is what makes `until` pagination work underneath the
+    // LIMIT below.
+    if (filter.since !== undefined) {
+      subConditions.push("created_at >= ?");
+      subParams.push(filter.since);
+    }
+    if (filter.until !== undefined) {
+      subConditions.push("created_at <= ?");
+      subParams.push(filter.until);
+    }
+    let subquery = `SELECT event_id FROM event_tags WHERE ${subConditions.join(" AND ")}`;
+    if (filter.limit !== undefined) {
+      subquery += " ORDER BY created_at DESC LIMIT ?";
+      subParams.push(tagScanLimit(filter.limit));
+    }
+    conditions.push(`id IN (${subquery})`);
+    params.push(...subParams);
   }
 
   let sql = `SELECT id, pubkey, created_at, kind, tags, content, sig FROM events WHERE ${conditions.join(" AND ")} ORDER BY created_at DESC, id ASC`;

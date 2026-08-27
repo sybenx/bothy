@@ -34,8 +34,14 @@
 // got there.
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
-import { buildFilterQuery, expandFilter, expandFilterCount } from "../src/filters";
-import { boundFilter, MAX_FILTER_ROWS_READ } from "../src/limits";
+import { buildFilterQuery, expandFilter, expandFilterCount, tagScanLimit } from "../src/filters";
+import {
+  boundFilter,
+  filterReadCost,
+  MAX_FILTER_LIMIT,
+  MAX_FILTER_ROWS_READ,
+  TAG_ROWS_READ_PER_MATCH,
+} from "../src/limits";
 import type { Filter } from "../src/nostr";
 import { queryFilter, readStatsSnapshot } from "../src/storage";
 import { readMetricsSnapshot, resetReadMetrics } from "../src/read-metrics";
@@ -105,9 +111,19 @@ beforeAll(async () => {
         sql.exec(
           `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at) VALUES (?, ?, ?, ?)`,
           t % 2 === 0 ? "e" : "p",
-          `v${i}_${t}`,
+          // One of the five is the same value on every event: the owner's
+          // own pubkey, p-tagged. That is not a contrived shape -- every
+          // gift wrap this relay accepts must p-tag the owner
+          // (relay.ts handleGiftWrap), so `#p:<owner>` is by construction
+          // the highest-cardinality tag value in the table, and it is
+          // exactly what a NIP-17 client asks for. The other four stay
+          // unique, so both ends of the cardinality range are seeded.
+          t === 1 ? OWNER_PUBKEY_HEX : `v${i}_${t}`,
           id,
-          now,
+          // The event's own created_at, as storage.ts insertEventRow
+          // copies it -- the tag index's ordering column is only usable
+          // as a bound on the outer query if the two agree.
+          now - (EVENTS - i) * 60,
         );
       }
     }
@@ -184,6 +200,130 @@ describe("rows read by query shape", () => {
       );
       expect(query).not.toBeNull();
       expect(rowsRead(sql, query!.sql, ...query!.params)).toBeLessThan(100);
+    });
+  });
+
+  it("bounds a high-cardinality tag filter by its limit, where it once read every matching row", async () => {
+    // The shape that survived the first read-abuse guard untouched.
+    // buildFilterQuery resolved a `#<letter>` condition as an unbounded
+    // `id IN (SELECT event_id FROM event_tags WHERE ...)`, so the
+    // subquery read every row carrying the named value whatever the
+    // filter's `limit` -- and `#p:<owner>` names the one value every gift
+    // wrap in the table carries. Flat in the limit meant limits.ts
+    // boundFilter could neither clamp the filter nor refuse it: halving a
+    // limit the cost does not depend on changes nothing.
+    //
+    // The "before" figure is measured live, against the same rows, by
+    // stripping the ORDER BY/LIMIT back off the subquery.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+
+      const small = buildFilterQuery({ "#p": [OWNER_PUBKEY_HEX], limit: 20 }, now);
+      const tiny = buildFilterQuery({ "#p": [OWNER_PUBKEY_HEX], limit: 1 }, now);
+      expect(small).not.toBeNull();
+      expect(tiny).not.toBeNull();
+
+      // 4 rows per tag row scanned -- the index entry and the
+      // `event_tags` row it points at (idx_event_tags_lookup carries no
+      // `event_id`), then the primary key entry and the `events` row.
+      // This is the measurement limits.ts TAG_ROWS_READ_PER_MATCH is set
+      // from, and TAG_SCAN_DEPTH x limit is how far the scan may go.
+      expect(rowsRead(sql, small!.sql, ...small!.params)).toBe(
+        TAG_ROWS_READ_PER_MATCH * tagScanLimit(20),
+      );
+      expect(rowsRead(sql, tiny!.sql, ...tiny!.params)).toBe(
+        TAG_ROWS_READ_PER_MATCH * tagScanLimit(1),
+      );
+
+      // The property that was missing: asking for less costs less.
+      const unbounded = small!.sql.replace(/ ORDER BY created_at DESC LIMIT \?\)/, ")");
+      const unboundedParams = small!.params.filter((p) => p !== tagScanLimit(20));
+      const before = rowsRead(sql, unbounded, ...unboundedParams);
+      // Four per tag row in the table, plus the one row the outer scan
+      // stops on: a function of E, with `limit` nowhere in it.
+      expect(before).toBe(4 * EVENTS + 1);
+      const beforeAtOne = rowsRead(
+        sql,
+        tiny!.sql.replace(/ ORDER BY created_at DESC LIMIT \?\)/, ")"),
+        ...tiny!.params.filter((p) => p !== tagScanLimit(1)),
+      );
+      // Identical at limit 1 and limit 20: the old cost was a function of
+      // the table, not of the request.
+      expect(beforeAtOne).toBe(before);
+    });
+  });
+
+  it("prices a tag condition as an addition to the driving path, not an alternative to it", async () => {
+    // A `#<letter>` condition is a conjunct: its subquery runs whatever
+    // else the filter names. filterReadCost used to offer it as one
+    // candidate access path among several and take the cheapest, which
+    // priced a query that pays for both as though it paid for one.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      const filter = { "#p": [OWNER_PUBKEY_HEX], kinds: [7], limit: 20 };
+
+      const query = buildFilterQuery(filter, now);
+      expect(query).not.toBeNull();
+      const measured = rowsRead(sql, query!.sql, ...query!.params);
+
+      const cost = filterReadCost(filter);
+      expect(cost).not.toBeNull();
+      // Both terms, added -- and the estimate stays on the safe side of
+      // what SQLite actually does.
+      expect(cost!.rowsRead).toBe(
+        2 * 20 + 1 + TAG_ROWS_READ_PER_MATCH * tagScanLimit(20),
+      );
+      expect(cost!.via).toContain("idx_event_tags_lookup");
+      expect(measured).toBeLessThan(cost!.rowsRead);
+      // The old model would have charged the `kinds` index alone.
+      expect(measured).toBeGreaterThan(2 * 20 + 1);
+    });
+  });
+
+  it("keeps the tag-scan depth derived from the ceiling it is meant to respect", () => {
+    // filters.ts TAG_SCAN_DEPTH is not a tuning knob picked by hand: it
+    // is the depth at which a single-value tag filter asking for
+    // MAX_FILTER_LIMIT events costs exactly the per-filter ceiling. If
+    // any of these three moves, the depth has to move with it, and this
+    // is what says so.
+    expect(TAG_ROWS_READ_PER_MATCH * tagScanLimit(MAX_FILTER_LIMIT)).toBe(MAX_FILTER_ROWS_READ);
+  });
+
+  it("clamps a tag filter's limit instead of admitting it at any cost", () => {
+    // The whole point of bounding the subquery. Before it, this filter
+    // was admitted at whatever limit it asked for, because the cost the
+    // guard computed did not move when the limit did.
+    const bound = boundFilter({ "#p": [OWNER_PUBKEY_HEX, "b".repeat(64), "c".repeat(64)], limit: 500 });
+    expect(bound.ok).toBe(true);
+    if (bound.ok) {
+      expect(bound.filter.limit).toBeLessThan(500);
+      expect(bound.cost.rowsRead).toBeLessThanOrEqual(MAX_FILTER_ROWS_READ);
+    }
+  });
+
+  it("narrows a paginating tag filter to the window it asked for", async () => {
+    // `since`/`until` are pushed into the tag subquery rather than
+    // applied to its output. `event_tags.created_at` is the event's own,
+    // so the bound is exact -- and without the pushdown a bounded
+    // subquery would hand `until` the newest rows in the table and then
+    // discard all of them, which is to say pagination would stop dead
+    // after the first page.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      const until = now - 500 * 60;
+      const query = buildFilterQuery({ "#p": [OWNER_PUBKEY_HEX], until, limit: 20 }, now);
+      expect(query).not.toBeNull();
+
+      const cursor = sql.exec(query!.sql, ...query!.params);
+      const rows = cursor.toArray() as { created_at: number }[];
+      // A full page, from the right end of the table, at the same cost as
+      // the first page.
+      expect(rows).toHaveLength(20);
+      expect(Math.max(...rows.map((r) => r.created_at))).toBeLessThanOrEqual(until);
+      expect(cursor.rowsRead).toBe(TAG_ROWS_READ_PER_MATCH * tagScanLimit(20));
     });
   });
 

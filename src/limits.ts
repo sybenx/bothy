@@ -1,5 +1,5 @@
 import { tagFilterEntries, type Filter } from "./nostr";
-import { expandFilterCount } from "./filters";
+import { expandFilterCount, tagScanLimit } from "./filters";
 import { eventRemovalBudget, eventRowCost, indexesOn } from "./schema";
 
 // Hijacking is not the threat here. Read abuse is. The write path is
@@ -208,6 +208,16 @@ export const PUBKEY_RATE_LIMIT_MAX_TRACKED = 10_000;
 // they bound a range, and a range ahead of the sort column still leaves
 // SQLite a sort to do -- which is why a filter of nothing but
 // since/until/limit remains rejected, exactly as before.
+//
+// A `#<letter>` condition adds a second term rather than choosing
+// between paths, since it is a conjunct and is evaluated whatever else
+// the filter names:
+//
+//   rows read  =  combinations x (2 x limit + 1)  +  values x 4 x TAG_SCAN_DEPTH x limit
+//
+// Both terms scale with `limit`, which is the property the whole guard
+// rests on and the one the tag term did not have until v0.7.7 -- see
+// filters.ts TAG_SCAN_DEPTH.
 // ---------------------------------------------------------------------
 
 // Cloudflare Workers Free's daily rows-READ ceiling, the companion to
@@ -230,6 +240,24 @@ export const MAX_FILTER_ROWS_READ = DAILY_ROWS_READ_LIMIT / 500;
 // derived -- 41 rows for a limit of 20.
 const ROWS_READ_PER_MATCH = 2;
 
+// Rows read per tag row a `#<letter>` condition looks at. Twice the
+// figure above, because a tag lookup pays the same two rows twice over:
+// idx_event_tags_lookup is (tag_name, tag_value, created_at) and carries
+// no `event_id`, so each match costs an index entry plus the
+// `event_tags` row it points at to learn the id -- and then the outer
+// `id IN (...)` costs the primary key entry plus the `events` row.
+// Measured at 4 exactly for a single tag value (test/read-cost.test.ts:
+// 400 rows for a scan of 100).
+//
+// It is charged per named value, which for more than one value is
+// deliberately pessimistic: SQLite merges the ranges and stops at the
+// subquery's LIMIT, so two values cost ~4.5 rows per scanned row rather
+// than 8. The worst case that cannot be exceeded is each named value
+// contributing a full scan's worth of index entries and table rows
+// (2 x values) plus the outer key lookups (2), which is what this
+// bounds.
+export const TAG_ROWS_READ_PER_MATCH = 4;
+
 // Which filter field pins which indexed column to a value.
 //
 // `created_at` is deliberately absent. `since`/`until` constrain it to a
@@ -247,13 +275,21 @@ export interface FilterReadCost {
   // Estimated rows read to answer this filter.
   rowsRead: number;
   // Which access path produces that estimate -- an index name, or the
-  // primary key. Carried so the test harness and any future diagnostic
-  // can say WHY a filter is cheap, not just that it is.
+  // primary key, or a driver and a tag conjunct joined by `+` when the
+  // filter pays for both. Carried so the test harness and any future
+  // diagnostic can say WHY a filter is cheap, not just that it is.
   via: string;
 }
 
 // The cheapest bounded way to answer this filter, or null when nothing
 // bounds it below the size of the table.
+//
+// Two parts, and they compose differently. The access paths (primary key
+// and the ordered indexes on `events`) are ALTERNATIVES -- SQLite picks
+// one, so the cheapest is the estimate. A `#<letter>` condition is not
+// an alternative but an addition: it is a conjunct, its subquery runs
+// whatever else the filter names, and its cost is added to whichever
+// path drives.
 //
 // `limit` is taken as given: callers pass an already-clamped filter, and
 // boundFilter below is what does the clamping.
@@ -268,32 +304,9 @@ export function filterReadCost(filter: Filter): FilterReadCost | null {
     candidates.push({ rowsRead: filter.ids.length, via: "events primary key" });
   }
 
-  // Tag filters, through idx_event_tags_lookup. buildFilterQuery
-  // resolves these as `id IN (SELECT event_id FROM event_tags WHERE
-  // tag_name = ? AND tag_value IN (...))`, an exact seek per named
-  // value.
-  //
-  // Be honest about this one: it is the single estimate here that can be
-  // wrong LOW. The subquery is not bounded by `limit` -- it reads every
-  // tag row carrying a named value -- so a filter like
-  // `{"#p":[owner]}` on a relay where most events p-tag the owner costs
-  // far more than this says. It is modelled as limit-bounded because
-  // every tag value a real client asks about is a specific event id or
-  // pubkey matching a handful of rows (measured: 5 rows for one match),
-  // and because pricing it correctly would take a COUNT query, i.e. a
-  // read, to decide whether a read is affordable. Recorded rather than
-  // fixed, and unchanged from the behaviour before this guard -- tag
-  // filters were always accepted.
-  const tags = tagFilterEntries(filter);
-  if (tags.length > 0) {
-    const values = tags.reduce((n, [, v]) => n + v.length, 0);
-    if (values > 0) {
-      candidates.push({
-        rowsRead: values * ROWS_READ_PER_MATCH * limit,
-        via: "idx_event_tags_lookup",
-      });
-    }
-  }
+  // Tag conditions are handled after the access paths below, because
+  // they are not an access path. See the block above `return` at the
+  // bottom of this function.
 
   // The ordered indexes on `events`. An index qualifies when every one
   // of its key columns is pinned by the filter at all -- once
@@ -330,11 +343,51 @@ export function filterReadCost(filter: Filter): FilterReadCost | null {
     });
   }
 
-  if (candidates.length === 0) return null;
   // SQLite picks one access path; the cheapest available is the honest
   // estimate of what it will pick, and the pessimistic direction is
   // already covered by rejecting anything above MAX_FILTER_ROWS_READ.
-  return candidates.reduce((best, c) => (c.rowsRead < best.rowsRead ? c : best));
+  const driver =
+    candidates.length === 0
+      ? null
+      : candidates.reduce((best, c) => (c.rowsRead < best.rowsRead ? c : best));
+
+  // Tag conditions, through idx_event_tags_lookup. These are priced
+  // ADDED to whatever drives the query rather than offered as an
+  // alternative to it, which is the correction v0.7.7 made: a
+  // `#<letter>` condition is a conjunct, so its subquery is evaluated
+  // whatever else the filter names, and taking the cheaper of the two
+  // priced a query that runs both as though it ran one. Measured, at
+  // E=1,000 with every event p-tagging the owner:
+  // `{"#p":[owner],"kinds":[1059],"limit":20}` reads 127 rows, against
+  // the 41 the `kinds` index alone was charged for.
+  //
+  // The estimate is now bounded rather than hopeful, because the query
+  // is: filters.ts tagScanLimit caps how far into the tag index the
+  // subquery may read, so this scales with the filter's `limit` instead
+  // of with the number of rows in the table that happen to carry the
+  // named value. That is what lets boundFilter below do anything at all
+  // with the shape -- see the comment on TAG_SCAN_DEPTH for the
+  // measurement that forced the change, and for what a bounded scan
+  // gives up in exchange.
+  //
+  // The bound only exists when the filter carries a `limit`, so neither
+  // does the estimate: a limitless tag filter is priced as unbounded and
+  // refused unless something else in the filter can carry it. Nothing
+  // reaches storage that way in practice -- boundFilter always supplies
+  // one -- but the two must agree on when the subquery is capped, or
+  // this function is describing a query the relay does not run.
+  const tags = tagFilterEntries(filter);
+  const values = tags.reduce((n, [, v]) => n + v.length, 0);
+  if (values > 0) {
+    if (filter.limit === undefined) return null;
+    const tagRows = values * TAG_ROWS_READ_PER_MATCH * tagScanLimit(filter.limit);
+    return {
+      rowsRead: (driver?.rowsRead ?? 0) + tagRows,
+      via: driver === null ? "idx_event_tags_lookup" : `${driver.via} + idx_event_tags_lookup`,
+    };
+  }
+
+  return driver;
 }
 
 export type FilterBound =

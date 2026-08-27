@@ -31,7 +31,14 @@ import {
 import { handleManagementCall, type ManagementResponse } from "./nip86";
 import { resolveIcon, resolveName, type OwnerProfile } from "./nip11";
 import { version } from "../package.json";
-import { type Filter, GIFT_WRAP_KIND, type NostrEvent, pTagValues, VANISH_KIND } from "./nostr";
+import {
+  type Filter,
+  GIFT_WRAP_KIND,
+  type NostrEvent,
+  pTagValues,
+  tagFilterEntries,
+  VANISH_KIND,
+} from "./nostr";
 import {
   allowFollowsEnabled,
   CONTACT_LIST_KIND,
@@ -1113,21 +1120,15 @@ export class Relay extends DurableObject<Env> {
     // (CLAUDE.md "What it is").
     // Reusing the real query engine here means the gate can't drift out
     // of sync with whatever storage.ts actually considers a match, the
-    // way the hand-rolled version did. Cheap: one extra rows-read query
-    // per filter, `limit: 1` since only existence matters, and skipped
-    // entirely when `kinds` already rules out 1059 without touching
-    // storage at all.
+    // way the hand-rolled version did.
+    //
+    // The AUTH check comes FIRST, and the probe only runs when it can
+    // still change the outcome. The owner is allowed to read gift wraps,
+    // so for them the probe decides nothing and is pure rows read on
+    // every REQ they send; a filter naming kind 1059 outright is refused
+    // without touching storage at all.
     const owner = getOwnerPubkey(this.sql, this.env);
-    const requestsGiftWraps = filters.some((f) => {
-      if (f.kinds !== undefined) return f.kinds.includes(GIFT_WRAP_KIND);
-      if (owner === null) return false;
-      return withReadPath(
-        "giftWrapGate",
-        () =>
-          queryFilter(this.sql, { ...f, kinds: [GIFT_WRAP_KIND], limit: 1 }, nowSeconds()).length > 0,
-      );
-    });
-    if (requestsGiftWraps && state.authedPubkey !== owner) {
+    if (state.authedPubkey !== owner && this.requestsGiftWraps(filters, owner)) {
       if (state.authedPubkey === undefined) {
         if (!state.challenge) {
           state.challenge = crypto.randomUUID();
@@ -1149,6 +1150,37 @@ export class Relay extends DurableObject<Env> {
       send(ws, ["EVENT", subId, event]);
     }
     send(ws, ["EOSE", subId]);
+  }
+
+  // Whether any filter in this REQ could surface a kind-1059 event.
+  // Answered from `kinds` alone where that settles it, and otherwise by
+  // re-running the filter against real storage restricted to gift wraps
+  // -- see the gate in handleReqInner for why the question is asked of
+  // storage rather than of the filter's shape.
+  //
+  // The probe's `limit` is the filter's own whenever the filter carries a
+  // tag condition, and 1 otherwise, and the difference is load-bearing
+  // rather than a tuning choice. filters.ts bounds a tag subquery to
+  // tagScanLimit(limit) rows, so how far a filter can reach into the tag
+  // index depends on its limit: probing `{"#p":[owner]}` at limit 1 would
+  // look at five tag rows and clear a REQ that goes on to read a hundred,
+  // and a gift wrap sitting anywhere past the fifth would be handed to an
+  // unauthenticated client. Probing at the same limit looks at exactly
+  // the rows the REQ itself can return. Every other filter shape is
+  // complete at any limit -- existence does not depend on it -- so 1 is
+  // still enough there, and the common kinds-less REQ keeps paying three
+  // rows for its gate.
+  private requestsGiftWraps(filters: Filter[], owner: string | null): boolean {
+    return filters.some((f) => {
+      if (f.kinds !== undefined) return f.kinds.includes(GIFT_WRAP_KIND);
+      if (owner === null) return false;
+      const limit = tagFilterEntries(f).length > 0 ? (f.limit ?? 1) : 1;
+      return withReadPath(
+        "giftWrapGate",
+        () =>
+          queryFilter(this.sql, { ...f, kinds: [GIFT_WRAP_KIND], limit }, nowSeconds()).length > 0,
+      );
+    });
   }
 
   private handleClose(ws: WebSocket, subId: unknown): void {

@@ -201,11 +201,13 @@ describe("NIP-42 gift wrap read gate", () => {
 // relay actually promises (CLAUDE.md "What it is": serve gift wraps only to
 // the authenticated p-tagged recipient", no carve-out for "unless you
 // already know the id"), and the old gate let it through unauthenticated.
-// These four lock in the shapes that matter: two that must be gated
+// These five lock in the shapes that matter: two that must be gated
 // despite not naming 1059 as the *only* kind, one that must be gated
-// despite carrying no kind or `#p` constraint at all, and one that must
-// NOT be gated because its `kinds` structurally excludes 1059 regardless
-// of what else the filter asks for.
+// despite carrying no kind or `#p` constraint at all, one that must be
+// gated despite the gift wrap sitting deeper in the tag index than the
+// probe's own default limit would reach, and one that must NOT be gated
+// because its `kinds` structurally excludes 1059 regardless of what else
+// the filter asks for.
 // The REQ-time gate above proves nothing about *future* events: a filter
 // that matches no stored gift wrap at registration time (most simply,
 // any `#p` filter naming the owner while the inbox is empty) registers
@@ -316,6 +318,48 @@ describe("NIP-42 gift wrap read gate: filter-shape coverage", () => {
     await publish(conn, giftWrap);
 
     conn.send(["REQ", "shapeC", { ids: [giftWrap.id] }]);
+    const frame = await conn.nextMessage();
+
+    expect(frame[0]).toBe("AUTH");
+    conn.close();
+  });
+
+  it("gates a gift wrap sitting deeper in the tag index than a limit-1 probe would look", async () => {
+    // The gate probes storage by re-running the client's filter
+    // restricted to kind 1059, and it used to do that at `limit: 1` on
+    // the grounds that only existence mattered. That was true while
+    // every query was complete. It stopped being true when filters.ts
+    // began bounding a tag subquery to TAG_SCAN_DEPTH x limit rows: at
+    // limit 1 the probe looks at five tag rows, so a gift wrap sitting
+    // any deeper than that is invisible to the probe and returned by the
+    // REQ, which is the gate failing open on exactly the filter NIP-17
+    // clients send. The probe now shares the REQ's own limit whenever a
+    // tag condition is present, so it can never look at less than what
+    // it is gating.
+    const conn = await connectRelay();
+    const now = Math.floor(Date.now() / 1000);
+    const giftWrap = signEvent(randomKeypair().secretKeyHex, {
+      kind: 1059,
+      tags: [["p", OWNER_PUBKEY_HEX]],
+      content: "x",
+      created_at: now - 100,
+    });
+    await publish(conn, giftWrap);
+    // Ten newer events carrying the same `#p` value, so the gift wrap is
+    // the eleventh row of the tag range rather than the first.
+    for (let i = 0; i < 10; i++) {
+      await publish(
+        conn,
+        signEvent(OWNER_SECRET_KEY_HEX, {
+          kind: 1,
+          tags: [["p", OWNER_PUBKEY_HEX]],
+          content: `note ${i}`,
+          created_at: now - 50 + i,
+        }),
+      );
+    }
+
+    conn.send(["REQ", "shapeE", { "#p": [OWNER_PUBKEY_HEX], limit: 20 }]);
     const frame = await conn.nextMessage();
 
     expect(frame[0]).toBe("AUTH");
