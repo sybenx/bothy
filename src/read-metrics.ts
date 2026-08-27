@@ -223,56 +223,6 @@ export interface ReadPathReport {
   share: number;
 }
 
-// ---------------------------------------------------------------------
-// R: replaceable/addressable replacements, counted as EVENTS rather than
-// as rows read.
-//
-// Every other number in this module attributes rows to a path. This one
-// counts occurrences, because the quantity that decides whether the
-// relay survives is not what a replacement costs -- that is known and
-// measured, T rows, about 5E -- but HOW OFTEN one happens. The path
-// spends 5E x R rows/day and clears the 5,000,000 ceiling at
-// E x R = 1,000,000, so R is the whole argument (see the comment on
-// storage.ts deleteEventRow).
-//
-// R can be estimated from the owner's posting habits and the follow
-// count, and that estimate lands on a range spanning the point where this
-// path overtakes the cron floor -- which is precisely why estimating it
-// is not good enough. This counter makes it observable on /api/stats
-// after deploy.
-//
-// In memory like everything else here, so it is a RATE over `sinceMs`,
-// not a daily total: read `projected24h`, and read it against a sample
-// long enough to mean something. A Durable Object that has been awake for
-// four minutes has seen four minutes of the owner's habits.
-// ---------------------------------------------------------------------
-let replacements = 0;
-
-// Called by storage.ts storeEvent at the two sites that supersede an
-// existing version -- and deliberately NOT from deleteEventRow itself,
-// which is also reached by NIP-09 deletion, NIP-62 vanish and NIP-86
-// banevent. Those pay the same per-call cost but are operator actions at
-// operator pace, not the per-event drumbeat R is trying to measure, and
-// folding them in would inflate exactly the number the fix decision turns
-// on.
-export function countReplacement(): void {
-  if (startedAtMs === null) startedAtMs = Date.now();
-  replacements++;
-}
-
-export interface ReplacementReport {
-  // Replacements observed in this sample.
-  count: number;
-  // Extrapolated to 24h at the observed rate -- this is R. Null under a
-  // minute of uptime, where it would be noise multiplied by 1,440.
-  projected24h: number | null;
-  // Rows read per replacement is T, so this path's daily spend is
-  // roughly `projected24h` x T. Stated as the table size at which this
-  // path alone reaches the 5,000,000/day ceiling, since that is the
-  // number the decision actually turns on: E = 1,000,000 / R.
-  ceilingAtEvents: number | null;
-}
-
 export interface ReadMetricsSnapshot {
   // Milliseconds this sample covers. Counters live in memory and reset
   // on eviction, so this is what says whether the breakdown below
@@ -285,9 +235,6 @@ export interface ReadMetricsSnapshot {
   // be noise multiplied by 1,440.
   projected24h: number | null;
   paths: ReadPathReport[];
-  // R, and what it implies. See ReplacementReport above and the comment
-  // on storage.ts deleteEventRow.
-  replacements: ReplacementReport;
 }
 
 const MIN_SAMPLE_MS = 60_000;
@@ -312,27 +259,12 @@ export function readMetricsSnapshot(): ReadMetricsSnapshot {
   }
   paths.sort((a, b) => b.rowsRead - a.rowsRead);
 
-  const replacementsPerDay =
-    sinceMs >= MIN_SAMPLE_MS ? (replacements * 86_400_000) / sinceMs : null;
-
   return {
     sinceMs,
     totalRowsRead,
     projected24h:
       sinceMs >= MIN_SAMPLE_MS ? Math.round((totalRowsRead * 86_400_000) / sinceMs) : null,
     paths,
-    replacements: {
-      count: replacements,
-      projected24h: replacementsPerDay === null ? null : Math.round(replacementsPerDay),
-      // E x R = 1,000,000. Null when R is unknown, and null rather than
-      // Infinity when R is zero: "no replacements seen in this sample" is
-      // not the same claim as "this path will never bind", and a sample
-      // this short is the likeliest reason to see zero.
-      ceilingAtEvents:
-        replacementsPerDay === null || replacementsPerDay <= 0
-          ? null
-          : Math.round(1_000_000 / replacementsPerDay),
-    },
   };
 }
 
@@ -342,5 +274,4 @@ export function resetReadMetrics(): void {
   counters.clear();
   startedAtMs = null;
   currentPath = "unattributed";
-  replacements = 0;
 }

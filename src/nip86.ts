@@ -31,6 +31,7 @@ import {
   unblockIp,
 } from "./storage";
 import { getOwnerPubkey } from "./ownership";
+import { normalizeIp } from "./ip";
 import { normalizePubkey } from "./pubkey";
 
 // nips/86.md: "a JSON-RPC-like request-response protocol over HTTP, on
@@ -250,7 +251,18 @@ export function handleManagementCall(
       // shared exit node, a test), and it is also the single most
       // plausible way to lock yourself out of your own relay by
       // accident -- so it costs one extra deliberate call.
-      if (ip === callerIp && reason !== SELF_BLOCK_CONFIRMATION) {
+      //
+      // Compared through normalizeIp (ip.ts), not as raw strings: `ip` is
+      // whatever the operator typed, `callerIp` is Cloudflare's own
+      // CF-Connecting-IP form, and an IPv6 address written two different
+      // ways (expanded vs. compressed) is the same address failing a
+      // literal `===`. Missing that would skip this very warning -- and
+      // since blockIp below normalizes the same way, the block it then
+      // stores would silently never match the operator's own future
+      // connections, which is worse than the lockout this check exists to
+      // prevent: listblockedips would report it active while it blocks
+      // nothing.
+      if (normalizeIp(ip) === normalizeIp(callerIp) && reason !== SELF_BLOCK_CONFIRMATION) {
         return err(
           `${ip} is the address this management request arrived from. Blocking it will refuse WebSocket ` +
             `connections from this address. The management API is never IP-blocked, so you will still be able ` +

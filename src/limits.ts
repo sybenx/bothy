@@ -94,13 +94,9 @@ export function maxEventBytes(env: Env): number | null {
   return resolveLimit(env.MAX_EVENT_BYTES, MAX_EVENT_BYTES);
 }
 
-// Total gift wraps this relay will hold at once. At the byte cap above,
-// worst case is MAX_GIFT_WRAPS * MAX_EVENT_BYTES = ~128MB, well under
-// the 5GB SQLite ceiling even alongside the owner's own data -- generous
-// for a real personal inbox, bounded against storage exhaustion from an
-// anonymous write path. New gift wraps are refused once reached; the
-// owner deleting old ones (or vanishing them) frees room.
-export const MAX_GIFT_WRAPS = 2000;
+// Total gift wraps this relay will hold at once -- see maxGiftWraps below
+// (moved next to STORAGE_BYTES_LIMIT, which it is now derived from) for
+// the cap itself and why it is a function of env rather than a constant.
 
 // Per-IP gift wrap write throttle, separate from the general per-message
 // rate limit in relay.ts (which counts REQ/CLOSE/AUTH too and is tuned
@@ -534,6 +530,40 @@ export function nonOwnerStorageLimit(env: Env): number | null {
   return resolveLimit(env.NON_OWNER_STORAGE_BYTES, NON_OWNER_STORAGE_SHARE_LIMIT);
 }
 
+// Share of total storage the gift wrap inbox may occupy: 1/40 of the 5GB
+// ceiling, ~128MB, well under it even alongside the owner's own data.
+// Generous for a real personal inbox, bounded against storage exhaustion
+// from an anonymous write path -- kind-1059 is the one write path with no
+// ownership check at all (CLAUDE.md "Threat model"), so this cap doesn't
+// get to trust the size of anything it admits the way NON_OWNER_STORAGE_-
+// SHARE_LIMIT above already bounds non-owner writers generally.
+const GIFT_WRAP_STORAGE_SHARE = STORAGE_BYTES_LIMIT / 40;
+
+// Total gift wraps this relay will hold at once, DERIVED from the share
+// above and the ACTUAL per-event byte cap in effect (maxEventBytes(env)),
+// not the compile-time MAX_EVENT_BYTES default this used to multiply
+// while ignoring env entirely. That was wrong in both directions: an
+// operator who raised MAX_EVENT_BYTES to, say, 1MB was still billed
+// against the 64KB default, so the documented ~128MB worst case was
+// actually 2000 * 1MB = ~2GB; an operator who disabled it (`"off"`) got
+// no derived bound at all, since there is no per-event size to multiply a
+// fixed count by.
+//
+// A disabled byte cap is priced against the compile-time default here
+// instead of making this count unbounded -- there is no real per-event
+// ceiling to derive a count from in that state, and pricing it at the
+// default keeps this cap meaningful rather than silently no-op. The
+// actual backstop when the byte cap is off is nonOwnerStorageLimit /
+// NON_OWNER_STORAGE_SHARE_LIMIT above, which bounds total bytes
+// regardless of event size or count.
+//
+// New gift wraps are refused once reached; the owner deleting old ones
+// (or vanishing them) frees room.
+export function maxGiftWraps(env: Env): number {
+  const perEventBytes = maxEventBytes(env) ?? MAX_EVENT_BYTES;
+  return Math.max(1, Math.floor(GIFT_WRAP_STORAGE_SHARE / perEventBytes));
+}
+
 // Cloudflare Workers Free's daily rows-written ceiling (CLAUDE.md "The
 // budget"). Named here, not just left as the bare `100000` already
 // hardcoded in public/index.html's admin-page display, because
@@ -641,7 +671,24 @@ export const BACKFILL_ROWS_SHARE_LIMIT = DAILY_ROWS_WRITTEN_LIMIT / 2;
 // estimate assumed.
 const TAGS_PER_REAL_EVENT = 5;
 const BACKFILL_SHARE_UTILISATION = 0.8;
-const CRON_TICKS_PER_DAY = 24;
+
+// Restates wrangler.jsonc's `triggers.crons` ("0 * * * *", hourly) as a
+// number, because BACKFILL_PAGE_SIZE and VANISH_BATCH_SIZE below need to
+// divide a per-tick share by ticks-per-day and a Worker cannot read its
+// own wrangler.jsonc at runtime to derive it -- that file is consumed by
+// the `wrangler` CLI at deploy time, not bundled in. So this is a second
+// place that has to agree with the crontab, and it is exported (rather
+// than kept private the way the rest of this section's inputs are) so
+// test/hibernation.test.ts can assert the crontab actually says what this
+// number claims.
+//
+// That assertion is load-bearing, not decorative: changing the trigger to
+// something more frequent -- `*/15 * * * *` for tighter backfill/vanish
+// latency, say -- without updating this constant would leave
+// BACKFILL_PAGE_SIZE and VANISH_BATCH_SIZE sized for 24 ticks/day while
+// the relay actually ran 96, quadrupling both paths' real daily rows
+// written with no test failing to say so.
+export const CRON_TICKS_PER_DAY = 24;
 
 // Never zero. Enough declared indexes would drive the quotient below one
 // and floor() would silently stop backfill entirely -- a derived constant

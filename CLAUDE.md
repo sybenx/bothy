@@ -58,20 +58,20 @@ which carry about five single-letter tags each).
 ### Rows written, per stored event
 
 ```
-5 + 3 × (single-letter tag count)
+6 + 3 × (single-letter tag count)
 ```
 
-Five for the event row: one base row, one for the implicit unique index behind
+Six for the event row: one base row, one for the implicit unique index behind
 `id TEXT PRIMARY KEY` (a TEXT primary key is not a rowid alias), and one for each
-of the three declared indexes on `events`. Three per indexed tag row: the row and
-its two indexes. A bare note costs 5, a reply carrying `#e` and `#p` costs 11, a
-real note carrying about five tags costs 20. A delete is a write too, so a
+of the four declared indexes on `events`. Three per indexed tag row: the row and
+its two indexes. A bare note costs 6, a reply carrying `#e` and `#p` costs 12, a
+real note carrying about five tags costs 21. A delete is a write too, so a
 replacement or a NIP-09 deletion costs this shape again, plus 2 for a tombstone.
 
 `schema.ts eventRowCost` derives this from `INDEXES` rather than restating it, so
 adding an index updates the admin page, backfill's headroom guard and
 `BACKFILL_PAGE_SIZE`'s sizing at once. `events.row_cost` stamps the figure at
-insert time so `estimateRowsWritten24h` can sum a column.
+insert time so `estimateRowsWrittenSince` can sum a column.
 
 ### Rows read, by path
 
@@ -81,10 +81,10 @@ insert time so `estimateRowsWritten24h` can sum a column.
 | REQ filter, `#<letter>` tag | ~2 per matching tag row |
 | REQ filter served by an index | combinations × (2 × limit + 1) |
 | Gift wrap gate probe, per filter, only when `kinds` is absent | 1–5 |
-| `estimateRowsWritten24h` | E |
-| `/api/stats`, cache miss | ~5E |
-| `/api/stats`, within `STATS_CACHE_TTL_MS` | ~1 |
-| Backfill tick | 2E + ~2 per event in the page |
+| `estimateRowsWrittenSince` | bounded by today's ingest count, not E (`idx_events_ingested`) |
+| `/api/stats`, snapshot stale (recomputes) | ~3E |
+| `/api/stats`, within `STATS_SNAPSHOT_MAX_AGE_MS` | small, independent of E |
+| Backfill tick | bounded by today's ingest count (headroom check) + ~2 per event in the page |
 | Live write, regular kind | 0–2 |
 | Replaceable/addressable replacement | ~2 per tag on the replaced event |
 | NIP-62 vanish, per event removed | ~2 per tag on that event |
@@ -118,26 +118,34 @@ the table row it points at.
 
 ### Where the read ceiling actually binds
 
-One path scales with the accumulated table rather than with traffic, so it gets
-worse as the relay fills whether or not anything else changes:
+Two paths used to scale with the accumulated table rather than with traffic,
+getting worse as the relay filled whether or not anything else changed. Both
+are closed now:
 
-- **The cron floor.** The hourly tick calls `estimateRowsWritten24h` twice, so
-  `2E × 24 = 48E` rows/day are spent with no client connected at all. That
-  reaches 5,000,000 at **E ≈ 104,000**.
-
-There were two. The second was every operation that removed an event —
-replaceable replacement, NIP-09 deletion, NIP-62 vanish — each of which scanned
-`event_tags` in full because no index covered `event_id`. That cost `5E` per
-removed event and bound at `E × R = 1,000,000`, sooner than the cron floor for
-any meaningful rate. `idx_event_tags_event` closed it in v0.7.3, and the reasoning
-on `deleteEventRow` in [src/storage.ts](src/storage.ts) is why that index is not
-optional: the vanish path that reaches it cannot be gated, throttled or revoked,
-so cost is the only control the relay has over it.
+- **The cron floor.** The hourly tick called `estimateRowsWrittenSince` twice
+  with no index behind `ingested_at`, so `2E × 24 = 48E` rows/day were spent
+  with no client connected at all, reaching 5,000,000 at **E ≈ 104,000**.
+  `idx_events_ingested` closed it in v0.7.6 — see that index's own comment in
+  [src/schema.ts](src/schema.ts).
+- **Removing an event.** Replaceable replacement, NIP-09 deletion and NIP-62
+  vanish each scanned `event_tags` in full because no index covered
+  `event_id`, costing `5E` per removed event and binding at
+  `E × R = 1,000,000`, sooner than the cron floor for any meaningful rate.
+  `idx_event_tags_event` closed it in v0.7.3, and the reasoning on
+  `deleteEventRow` in [src/storage.ts](src/storage.ts) is why that index is not
+  optional: the vanish path that reaches it cannot be gated, throttled or
+  revoked, so cost is the only control the relay has over it.
 
 Rows **written** are now the binding side of a vanish, and no index helps there:
 removing an event costs its tag rows, its own row and a tombstone.
 That is why vanish requests are checkpointed and drained across cron ticks rather
 than attempted inside the request — see `beginVanish`/`drainVanish`.
+
+The one path left that scales with E is the `/api/stats` snapshot recompute
+(~3E, `storage.ts computeStatsSnapshot`), and it stays gated behind
+`STATS_SNAPSHOT_MAX_AGE_MS` (six hours) precisely to keep it there: four
+refreshes a day is `12E`/day, which does not reach the 5,000,000 ceiling until
+**E ≈ 416,000**.
 
 Traffic-driven paths are bounded by `limits.ts boundFilter`, which admits a REQ
 filter only at a limit some index can afford, and by the per-IP message throttle
@@ -209,7 +217,7 @@ usefully — what it structurally cannot do.
 - [src/index.ts](src/index.ts) — Worker entry: routing, `/api/*`, `scheduled()` cron dispatch.
 - [src/relay.ts](src/relay.ts) — the `Relay` Durable Object: connection lifecycle, NIP-01 message handling, live feed, alarm.
 - [src/relay-stub.ts](src/relay-stub.ts) — the one `idFromName("relay")` accessor, shared so nothing else can shard it.
-- [src/storage.ts](src/storage.ts) / [src/schema.ts](src/schema.ts) — SQLite schema and all read/write queries, including the row-cost accounting. `events.ingested_at` is wall-clock write time and must never be conflated with `created_at`: rows-written accounting and backfill's headroom guard both measure `ingested_at`, because a backfilled event's `created_at` is years old and measuring that made backfill's own writes invisible to the guard restraining them. A column, not a counter table — a counter costs a row write per event, a column costs nothing. The same argument added `events.row_cost` in v0.7.2: each event's rows-written cost is stamped at insert time so `estimateRowsWritten24h` sums a column instead of rebuilding the figure from a `LEFT JOIN event_tags` with no index behind it, which read every tag row in the table to answer a question about the 24h window. See CLAUDE.md "The budget".
+- [src/storage.ts](src/storage.ts) / [src/schema.ts](src/schema.ts) — SQLite schema and all read/write queries, including the row-cost accounting. `events.ingested_at` is wall-clock write time and must never be conflated with `created_at`: rows-written accounting and backfill's headroom guard both measure `ingested_at`, because a backfilled event's `created_at` is years old and measuring that made backfill's own writes invisible to the guard restraining them. A column, not a counter table — a counter costs a row write per event, a column costs nothing. The same argument added `events.row_cost` in v0.7.2: each event's rows-written cost is stamped at insert time so `estimateRowsWrittenSince` sums a column instead of rebuilding the figure from a `LEFT JOIN event_tags` with no index behind it, which read every tag row in the table to answer a question about the 24h window. See CLAUDE.md "The budget".
 - [src/filters.ts](src/filters.ts) — REQ filter parsing, SQL query building, in-memory match testing for live broadcast, and `expandFilter`, which splits one filter into the cross-product of its `authors` × `kinds` singletons. That split is what lets an index serve `ORDER BY created_at DESC LIMIT n`: a key column pinned to one value arrives sorted, `kind IN (1, 7)` does not, so a multi-kind filter defeats an index as thoroughly as no index at all. `storage.ts queryFilter` re-merges and re-slices to `limit`, so the split is invisible on the wire.
 - [src/nostr.ts](src/nostr.ts) — wire types and kind-range classifiers (replaceable/ephemeral/addressable).
 - [src/validate.ts](src/validate.ts) — event id computation and schnorr signature verification (`@noble/curves`).
@@ -233,7 +241,7 @@ usefully — what it structurally cannot do.
 - Protocol errors go back as `["OK", id, false, "reason: message"]` or `["CLOSED", subid, "reason: message"]` with the NIP-01 machine-readable prefix (`invalid:`, `restricted:`, `blocked:`, `rate-limited:`, `auth-required:`, `duplicate:`). Never fail silently.
 - Comments explain *why*, especially anything hibernation- or budget-related — most modules carry inline notes on their row-write cost or CPU cost and point at CLAUDE.md "The budget" for the measured baseline.
 - Cheapest/most-certain rejections run before expensive ones on every write path: ownership check and tombstone check both precede schnorr verification.
-- Indexes are declared once, as data, in `schema.ts INDEXES`, and three things read that declaration: `limits.ts boundFilter` (which filters are affordable), `schema.ts eventRowCost` (what an event costs to write), and `limits.ts BACKFILL_PAGE_SIZE`/`VANISH_BATCH_SIZE` (how much work fits in a cron tick). Three on `events` — `(pubkey, kind, created_at)`, `(kind, created_at)`, `(pubkey, created_at)` — and two on `event_tags` — `(tag_name, tag_value, created_at)` and `(event_id)`. A fourth index therefore changes both the guard and the write accounting on its own; what it must NOT change silently is the measured baseline, so re-run `test/hibernation.test.ts`'s rows-written assertions and update the schema.ts comment and CLAUDE.md "The budget". Every accepted read filter must be answerable from one of these — that is enforced by cost, not by requiring a particular field.
+- Indexes are declared once, as data, in `schema.ts INDEXES`, and three things read that declaration: `limits.ts boundFilter` (which filters are affordable), `schema.ts eventRowCost` (what an event costs to write), and `limits.ts BACKFILL_PAGE_SIZE`/`VANISH_BATCH_SIZE` (how much work fits in a cron tick). Four on `events` — `(pubkey, kind, created_at)`, `(kind, created_at)`, `(pubkey, created_at)`, `(ingested_at)` covering `row_cost` — and two on `event_tags` — `(tag_name, tag_value, created_at)` and `(event_id)`. Adding another index therefore changes both the guard and the write accounting on its own; what it must NOT change silently is the measured baseline, so re-run `test/hibernation.test.ts`'s rows-written assertions and update the schema.ts comment and CLAUDE.md "The budget". Every accepted read filter must be answerable from one of these — that is enforced by cost, not by requiring a particular field.
 - Verify Cloudflare's own platform limits against live docs before relying on a number in a file — they change between compatibility dates. CLAUDE.md "The budget" cites the source and date at each point of use rather than assuming a cached number still holds.
 - Pin dependency versions; don't float to `latest` mid-project.
 

@@ -321,6 +321,54 @@ describe("blockip / unblockip / listblockedips", () => {
     const reply = await callManagement("blockip", [""], { ip: CALLER_IP });
     expect(reply.error).toContain("non-empty");
   });
+
+  // The same IPv6 address, spelled two different ways: the operator's
+  // hand-typed expanded form and Cloudflare's own compressed
+  // CF-Connecting-IP form. If the self-block check or the storage it
+  // feeds ever compared these as raw strings, an operator would either
+  // slip past the confirmation prompt (fix for src/nip86.ts's
+  // normalizeIp comparison) or block an address that then never matches
+  // their real connections (fix for storage.ts's blockIp/isIpBlocked).
+  const CALLER_IP6_EXPANDED = "2001:0db8:0000:0000:0000:0000:0000:0001";
+  const CALLER_IP6_COMPRESSED = "2001:db8::1";
+
+  it("still asks for confirmation when the operator's own IPv6 address is spelled differently than the caller header", async () => {
+    const reply = await callManagement("blockip", [CALLER_IP6_EXPANDED, "oops"], {
+      ip: CALLER_IP6_COMPRESSED,
+    });
+    expect(reply.result).toBeUndefined();
+    expect(reply.error).toContain(SELF_BLOCK_CONFIRMATION);
+    expect((await callManagement("listblockedips", [], { ip: CALLER_IP })).result).toEqual([]);
+  });
+
+  it("blocks and matches an IPv6 address by its canonical form regardless of which equivalent spelling was used", async () => {
+    const block = await callManagement(
+      "blockip",
+      [CALLER_IP6_EXPANDED, SELF_BLOCK_CONFIRMATION],
+      { ip: CALLER_IP6_COMPRESSED },
+    );
+    expect(block.result).toBe(true);
+
+    // Stored under one canonical form, not the expanded spelling the
+    // operator actually typed.
+    expect((await callManagement("listblockedips", [], { ip: CALLER_IP })).result).toEqual([
+      { ip: CALLER_IP6_COMPRESSED, reason: SELF_BLOCK_CONFIRMATION },
+    ]);
+
+    // A future connection presenting the OTHER equivalent spelling still
+    // has to match -- this is the "block is then inert" failure mode.
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    const response = await stub.fetch("https://example.com/", {
+      headers: { Upgrade: "websocket", "CF-Connecting-IP": CALLER_IP6_EXPANDED },
+    });
+    expect(response.status).toBe(403);
+
+    // unblockip called with yet another spelling of the same address must
+    // remove it too, not silently no-op.
+    const unblock = await callManagement("unblockip", [CALLER_IP6_COMPRESSED], { ip: CALLER_IP });
+    expect(unblock.result).toBe(true);
+    expect((await callManagement("listblockedips", [], { ip: CALLER_IP })).result).toEqual([]);
+  });
 });
 
 describe("changerelayname / changerelaydescription / changerelayicon", () => {

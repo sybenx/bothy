@@ -1,6 +1,7 @@
 import { buildFilterQuery, compareEvents, expandFilter } from "./filters";
 import { eventRowCost } from "./schema";
-import { countReplacement, withReadPath } from "./read-metrics";
+import { withReadPath } from "./read-metrics";
+import { normalizeIp } from "./ip";
 import {
   dTagValue,
   type Filter,
@@ -191,7 +192,7 @@ export function hasNonOwnerStorageHeadroom(sql: SqlStorage, limit: number): bool
   return sql.databaseSize < limit;
 }
 
-// Current count of stored gift wraps -- backs the MAX_GIFT_WRAPS cap
+// Current count of stored gift wraps -- backs the maxGiftWraps cap
 // (limits.ts) on the write path. A read against the 5,000,000/day
 // rows-read ceiling, not the rows-written one -- see CLAUDE.md "The
 // budget".
@@ -231,10 +232,7 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent, ingestedAt: numbe
     if (existing && isSupersededBy(existing, event)) {
       return { ok: true, message: "", stored: null };
     }
-    // Counted here rather than inside deleteEventRow, which is also
-    // reached by NIP-09/NIP-62/NIP-86 deletions -- see countReplacement.
     if (existing) {
-      countReplacement();
       deleteEventRow(sql, existing.id);
     }
     insertEventRow(sql, event, expirationOf(event), ingestedAt);
@@ -255,7 +253,6 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent, ingestedAt: numbe
       return { ok: true, message: "", stored: null };
     }
     if (existing) {
-      countReplacement();
       deleteEventRow(sql, existing.id);
     }
     insertEventRow(sql, event, expirationOf(event), ingestedAt);
@@ -972,18 +969,27 @@ export interface BlockedIp {
   reason: string | null;
 }
 
+// ip is canonicalized (ip.ts normalizeIp) before it ever reaches storage
+// or a comparison, at all three call sites here plus the self-block check
+// in nip86.ts -- the same address written two different ways (an
+// operator's hand-typed, expanded IPv6 vs. Cloudflare's own compressed
+// CF-Connecting-IP) must resolve to the same key, or a block stored under
+// one spelling silently fails to match connections presenting the other:
+// listblockedips would read the row back as "blocked" while the
+// connection-time check below never fires. See ip.ts for the full
+// reasoning.
 export function blockIp(sql: SqlStorage, ip: string, reason: string | null, nowSec: number): void {
   sql.exec(
     `INSERT INTO blocked_ips (ip, reason, blocked_at) VALUES (?, ?, ?)
        ON CONFLICT(ip) DO UPDATE SET reason = excluded.reason, blocked_at = excluded.blocked_at`,
-    ip,
+    normalizeIp(ip),
     reason,
     nowSec,
   );
 }
 
 export function unblockIp(sql: SqlStorage, ip: string): void {
-  sql.exec(`DELETE FROM blocked_ips WHERE ip = ?`, ip);
+  sql.exec(`DELETE FROM blocked_ips WHERE ip = ?`, normalizeIp(ip));
 }
 
 export function listBlockedIps(sql: SqlStorage): BlockedIp[] {
@@ -997,7 +1003,7 @@ export function listBlockedIps(sql: SqlStorage): BlockedIp[] {
 // on the hot path. The management endpoint never calls this: see
 // src/nip86.ts.
 export function isIpBlocked(sql: SqlStorage, ip: string): boolean {
-  return sql.exec(`SELECT 1 FROM blocked_ips WHERE ip = ?`, ip).toArray().length > 0;
+  return sql.exec(`SELECT 1 FROM blocked_ips WHERE ip = ?`, normalizeIp(ip)).toArray().length > 0;
 }
 
 // The stored rung of the relay identity chain (nip11.ts) -- what

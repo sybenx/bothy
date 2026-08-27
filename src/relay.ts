@@ -13,12 +13,14 @@ import { matchesAnyFilter, parseFilter } from "./filters";
 import { recordHost } from "./host";
 import {
   boundFilter,
+  DAILY_ROWS_READ_LIMIT,
+  DAILY_ROWS_WRITTEN_LIMIT,
   GIFT_WRAP_RATE_LIMIT_WINDOW_MS,
   LIVE_FEED_MAX_LIFETIME_MS,
   MAX_EVENTS_PER_REQ,
   maxEventBytes,
   maxEventsPerPubkeyPerWindow,
-  MAX_GIFT_WRAPS,
+  maxGiftWraps,
   MAX_GIFT_WRAPS_PER_IP_PER_WINDOW,
   MAX_LIVE_FEED_CONNECTIONS,
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
@@ -27,6 +29,7 @@ import {
   PUBKEY_RATE_LIMIT_MAX_TRACKED,
   PUBKEY_RATE_LIMIT_WINDOW_MS,
   STATS_SNAPSHOT_MAX_AGE_MS,
+  STORAGE_BYTES_LIMIT,
   utcDayStartSeconds,
 } from "./limits";
 import { handleManagementCall, type ManagementResponse } from "./nip86";
@@ -430,6 +433,15 @@ export class Relay extends DurableObject<Env> {
     // rather than one this relay chose. See storage.ts
     // estimateRowsWrittenSince for what it does not count.
     rowsWrittenToday: number;
+    // The three Workers-free-tier ceilings limits.ts declares, transported
+    // rather than left for public/index.html to hardcode a second copy of
+    // -- see CLAUDE.md "The budget". Static per deployment (none of these
+    // are env-overridable), but served from the one place that already
+    // knows them so the admin page's progress bars can never drift from
+    // what this relay is actually being measured against.
+    storageBytesLimit: number;
+    dailyRowsWrittenLimit: number;
+    dailyRowsReadLimit: number;
     backfill: BackfillStatus | null;
     icon: string | null;
     // The name actually in effect, resolved through the same chain the
@@ -528,6 +540,9 @@ export class Relay extends DurableObject<Env> {
       ingested24h: countIngested24h(sql, since),
       storageBytes: sql.databaseSize,
       rowsWrittenToday: estimateRowsWrittenSince(sql, budgetSince),
+      storageBytesLimit: STORAGE_BYTES_LIMIT,
+      dailyRowsWrittenLimit: DAILY_ROWS_WRITTEN_LIMIT,
+      dailyRowsReadLimit: DAILY_ROWS_READ_LIMIT,
       // Live: the backfill tables hold one row per relay in the owner's
       // kind-10002 list, so this is ~20 rows read, not O(E). Snapshotting
       // it would save nothing and would make "last ran" and the refusal
@@ -823,7 +838,7 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
-    if (giftWrapCount(sql) >= MAX_GIFT_WRAPS) {
+    if (giftWrapCount(sql) >= maxGiftWraps(this.env)) {
       ok(ws, event.id, false, "blocked: gift wrap inbox storage is full");
       return;
     }

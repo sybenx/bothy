@@ -19,6 +19,7 @@ import {
 import {
   BACKFILL_PAGE_SIZE,
   BACKFILL_ROWS_SHARE_LIMIT,
+  CRON_TICKS_PER_DAY,
   VANISH_BATCH_SIZE,
   VANISH_ROWS_SHARE_LIMIT,
 } from "../src/limits";
@@ -28,6 +29,8 @@ import type { Relay } from "../src/relay";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
 import { OWNER_SECRET_KEY_HEX } from "./helpers/keys";
+import wranglerConfig from "../wrangler.jsonc?raw";
+import { cronTicksPerDay } from "./helpers/cron";
 
 isolateStorage();
 
@@ -222,7 +225,22 @@ describe("rows written per removed event", () => {
 // whatever the schema does.
 describe("work-per-tick constants stay inside their share", () => {
   const TAGS_PER_REAL_EVENT = 5;
-  const CRON_TICKS_PER_DAY = 24;
+
+  it("matches the actual cron trigger in wrangler.jsonc", () => {
+    // limits.ts CRON_TICKS_PER_DAY restates this project's crontab as a
+    // number, because BACKFILL_PAGE_SIZE and VANISH_BATCH_SIZE need to
+    // divide a per-tick share by it and a Worker cannot read its own
+    // wrangler.jsonc at runtime -- that file is consumed by the `wrangler`
+    // CLI at deploy time, not bundled into what runs. So it is a fact
+    // about wrangler.jsonc living in a second file, and this is the test
+    // that keeps the two from drifting: change the trigger to, say,
+    // `*/15 * * * *` for tighter backfill/vanish latency without updating
+    // CRON_TICKS_PER_DAY, and this fails instead of BACKFILL_PAGE_SIZE
+    // silently projecting 4x its actual reserved share.
+    const match = wranglerConfig.match(/"crons"\s*:\s*\[\s*"([^"]+)"/);
+    if (!match) throw new Error("could not find triggers.crons in wrangler.jsonc");
+    expect(cronTicksPerDay(match[1]!)).toBe(CRON_TICKS_PER_DAY);
+  });
 
   it("keeps backfill inside its reserved share", () => {
     const perDay = BACKFILL_PAGE_SIZE * eventRowCost(TAGS_PER_REAL_EVENT) * CRON_TICKS_PER_DAY;

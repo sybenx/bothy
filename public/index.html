@@ -176,15 +176,23 @@
 
 <script>
 // The three Workers-free-tier ceilings this page displays progress
-// against (CLAUDE.md "The budget"). Shared by the top stat bars and the
-// diagnostics panel so the two can never disagree.
-const STORAGE_LIMIT = 5 * 1024 * 1024 * 1024;
-const ROWS_WRITTEN_LIMIT = 100000;
-const ROWS_READ_LIMIT = 5000000;
+// against (CLAUDE.md "The budget"), read from /api/stats rather than
+// hardcoded here a second time -- src/limits.ts STORAGE_BYTES_LIMIT /
+// DAILY_ROWS_WRITTEN_LIMIT / DAILY_ROWS_READ_LIMIT is the one place that
+// declares them. Assigned once main() has the response; every consumer
+// below (the top stat bars and the diagnostics panel) only runs after
+// that assignment, since nothing here renders before the fetch resolves.
+let STORAGE_LIMIT;
+let ROWS_WRITTEN_LIMIT;
+let ROWS_READ_LIMIT;
 
 async function main() {
   const res = await fetch("/api/stats");
   const stats = await res.json();
+
+  STORAGE_LIMIT = stats.storageBytesLimit;
+  ROWS_WRITTEN_LIMIT = stats.dailyRowsWrittenLimit;
+  ROWS_READ_LIMIT = stats.dailyRowsReadLimit;
 
   document.getElementById("reset-note").hidden = false;
   setFavicon(stats.icon);

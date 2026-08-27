@@ -704,65 +704,6 @@ describe("read attribution", () => {
     expect(row?.computedAt).toBeGreaterThan(0);
   });
 
-  it("counts replacements as R, and projects the table size at which that path alone hits the ceiling", async () => {
-    // R is the number the event_tags-delete decision turns on (see the
-    // comment on storage.ts deleteEventRow). The per-call cost is known
-    // and measured; how OFTEN it is paid is not, and estimating it lands
-    // on a range spanning the point where this path overtakes the cron
-    // floor -- so it is counted rather than guessed.
-    await runInDurableObject(stub(), async () => resetReadMetrics());
-    const now = Math.floor(Date.now() / 1000);
-
-    // kind 10003 (NIP-51 bookmarks): replaceable, special-cased nowhere in
-    // relay.ts, and touched by no other test in this file -- which matters
-    // because this file deliberately shares one Durable Object across its
-    // tests, so two of them contending for the same replaceable address
-    // would make whichever ran second depend on the first one's
-    // timestamps.
-    const conn = await connectRelay();
-    conn.send(["EVENT", signEvent(OWNER_SECRET_KEY_HEX, { kind: 10003, content: "", created_at: now })]);
-    await conn.nextMessage();
-    // Only this second one supersedes an existing version, so only this
-    // one is a replacement.
-    conn.send([
-      "EVENT",
-      signEvent(OWNER_SECRET_KEY_HEX, { kind: 10003, content: "again", created_at: now + 10 }),
-    ]);
-    await conn.nextMessage();
-    conn.close();
-
-    const snapshot = await runInDurableObject(stub(), async () => readMetricsSnapshot());
-    expect(snapshot.replacements.count).toBe(1);
-    // Under MIN_SAMPLE_MS of uptime the rate is deliberately null rather
-    // than one replacement multiplied by 1,440.
-    if (snapshot.replacements.projected24h !== null) {
-      expect(snapshot.replacements.ceilingAtEvents).not.toBeNull();
-    }
-  });
-
-  it("does not count an operator deletion as R", async () => {
-    // NIP-09/NIP-62/NIP-86 deletions reach the same unindexed DELETE and
-    // pay the same per-call cost, but they happen at operator pace rather
-    // than on the per-event drumbeat R measures. Folding them in would
-    // inflate exactly the number the fix decision turns on.
-    await runInDurableObject(stub(), async () => resetReadMetrics());
-    const now = Math.floor(Date.now() / 1000);
-
-    const conn = await connectRelay();
-    const note = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "to delete", created_at: now });
-    conn.send(["EVENT", note]);
-    await conn.nextMessage();
-    conn.send([
-      "EVENT",
-      signEvent(OWNER_SECRET_KEY_HEX, { kind: 5, tags: [["e", note.id]], created_at: now + 1 }),
-    ]);
-    await conn.nextMessage();
-    conn.close();
-
-    const snapshot = await runInDurableObject(stub(), async () => readMetricsSnapshot());
-    expect(snapshot.replacements.count).toBe(0);
-  });
-
   it("bills a replaceable replacement to the write path, now at index-seek cost", async () => {
     await runInDurableObject(stub(), async () => resetReadMetrics());
     const now = Math.floor(Date.now() / 1000);

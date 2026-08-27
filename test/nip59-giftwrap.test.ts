@@ -8,8 +8,8 @@
 // the NIP-42 read gate lives in test/nip42-auth.test.ts.
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
-import { MAX_GIFT_WRAPS } from "../src/limits";
+import { afterEach, describe, expect, it } from "vitest";
+import { maxGiftWraps } from "../src/limits";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
 import { OWNER_PUBKEY_HEX, randomKeypair } from "./helpers/keys";
@@ -119,11 +119,12 @@ describe("NIP-59 gift wrap accept path", () => {
   it("rejects a gift wrap once the total storage cap is reached", async () => {
     const id = env.RELAY.idFromName("relay");
     const stub = env.RELAY.get(id);
-    // Seed directly via SQL -- signing MAX_GIFT_WRAPS real events just to
-    // fill the cap would make this test needlessly slow, and the cap
-    // check (storage.ts giftWrapCount) only cares about row count.
+    const cap = maxGiftWraps(env);
+    // Seed directly via SQL -- signing `cap` real events just to fill it
+    // would make this test needlessly slow, and the cap check
+    // (storage.ts giftWrapCount) only cares about row count.
     await runInDurableObject(stub, async (_instance, state) => {
-      for (let i = 0; i < MAX_GIFT_WRAPS; i++) {
+      for (let i = 0; i < cap; i++) {
         state.storage.sql.exec(
           `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -150,6 +151,38 @@ describe("NIP-59 gift wrap accept path", () => {
     expect(ok).toBe(false);
     expect(message.startsWith("blocked:")).toBe(true);
     conn.close();
+  });
+});
+
+// maxGiftWraps prices the gift wrap inbox against a fixed byte SHARE of
+// total storage, not a fixed event COUNT -- so it has to move when the
+// per-event byte cap does, or an operator who raises MAX_EVENT_BYTES
+// blows past the share silently. mutableEnv follows the same
+// env-mutation pattern as write-limits.test.ts's non-owner storage suite.
+const mutableEnv = env as unknown as Record<string, string | undefined>;
+
+describe("maxGiftWraps derivation", () => {
+  afterEach(() => {
+    delete mutableEnv.MAX_EVENT_BYTES;
+  });
+
+  it("shrinks as the per-event byte cap grows, keeping the storage share fixed", () => {
+    const atDefault = maxGiftWraps(env);
+    mutableEnv.MAX_EVENT_BYTES = String(1024 * 1024); // 1MB
+    const atOneMB = maxGiftWraps(env);
+    expect(atOneMB).toBeLessThan(atDefault);
+    // ~128MB share / 1MB per event.
+    expect(atOneMB).toBe(128);
+  });
+
+  it("falls back to the compile-time default when the byte cap is disabled, rather than becoming unbounded", () => {
+    const atDefault = maxGiftWraps(env);
+    mutableEnv.MAX_EVENT_BYTES = "off";
+    // No real per-event size to derive a count from once the cap is
+    // "off" -- priced at the compile-time default instead of resolving
+    // to Infinity, so this cap stays meaningful. The real backstop in
+    // that state is NON_OWNER_STORAGE_BYTES, not this count.
+    expect(maxGiftWraps(env)).toBe(atDefault);
   });
 });
 

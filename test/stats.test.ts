@@ -10,6 +10,7 @@ import type { Relay } from "../src/relay";
 import { readStatsSnapshot } from "../src/storage";
 import { connectRelay, publish } from "./helpers/socket";
 import { version } from "../package.json";
+import { DAILY_ROWS_READ_LIMIT, DAILY_ROWS_WRITTEN_LIMIT, STORAGE_BYTES_LIMIT } from "../src/limits";
 
 isolateStorage();
 
@@ -37,6 +38,12 @@ describe("GET /api/stats", () => {
       storageBytes: expect.any(Number),
       rowsWrittenToday: expect.any(Number),
       ingested24h: expect.any(Number),
+      // The three ceilings public/index.html used to hardcode a second
+      // copy of -- transported so the admin page's progress bars can
+      // never drift from what limits.ts actually declares.
+      storageBytesLimit: STORAGE_BYTES_LIMIT,
+      dailyRowsWrittenLimit: DAILY_ROWS_WRITTEN_LIMIT,
+      dailyRowsReadLimit: DAILY_ROWS_READ_LIMIT,
       backfill: { status: "pending", totalStored: 0, relayCount: 0, exhaustedCount: 0 },
     });
     expect(body.totalEvents).toBeGreaterThanOrEqual(1);
