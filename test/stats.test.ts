@@ -48,7 +48,7 @@ describe("GET /api/stats", () => {
     const body = (await response.json()) as {
       writePolicy: string;
       followCount: number;
-      followsRefreshedAt: number | null;
+      followsListAt: number | null;
     };
 
     // The global test env leaves ALLOW_FOLLOWS unset (vitest.config.ts),
@@ -57,7 +57,7 @@ describe("GET /api/stats", () => {
     // follows.test.ts for the ALLOW_FOLLOWS=false owner-only case.
     expect(body.writePolicy).toBe("follows");
     expect(body.followCount).toBe(0);
-    expect(body.followsRefreshedAt).toBeNull();
+    expect(body.followsListAt).toBeNull();
   });
 
   it("reflects real follow table contents once the owner publishes kind-3", async () => {
@@ -82,27 +82,23 @@ describe("GET /api/stats", () => {
     // same technique test/follows.test.ts uses for the write-gate itself)
     // so this test doesn't depend on ALLOW_FOLLOWS's default staying what
     // it is today -- what's under test here is that getStats'
-    // followCount/followsRefreshedAt reflect whatever is actually in the
+    // followCount/followsListAt reflect whatever is actually in the
     // table, not relay.ts's refresh trigger (covered by
     // test/write-gate-refresh.test.ts instead).
     const id = env.RELAY.idFromName("relay");
     const stub = env.RELAY.get(id);
     await runInDurableObject(stub, async (_instance, state) => {
-      refreshFollows(
-        state.storage.sql,
-        { ...env, ALLOW_FOLLOWS: "true" } as unknown as Env,
-        Math.floor(Date.now() / 1000),
-      );
+      refreshFollows(state.storage.sql, { ...env, ALLOW_FOLLOWS: "true" } as unknown as Env);
     });
 
     const response = await exports.default.fetch("https://example.com/api/stats");
     const body = (await response.json()) as {
       followCount: number;
-      followsRefreshedAt: number | null;
+      followsListAt: number | null;
     };
 
     expect(body.followCount).toBe(2);
-    expect(body.followsRefreshedAt).toEqual(expect.any(Number));
+    expect(body.followsListAt).toEqual(expect.any(Number));
   });
 });
 

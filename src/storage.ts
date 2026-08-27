@@ -578,7 +578,14 @@ export interface StatsSnapshot {
   totalEvents: number;
   events24h: number;
   followCount: number;
-  followsRefreshedAt: number | null;
+  // The `created_at` of the contact list the follow cache reflects. The
+  // column behind it is still called `follows_refreshed_at`: it held a
+  // refresh timestamp until v0.7.7, when refreshFollows stopped
+  // rebuilding a list that had not changed and there ceased to be a
+  // refresh time to report. Renaming a stored column would mean a
+  // migration for a diagnostic, so the column keeps its name and this is
+  // where the two are reconciled.
+  followsListAt: number | null;
   largestNonOwnerAuthor: LargestNonOwnerAuthor | null;
 }
 
@@ -606,7 +613,7 @@ export function readStatsSnapshot(sql: SqlStorage): StatsSnapshot | null {
     totalEvents: row.total_events,
     events24h: row.events_24h,
     followCount: row.follow_count,
-    followsRefreshedAt: row.follows_refreshed_at,
+    followsListAt: row.follows_refreshed_at,
     largestNonOwnerAuthor:
       row.largest_author_pubkey === null || row.largest_author_events === null
         ? null
@@ -646,7 +653,13 @@ export function computeStatsSnapshot(
         .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events WHERE created_at > ?`, since)
         .toArray()[0]?.n ?? 0,
     followCount: sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM follows`).toArray()[0]?.n ?? 0,
-    followsRefreshedAt:
+    // The `created_at` of the contact list the cache currently reflects
+    // (schema.ts `follows`), not the moment it was last rebuilt -- there
+    // is no longer such a moment to report, since refreshFollows only
+    // writes when the list has actually changed. Every row carries the
+    // same value; MAX is how one is picked, not an aggregate over
+    // different ones.
+    followsListAt:
       sql.exec<{ t: number | null }>(`SELECT MAX(fetched_at) AS t FROM follows`).toArray()[0]?.t ??
       null,
     largestNonOwnerAuthor: largestNonOwnerAuthor(sql, owner),
@@ -674,7 +687,7 @@ export function writeStatsSnapshot(sql: SqlStorage, snapshot: StatsSnapshot): vo
     snapshot.totalEvents,
     snapshot.events24h,
     snapshot.followCount,
-    snapshot.followsRefreshedAt,
+    snapshot.followsListAt,
     snapshot.largestNonOwnerAuthor?.pubkey ?? null,
     snapshot.largestNonOwnerAuthor?.events ?? null,
   );
@@ -825,6 +838,16 @@ function runFilterQuery(sql: SqlStorage, filter: Filter, nowSec: number): NostrE
 //     handful of replaceable republishes a day at 8 rows each -- but it
 //     is unbounded in principle, since nothing reserves a share for
 //     NIP-09.
+//
+// Deletion is not the only omission, and the other one is quieter: this
+// sums `events.row_cost`, so it sees nothing this relay writes that is
+// not an event row. The follow cache rebuild (ownership.ts
+// refreshFollows) is the largest of those -- 900 rows at 300 follows,
+// every time the owner's contact list changes, and once per cron tick
+// besides until v0.7.7 stopped it rebuilding a list that had not moved.
+// The NIP-86 ban and settings tables, backfill's cursor bookkeeping and
+// the stats snapshot are the rest, each small and none of them here.
+// Every one is a real write against the same 100,000/day ceiling.
 //
 // So: read this number as "rows written STORING events", not "rows
 // written". `/api/stats` reports draining vanish requests alongside it

@@ -18,6 +18,29 @@ import { allowPubkey, banPubkey, storeEvent } from "../src/storage";
 
 isolateStorage();
 
+// Sums SqlStorageCursor.rowsWritten across every statement `fn` issues --
+// the same instrument test/hibernation.test.ts uses for the per-event
+// write cost, kept local rather than shared so neither file's fixture can
+// reach into the other's.
+function measureRowsWritten(sql: SqlStorage, fn: (sql: SqlStorage) => void): number {
+  let total = 0;
+  const proxy = new Proxy(sql, {
+    get(target, property) {
+      if (property === "exec") {
+        return (query: string, ...bindings: unknown[]) => {
+          const cursor = target.exec(query, ...bindings);
+          total += cursor.rowsWritten;
+          return cursor;
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+    },
+  }) as SqlStorage;
+  fn(proxy);
+  return total;
+}
+
 const FOLLOWS_ENV = { OWNER_PUBKEY: OWNER_PUBKEY_HEX, ALLOW_FOLLOWS: "true" } as unknown as Env;
 const NO_FOLLOWS_ENV = { OWNER_PUBKEY: OWNER_PUBKEY_HEX, ALLOW_FOLLOWS: "false" } as unknown as Env;
 
@@ -42,7 +65,7 @@ describe("ALLOW_FOLLOWS write gate", () => {
 
       expect(isAllowedWriter(state.storage.sql, FOLLOWS_ENV, friend.pubkeyHex).allowed).toBe(false);
 
-      refreshFollows(state.storage.sql, FOLLOWS_ENV, Math.floor(Date.now() / 1000));
+      refreshFollows(state.storage.sql, FOLLOWS_ENV);
 
       expect(isAllowedWriter(state.storage.sql, FOLLOWS_ENV, friend.pubkeyHex).allowed).toBe(true);
     });
@@ -61,7 +84,7 @@ describe("ALLOW_FOLLOWS write gate", () => {
     const id = env.RELAY.idFromName("relay");
     const stub = env.RELAY.get(id);
     await runInDurableObject(stub, async (_instance, state) => {
-      refreshFollows(state.storage.sql, NO_FOLLOWS_ENV, Math.floor(Date.now() / 1000));
+      refreshFollows(state.storage.sql, NO_FOLLOWS_ENV);
       expect(isAllowedWriter(state.storage.sql, NO_FOLLOWS_ENV, friend.pubkeyHex).allowed).toBe(false);
     });
   });
@@ -95,7 +118,7 @@ describe("NIP-86 banpubkey/allowpubkey write gate (phase two)", () => {
       const sql = state.storage.sql;
       const now = Math.floor(Date.now() / 1000);
       storeEvent(sql, contacts, now);
-      refreshFollows(sql, FOLLOWS_ENV, now);
+      refreshFollows(sql, FOLLOWS_ENV);
       expect(isAllowedWriter(sql, FOLLOWS_ENV, friend.pubkeyHex).allowed).toBe(true);
 
       // Also allowlisted -- the ban must still win, since banned_pubkeys
@@ -106,6 +129,86 @@ describe("NIP-86 banpubkey/allowpubkey write gate (phase two)", () => {
       const auth = isAllowedWriter(sql, FOLLOWS_ENV, friend.pubkeyHex);
       expect(auth.allowed).toBe(false);
       expect(auth).toMatchObject({ reason: "banned" });
+    });
+  });
+
+  it("writes nothing on a refresh that finds the same contact list", async () => {
+    // The cron path is a FALLBACK -- relay.ts acceptEvent refreshes the
+    // moment the owner publishes a kind-3 here -- so a tick that finds
+    // nothing new is the normal case. It used to DELETE the table and
+    // re-INSERT every row anyway: 900 rows written at 300 follows
+    // (measured: 300 for the delete, 600 for the inserts), 21,600/day on
+    // an hourly cron, against a 100,000/day ceiling.
+    const follows = Array.from({ length: 50 }, () => randomKeypair().pubkeyHex);
+    const contacts = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 3,
+      tags: follows.map((pubkey) => ["p", pubkey]),
+    });
+
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      storeEvent(sql, contacts, Math.floor(Date.now() / 1000));
+
+      const build = measureRowsWritten(sql, (s) => refreshFollows(s, FOLLOWS_ENV));
+      // 2 per follow to insert (the row and its primary key index), and
+      // nothing to delete on a cache that was empty.
+      expect(build).toBe(2 * follows.length);
+
+      const unchanged = measureRowsWritten(sql, (s) => refreshFollows(s, FOLLOWS_ENV));
+      expect(unchanged).toBe(0);
+      // And the cache it declined to rebuild is still the right one.
+      expect(isAllowedWriter(sql, FOLLOWS_ENV, follows[0]!).allowed).toBe(true);
+    });
+  });
+
+  it("rebuilds when the owner's contact list is replaced by a newer one", async () => {
+    const first = randomKeypair().pubkeyHex;
+    const second = randomKeypair().pubkeyHex;
+    const now = Math.floor(Date.now() / 1000);
+
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      storeEvent(sql, signEvent(OWNER_SECRET_KEY_HEX, { kind: 3, tags: [["p", first]], created_at: now }), now);
+      refreshFollows(sql, FOLLOWS_ENV);
+      expect(isAllowedWriter(sql, FOLLOWS_ENV, first).allowed).toBe(true);
+
+      storeEvent(
+        sql,
+        signEvent(OWNER_SECRET_KEY_HEX, { kind: 3, tags: [["p", second]], created_at: now + 1 }),
+        now + 1,
+      );
+      const rebuild = measureRowsWritten(sql, (s) => refreshFollows(s, FOLLOWS_ENV));
+      expect(rebuild).toBeGreaterThan(0);
+
+      expect(isAllowedWriter(sql, FOLLOWS_ENV, second).allowed).toBe(true);
+      expect(isAllowedWriter(sql, FOLLOWS_ENV, first).allowed).toBe(false);
+    });
+  });
+
+  it("clears the cache once, not every tick, when the contact list is gone", async () => {
+    // A kind-3 removed by NIP-09 or NIP-62 must empty the allowlist --
+    // and then stop costing anything. The DELETE only runs while there is
+    // something to delete.
+    const friend = randomKeypair().pubkeyHex;
+    const now = Math.floor(Date.now() / 1000);
+
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      storeEvent(sql, signEvent(OWNER_SECRET_KEY_HEX, { kind: 3, tags: [["p", friend]], created_at: now }), now);
+      refreshFollows(sql, FOLLOWS_ENV);
+      expect(isAllowedWriter(sql, FOLLOWS_ENV, friend).allowed).toBe(true);
+
+      sql.exec(`DELETE FROM events WHERE kind = 3`);
+
+      expect(measureRowsWritten(sql, (s) => refreshFollows(s, FOLLOWS_ENV))).toBeGreaterThan(0);
+      expect(isAllowedWriter(sql, FOLLOWS_ENV, friend).allowed).toBe(false);
+      expect(measureRowsWritten(sql, (s) => refreshFollows(s, FOLLOWS_ENV))).toBe(0);
     });
   });
 

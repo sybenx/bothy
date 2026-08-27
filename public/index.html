@@ -163,7 +163,7 @@
   <dl class="diag-grid">
     <dt>Storage used</dt><dd id="diag-storage">-</dd>
     <dt>Stats snapshot taken</dt><dd id="diag-snapshot-at">-</dd>
-    <dt>Follow list refreshed</dt><dd id="diag-follows-at">-</dd>
+    <dt>Follow list published</dt><dd id="diag-follows-at">-</dd>
     <dt>Backfill last ran</dt><dd id="diag-backfill-at">-</dd>
     <dt>Read budget</dt><dd id="diag-read-budget">-</dd>
     <dt>Write budget</dt><dd id="diag-write-budget">-</dd>
@@ -290,24 +290,19 @@ function renderWritePolicyStatus(stats) {
   } else if (stats.followCount === 0) {
     parts.push("Follows are allowed to publish, but the follow list is empty -- no one but the owner can write until the owner's kind-3 contact list is stored on this relay.");
   } else {
-    // The count already implies a working refresh -- printing "as of
-    // <time>" on every load just repeats that. The one time the
-    // timestamp is worth a reader's attention is when it's stale enough
-    // to mean the refresh (relay.ts's immediate-on-publish path, or the
-    // hourly cron fallback -- CLAUDE.md "Configuration") may have
-    // silently stopped: a follow list that looks current but hasn't
-    // moved in hours is the failure mode this line exists to catch.
-    const staleAfterSec = 3 * 60 * 60; // "a few hours"
-    const ageSec = stats.followsRefreshedAt ? Math.floor(Date.now() / 1000) - stats.followsRefreshedAt : null;
-    const stale = ageSec === null || ageSec > staleAfterSec;
-    const staleNote = stale
-      ? " (follow list last refreshed " +
-        (stats.followsRefreshedAt ? new Date(stats.followsRefreshedAt * 1000).toLocaleString() : "never") +
-        " -- refresh may be stuck)"
-      : "";
+    // No staleness note here any more. It used to warn when the follow
+    // cache had not been rebuilt in a few hours, which was a real signal
+    // only while the cron rebuilt it unconditionally on every tick.
+    // refreshFollows now writes only when the owner's contact list has
+    // actually changed (ownership.ts), so "not rebuilt in hours" is the
+    // healthy case and a warning on it would fire forever on a stable
+    // follow list. The failure this line exists to catch -- an empty
+    // allowlist silently rejecting every follow -- is the branch above,
+    // and it is a state rather than an age. The contact list's own
+    // timestamp is in the diagnostics panel below.
     parts.push(
       "Owner plus " + stats.followCount + (stats.followCount === 1 ? " follow" : " follows") +
-      " can publish here." + staleNote,
+      " can publish here.",
     );
   }
   el.textContent = parts.join(" ");
@@ -367,12 +362,16 @@ function renderDiagnostics(stats) {
 
   document.getElementById("diag-storage").textContent = formatMB(stats.storageBytes);
   document.getElementById("diag-snapshot-at").textContent = new Date(stats.snapshotAt * 1000).toLocaleString();
+  // The contact list's own created_at, not a refresh time -- see
+  // storage.ts StatsSnapshot.followsListAt. "none stored" rather than
+  // "never" because the absence being reported is a missing kind-3, not
+  // a refresh that has not run.
   document.getElementById("diag-follows-at").textContent =
     stats.writePolicy !== "follows"
       ? "n/a (owner-only writes)"
-      : stats.followsRefreshedAt
-        ? new Date(stats.followsRefreshedAt * 1000).toLocaleString()
-        : "never";
+      : stats.followsListAt
+        ? new Date(stats.followsListAt * 1000).toLocaleString()
+        : "none stored";
   // "<when> (pulls N events)" -- N is limits.ts BACKFILL_PAGE_SIZE, read
   // off the wire rather than written here. It is derived from the
   // declared index set, so a fifth index shrinks it; a literal in this

@@ -413,7 +413,7 @@ export class Relay extends DurableObject<Env> {
     // ingested24h below, which is the other half of that sentence.
     events24h: number;
     // When `totalEvents`, `events24h`, `followCount`,
-    // `followsRefreshedAt` and `largestNonOwnerAuthor` were computed
+    // `followsListAt` and `largestNonOwnerAuthor` were computed
     // (unix seconds). Those five come from the `stats_snapshot` row and
     // are up to limits.ts STATS_SNAPSHOT_MAX_AGE_MS old; every other
     // field here is read live. Reported so a consumer can tell the two
@@ -441,7 +441,11 @@ export class Relay extends DurableObject<Env> {
     // a mystery.
     writePolicy: "owner" | "follows";
     followCount: number;
-    followsRefreshedAt: number | null;
+    // The `created_at` of the owner's contact list as the follow cache
+    // currently has it -- not when that cache was last refreshed, which
+    // is no longer a thing that happens on a schedule (ownership.ts
+    // refreshFollows).
+    followsListAt: number | null;
     // The largest number of stored events held by one non-owner pubkey,
     // and NIP-62 vanish requests still draining. Both are here for the
     // same reason: a vanish removes every event its sender authored, the
@@ -524,7 +528,7 @@ export class Relay extends DurableObject<Env> {
       relayName: resolveName(this.env, settings, profile),
       writePolicy: allowFollowsEnabled(this.env) ? "follows" : "owner",
       followCount: snapshot.followCount,
-      followsRefreshedAt: snapshot.followsRefreshedAt,
+      followsListAt: snapshot.followsListAt,
       largestNonOwnerAuthor: snapshot.largestNonOwnerAuthor,
       vanishing: pendingVanishes(sql),
     };
@@ -582,7 +586,7 @@ export class Relay extends DurableObject<Env> {
       const sql = this.sql;
       const now = nowSeconds();
       withReadPath("cron", () => {
-        refreshFollows(sql, this.env, now);
+        refreshFollows(sql, this.env);
         refreshProfile(sql, this.env, now);
       // One-time correction for relays the pre-fix short-page exhaustion
       // heuristic wrongly retired -- see backfill.ts resetWronglyExhaustedRelays.
@@ -1053,7 +1057,7 @@ export class Relay extends DurableObject<Env> {
       // follow's own kind-3 can never even trigger a redundant refresh.
       const owner = getOwnerPubkey(sql, this.env);
       if (event.pubkey === owner && event.kind === CONTACT_LIST_KIND) {
-        refreshFollows(sql, this.env, nowSeconds());
+        refreshFollows(sql, this.env);
       }
       this.broadcast(result.stored);
       this.liveBroadcast(result.stored);

@@ -31,8 +31,8 @@ vi.mock("../src/ownership", async (importOriginal) => {
   return {
     ...actual,
     isAllowedWriter: vi.fn(() => ({ allowed: true }) as const),
-    refreshFollows: vi.fn((sql: SqlStorage, env: Env, now: number) =>
-      actual.refreshFollows(sql, { ...env, ALLOW_FOLLOWS: "true" }, now),
+    refreshFollows: vi.fn((sql: SqlStorage, env: Env) =>
+      actual.refreshFollows(sql, { ...env, ALLOW_FOLLOWS: "true" }),
     ),
   };
 });

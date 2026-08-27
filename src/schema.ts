@@ -322,8 +322,20 @@ export const TABLES: readonly TableSpec[] = [
   {
     // ALLOW_FOLLOWS cache (CLAUDE.md "Configuration"): the owner's own
     // kind-3 follow list, re-derived on a cron schedule rather than per
-    // event -- see ownership.ts refreshFollows(). Replaced wholesale on
-    // each refresh, so no index beyond the primary key is needed.
+    // event -- see ownership.ts refreshFollows(). Replaced wholesale when
+    // it is replaced at all, so no index beyond the primary key is
+    // needed.
+    //
+    // `fetched_at` is the `created_at` of the kind-3 these rows were
+    // derived FROM, not the wall clock at which they were written. It is
+    // the watermark refreshFollows compares against to decide whether
+    // there is anything to rebuild -- the same job owner.profile_synced_at
+    // does for kind-0, kept here because a relay running under
+    // OWNER_PUBKEY has no `owner` row to put it on. Every row carries the
+    // same value, so one row read answers for the whole table. It was
+    // wall-clock time until v0.7.7, when rebuilding unconditionally on
+    // every cron tick turned out to cost 900 rows written per tick at 300
+    // follows.
     name: "follows",
     columns: [col("pubkey", "TEXT PRIMARY KEY"), col("fetched_at", "INTEGER NOT NULL")],
   },

@@ -120,28 +120,75 @@ export function isAllowedWriter(sql: SqlStorage, env: Env, pubkey: string): Writ
 // where they claimed it), so their client will have replicated their
 // contact list here; reading it locally avoids an outbound connection
 // (CLAUDE.md "The budget": an outbound connection keeps the DO in memory
-// for up to 15 minutes). Called from the cron handler, never per-event.
-export function refreshFollows(sql: SqlStorage, env: Env, nowSec: number): void {
+// for up to 15 minutes). Called from the cron handler, and from
+// relay.ts acceptEvent the moment the owner publishes a kind-3 here.
+//
+// Measures the property before writing, like refreshProfile below.
+// This used to DELETE the table and re-INSERT every row on every call,
+// unconditionally: 900 rows written per refresh at 300 follows (measured
+// -- 300 for the delete, 600 for the inserts), 21,600/day on an hourly
+// cron, 21.6% of the daily rows-written ceiling, spent to discover that a
+// contact list nobody had touched still said what it said an hour ago.
+// The cron path is the FALLBACK -- acceptEvent refreshes the instant the
+// owner publishes a new kind-3 to this relay, and the tick exists only
+// for a list that arrived some other way (backfill, or a client that
+// published it elsewhere first) -- so a tick that finds nothing new is
+// the normal case, not the exception, and it should cost nothing.
+//
+// `follows.fetched_at` is what makes the comparison possible, and it now
+// holds the `created_at` of the kind-3 the rows were derived FROM rather
+// than the wall clock at which they were written. That is the same
+// watermark `owner.profile_synced_at` is for kind-0, kept in this table
+// rather than on the `owner` row because there may not BE an owner row:
+// OWNER_PUBKEY skips the claim flow that creates it (see refreshProfile),
+// and a cache keyed to a row that does not exist is a cache that never
+// compares. Every row carries the same value, so reading one answers for
+// all of them -- one row read per call.
+//
+// Compared by equality rather than by "is the stored list newer". A
+// replaceable event's created_at only moves forward (NIP-01, and
+// MAX_CREATED_AT_FUTURE_SECONDS bounds the other end), so the two orderings
+// agree on every real change; equality additionally forces exactly one
+// rebuild on the first call after an upgrade, when the stored watermark
+// is a wall-clock second left by the old code and cannot match any
+// event's created_at. What neither form catches is a replacement
+// published at the identical created_at as the event it replaces -- NIP-01
+// resolves that tie by id, so the content can change while the timestamp
+// does not. refreshProfile has carried exactly that exposure since it was
+// written; noted here rather than defended against, since the cost of
+// defending is the 900 rows this change exists to stop paying.
+export function refreshFollows(sql: SqlStorage, env: Env): void {
   const owner = getOwnerPubkey(sql, env);
   if (owner === null || !allowFollowsEnabled(env)) return;
 
   const latest = sql
-    .exec<{ tags: string }>(
-      `SELECT tags FROM events WHERE pubkey = ? AND kind = ? ORDER BY created_at DESC LIMIT 1`,
+    .exec<{ created_at: number; tags: string }>(
+      `SELECT created_at, tags FROM events WHERE pubkey = ? AND kind = ? ORDER BY created_at DESC LIMIT 1`,
       owner,
       CONTACT_LIST_KIND,
     )
     .toArray()[0];
 
-  sql.exec(`DELETE FROM follows`);
-  if (!latest) return;
+  const cachedFrom = sql
+    .exec<{ fetched_at: number }>(`SELECT fetched_at FROM follows LIMIT 1`)
+    .toArray()[0]?.fetched_at;
 
+  if (!latest) {
+    // The contact list is gone -- deleted, vanished, or never stored.
+    // Only pay for the DELETE if there is something to delete; an empty
+    // cache on a relay with no kind-3 is already the right answer.
+    if (cachedFrom !== undefined) sql.exec(`DELETE FROM follows`);
+    return;
+  }
+  if (cachedFrom === latest.created_at) return;
+
+  sql.exec(`DELETE FROM follows`);
   const tags = JSON.parse(latest.tags) as string[][];
   const follows = new Set(
     tags.filter((t) => t[0] === "p" && t[1]).map((t) => t[1] as string),
   );
   for (const pubkey of follows) {
-    sql.exec(`INSERT INTO follows (pubkey, fetched_at) VALUES (?, ?)`, pubkey, nowSec);
+    sql.exec(`INSERT INTO follows (pubkey, fetched_at) VALUES (?, ?)`, pubkey, latest.created_at);
   }
 }
 
