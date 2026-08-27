@@ -1,4 +1,6 @@
-import { buildFilterQuery } from "./filters";
+import { buildFilterQuery, compareEvents, expandFilter } from "./filters";
+import { eventRowCost } from "./schema";
+import { countReplacement, withReadPath } from "./read-metrics";
 import {
   dTagValue,
   type Filter,
@@ -40,19 +42,37 @@ export function expirationOf(event: NostrEvent): number | null {
   return Number.isInteger(value) ? value : null;
 }
 
+// True for a tag this relay writes an `event_tags` row for. Only
+// single-letter tag names are indexed (NIP-01 `#<letter>` filters only
+// ever query those), and only each tag's first value -- see schema.ts's
+// write-cost comment. Shared by insertEventRow and the row-cost stamp
+// below so the count and the inserts can never disagree.
+function isIndexedTag(tag: string[]): boolean {
+  return tag[0]?.length === 1 && tag[1] !== undefined;
+}
+
 // `ingestedAt` is wall-clock now, not event.created_at -- see schema.ts's
 // `ingested_at` comment for why the two must never be conflated. It is
 // one more column on an INSERT this function already performs, so it adds
 // zero rows written per event.
+//
+// `row_cost` is stamped here for the same reason and at the same price:
+// this INSERT is the only place that knows both how many indexed tag rows
+// are about to follow and what the schema charges for each, and
+// estimateRowsWritten24h below then reads a column instead of rebuilding
+// the figure from a table-wide join. eventRowCost is derived from
+// schema.ts INDEXES, so the number stamped here tracks the real index set
+// rather than a constant somebody has to remember to update.
 function insertEventRow(
   sql: SqlStorage,
   event: NostrEvent,
   expiration: number | null,
   ingestedAt: number,
 ): void {
+  const indexedTags = event.tags.filter(isIndexedTag);
   sql.exec(
-    `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     event.id,
     event.pubkey,
     event.created_at,
@@ -62,23 +82,104 @@ function insertEventRow(
     event.sig,
     expiration,
     ingestedAt,
+    eventRowCost(indexedTags.length),
   );
-  // Only single-letter tag names are indexed (NIP-01 `#<letter>` filters
-  // only ever query those), and only each tag's first value -- see
-  // schema.ts's write-cost comment.
-  for (const tag of event.tags) {
-    if (tag[0]?.length === 1 && tag[1] !== undefined) {
-      sql.exec(
-        `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at) VALUES (?, ?, ?, ?)`,
-        tag[0],
-        tag[1],
-        event.id,
-        event.created_at,
-      );
-    }
+  for (const tag of indexedTags) {
+    sql.exec(
+      `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at) VALUES (?, ?, ?, ?)`,
+      tag[0],
+      tag[1],
+      event.id,
+      event.created_at,
+    );
   }
 }
 
+// ---------------------------------------------------------------------
+// The most expensive read left in this codebase, and deliberately still
+// here. Read this before "optimising" anything else.
+//
+// `DELETE FROM event_tags WHERE event_id = ?` has no index to use.
+// `idx_event_tags_lookup` is (tag_name, tag_value, created_at) and
+// `event_id` appears nowhere in it, so this scans the whole table: T
+// rows, about 5E, to delete a handful. The `DELETE FROM events` beside
+// it is a primary-key seek and costs ~1.
+//
+// It is paid on every replaceable/addressable REPLACEMENT -- every
+// kind-0, kind-3, kind-10002, NIP-51 list and addressable event the
+// owner republishes -- and on every NIP-09 deletion, NIP-62 vanish and
+// NIP-86 banevent.
+//
+// WHY IT IS STILL HERE, AND WHY THAT IS A DEBT AND NOT A DECISION
+//
+// The fix is an index on event_tags(event_id). Pricing only the fix gets
+// this wrong, and it did once: the fix costs a row write per TAG row
+// rather than per event -- TAG_ROW_COST 2 -> 3, about five more rows per
+// real note, roughly 15,000 rows/day at this relay's rate -- and stopping
+// there makes it look like the expensive option. It is a FIXED DAILY
+// FLOW against a ceiling that resets every morning.
+//
+// What it buys is the removal of a cost that SCALES WITH THE ACCUMULATED
+// TABLE, which is the property that took this relay down. This path
+// spends 5E rows read per replacement, so:
+//
+//   5E x R = 5,000,000   =>   E x R = 1,000,000
+//
+// where R is replaceable events stored per day that supersede an
+// existing version. The cron floor (CLAUDE.md "The budget") reaches
+// 5,000,000 at E ~= 104,000. This path reaches it at:
+//
+//   R =   5/day  ->  E = 200,000
+//   R =  10/day  ->  E = 100,000     <- crossover with the cron floor
+//   R =  25/day  ->  E =  40,000
+//   R =  50/day  ->  E =  20,000
+//   R = 100/day  ->  E =  10,000
+//   R = 250/day  ->  E =   4,000     <- today's table size
+//
+// So this is the binding constraint for any R above about 10/day, and
+// the cron floor -- the thing v0.7.2 spent two indexes fixing -- stops
+// being the limit that matters at all.
+//
+// ESTIMATING R
+//
+// The replaceable kinds this relay accepts are kind 0, kind 3, 10000-19999
+// and the addressable range 30000-39999 (nostr.ts). Three sources, and
+// only two of them matter:
+//
+//  - The OWNER's own clients, which is the sustained term. kind-3 is
+//    republished on every follow and unfollow, and some clients republish
+//    it on every launch; NIP-51 lists (10000-10030: mutes, pins,
+//    bookmarks, interests) are republished on every edit; addressable
+//    kinds are the volatile ones, since a client autosaving a kind-30023
+//    draft republishes the same address repeatedly. kind-0 and kind-10002
+//    are rare. For one active owner this lands at roughly 5-20/day, with
+//    the drafting case able to spike it by an order of magnitude for an
+//    afternoon.
+//
+//  - FOLLOWS, when ALLOW_FOLLOWS is on (the default) AND a follow's
+//    client actually writes to this relay -- which needs bothy in their
+//    own write set, so it is normally zero and is entirely outside the
+//    owner's control when it is not. Bounded by F x their republish rate,
+//    so a single follow whose client re-blasts kind-3 aggressively can
+//    contribute more than the owner does.
+//
+//  - BACKFILL contributes ~zero, which is worth stating because it looks
+//    like it should dominate. Backfill walks time BACKWARD, so the newest
+//    version of any replaceable address arrives first and every older one
+//    is superseded -- storeEvent returns early on isSupersededBy without
+//    calling this function at all. The cost is one replacement per
+//    distinct (pubkey, kind, d), once, not one per ingested event.
+//
+// That estimate is a range spanning the crossover, which is exactly why
+// it is not good enough to act on: read-metrics.ts counts replacements so
+// R can be READ off /api/stats after deploy instead of guessed at. Fix
+// this once that number is real -- the same rule that produced
+// read-metrics.ts in the first place, and the same one hasBackfillHeadroom
+// broke by guarding a number nobody had measured.
+//
+// test/read-cost.test.ts asserts this cost as "scales with the table"
+// rather than "stays under N", so it stays visible while it stays here.
+// ---------------------------------------------------------------------
 function deleteEventRow(sql: SqlStorage, id: string): void {
   sql.exec(`DELETE FROM event_tags WHERE event_id = ?`, id);
   sql.exec(`DELETE FROM events WHERE id = ?`, id);
@@ -156,7 +257,12 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent, ingestedAt: numbe
     if (existing && isSupersededBy(existing, event)) {
       return { ok: true, message: "", stored: null };
     }
-    if (existing) deleteEventRow(sql, existing.id);
+    // Counted here rather than inside deleteEventRow, which is also
+    // reached by NIP-09/NIP-62/NIP-86 deletions -- see countReplacement.
+    if (existing) {
+      countReplacement();
+      deleteEventRow(sql, existing.id);
+    }
     insertEventRow(sql, event, expirationOf(event), ingestedAt);
     return { ok: true, message: "", stored: event };
   }
@@ -174,7 +280,10 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent, ingestedAt: numbe
     if (existing && isSupersededBy(existing, event)) {
       return { ok: true, message: "", stored: null };
     }
-    if (existing) deleteEventRow(sql, existing.id);
+    if (existing) {
+      countReplacement();
+      deleteEventRow(sql, existing.id);
+    }
     insertEventRow(sql, event, expirationOf(event), ingestedAt);
     return { ok: true, message: "", stored: event };
   }
@@ -325,7 +434,32 @@ export function applyVanish(
   return { deletedAuthored: authored.length, deletedGiftWraps: giftWraps.length };
 }
 
+// Runs one filter, splitting it into per-(author, kind) queries first
+// (filters.ts expandFilter) so each one pins its index key columns to a
+// single value and stops at `limit` instead of sorting the table.
+//
+// The split is invisible from the outside. Each sub-filter carries the
+// original `limit`, so the union may hold more events than the client
+// asked for; re-sorting by the same rule buildFilterQuery's ORDER BY
+// uses and slicing back to `limit` yields exactly the rows the unsplit
+// query would have returned. Dedupe by id first -- `authors` and `kinds`
+// are disjoint dimensions, so no event can appear twice, but the
+// single-query path fed a Map for the same reason and the guarantee is
+// cheap to keep.
 export function queryFilter(sql: SqlStorage, filter: Filter, nowSec: number): NostrEvent[] {
+  const parts = expandFilter(filter);
+  const only = parts[0];
+  if (parts.length === 1 && only !== undefined) return runFilterQuery(sql, only, nowSec);
+
+  const byId = new Map<string, NostrEvent>();
+  for (const part of parts) {
+    for (const event of runFilterQuery(sql, part, nowSec)) byId.set(event.id, event);
+  }
+  const merged = [...byId.values()].sort(compareEvents);
+  return filter.limit === undefined ? merged : merged.slice(0, filter.limit);
+}
+
+function runFilterQuery(sql: SqlStorage, filter: Filter, nowSec: number): NostrEvent[] {
   const query = buildFilterQuery(filter, nowSec);
   if (query === null) return [];
   return sql
@@ -334,25 +468,18 @@ export function queryFilter(sql: SqlStorage, filter: Filter, nowSec: number): No
     .map(rowToEvent);
 }
 
-// Row-cost formula from schema.ts: 3 base rows + 2 per single-letter tag.
-// A read-only estimate, not a tracked counter -- see limits.ts/relay.ts
-// comments on why this relay avoids extra writes just to measure itself.
-// Backs /api/stats's `rowsWrittenEstimate24h` (relay.ts getStats) and
-// backfill's own headroom check (backfill.ts hasBackfillHeadroom,
-// ROADMAP.md chunk 7: backfill must yield to the owner's live traffic
-// rather than compete with it for the same daily ceiling) -- both need
-// the same number, so it lives here once rather than being computed
-// twice and risking drift between what the admin page displays and what
-// backfill actually throttles against.
+// Rows written in the last 24h, summed from the per-event `row_cost`
+// column each INSERT stamps (schema.ts eventRowCost, storage.ts
+// insertEventRow). A read-only estimate, not a tracked counter -- see
+// limits.ts/relay.ts comments on why this relay avoids extra writes just
+// to measure itself. Backs /api/stats's `rowsWrittenEstimate24h`
+// (relay.ts getStats) and backfill's own headroom check (backfill.ts
+// hasBackfillHeadroom, ROADMAP.md chunk 7: backfill must yield to the
+// owner's live traffic rather than compete with it for the same daily
+// ceiling) -- both need the same number, so it lives here once rather
+// than being computed twice and risking drift between what the admin page
+// displays and what backfill actually throttles against.
 //
-// A single LEFT JOIN + GROUP BY, not a two-query "fetch ids, then IN (...)
-// those ids" -- an earlier version did the latter and passed one bound
-// parameter per matching event, which broke past a few hundred events in
-// the window with a real SqlStorage "too many SQL variables" error. That
-// window is normally small (this relay's own recent live traffic), but
-// backfill's headroom check calls this same function while the window
-// may also contain a large burst of live writes -- exactly the case this
-// query now has to hold up under.
 // Measured by `ingested_at` -- when this relay actually wrote the row --
 // and never by `created_at`, which is when the author says they signed
 // it. Filtering on created_at made this function report rows
@@ -361,38 +488,65 @@ export function queryFilter(sql: SqlStorage, filter: Filter, nowSec: number): No
 // reported against 33,000 actually written. See schema.ts's
 // `ingested_at` comment for the full account.
 //
-// Still an estimate, and still named one. It counts the rows currently
-// standing for events ingested in the window, which is not quite the
-// same as every row written in it: a row written and then deleted inside
-// the same window drops out, and the deletion's own write, plus any
-// tombstone, is not counted. Both make this a floor rather than a
-// ceiling, which is the safe direction for the budget guard in
-// backfill.ts hasBackfillHeadroom -- it will never believe there is less
-// headroom than there is, only more, and the reserved-half rule
-// (BACKFILL_ROWS_SHARE_LIMIT) is what absorbs the difference.
+// Rows read: E, where E is every row in `events`. It was E + T until
+// v0.7.2, and that join is the single change in this file that mattered
+// most to the read budget. The old query derived each event's tag count
+// live:
 //
-// Rows read: one scan of `events` joined to `event_tags`. No index
-// covers `ingested_at` and none should -- an index here would cost a row
-// write per event, the exact thing this column was chosen to avoid. The
-// unindexed scan is what the created_at version already did, so the read
-// cost is unchanged.
+//   SELECT COUNT(t.event_id) FROM events e
+//   LEFT JOIN event_tags t ON t.event_id = e.id
+//   WHERE e.ingested_at > ? GROUP BY e.id
+//
+// `idx_event_tags_lookup` is (tag_name, tag_value, created_at) and
+// `event_id` appears nowhere in it, so SQLite resolved that join by
+// building an automatic index over the whole of `event_tags` -- reading
+// every tag row in the table to answer a question about the handful of
+// events in the 24h window. The cost tracked the TABLE, not the window.
+// backfill.ts hasBackfillHeadroom calls this twice per cron tick, so on
+// an hourly cron that one query was ~288E rows read per day, and at
+// E ~= 17,400 it was the entire 5,000,000/day ceiling on its own with no
+// client connected (CLAUDE.md "The budget").
+//
+// Summing a stamped column removes the join outright and never touches
+// `event_tags` at all. What remains is the scan of `events` itself:
+// `ingested_at` is covered by no index and must not be -- an index there
+// would cost a row write per event, the exact cost the column was chosen
+// to avoid -- so this is E, not the size of the window. Cutting E to the
+// window would take that forbidden index; cutting the ~288E floor to
+// ~48E did not, which is why this is where the line is drawn.
+//
+// Still an estimate, and still named one. It sums the cost of rows
+// currently standing for events ingested in the window, which is not
+// quite the same as every row written in it: a row written and then
+// deleted inside the same window drops out, and the deletion's own write,
+// plus any tombstone, is not counted. Rows written before `row_cost`
+// existed carry NULL and are absent from the SUM entirely, which
+// undercounts for at most the one 24h window straddling an upgrade. All
+// three make this a floor rather than a ceiling, which is the safe
+// direction for the budget guard in backfill.ts hasBackfillHeadroom -- it
+// will never believe there is less headroom than there is, only more, and
+// the reserved-half rule (BACKFILL_ROWS_SHARE_LIMIT) is what absorbs the
+// difference.
 export function estimateRowsWritten24h(sql: SqlStorage, sinceCutoff: number): number {
-  const rows = sql
-    .exec<{ tag_count: number }>(
-      `SELECT COUNT(t.event_id) AS tag_count
-       FROM events e
-       LEFT JOIN event_tags t ON t.event_id = e.id
-       WHERE e.ingested_at > ?
-       GROUP BY e.id`,
-      sinceCutoff,
-    )
-    .toArray();
+  return withReadPath("estimateRowsWritten24h", () => estimateRowsWritten24hInner(sql, sinceCutoff));
+}
 
-  let total = 0;
-  for (const r of rows) {
-    total += 3 + 2 * r.tag_count;
-  }
-  return total;
+// Scoped separately from whichever path called it (read-metrics.ts):
+// getStats displays this number once per admin page load, but
+// backfill.ts hasBackfillHeadroom calls it twice per cron tick, and
+// nothing in the /api/stats breakdown would distinguish those if this
+// inherited its caller's bucket. It is also the one query here that
+// filters on an unindexed column, which is reason enough to give it its
+// own line in the report.
+function estimateRowsWritten24hInner(sql: SqlStorage, sinceCutoff: number): number {
+  return (
+    sql
+      .exec<{ total: number | null }>(
+        `SELECT SUM(row_cost) AS total FROM events WHERE ingested_at > ?`,
+        sinceCutoff,
+      )
+      .toArray()[0]?.total ?? 0
+  );
 }
 
 // How many events this relay actually took in during the window,
@@ -421,10 +575,7 @@ export function queryFilters(sql: SqlStorage, filters: Filter[], nowSec: number)
       byId.set(event.id, event);
     }
   }
-  return [...byId.values()].sort((a, b) => {
-    if (a.created_at !== b.created_at) return b.created_at - a.created_at;
-    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-  });
+  return [...byId.values()].sort(compareEvents);
 }
 
 // ---------------------------------------------------------------------

@@ -12,9 +12,8 @@ import {
 import { matchesAnyFilter, parseFilter } from "./filters";
 import { recordHost } from "./host";
 import {
-  clampFilterLimit,
+  boundFilter,
   GIFT_WRAP_RATE_LIMIT_WINDOW_MS,
-  isUnconstrainedFilter,
   LIVE_FEED_MAX_LIFETIME_MS,
   MAX_EVENTS_PER_REQ,
   maxEventBytes,
@@ -43,6 +42,7 @@ import {
 } from "./ownership";
 import type { Profile } from "./profile-lookup";
 import { normalizePubkey } from "./pubkey";
+import { instrumentSql, readMetricsSnapshot, type ReadMetricsSnapshot, withReadPath } from "./read-metrics";
 import { initSchema } from "./schema";
 import {
   applyDeletion,
@@ -184,6 +184,23 @@ function writeRejectionMessage(reason: "unclaimed" | "not-follow" | "owner-only"
   }
 }
 
+// How long /api/stats' counts may be served from memory (Relay.statsCache).
+//
+// Fifteen seconds, chosen against what the numbers are for rather than
+// against a round figure: the admin page fetches this once per load, so
+// the cache is what stops a refresh-happy tab -- or several tabs, or a
+// browser reloading on wake -- from spending ~4E rows read each time.
+// Fifteen seconds is short enough that an owner who publishes an event
+// and then reloads the page sees their own write, and long enough that a
+// burst of loads costs one computation.
+const STATS_CACHE_TTL_MS = 15_000;
+
+// The part of getStats' answer that is derived from storage, and so the
+// part worth memoizing. `reads` is deliberately NOT in here: it is the
+// diagnostic snapshot (read-metrics.ts), it costs no query at all, and a
+// cached copy of it would report the rows read by some earlier request.
+type CachedStats = Omit<Awaited<ReturnType<Relay["getStats"]>>, "reads">;
+
 export class Relay extends DurableObject<Env> {
   // Per-IP sliding window counters for webSocketMessage throttling --
   // see the RATE_LIMIT_* constants above for why this is memory, not
@@ -205,9 +222,40 @@ export class Relay extends DurableObject<Env> {
   // the constant's comment for exactly how much that is and isn't worth.
   private pubkeyRateLimits = new Map<string, { windowStart: number; count: number }>();
 
+  // DIAGNOSTIC (src/read-metrics.ts, and expected to be removed with it):
+  // every storage access in this object goes through this handle rather
+  // than `ctx.storage.sql` directly, so rows read are attributed to the
+  // code path that caused them. Behaviourally identical to the handle it
+  // wraps -- it adds a Proxy per query and no storage of its own.
+  //
+  // A field initializer, which runs after super() has set `ctx` and
+  // before the constructor body, so initSchema below already sees it.
+  private readonly sql: SqlStorage = instrumentSql(this.ctx.storage.sql);
+
+  // Memoized /api/stats counts (collectStats below). In memory, never in
+  // storage: caching a number in a row would cost a row write to save a
+  // row read, the same trade schema.ts rejected for a rows-written
+  // counter table and read-metrics.ts rejected again for its own
+  // counters.
+  //
+  // Every figure behind it is a COUNT or a SUM over `events`, so one
+  // uncached load costs ~4E rows read -- 28 admin page loads was the
+  // entire 5,000,000/day ceiling at E=20,000 (CLAUDE.md "The budget"). None of
+  // them needs to be exact: they are a dashboard, not a gate. Nothing on
+  // a correctness path reads this cache -- backfill's headroom guard
+  // calls estimateRowsWritten24h directly and still gets a fresh answer
+  // every time, which matters because it decides whether writes may
+  // proceed.
+  private statsCache: { at: number; value: CachedStats } | null = null;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    initSchema(ctx.storage.sql);
+    // Scoped because this runs on every wake from hibernation, not once
+    // per deploy -- the Durable Object constructor is re-entered each
+    // time an evicted object is revived, so whatever initSchema reads is
+    // paid per wake. Whether that is a real share of the read budget was
+    // exactly the sort of thing nothing here could answer before.
+    withReadPath("schema", () => initSchema(this.sql));
     ctx.setWebSocketAutoResponse(PING_PONG);
   }
 
@@ -220,21 +268,29 @@ export class Relay extends DurableObject<Env> {
     // so this is the most reliable single place to learn the
     // deployment's own host (src/host.ts) for backfill's self-skip.
     // recordHost is a no-op write once the host is already known.
-    recordHost(this.ctx.storage.sql, new URL(request.url).host);
+    // DIAGNOSTIC scope (read-metrics.ts): the two storage touches every
+    // connection pays, kept together and off the async path -- a
+    // withReadPath scope is synchronous, so it must not straddle the
+    // `await` further down this method.
+    const blocked = withReadPath("connect", () => {
+      recordHost(this.sql, new URL(request.url).host);
 
-    // NIP-86 blockip (src/nip86.ts), enforced exactly here: once per
-    // connection, before the socket is accepted, and never again for the
-    // life of that connection. Checking per message or per event would
-    // put a storage read on the hot path for a table that is almost
-    // always empty -- the whole reason IP blocking made phase one.
-    //
-    // This covers both WebSocket paths (the nostr protocol connection and
-    // the admin page's /live feed) and nothing else. In particular it
-    // does NOT cover the management endpoint, which is a plain POST
-    // handled in the Worker and never reaches this method: blocking your
-    // own address must never lock you out of the API that unblocks it.
-    const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
-    if (isIpBlocked(this.ctx.storage.sql, ip)) {
+      // NIP-86 blockip (src/nip86.ts), enforced exactly here: once per
+      // connection, before the socket is accepted, and never again for the
+      // life of that connection. Checking per message or per event would
+      // put a storage read on the hot path for a table that is almost
+      // always empty -- the whole reason IP blocking made phase one.
+      //
+      // This covers both WebSocket paths (the nostr protocol connection
+      // and the admin page's /live feed) and nothing else. In particular
+      // it does NOT cover the management endpoint, which is a plain POST
+      // handled in the Worker and never reaches this method: blocking
+      // your own address must never lock you out of the API that
+      // unblocks it.
+      const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+      return isIpBlocked(this.sql, ip);
+    });
+    if (blocked) {
       return new Response("blocked", { status: 403 });
     }
 
@@ -246,8 +302,9 @@ export class Relay extends DurableObject<Env> {
     // push-only, unauthenticated channel -- not a nostr protocol
     // connection -- so it's routed to its own path rather than reusing
     // REQ/EVENT semantics. Keeping it separate means it never has to
-    // satisfy isUnconstrainedFilter (CLAUDE.md "Threat model": reject
-    // filters with no authors/kinds) just to see "everything," and the
+    // satisfy the read-cost guard (limits.ts boundFilter, which admits a
+    // filter only at a limit some index can afford) just to see
+    // "everything," and the
     // gift-wrap NIP-42 read gate (handleReq below) never has to reason
     // about it: liveBroadcast unconditionally never sends kind 1059,
     // full stop, so there's no unauthenticated-viewer case to gate.
@@ -310,10 +367,12 @@ export class Relay extends DurableObject<Env> {
     const pubkey = normalizePubkey(rawPubkey);
     if (!pubkey) return { status: "invalid" };
 
-    const sql = this.ctx.storage.sql;
-    if (host) recordHost(sql, host);
-    if (!claimOwner(sql, pubkey, profile)) return { status: "conflict" };
-    return { status: "claimed", pubkey };
+    return withReadPath("identity", () => {
+      const sql = this.sql;
+      if (host) recordHost(sql, host);
+      if (!claimOwner(sql, pubkey, profile)) return { status: "conflict" as const };
+      return { status: "claimed" as const, pubkey };
+    });
   }
 
   // Backs the NIP-11 document's name/icon (src/nip11.ts) -- derived from
@@ -322,9 +381,11 @@ export class Relay extends DurableObject<Env> {
   // storage entirely, or when the claim-time profile lookup failed; the
   // caller (nip11.ts) falls back to hardcoded defaults in all those cases.
   async getIdentity(host?: string): Promise<{ profile: OwnerProfile; settings: RelaySettings }> {
-    const sql = this.ctx.storage.sql;
-    if (host) recordHost(sql, host);
-    return { profile: getOwnerProfile(sql, this.env), settings: getRelaySettings(sql) };
+    return withReadPath("identity", () => {
+      const sql = this.sql;
+      if (host) recordHost(sql, host);
+      return { profile: getOwnerProfile(sql, this.env), settings: getRelaySettings(sql) };
+    });
   }
 
   // The owner pubkey on its own, for the Worker's NIP-98 check
@@ -333,7 +394,7 @@ export class Relay extends DurableObject<Env> {
   // deliberately happens in the Worker. Null when unclaimed, which
   // verifyNip98 turns into a 401.
   async getOwner(): Promise<string | null> {
-    return getOwnerPubkey(this.ctx.storage.sql, this.env);
+    return withReadPath("identity", () => getOwnerPubkey(this.sql, this.env));
   }
 
   // NIP-86 relay management (src/nip86.ts), write side. Reached only
@@ -344,7 +405,9 @@ export class Relay extends DurableObject<Env> {
   // ingestBackfillPage() do: the Durable Object owns every write, and it
   // opens no outbound connection to serve one.
   async manage(method: unknown, params: unknown[], callerIp: string): Promise<ManagementResponse> {
-    return handleManagementCall(this.ctx.storage.sql, this.env, method, params, callerIp, nowSeconds());
+    return withReadPath("management", () =>
+      handleManagementCall(this.sql, this.env, method, params, callerIp, nowSeconds()),
+    );
   }
 
   // Backs GET /api/stats (src/index.ts) -- see CLAUDE.md "Admin page".
@@ -381,9 +444,53 @@ export class Relay extends DurableObject<Env> {
     writePolicy: "owner" | "follows";
     followCount: number;
     followsRefreshedAt: number | null;
+    // DIAGNOSTIC, and expected to be removed with src/read-metrics.ts.
+    // Rows read attributed to the code path that caused them, since the
+    // relay's last outage was the 5,000,000 rows-read/day ceiling and
+    // nothing here could say which path spent it. In-memory counters,
+    // so this describes `reads.sinceMs` of uptime, NOT a day -- read it
+    // for proportions, and read `projected24h` as an extrapolation of
+    // exactly that sample, not as a measurement.
+    reads: ReadMetricsSnapshot;
   }> {
-    const sql = this.ctx.storage.sql;
-    if (host) recordHost(sql, host);
+    // Scoped to "getStats" rather than measured per query: the nested
+    // estimateRowsWritten24h declares its own scope and so reports
+    // separately, which is the one call in here already suspected of
+    // being expensive.
+    const stats = withReadPath("getStats", () => this.collectStats(host));
+    // Snapshotted after the scope closes so this call's own reads are
+    // included in what it reports -- a breakdown that excluded the
+    // request producing it would understate getStats by exactly one call.
+    return { ...stats, reads: readMetricsSnapshot() };
+  }
+
+  private collectStats(host?: string): Omit<Awaited<ReturnType<Relay["getStats"]>>, "reads"> {
+    // Outside the cache deliberately: recordHost is a write, and it is a
+    // no-op once the host is already known (src/host.ts), so it costs
+    // nothing to keep honest.
+    if (host) recordHost(this.sql, host);
+
+    const now = Date.now();
+    const cached = this.statsCache;
+    if (cached !== null && now - cached.at < STATS_CACHE_TTL_MS) return cached.value;
+
+    const value = this.computeStats();
+    this.statsCache = { at: now, value };
+    return value;
+  }
+
+  // Tests only, and there is no production caller -- same rule as
+  // read-metrics.ts resetReadMetrics. `reset()` in the vitest harness
+  // clears storage without going through any write path this object can
+  // see, so a test that resets storage and then reads stats would
+  // otherwise be answered from a cache describing the database it just
+  // threw away. Called from test/helpers/isolate.ts.
+  resetStatsCache(): void {
+    this.statsCache = null;
+  }
+
+  private computeStats(): CachedStats {
+    const sql = this.sql;
     const owner = getOwnerPubkey(sql, this.env);
     const since = nowSeconds() - 86400;
 
@@ -443,18 +550,20 @@ export class Relay extends DurableObject<Env> {
     // silently disable that. This adds a log line, not a behaviour
     // change.
     try {
-      const sql = this.ctx.storage.sql;
+      const sql = this.sql;
       const now = nowSeconds();
-      refreshFollows(sql, this.env, now);
-      refreshProfile(sql, this.env, now);
+      withReadPath("cron", () => {
+        refreshFollows(sql, this.env, now);
+        refreshProfile(sql, this.env, now);
       // One-time correction for relays the pre-fix short-page exhaustion
       // heuristic wrongly retired -- see backfill.ts resetWronglyExhaustedRelays.
-      resetWronglyExhaustedRelays(sql);
+        resetWronglyExhaustedRelays(sql);
       // Runs AFTER the reset, deliberately: the reset clears every
       // exhausted flag including this relay's own row, so purging has to
       // be what happens last or backfill would spend the next tick
       // fetching its own history from itself. See purgeSelfRelay.
-      purgeSelfRelay(sql);
+        purgeSelfRelay(sql);
+      });
     } catch (err) {
       console.error(
         "runCron failed (DO-side):",
@@ -472,18 +581,20 @@ export class Relay extends DurableObject<Env> {
   // when unclaimed -- there's no owner pubkey to backfill and no relay
   // list to discover yet.
   async getBackfillState(): Promise<BackfillState | null> {
-    const sql = this.ctx.storage.sql;
-    const owner = getOwnerPubkey(sql, this.env);
-    if (owner === null) return null;
-    const now = nowSeconds();
-    return { ...getBackfillStatus(sql), ownerPubkey: owner, canIngestNow: hasBackfillHeadroom(sql, now) };
+    return withReadPath("backfillState", () => {
+      const sql = this.sql;
+      const owner = getOwnerPubkey(sql, this.env);
+      if (owner === null) return null;
+      const now = nowSeconds();
+      return { ...getBackfillStatus(sql), ownerPubkey: owner, canIngestNow: hasBackfillHeadroom(sql, now) };
+    });
   }
 
   // Seeds backfill_relays from the owner's kind-10002 write relays, once
   // the Worker has resolved them from well-known relays (backfill-worker.ts
   // discoverWriteRelays). A pure write, no outbound connection here.
   async discoverBackfillRelays(relayUrls: string[]): Promise<void> {
-    seedBackfillRelays(this.ctx.storage.sql, relayUrls, nowSeconds());
+    withReadPath("backfillIngest", () => seedBackfillRelays(this.sql, relayUrls, nowSeconds()));
   }
 
   // Stores one page of raw EVENT payloads the Worker already fetched over
@@ -499,10 +610,16 @@ export class Relay extends DurableObject<Env> {
     eose: boolean,
     refusals: string[] = [],
   ): Promise<{ stored: number; exhausted: boolean } | null> {
-    const sql = this.ctx.storage.sql;
-    const owner = getOwnerPubkey(sql, this.env);
-    if (owner === null) return null;
-    return applyBackfillPage(sql, owner, relayUrl, rawEvents, eose, nowSeconds(), refusals);
+    // Scoped here, at the RPC entry, rather than inside applyBackfillPage
+    // -- one entry per cron tick, so `rowsPerCall` in the /api/stats
+    // breakdown reads as "rows read per backfill tick", which is the unit
+    // the arithmetic in CLAUDE.md "The budget" multiplies by 24.
+    return withReadPath("backfillIngest", () => {
+      const sql = this.sql;
+      const owner = getOwnerPubkey(sql, this.env);
+      if (owner === null) return null;
+      return applyBackfillPage(sql, owner, relayUrl, rawEvents, eose, nowSeconds(), refusals);
+    });
   }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -565,7 +682,17 @@ export class Relay extends DurableObject<Env> {
     return entry.count > RATE_LIMIT_MAX_MESSAGES;
   }
 
+  // Scoped as one "write" entry per EVENT frame (read-metrics.ts), which
+  // covers the ownership gate, the tombstone and duplicate checks, the
+  // gift wrap count, storeEvent's own replaceable/addressable lookups and
+  // any NIP-09/NIP-62 application -- i.e. everything an inbound event
+  // reads, in one bucket, so `rowsPerCall` reads as "rows read per event
+  // offered to this relay".
   private handleEvent(ws: WebSocket, raw: unknown): void {
+    withReadPath("write", () => this.handleEventInner(ws, raw));
+  }
+
+  private handleEventInner(ws: WebSocket, raw: unknown): void {
     const event = parseEventShape(raw);
     if (!event) {
       send(ws, ["NOTICE", "error: malformed event"]);
@@ -593,7 +720,7 @@ export class Relay extends DurableObject<Env> {
     // outcome. This also means a non-owner event with a bad id or bad
     // signature still gets "restricted:"/"blocked:", not "invalid:", which
     // is fine: NIP-01 doesn't require checking id/sig before authorization.
-    const sql = this.ctx.storage.sql;
+    const sql = this.sql;
     const auth = isAllowedWriter(sql, this.env, event.pubkey);
     if (!auth.allowed) {
       ok(ws, event.id, false, writeRejectionMessage(auth.reason));
@@ -611,7 +738,7 @@ export class Relay extends DurableObject<Env> {
   // abuse controls below, on top of the general per-connection rate
   // limit already applied to every message in webSocketMessage.
   private handleGiftWrap(ws: WebSocket, event: NostrEvent): void {
-    const sql = this.ctx.storage.sql;
+    const sql = this.sql;
     const owner = getOwnerPubkey(sql, this.env);
     if (owner === null) {
       ok(ws, event.id, false, "restricted: relay has not been claimed yet");
@@ -731,7 +858,7 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
-    applyVanish(this.ctx.storage.sql, event.pubkey, event.created_at);
+    applyVanish(this.sql, event.pubkey, event.created_at);
     ok(ws, event.id, true, "");
   }
 
@@ -757,7 +884,7 @@ export class Relay extends DurableObject<Env> {
     // A plain integer comparison -- the cheapest check here after the
     // length above, and still well ahead of id/signature verification, for
     // the same cheapest-check-first reason as the tombstone check below
-    // (CLAUDE.md "Conventions", docs/budget.md chunk 5). See limits.ts
+    // (CLAUDE.md "Conventions", CLAUDE.md "The budget"). See limits.ts
     // MAX_CREATED_AT_FUTURE_SECONDS for why this rejects at all.
     if (isCreatedAtTooFarInFuture(event, nowSeconds())) {
       ok(ws, event.id, false, "invalid: created_at is too far in the future");
@@ -847,7 +974,15 @@ export class Relay extends DurableObject<Env> {
     }
   }
 
+  // Scoped as one "req" entry per REQ frame (read-metrics.ts). The
+  // NIP-42 gift wrap probe inside declares its own scope, so the two
+  // report separately: the probe is a cost CLAUDE.md "The budget" already
+  // measured and defended, the REQ query itself is one it never did.
   private handleReq(ws: WebSocket, frame: unknown[]): void {
+    withReadPath("req", () => this.handleReqInner(ws, frame));
+  }
+
+  private handleReqInner(ws: WebSocket, frame: unknown[]): void {
     const subId = frame[1];
     if (typeof subId !== "string") {
       send(ws, ["NOTICE", "error: malformed REQ"]);
@@ -860,6 +995,13 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
+    // One pass, not two. The old code clamped the limit and separately
+    // asked whether the filter was "unconstrained", and neither step
+    // could see the other -- the clamp bounded rows RETURNED and the
+    // guard bounded nothing about rows READ. boundFilter (limits.ts)
+    // does both against one cost model derived from the index set, so a
+    // filter is admitted only at a limit its access path can actually
+    // afford.
     const filters: Filter[] = [];
     for (const raw of frame.slice(2)) {
       const filter = parseFilter(raw);
@@ -867,11 +1009,12 @@ export class Relay extends DurableObject<Env> {
         send(ws, ["CLOSED", subId, "error: malformed filter"]);
         return;
       }
-      if (isUnconstrainedFilter(filter)) {
-        send(ws, ["CLOSED", subId, "invalid: filter must have an authors or kinds constraint"]);
+      const bound = boundFilter(filter);
+      if (!bound.ok) {
+        send(ws, ["CLOSED", subId, bound.reason]);
         return;
       }
-      filters.push(clampFilterLimit(filter));
+      filters.push(bound.filter);
     }
 
     // NIP-42 gate on gift wrap reads (ROADMAP.md chunk 6, CLAUDE.md
@@ -894,12 +1037,15 @@ export class Relay extends DurableObject<Env> {
     // per filter, `limit: 1` since only existence matters, and skipped
     // entirely when `kinds` already rules out 1059 without touching
     // storage at all.
-    const owner = getOwnerPubkey(this.ctx.storage.sql, this.env);
+    const owner = getOwnerPubkey(this.sql, this.env);
     const requestsGiftWraps = filters.some((f) => {
       if (f.kinds !== undefined) return f.kinds.includes(GIFT_WRAP_KIND);
       if (owner === null) return false;
-      return queryFilter(this.ctx.storage.sql, { ...f, kinds: [GIFT_WRAP_KIND], limit: 1 }, nowSeconds())
-        .length > 0;
+      return withReadPath(
+        "giftWrapGate",
+        () =>
+          queryFilter(this.sql, { ...f, kinds: [GIFT_WRAP_KIND], limit: 1 }, nowSeconds()).length > 0,
+      );
     });
     if (requestsGiftWraps && state.authedPubkey !== owner) {
       if (state.authedPubkey === undefined) {
@@ -918,7 +1064,7 @@ export class Relay extends DurableObject<Env> {
     state.subs[subId] = filters;
     setState(ws, state);
 
-    const events = queryFilters(this.ctx.storage.sql, filters, nowSeconds()).slice(0, MAX_EVENTS_PER_REQ);
+    const events = queryFilters(this.sql, filters, nowSeconds()).slice(0, MAX_EVENTS_PER_REQ);
     for (const event of events) {
       send(ws, ["EVENT", subId, event]);
     }
@@ -992,7 +1138,7 @@ export class Relay extends DurableObject<Env> {
     // unauthenticated channel. Owner looked up only on the gated kind so
     // the common path stays free of the extra read.
     const gated = event.kind === GIFT_WRAP_KIND;
-    const owner = gated ? getOwnerPubkey(this.ctx.storage.sql, this.env) : null;
+    const owner = gated ? getOwnerPubkey(this.sql, this.env) : null;
     for (const ws of this.ctx.getWebSockets()) {
       // ctx.getWebSockets() with no tag argument returns every socket,
       // live feed ones included -- those carry a LiveFeedState

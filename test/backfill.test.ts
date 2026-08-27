@@ -15,6 +15,7 @@ import {
 } from "../src/backfill";
 import { recordHost } from "../src/host";
 import { BACKFILL_ROWS_SHARE_LIMIT, MAX_CREATED_AT_FUTURE_SECONDS } from "../src/limits";
+import { eventRowCost } from "../src/schema";
 import { countIngested24h, estimateRowsWritten24h } from "../src/storage";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
@@ -48,13 +49,20 @@ function insertSyntheticLiveRows(sql: SqlStorage, idPrefix: string, count: numbe
   let inserted = 0;
   while (inserted < count) {
     const batchCount = Math.min(BATCH, count - inserted);
-    const values = Array(batchCount).fill("(?, ?, ?, ?, ?, ?, ?, NULL, ?)").join(", ");
+    const values = Array(batchCount).fill("(?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)").join(", ");
     const params: (string | number)[] = [];
     for (let i = 0; i < batchCount; i++) {
-      params.push(`${idPrefix}-${inserted + i}`, "f".repeat(64), at, 1, "[]", "", "0".repeat(128), at);
+      // row_cost stamped exactly as storage.ts insertEventRow would --
+      // these stand in for real live writes, and a row with a NULL
+      // row_cost is invisible to estimateRowsWritten24h by design (the
+      // pre-migration case, covered separately below).
+      params.push(
+        `${idPrefix}-${inserted + i}`, "f".repeat(64), at, 1, "[]", "", "0".repeat(128), at,
+        eventRowCost(0),
+      );
     }
     sql.exec(
-      `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at)
+      `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost)
        VALUES ${values}`,
       ...params,
     );
@@ -91,10 +99,14 @@ describe("backfill write accounting", () => {
       const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [oldNote], true, NOW);
       expect(result.stored).toBe(1);
 
-      // 3 rows for the event itself (base + implicit PK index +
-      // composite index, schema.ts) and none for tags, since this note
-      // carries none.
-      expect(estimateRowsWritten24h(sql, since)).toBe(3);
+      // The event's own rows (base + implicit PK index + one per index
+      // on `events`) and none for tags, since this note carries none.
+      // Derived from schema.ts rather than written as a literal: this
+      // assertion said `3` until v0.7.2 added two indexes, and a literal
+      // here would have to be found and changed by hand every time the
+      // index set moves. test/hibernation.test.ts is what checks
+      // eventRowCost against SQLite's real rowsWritten.
+      expect(estimateRowsWritten24h(sql, since)).toBe(eventRowCost(0));
 
       // The old behaviour, shown to be the wrong question rather than
       // just a wrong number: by created_at this event is invisible in the
@@ -122,8 +134,8 @@ describe("backfill write accounting", () => {
     await runInDurableObject(stub, async (_instance, state) => {
       const sql = state.storage.sql;
       applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [reply], true, NOW);
-      // 3 + 2 per indexed tag = 7, per schema.ts's write-cost comment.
-      expect(estimateRowsWritten24h(sql, NOW - 86400)).toBe(7);
+      // Base cost plus TAG_ROW_COST per indexed tag, per schema.ts.
+      expect(estimateRowsWritten24h(sql, NOW - 86400)).toBe(eventRowCost(2));
     });
   });
 
@@ -134,7 +146,7 @@ describe("backfill write accounting", () => {
     await runInDurableObject(stub, async (_instance, state) => {
       const sql = state.storage.sql;
       applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [oldNote], true, NOW);
-      expect(estimateRowsWritten24h(sql, NOW - 86400)).toBe(3);
+      expect(estimateRowsWritten24h(sql, NOW - 86400)).toBe(eventRowCost(0));
       // A day and a half later the same row no longer counts against the
       // budget -- the window rolls rather than accumulating forever.
       expect(estimateRowsWritten24h(sql, NOW + 86400 / 2)).toBe(0);
@@ -662,9 +674,15 @@ describe("backfill ingest", () => {
       const sql = state.storage.sql;
       seedBackfillRelays(sql, ["wss://relay-a"], now);
 
-      // Below BACKFILL_ROWS_SHARE_LIMIT/3 bare-note-equivalent rows --
-      // still plenty of headroom.
-      insertSyntheticLiveRows(sql, "under", Math.floor(BACKFILL_ROWS_SHARE_LIMIT / 3) - 100, now);
+      // Just under BACKFILL_ROWS_SHARE_LIMIT worth of bare-note-equivalent
+      // rows -- still headroom. Sized from eventRowCost so the fixture
+      // tracks the schema instead of assuming a bare note costs 3.
+      insertSyntheticLiveRows(
+        sql,
+        "under",
+        Math.floor(BACKFILL_ROWS_SHARE_LIMIT / eventRowCost(0)) - 100,
+        now,
+      );
       expect(hasBackfillHeadroom(sql, now)).toBe(true);
 
       // Cross the reserved share -- live traffic (real or, here,

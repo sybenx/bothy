@@ -5,25 +5,57 @@
 //
 // Measured via SqlStorageCursor.rowsWritten (chunk 3, docs/baselines.json)
 // rather than estimated, since `id TEXT PRIMARY KEY` isn't a rowid alias
-// and costs its own implicit unique index on top of the composite one:
+// and costs its own implicit unique index on top of the declared ones:
 //
 //   events insert:                    1 base row + 1 implicit PK index
 //                                      (TEXT primary key, not a rowid
-//                                      alias) + 1 composite index below = 3
+//                                      alias) + 1 per declared index on
+//                                      `events` (3 of them)             = 5
 //   event_tags insert, per tag row:   1 base row + 1 for its index       = 2
 //
-//   => 3 + 2 * (single-letter tag count) rows per stored event.
-//      A bare note costs 3 rows; a reply carrying #e and #p costs 7.
+//   => 5 + 2 * (single-letter tag count) rows per stored event.
+//      A bare note costs 5 rows; a reply carrying #e and #p costs 9.
 //      NIP-09 deletes and replaceable-event replacement cost the same
 //      shape again (a delete is a write too) plus this insert cost.
 //
-// Only ONE index exists on `events`. A second index on (kind, created_at)
-// for kind-only filters was considered and rejected: chunk 4's read-abuse
-// rules reject any filter lacking both `authors` and `kinds`, so every
-// accepted query filters by pubkey, and pubkey cardinality for a single
-// owner (plus optional follows) is small enough that an unindexed
-// secondary scan is cheap. Do not add it without updating this comment
-// and re-justifying the write cost.
+// eventRowCost() below computes exactly that from INDEXES, and
+// test/hibernation.test.ts asserts the computed figure against a real
+// SqlStorageCursor.rowsWritten. Neither number is written down twice.
+//
+// THREE indexes exist on `events`, and the third and fourth rows of the
+// arithmetic above are what they cost. Two of them were added in v0.7.2
+// after the relay went down on rows READ, not rows written -- see
+// CLAUDE.md "The budget".
+//
+// This comment twice rejected an index on (kind, created_at), on the
+// grounds that "chunk 4's read-abuse rules reject any filter lacking
+// both `authors` and `kinds`, so every accepted query filters by
+// pubkey." Both halves were wrong. `isUnconstrainedFilter` accepted
+// `authors` OR `kinds`, not both, so a kinds-only filter was always
+// admissible; and filtering by pubkey buys nothing on a single-owner
+// relay, where every row shares one pubkey. The reasoning was never
+// re-checked against a measurement because the read cost was
+// hypothetical. It stopped being hypothetical when the relay consumed
+// its entire 5,000,000 rows-read/day allowance with no attacker
+// involved.
+//
+// Measured, at E=2,000 rows in `events` (test/read-cost.test.ts):
+//
+//   {"kinds":[1],"limit":20}            3,940 rows -> 41
+//   {"authors":[owner],"limit":20}      3,600 rows -> 41
+//
+// The trade is stated plainly: two more rows written per stored event,
+// against two filter shapes that each read the whole table however small
+// their `limit`. At the live relay's ~2,900 events/day that is ~5,800
+// extra rows written against a 100,000/day ceiling metered at ~38,000 --
+// versus 125 REQs being enough to clear the entire read ceiling.
+//
+// Every index below is declared once, as data, and the per-event write
+// cost is DERIVED from that declaration by eventRowCost() rather than
+// restated as a constant beside it. Adding a fourth index therefore
+// updates the accounting automatically -- which matters because this
+// project has already shipped rows-written accounting that was wrong by
+// a factor of 45 (see `ingested_at` below).
 //
 // `ingested_at` is the wall-clock second this relay wrote the row, which
 // is a different thing from `created_at`, the second the author says they
@@ -39,11 +71,10 @@
 // protecting the daily write budget from backfill could not see
 // backfill's own writes.
 //
-// A column, not a counter table. docs/budget.md rejected a write-counter
-// row on the grounds that "a counter incremented on every stored event
-// would itself cost a row write per event, which directly fights the
-// thing the stats endpoint exists to make visible," and that reasoning
-// still holds. A column added to an INSERT this code already performs
+// A column, not a counter table. A counter row incremented on every
+// stored event would itself cost a row write per event, which directly
+// fights the thing the stats endpoint exists to make visible -- the
+// measurement would consume the budget it reports on. A column added to an INSERT this code already performs
 // costs zero additional rows written: a row write is a row, not a
 // column, and no index covers `ingested_at` (adding one would cost the
 // per-event row this approach exists to avoid). The per-event cost
@@ -159,6 +190,38 @@ export const TABLES: readonly TableSpec[] = [
       // `created_at`, which would reintroduce the very conflation the
       // column exists to end.
       col("ingested_at", "INTEGER"),
+      // What this event's INSERT actually cost in rows written, stamped
+      // at insert time by eventRowCost() -- base row, implicit PK index,
+      // one row per declared index on `events`, plus TAG_ROW_COST for
+      // each single-letter tag row.
+      //
+      // Stored rather than recomputed because recomputing it was the
+      // single most expensive read in the codebase.
+      // estimateRowsWritten24h used to derive it from a
+      // `LEFT JOIN event_tags` and a per-row COUNT, and `event_tags` has
+      // no index on `event_id` -- so SQLite built an automatic index over
+      // the whole table on every call, reading E + T rows to answer a
+      // question about the ten rows in the 24h window. Called twice per
+      // cron tick, that one query was ~288E rows/day of the 5,000,000
+      // ceiling all by itself, and at E ~= 17,400 it was the entire
+      // ceiling with no client connected (CLAUDE.md "The budget"). Summing a
+      // column reads E and touches `event_tags` not at all.
+      //
+      // Costs zero additional rows written: this is one more column on an
+      // INSERT that already happens, and a row write is a row, not a
+      // column. Same argument as `ingested_at` above, and no index covers
+      // it either -- an index here would cost the per-event row the whole
+      // approach exists to avoid.
+      //
+      // Nullable, and NULL rows are simply absent from the SUM. Rows
+      // written before this column existed undercount for at most the one
+      // 24h window straddling an upgrade, then it is exact forever --
+      // the same tradeoff `ingested_at` made, accepted for the same
+      // reason. Deliberately not backfilled: the historical cost of a row
+      // written under a two-index schema is not the cost it would carry
+      // today, and inventing that number is how this project got
+      // rows-written accounting wrong by 45x the first time.
+      col("row_cost", "INTEGER"),
     ],
   },
   {
@@ -318,7 +381,7 @@ export const TABLES: readonly TableSpec[] = [
   },
   {
     // NIP-86 banpubkey/unbanpubkey/listbannedpubkeys (src/nip86.ts,
-    // "phase two" -- docs/budget.md). Unlike banned_events, this table IS
+    // "phase two" -- CLAUDE.md "The budget"). Unlike banned_events, this table IS
     // read on the per-event write path: ownership.ts isAllowedWriter
     // checks it for every non-owner write, before the follows lookup, so
     // a banned pubkey is refused even if it also appears in the owner's
@@ -342,15 +405,129 @@ export const TABLES: readonly TableSpec[] = [
   },
 ];
 
-// Exactly two secondary indexes, and adding a third multiplies the
-// per-event write cost -- see the accounting at the top of this file
-// before touching these. Not part of the column reconciliation: an index
-// is created by CREATE INDEX IF NOT EXISTS, which unlike CREATE TABLE
-// really does act on an existing table.
-const INDEXES = [
-  `CREATE INDEX IF NOT EXISTS idx_events_pubkey_kind_created ON events (pubkey, kind, created_at DESC)`,
-  `CREATE INDEX IF NOT EXISTS idx_event_tags_lookup ON event_tags (tag_name, tag_value, created_at DESC)`,
+// ---------------------------------------------------------------------
+// The index set, declared as data for the same reason TABLES is: two
+// separate things read it, and neither may drift from what SQLite
+// actually has.
+//
+// 1. initSchema creates them.
+// 2. limits.ts filterReadCost asks "which of these serves this filter,
+//    and what does its `limit` cost against that index" -- the read-abuse
+//    guard is DERIVED from this list rather than hardcoding a list of
+//    permitted filter field combinations. That is the whole fix: the
+//    old guard reasoned about a filter's shape, this one reasons about
+//    its cost, and adding or removing an index below changes which
+//    filters are affordable without anyone editing the guard.
+// 3. eventRowCost derives the per-event rows-written cost from the count.
+//
+// Each entry says which columns are pinned by equality and which single
+// column the index then orders by. That split is not decoration -- it is
+// exactly the property that decides cost. An index can serve
+// `ORDER BY created_at DESC LIMIT n` cheaply only when every key column
+// ahead of `created_at` is pinned to a single value; pin all of them and
+// the rows arrive already sorted, so LIMIT stops the scan. Pin none, or
+// pin only some, and SQLite must read every matching row and sort it
+// before LIMIT can discard any -- which is why a `limit` of 20 and a
+// `limit` of 500 cost the identical 2E rows on the shapes that broke
+// this relay.
+//
+// Not part of the column reconciliation: an index is created by
+// CREATE INDEX IF NOT EXISTS, which unlike CREATE TABLE really does act
+// on an existing table, so a new entry here reaches a deployed relay on
+// its next Durable Object constructor.
+// ---------------------------------------------------------------------
+
+export interface IndexSpec {
+  readonly name: string;
+  readonly table: string;
+  // Columns that must ALL be pinned to a single value by a filter before
+  // this index can serve an ordered scan. In index order.
+  readonly keyColumns: readonly string[];
+  // The column the index is then sorted by, matching buildFilterQuery's
+  // `ORDER BY created_at DESC`. Declared DESC in the SQL below.
+  readonly orderedBy: string;
+}
+
+export const INDEXES: readonly IndexSpec[] = [
+  // Serves `authors` + `kinds` together -- the shape a well-behaved
+  // client sends, and the only one that was ever cheap here.
+  {
+    name: "idx_events_pubkey_kind_created",
+    table: "events",
+    keyColumns: ["pubkey", "kind"],
+    orderedBy: "created_at",
+  },
+  // Serves `kinds` with no `authors`. Added v0.7.2; see the measurement
+  // at the top of this file. Also turns storage.ts giftWrapCount --
+  // `SELECT COUNT(*) FROM events WHERE kind = ?`, run on every accepted
+  // gift wrap -- from a full scan of `events` into an index count.
+  {
+    name: "idx_events_kind_created",
+    table: "events",
+    keyColumns: ["kind"],
+    orderedBy: "created_at",
+  },
+  // Serves `authors` with no `kinds`. Added v0.7.2. On a single-owner
+  // relay this is the shape that looks harmless and is not: every row in
+  // the table carries the owner's pubkey, so `{"authors":[owner]}` is a
+  // request for the whole table with a `limit` that bounds nothing.
+  {
+    name: "idx_events_pubkey_created",
+    table: "events",
+    keyColumns: ["pubkey"],
+    orderedBy: "created_at",
+  },
+  // Serves `#<letter>` tag filters, through the subquery in
+  // buildFilterQuery.
+  {
+    name: "idx_event_tags_lookup",
+    table: "event_tags",
+    keyColumns: ["tag_name", "tag_value"],
+    orderedBy: "created_at",
+  },
 ];
+
+function createIndexSql(spec: IndexSpec): string {
+  const columns = [...spec.keyColumns, `${spec.orderedBy} DESC`].join(", ");
+  return `CREATE INDEX IF NOT EXISTS ${spec.name} ON ${spec.table} (${columns})`;
+}
+
+// Indexes declared on one table. Exported because limits.ts needs the
+// `events` set to decide what a filter costs.
+export function indexesOn(table: string): readonly IndexSpec[] {
+  return INDEXES.filter((i) => i.table === table);
+}
+
+// ---------------------------------------------------------------------
+// Per-event rows-written cost, DERIVED from INDEXES above rather than
+// written down as a constant beside it.
+//
+// Derived on purpose. The figure is used in three places -- the admin
+// page's 24h estimate, backfill.ts's headroom guard, and limits.ts
+// BACKFILL_PAGE_SIZE's sizing -- and the last time it was maintained by
+// hand it was wrong by a factor of 45 and stayed wrong for months
+// (see `ingested_at` above). Adding an index below now updates all
+// three, and test/hibernation.test.ts checks the derivation against a
+// real SqlStorageCursor.rowsWritten, so an SQLite change that made the
+// arithmetic wrong would fail the suite rather than quietly mis-bill the
+// budget.
+// ---------------------------------------------------------------------
+
+// One base row, plus the implicit unique index SQLite maintains for
+// `id TEXT PRIMARY KEY` (a TEXT primary key is not a rowid alias, so it
+// costs its own index), plus one row per declared index on `events`.
+export const EVENT_BASE_ROW_COST = 2 + indexesOn("events").length;
+
+// One base row per `event_tags` row, plus one per index on that table.
+export const TAG_ROW_COST = 1 + indexesOn("event_tags").length;
+
+// Rows written by storing one event carrying `indexedTagCount`
+// single-letter tags. Stamped into `events.row_cost` at insert time
+// (storage.ts insertEventRow) so estimateRowsWritten24h can sum a column
+// instead of rebuilding this from a join.
+export function eventRowCost(indexedTagCount: number): number {
+  return EVENT_BASE_ROW_COST + TAG_ROW_COST * indexedTagCount;
+}
 
 function createTableSql(spec: TableSpec): string {
   const columns = spec.columns.map((c) => `${c.name} ${c.definition}`).join(", ");
@@ -440,9 +617,9 @@ export function initSchema(sql: SqlStorage): void {
     reconcileColumns(sql, spec);
   }
   for (const index of INDEXES) {
-    sql.exec(index);
+    sql.exec(createIndexSql(index));
   }
-  // NIP-51 mute list support was removed (see docs/budget.md); this drops
+  // NIP-51 mute list support was removed (see CLAUDE.md "The budget"); this drops
   // the now-orphaned table on deployed relays that still carry it from
   // before the removal. Idempotent and a no-op on a fresh database.
   sql.exec(`DROP TABLE IF EXISTS mutes`);

@@ -82,7 +82,7 @@ export type WriteAuthorization =
   | { allowed: false; reason: "unclaimed" | "not-follow" | "owner-only" | "banned" };
 
 // Owner writes are always allowed. NIP-86 banpubkey/allowpubkey (phase
-// two, docs/budget.md) add two lookups beyond the owner/follows check
+// two, CLAUDE.md "The budget") add two lookups beyond the owner/follows check
 // that shipped in phase one:
 //
 //   - banned_pubkeys is checked for every non-owner write, before the

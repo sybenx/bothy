@@ -1,4 +1,5 @@
 import { runBackfillTick } from "./backfill-worker";
+import { logExhaustion } from "./exhaustion";
 import { MANAGEMENT_CONTENT_TYPE } from "./nip86";
 import { nip11Response } from "./nip11";
 import { verifyNip98 } from "./nip98";
@@ -116,41 +117,88 @@ async function handleProfile(request: Request): Promise<Response> {
   return json({ profile });
 }
 
+// The routing table, split out from `fetch` below so the exhaustion
+// wrapper there has something to wrap.
+async function route(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+
+  // NIP-86 is checked BEFORE NIP-11, and the order is load-bearing:
+  // "application/nostr+json+rpc" contains "application/nostr+json" as a
+  // substring, so a management client that also sets an Accept header
+  // would otherwise be served the relay information document instead of
+  // having its command run. Substring match here too, for the same
+  // reason as below -- a real client sends
+  // "application/nostr+json+rpc; charset=utf-8".
+  if (
+    request.method === "POST" &&
+    request.headers.get("Content-Type")?.includes(MANAGEMENT_CONTENT_TYPE)
+  ) {
+    return handleManagement(request, env);
+  }
+
+  // Substring match, not equality -- clients commonly send compound
+  // Accept headers ("application/nostr+json, */*"), and NIP-11 only
+  // requires the media type be present, not that it stand alone.
+  if (request.headers.get("Accept")?.includes("application/nostr+json")) {
+    const { profile, settings } = await relayStub(env).getIdentity(url.host);
+    return nip11Response(env, settings, profile);
+  }
+
+  if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+    return relayStub(env).fetch(request);
+  }
+
+  if (url.pathname === "/api/claim") return handleClaim(request, env);
+  if (url.pathname === "/api/stats") return handleStats(request, env);
+  if (url.pathname === "/api/profile") return handleProfile(request);
+
+  return env.ASSETS.fetch(request);
+}
+
+// Cloudflare's free-tier allowances reset at 00:00 UTC, so this is a real
+// retry time rather than a guess -- see CLAUDE.md "The budget".
+function secondsUntilUtcMidnight(nowMs: number): number {
+  const msPerDay = 86_400_000;
+  return Math.ceil((msPerDay - (nowMs % msPerDay)) / 1000);
+}
+
 export default {
+  // Wrapped as a whole rather than per handler, because the failure this
+  // catches is not route-specific: when a Cloudflare allowance is
+  // consumed, every path that reaches the Durable Object fails at once
+  // while the static admin page -- served from env.ASSETS, which never
+  // touches the DO -- keeps returning 200. That combination is exactly
+  // what made the last outage undiagnosable from the outside: the only
+  // symptom was a page that loaded the word "bothy" and no numbers, and
+  // nothing anywhere named a resource or a ceiling. See src/exhaustion.ts.
+  //
+  // Non-exhaustion errors are logged and rethrown, so this cannot turn an
+  // ordinary bug into a quiet 503.
   async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-
-    // NIP-86 is checked BEFORE NIP-11, and the order is load-bearing:
-    // "application/nostr+json+rpc" contains "application/nostr+json" as a
-    // substring, so a management client that also sets an Accept header
-    // would otherwise be served the relay information document instead of
-    // having its command run. Substring match here too, for the same
-    // reason as below -- a real client sends
-    // "application/nostr+json+rpc; charset=utf-8".
-    if (
-      request.method === "POST" &&
-      request.headers.get("Content-Type")?.includes(MANAGEMENT_CONTENT_TYPE)
-    ) {
-      return handleManagement(request, env);
+    try {
+      return await route(request, env);
+    } catch (err) {
+      const verdict = logExhaustion(`fetch ${new URL(request.url).pathname}`, err);
+      if (!verdict.exhausted) throw err;
+      // 503 with a Retry-After, not a 500. This is a temporary refusal
+      // with a known end time, and saying so is the difference between
+      // "the relay is broken" and "the relay is out of budget until
+      // midnight" -- a distinction the owner could not make last time.
+      return new Response(
+        JSON.stringify({
+          error: `relay is out of its daily ${verdict.resource} allowance`,
+          exhausted: verdict.resource,
+          resets: "00:00 UTC",
+        }),
+        {
+          status: 503,
+          headers: {
+            "Content-Type": "application/json",
+            "Retry-After": String(secondsUntilUtcMidnight(Date.now())),
+          },
+        },
+      );
     }
-
-    // Substring match, not equality -- clients commonly send compound
-    // Accept headers ("application/nostr+json, */*"), and NIP-11 only
-    // requires the media type be present, not that it stand alone.
-    if (request.headers.get("Accept")?.includes("application/nostr+json")) {
-      const { profile, settings } = await relayStub(env).getIdentity(url.host);
-      return nip11Response(env, settings, profile);
-    }
-
-    if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
-      return relayStub(env).fetch(request);
-    }
-
-    if (url.pathname === "/api/claim") return handleClaim(request, env);
-    if (url.pathname === "/api/stats") return handleStats(request, env);
-    if (url.pathname === "/api/profile") return handleProfile(request);
-
-    return env.ASSETS.fetch(request);
   },
 
   // ALLOW_FOLLOWS refresh (ROADMAP.md chunk 4) -- a no-op when the env
@@ -164,16 +212,23 @@ export default {
   // caught and logged independently, so an exception in runCron (e.g. a
   // storage error while refreshing the follow cache) can never silently
   // stop backfill from ever running again, and vice versa.
+  //
+  // Both go through logExhaustion rather than a bare console.error. The
+  // cron tick is where budget exhaustion shows up FIRST -- it runs hourly
+  // whether or not anyone is connected, and the whole of the relay's
+  // client-independent read floor is spent here (CLAUDE.md "The budget")
+  // -- so a tick that dies on an allowance is the earliest warning the
+  // deployment gets.
   async scheduled(_event: ScheduledController, env: Env): Promise<void> {
     try {
       await relayStub(env).runCron();
     } catch (err) {
-      console.error("scheduled: runCron failed", err);
+      logExhaustion("scheduled: runCron", err);
     }
     try {
       await runBackfillTick(env);
     } catch (err) {
-      console.error("scheduled: runBackfillTick failed", err);
+      logExhaustion("scheduled: runBackfillTick", err);
     }
   },
 } satisfies ExportedHandler<Env>;

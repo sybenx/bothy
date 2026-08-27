@@ -1,0 +1,547 @@
+// Rows-read cost measurement, the read-side companion to
+// test/hibernation.test.ts's write/CPU regressions.
+//
+// This file exists because the live relay exhausted the Workers Free
+// plan's 5,000,000 rows-read/day allowance under ordinary single-owner
+// operation and nothing here could say which path spent them --
+// CLAUDE.md "The budget" had measured rows *written* per event to four decimal
+// places and rows *read* only at the two places somebody was already
+// suspicious of. The figures below are the ones CLAUDE.md "The budget"'s
+// "Rows read, by path" section reasons from; if a change moves one,
+// that section's arithmetic is stale and has to be redone.
+//
+// Most costs here are measured BOTH ways -- the pre-v0.7.2 form and the
+// current one, against the same rows in the same Durable Object -- so the
+// before/after table in CLAUDE.md "The budget" is a measurement rather than two
+// runs compared from memory. Where an index is what changed, the "before"
+// case is reproduced with SQLite's unary + operator, which suppresses
+// index use on a term (sqlite.org/optoverview.html). Dropping the index
+// instead would leave this file's shared Durable Object in a different
+// state for whatever test ran next.
+//
+// One assertion is still shaped as "this is expensive and scales with the
+// table" rather than "this must stay under N": the event_tags delete. It
+// records a cost that was deliberately NOT fixed, for a reason
+// CLAUDE.md "The budget" states, and a test that pretended otherwise would hide
+// it.
+//
+// Rows are inserted straight into `events`/`event_tags` rather than
+// published over the wire -- the same deliberate exception
+// docs/test-notes.md records for nip40-expiration.test.ts, for the same
+// kind of reason: these costs only become legible at a table size that
+// would take thousands of schnorr signatures to reach through the
+// protocol, and nothing about the read cost of a row depends on how it
+// got there.
+import { env, runInDurableObject, SELF } from "cloudflare:test";
+import { beforeAll, describe, expect, it } from "vitest";
+import { buildFilterQuery, expandFilter, expandFilterCount } from "../src/filters";
+import { boundFilter, MAX_FILTER_ROWS_READ } from "../src/limits";
+import type { Filter } from "../src/nostr";
+import { queryFilter } from "../src/storage";
+import { readMetricsSnapshot, resetReadMetrics } from "../src/read-metrics";
+import type { Relay } from "../src/relay";
+import { signEvent } from "./helpers/event";
+import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX } from "./helpers/keys";
+import { connectRelay } from "./helpers/socket";
+
+// Small enough to seed quickly, large enough that a full scan is
+// unmistakably distinct from an index seek. Every expectation below is
+// written against these two numbers rather than against a bare
+// constant, so the *shape* of each cost (bounded, ~E, ~T) is what is
+// actually asserted.
+const EVENTS = 1000;
+const TAGS_PER_EVENT = 5;
+const TAG_ROWS = EVENTS * TAGS_PER_EVENT;
+// How many of the seeded rows carry an `ingested_at` inside the rolling
+// 24h window estimateRowsWritten24h measures. Ten, not zero, and the
+// difference matters: with nothing in the window SQLite scans `events`
+// and stops, never touching `event_tags`; with anything in it, the
+// unindexed join engages and the whole of `event_tags` is read to
+// satisfy ten rows. A relay that ingested even one event today pays the
+// second price, which is the only one worth recording.
+const RECENTLY_INGESTED = 10;
+
+function stub() {
+  return env.RELAY.get(env.RELAY.idFromName("relay"));
+}
+
+// Rows read by one query, straight off the cursor -- the same mechanism
+// CLAUDE.md "The budget" used for rowsWritten in chunk 3.
+function rowsRead(sql: SqlStorage, query: string, ...bindings: unknown[]): number {
+  const cursor = sql.exec(query, ...bindings);
+  cursor.toArray();
+  return cursor.rowsRead;
+}
+
+beforeAll(async () => {
+  await runInDurableObject(stub(), async (_instance: Relay, state) => {
+    const sql = state.storage.sql;
+    const now = Math.floor(Date.now() / 1000);
+    for (let i = 0; i < EVENTS; i++) {
+      const id = i.toString(16).padStart(64, "0");
+      sql.exec(
+        `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        id,
+        OWNER_PUBKEY_HEX,
+        now - (EVENTS - i) * 60,
+        // A minority of a second kind, so a kinds filter is selective
+        // enough to be worth an index if one existed.
+        i % 40 === 0 ? 7 : 1,
+        "[]",
+        "x",
+        "sig",
+        null,
+        i >= EVENTS - RECENTLY_INGESTED ? now - 100 : now - 200_000,
+      );
+      for (let t = 0; t < TAGS_PER_EVENT; t++) {
+        sql.exec(
+          `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at) VALUES (?, ?, ?, ?)`,
+          t % 2 === 0 ? "e" : "p",
+          `v${i}_${t}`,
+          id,
+          now,
+        );
+      }
+    }
+  });
+});
+
+describe("rows read by query shape", () => {
+  it("bounds a kinds-only filter by its limit, where it once scanned the table", async () => {
+    // The shape that broke the relay. `kind` was the leftmost column of
+    // no index, so buildFilterQuery's ORDER BY created_at DESC had to
+    // sort every matching row before LIMIT could discard any -- limit 20
+    // and limit 500 cost the identical 2E. idx_events_kind_created
+    // (schema.ts) now serves the sort directly.
+    //
+    // The "before" figure is measured live rather than quoted from a
+    // comment: SQLite's unary + operator suppresses index use on a term
+    // (sqlite.org/optoverview.html), so `+kind IN (...)` reproduces
+    // exactly the plan this filter used to get, against the same rows.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+
+      const small = buildFilterQuery({ kinds: [1], limit: 20 }, now);
+      const large = buildFilterQuery({ kinds: [1], limit: 500 }, now);
+      expect(small).not.toBeNull();
+      expect(large).not.toBeNull();
+
+      const smallCost = rowsRead(sql, small!.sql, ...small!.params);
+      const largeCost = rowsRead(sql, large!.sql, ...large!.params);
+
+      // 2 rows per returned event (index entry + table row) + 1. This is
+      // the measurement limits.ts ROWS_READ_PER_MATCH is set from.
+      expect(smallCost).toBe(41);
+      expect(largeCost).toBe(1001);
+      // The property that was missing before: asking for less costs less.
+      expect(smallCost).toBeLessThan(largeCost);
+
+      const unindexed = rowsRead(sql, small!.sql.replace("kind IN", "+kind IN"), ...small!.params);
+      expect(unindexed).toBeGreaterThan(EVENTS);
+      // ~48x cheaper at E=1,000, and the ratio grows with the table: the
+      // new cost is a function of `limit`, the old one of E.
+      expect(smallCost * 10).toBeLessThan(unindexed);
+    });
+  });
+
+  it("bounds an authors-only filter by its limit, where it once scanned the table", async () => {
+    // Not a surprise once stated: the only index was (pubkey, kind,
+    // created_at), so with `kind` unconstrained the rows for one pubkey
+    // arrived grouped by kind rather than in created_at order and ORDER
+    // BY had to sort all of them. On a single-owner relay "all rows for
+    // one pubkey" is the entire table. idx_events_pubkey_created is the
+    // index that makes this the same shape of cheap as any other.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const query = buildFilterQuery({ authors: [OWNER_PUBKEY_HEX], limit: 20 }, Math.floor(Date.now() / 1000));
+      expect(query).not.toBeNull();
+
+      expect(rowsRead(sql, query!.sql, ...query!.params)).toBe(41);
+      const unindexed = rowsRead(sql, query!.sql.replace("pubkey IN", "+pubkey IN"), ...query!.params);
+      expect(unindexed).toBeGreaterThan(EVENTS);
+    });
+  });
+
+  it("stays bounded by the limit when the same filter also names authors and one kind", async () => {
+    // (pubkey, kind, created_at DESC) covers this exactly, and always
+    // did -- the one filter shape that was never the problem. Kept as the
+    // control: if this regresses, the index set has been broken rather
+    // than extended.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const query = buildFilterQuery(
+        { authors: [OWNER_PUBKEY_HEX], kinds: [1], limit: 20 },
+        Math.floor(Date.now() / 1000),
+      );
+      expect(query).not.toBeNull();
+      expect(rowsRead(sql, query!.sql, ...query!.params)).toBeLessThan(100);
+    });
+  });
+
+  it("splits a multi-kind filter instead of sorting the table for it", async () => {
+    // An index can only serve the sort when every key column ahead of
+    // created_at is pinned to ONE value, and `kind IN (1, 7)` pins
+    // nothing -- so a multi-kind filter defeated the new index just as
+    // thoroughly as no index at all. filters.ts expandFilter is what
+    // closes that hole: one limited query per (author, kind)
+    // combination, re-merged and re-sliced by storage.ts queryFilter.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      const filter = { kinds: [1, 7], limit: 20 };
+
+      const single = buildFilterQuery(filter, now);
+      expect(single).not.toBeNull();
+      const singleCost = rowsRead(sql, single!.sql, ...single!.params);
+
+      let splitCost = 0;
+      const parts = expandFilter(filter);
+      expect(parts).toHaveLength(2);
+      for (const part of parts) {
+        const query = buildFilterQuery(part, now);
+        splitCost += rowsRead(sql, query!.sql, ...query!.params);
+      }
+
+      expect(singleCost).toBeGreaterThan(EVENTS);
+      expect(splitCost).toBe(82);
+      expect(splitCost * 10).toBeLessThan(singleCost);
+    });
+  });
+
+  it("returns the same events split as it would have unsplit", async () => {
+    // The split has to be invisible from the outside, or it is a protocol
+    // change rather than an optimisation. Each sub-filter carries the
+    // original limit, so the union can overshoot; queryFilter re-sorts by
+    // buildFilterQuery's own ordering rule and slices back.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      const filter = { kinds: [1, 7], limit: 20 };
+
+      const split = queryFilter(sql, filter, now);
+      const single = buildFilterQuery(filter, now)!;
+      const unsplit = sql
+        .exec<{ id: string }>(single.sql, ...single.params)
+        .toArray()
+        .map((r) => r.id);
+
+      expect(split).toHaveLength(20);
+      expect(split.map((e) => e.id)).toEqual(unsplit);
+    });
+  });
+
+  it("reads only `events` for estimateRowsWritten24h, not events + event_tags", async () => {
+    // The single largest line in the fixed daily floor. The old query
+    // derived each event's tag count with a LEFT JOIN, and
+    // idx_event_tags_lookup is (tag_name, tag_value, created_at) with
+    // `event_id` nowhere in it -- so SQLite built an automatic index over
+    // all of `event_tags` on every call, reading E + T to answer a
+    // question about the ten rows in the window. hasBackfillHeadroom
+    // calls this twice per cron tick: ~288E rows/day, the whole 5,000,000
+    // ceiling on its own at E ~= 17,400.
+    //
+    // Both forms are run here against the same data, so the comparison is
+    // a measurement rather than a claim.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const since = Math.floor(Date.now() / 1000) - 86_400;
+
+      const oldCost = rowsRead(
+        sql,
+        `SELECT COUNT(t.event_id) AS tag_count
+           FROM events e
+           LEFT JOIN event_tags t ON t.event_id = e.id
+          WHERE e.ingested_at > ?
+          GROUP BY e.id`,
+        since,
+      );
+      const newCost = rowsRead(sql, `SELECT SUM(row_cost) AS total FROM events WHERE ingested_at > ?`, since);
+
+      expect(oldCost).toBeGreaterThanOrEqual(EVENTS + TAG_ROWS);
+      // `ingested_at` is covered by no index and must not be -- an index
+      // there would cost a row write per event, the exact cost the column
+      // exists to avoid -- so this is still a scan of `events`. It is E,
+      // not the size of the window, and that is where the line is drawn:
+      // dropping E + T to E took no index, dropping E to the window would.
+      expect(newCost).toBeLessThanOrEqual(EVENTS + 1);
+      expect(newCost * 5).toBeLessThan(oldCost);
+    });
+  });
+
+  it("counts gift wraps through an index instead of scanning the table", async () => {
+    // storage.ts giftWrapCount, run on every accepted gift wrap. It cost
+    // E because `kind` led no index; idx_events_kind_created fixed it as
+    // a side effect of fixing kinds-only REQ filters.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const cost = rowsRead(sql, `SELECT COUNT(*) AS n FROM events WHERE kind = ?`, 1059);
+      const unindexed = rowsRead(sql, `SELECT COUNT(*) AS n FROM events WHERE +kind = ?`, 1059);
+      expect(cost).toBeLessThan(10);
+      expect(unindexed).toBeGreaterThanOrEqual(EVENTS);
+    });
+  });
+
+  it("still scans the whole event_tags table to delete one event's tags", async () => {
+    // NOT fixed here, and recorded so it stays visible. `DELETE FROM
+    // event_tags WHERE event_id = ?` (storage.ts deleteEventRow) has no
+    // index to use. Paid on every replaceable/addressable replacement --
+    // every kind-0, kind-3 and kind-10002 the owner republishes -- and on
+    // every NIP-09/NIP-62 deletion and NIP-86 banevent.
+    //
+    // Fixing it needs an index on event_tags(event_id), which costs a row
+    // write per TAG row (TAG_ROW_COST goes 2 -> 3, i.e. ~5 more rows per
+    // real event) rather than per event. That is a materially bigger
+    // write-side trade than the two indexes added to `events`, and
+    // CLAUDE.md "The budget" names it as its own decision rather than something
+    // to fold in here.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      // An id that matches nothing, so the scan is all cost and no work
+      // and the seeded rows survive for the tests after this one.
+      expect(rowsRead(sql, `DELETE FROM event_tags WHERE event_id = ?`, "no-such-id")).toBe(TAG_ROWS);
+    });
+  });
+});
+
+describe("the read-cost guard", () => {
+  // limits.ts boundFilter, asserted as a cost model rather than as a list
+  // of accepted shapes -- the distinction the old isUnconstrainedFilter
+  // got wrong.
+  it("refuses a filter no index can serve", () => {
+    const bound = boundFilter({ since: 0 });
+    expect(bound.ok).toBe(false);
+    if (!bound.ok) expect(bound.reason.startsWith("invalid:")).toBe(true);
+  });
+
+  it("admits the shapes an index now covers, and says which index", () => {
+    const cases: [Filter, string][] = [
+      [{ kinds: [1], limit: 20 }, "idx_events_kind_created"],
+      [{ authors: [OWNER_PUBKEY_HEX], limit: 20 }, "idx_events_pubkey_created"],
+      [{ authors: [OWNER_PUBKEY_HEX], kinds: [1], limit: 20 }, "idx_events_pubkey_kind_created"],
+      [{ ids: ["0".repeat(64)] }, "events primary key"],
+    ];
+    for (const [filter, via] of cases) {
+      const bound = boundFilter(filter);
+      expect(bound.ok).toBe(true);
+      if (bound.ok) expect(bound.cost.via).toBe(via);
+    }
+  });
+
+  it("prices a filter by combinations x limit, matching what expandFilter runs", () => {
+    const bound = boundFilter({ authors: [OWNER_PUBKEY_HEX], kinds: [1, 7], limit: 20 });
+    expect(bound.ok).toBe(true);
+    // Two (author, kind) combinations at 2*20+1 each -- and the measured
+    // split cost above was 82. The model is not decorative.
+    if (bound.ok) expect(bound.cost.rowsRead).toBe(82);
+  });
+
+  it("counts combinations without materialising them, and gets the same answer", () => {
+    // filterReadCost runs on every REQ filter before anything has decided
+    // the filter is affordable, and `authors` is uncapped off the wire --
+    // so it counts arithmetically rather than building the cross-product.
+    // These two must not drift, since the cost model is only honest if
+    // the count matches what expandFilter actually runs.
+    const cases: Filter[] = [
+      { kinds: [1], limit: 20 },
+      { kinds: [1, 7, 0], limit: 20 },
+      { authors: [OWNER_PUBKEY_HEX], limit: 20 },
+      { authors: [OWNER_PUBKEY_HEX, "a".repeat(64)], kinds: [1, 7], limit: 20 },
+      { ids: ["b".repeat(64)], limit: 20 },
+      { "#e": ["c".repeat(64)], limit: 20 },
+    ];
+    for (const filter of cases) {
+      expect(expandFilterCount(filter)).toBe(expandFilter(filter).length);
+    }
+  });
+
+  it("clamps the limit rather than refusing a client with many follows", () => {
+    const authors = Array.from({ length: 200 }, (_, i) => i.toString(16).padStart(64, "0"));
+    const bound = boundFilter({ authors, kinds: [1], limit: 500 });
+    expect(bound.ok).toBe(true);
+    if (bound.ok) {
+      expect(bound.filter.limit).toBeLessThan(500);
+      expect(bound.cost.rowsRead).toBeLessThanOrEqual(MAX_FILTER_ROWS_READ);
+    }
+  });
+
+  it("refuses when no limit is small enough to make the cost affordable", () => {
+    // Two shapes reach this, and both are refused rather than clamped
+    // because their cost does not fall with the limit.
+    const authors = Array.from({ length: 5000 }, (_, i) => i.toString(16).padStart(64, "0"));
+    expect(boundFilter({ authors, kinds: [1, 7], limit: 1 }).ok).toBe(false);
+
+    // An `ids` seek costs one row per id however few the client wants
+    // back, so halving the limit never helps. filters.ts parseFilter does
+    // not cap the array, so this is reachable straight off the wire.
+    const ids = Array.from({ length: 50_000 }, (_, i) => i.toString(16).padStart(64, "0"));
+    const bound = boundFilter({ ids, limit: 1 });
+    expect(bound.ok).toBe(false);
+    // The message must not blame authors x kinds for an ids-only filter.
+    if (!bound.ok) expect(bound.reason).toContain("fewer ids");
+  });
+
+  it("closes a REQ the guard refuses, with a NIP-01 machine-readable prefix", async () => {
+    const conn = await connectRelay();
+    conn.send(["REQ", "unbounded", { since: 0 }]);
+    const frame = await conn.nextMessage();
+    expect(frame[0]).toBe("CLOSED");
+    expect((frame[2] as string).startsWith("invalid:")).toBe(true);
+    conn.close();
+  });
+});
+
+describe("read attribution", () => {
+  it("bills a REQ, the stats endpoint and the rows-written estimate to separate paths", async () => {
+    await runInDurableObject(stub(), async () => resetReadMetrics());
+
+    const conn = await connectRelay();
+    conn.send(["REQ", "sub", { kinds: [1], limit: 20 }]);
+    let frame = await conn.nextMessage();
+    while (frame[0] !== "EOSE") frame = await conn.nextMessage();
+    conn.close();
+
+    await SELF.fetch("https://example.com/api/stats");
+
+    const snapshot = await runInDurableObject(stub(), async () => readMetricsSnapshot());
+    const byPath = new Map(snapshot.paths.map((p) => [p.path, p]));
+
+    // The same REQ that used to carry a table-sized cost. It is now
+    // bounded by its limit, and the bucket still has to exist and be
+    // billed separately -- a path that reports nothing is
+    // indistinguishable from a path that was never instrumented.
+    expect(byPath.get("req")?.calls).toBe(1);
+    expect(byPath.get("req")?.rowsRead ?? 0).toBeGreaterThan(0);
+    expect(byPath.get("req")?.rowsRead ?? 0).toBeLessThan(EVENTS);
+
+    // estimateRowsWritten24h reports separately from the getStats call
+    // that invoked it -- the whole reason it declares its own scope. It
+    // no longer touches `event_tags` at all, so its bucket must now sit
+    // at or below E rather than above E + T.
+    expect(byPath.get("estimateRowsWritten24h")?.rowsRead ?? 0).toBeLessThanOrEqual(EVENTS + 1);
+    expect(byPath.get("getStats")?.rowsRead ?? 0).toBeGreaterThan(0);
+
+    expect(snapshot.totalRowsRead).toBeGreaterThan(0);
+    // The gap detector. Anything reaching SQLite outside a withReadPath
+    // scope lands in `unattributed`, and a non-empty bucket here means
+    // the breakdown /api/stats reports cannot be reasoned from.
+    expect(byPath.has("unattributed")).toBe(false);
+  });
+
+  it("surfaces the breakdown on /api/stats", async () => {
+    const response = await SELF.fetch("https://example.com/api/stats");
+    const stats = (await response.json()) as {
+      reads: { totalRowsRead: number; sinceMs: number; paths: { path: string }[] };
+    };
+    expect(stats.reads.totalRowsRead).toBeGreaterThan(0);
+    expect(stats.reads.sinceMs).toBeGreaterThanOrEqual(0);
+    expect(stats.reads.paths.map((p) => p.path)).toContain("getStats");
+  });
+
+  it("serves a second /api/stats load from memory instead of rescanning", async () => {
+    // relay.ts statsCache. Four full scans of `events` per load was 28
+    // admin page loads to the entire daily ceiling at E=20,000
+    // (CLAUDE.md "The budget"); the counts behind them are a dashboard, not a
+    // gate, so they are memoized for STATS_CACHE_TTL_MS.
+    await runInDurableObject(stub(), async () => resetReadMetrics());
+
+    await SELF.fetch("https://example.com/api/stats");
+    const first = await runInDurableObject(stub(), async () => readMetricsSnapshot());
+    const firstCost =
+      (first.paths.find((p) => p.path === "getStats")?.rowsRead ?? 0) +
+      (first.paths.find((p) => p.path === "estimateRowsWritten24h")?.rowsRead ?? 0);
+
+    await SELF.fetch("https://example.com/api/stats");
+    const second = await runInDurableObject(stub(), async () => readMetricsSnapshot());
+    const secondCost =
+      (second.paths.find((p) => p.path === "getStats")?.rowsRead ?? 0) +
+      (second.paths.find((p) => p.path === "estimateRowsWritten24h")?.rowsRead ?? 0);
+
+    expect(firstCost).toBeGreaterThan(0);
+    // The second load adds almost nothing -- recordHost is deliberately
+    // left outside the cache, so "almost" rather than "exactly".
+    expect(secondCost - firstCost).toBeLessThan(10);
+  });
+
+  it("counts replacements as R, and projects the table size at which that path alone hits the ceiling", async () => {
+    // R is the number the event_tags-delete decision turns on (see the
+    // comment on storage.ts deleteEventRow). The per-call cost is known
+    // and measured; how OFTEN it is paid is not, and estimating it lands
+    // on a range spanning the point where this path overtakes the cron
+    // floor -- so it is counted rather than guessed.
+    await runInDurableObject(stub(), async () => resetReadMetrics());
+    const now = Math.floor(Date.now() / 1000);
+
+    // kind 10003 (NIP-51 bookmarks): replaceable, special-cased nowhere in
+    // relay.ts, and touched by no other test in this file -- which matters
+    // because this file deliberately shares one Durable Object across its
+    // tests, so two of them contending for the same replaceable address
+    // would make whichever ran second depend on the first one's
+    // timestamps.
+    const conn = await connectRelay();
+    conn.send(["EVENT", signEvent(OWNER_SECRET_KEY_HEX, { kind: 10003, content: "", created_at: now })]);
+    await conn.nextMessage();
+    // Only this second one supersedes an existing version, so only this
+    // one is a replacement.
+    conn.send([
+      "EVENT",
+      signEvent(OWNER_SECRET_KEY_HEX, { kind: 10003, content: "again", created_at: now + 10 }),
+    ]);
+    await conn.nextMessage();
+    conn.close();
+
+    const snapshot = await runInDurableObject(stub(), async () => readMetricsSnapshot());
+    expect(snapshot.replacements.count).toBe(1);
+    // Under MIN_SAMPLE_MS of uptime the rate is deliberately null rather
+    // than one replacement multiplied by 1,440.
+    if (snapshot.replacements.projected24h !== null) {
+      expect(snapshot.replacements.ceilingAtEvents).not.toBeNull();
+    }
+  });
+
+  it("does not count an operator deletion as R", async () => {
+    // NIP-09/NIP-62/NIP-86 deletions reach the same unindexed DELETE and
+    // pay the same per-call cost, but they happen at operator pace rather
+    // than on the per-event drumbeat R measures. Folding them in would
+    // inflate exactly the number the fix decision turns on.
+    await runInDurableObject(stub(), async () => resetReadMetrics());
+    const now = Math.floor(Date.now() / 1000);
+
+    const conn = await connectRelay();
+    const note = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "to delete", created_at: now });
+    conn.send(["EVENT", note]);
+    await conn.nextMessage();
+    conn.send([
+      "EVENT",
+      signEvent(OWNER_SECRET_KEY_HEX, { kind: 5, tags: [["e", note.id]], created_at: now + 1 }),
+    ]);
+    await conn.nextMessage();
+    conn.close();
+
+    const snapshot = await runInDurableObject(stub(), async () => readMetricsSnapshot());
+    expect(snapshot.replacements.count).toBe(0);
+  });
+
+  it("bills a replaceable replacement to the write path, at the cost of a full event_tags scan", async () => {
+    await runInDurableObject(stub(), async () => resetReadMetrics());
+    const now = Math.floor(Date.now() / 1000);
+
+    const conn = await connectRelay();
+    conn.send(["EVENT", signEvent(OWNER_SECRET_KEY_HEX, { kind: 0, content: "{}", created_at: now })]);
+    await conn.nextMessage();
+    // The second one replaces the first, which is what reaches
+    // deleteEventRow's unindexed DELETE.
+    conn.send([
+      "EVENT",
+      signEvent(OWNER_SECRET_KEY_HEX, { kind: 0, content: `{"name":"a"}`, created_at: now + 10 }),
+    ]);
+    await conn.nextMessage();
+    conn.close();
+
+    const snapshot = await runInDurableObject(stub(), async () => readMetricsSnapshot());
+    const write = snapshot.paths.find((p) => p.path === "write");
+    expect(write?.calls).toBe(2);
+    expect(write?.rowsRead ?? 0).toBeGreaterThanOrEqual(TAG_ROWS);
+  });
+});

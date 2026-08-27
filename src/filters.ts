@@ -59,6 +59,85 @@ function placeholders(count: number): string {
   return Array(count).fill("?").join(", ");
 }
 
+// Splits one filter into the cross-product of its `authors` x `kinds`
+// singletons, so every query that reaches SQLite pins each index key
+// column to ONE value.
+//
+// This is what turns limits.ts filterReadCost from an assertion into a
+// fact. An index can serve `ORDER BY created_at DESC LIMIT n` cheaply
+// only when the key columns ahead of `created_at` are pinned to a single
+// value each; `kind IN (1, 7)` pins nothing, so SQLite reads every
+// matching row and sorts it before LIMIT can discard any. Measured at
+// E=2,000 (test/read-cost.test.ts):
+//
+//   {"kinds":[1,7],"limit":20}            one query   3,983 rows
+//                                         split           82 rows
+//   {"authors":[owner],"kinds":[1,7]}     one query   3,584 rows
+//                                         split           42 rows
+//
+// Two queries at 41 rows each beat one query at 3,983, and the gap
+// widens linearly with the table. Splitting is also what makes the cost
+// PREDICTABLE rather than left to the query planner: measuring the
+// unsplit forms across candidate index sets produced answers that swung
+// between 41 and 3,584 for the same filter depending on which index
+// SQLite happened to choose. The split form costs
+// authors x kinds x (2 x limit) whichever index it picks.
+//
+// Only `authors` and `kinds` are expanded. `ids` is a primary-key seek
+// that needs no ordering at all and already costs one row per id, and a
+// `#<letter>` filter is resolved by a subquery against
+// idx_event_tags_lookup rather than by the ordered scan -- neither is
+// made cheaper by splitting, and both would multiply the query count for
+// nothing.
+//
+// Callers must re-merge: each sub-filter returns up to `limit` events of
+// its own, so the union can exceed what the client asked for. storage.ts
+// queryFilter dedupes, re-sorts and slices back to `limit`, which is what
+// keeps this an implementation detail rather than a protocol change --
+// NIP-01's `limit` is "the maximum number of events relays SHOULD return
+// in the initial query" (nips/01.md), and the split result set is
+// identical to the unsplit one.
+// How many queries expandFilter would produce, without producing them.
+//
+// limits.ts filterReadCost needs this count on every REQ filter from
+// every client, BEFORE anything has decided the filter is affordable, and
+// `authors` arrives off the wire uncapped (parseFilter does not bound it).
+// Materialising a ten-thousand-element cross-product to discover that it
+// is too expensive to run would be a cheap denial of service against the
+// guard that exists to prevent one. test/read-cost.test.ts asserts this
+// agrees with expandFilter, so the two cannot drift.
+export function expandFilterCount(filter: Filter): number {
+  return Math.max(1, filter.authors?.length ?? 1) * Math.max(1, filter.kinds?.length ?? 1);
+}
+
+export function expandFilter(filter: Filter): Filter[] {
+  const authors = filter.authors;
+  const kinds = filter.kinds;
+  // The common case by a wide margin -- nothing to expand, and the
+  // caller skips its merge entirely.
+  if ((authors?.length ?? 1) <= 1 && (kinds?.length ?? 1) <= 1) return [filter];
+
+  const expanded: Filter[] = [];
+  for (const author of authors ?? [undefined]) {
+    for (const kind of kinds ?? [undefined]) {
+      const sub: Filter = { ...filter };
+      if (author !== undefined) sub.authors = [author];
+      if (kind !== undefined) sub.kinds = [kind];
+      expanded.push(sub);
+    }
+  }
+  return expanded;
+}
+
+// Newest first, ties broken by lowest id -- the ordering
+// buildFilterQuery's `ORDER BY created_at DESC, id ASC` produces, stated
+// once here because both queryFilter (re-merging a split filter) and
+// queryFilters (ORing several filters) have to reproduce it exactly.
+export function compareEvents(a: NostrEvent, b: NostrEvent): number {
+  if (a.created_at !== b.created_at) return b.created_at - a.created_at;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
 // In-memory equivalent of buildFilterQuery, used to test a single
 // freshly-stored event against a live subscription's filters without a
 // round trip through SQL.

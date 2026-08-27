@@ -1,4 +1,6 @@
 import { tagFilterEntries, type Filter } from "./nostr";
+import { expandFilterCount } from "./filters";
+import { indexesOn } from "./schema";
 
 // Hijacking is not the threat here. Read abuse is. The write path is
 // already owner-gated (ownership.ts isAllowedWriter), so these caps
@@ -22,14 +24,6 @@ export const MAX_FILTER_LIMIT = 500;
 // filters each returning MAX_FILTER_LIMIT.
 export const MAX_EVENTS_PER_REQ = 500;
 
-// Clamps a filter's `limit` to MAX_FILTER_LIMIT, defaulting to it when
-// the filter doesn't specify one -- every filter this relay executes
-// against storage carries a bounded limit.
-export function clampFilterLimit(filter: Filter): Filter {
-  const limit = filter.limit === undefined ? MAX_FILTER_LIMIT : Math.min(filter.limit, MAX_FILTER_LIMIT);
-  return { ...filter, limit };
-}
-
 // ---------------------------------------------------------------------
 // Write-path abuse caps. Everything below this line bounds what a writer
 // who is *allowed* to write can cost -- a separate concern from the read
@@ -43,7 +37,7 @@ export function clampFilterLimit(filter: Filter): Filter {
 // pubkeys the owner has merely followed" -- without moving any of the
 // gift wrap caps across. A single compromised or malicious follow was
 // then bounded only by the per-IP message rate limit in relay.ts: at 300
-// messages/minute and the measured 13 rows/event (docs/budget.md), about
+// messages/minute and the measured 13 rows/event (CLAUDE.md "The budget"), about
 // 26 minutes to exhaust the daily rows-written ceiling, and -- far worse,
 // because storage does not reset daily -- under ten minutes to fill the
 // free tier's whole 5GB permanently. Nothing in this codebase bounded an
@@ -51,7 +45,7 @@ export function clampFilterLimit(filter: Filter): Filter {
 // size (developers.cloudflare.com/durable-objects/platform/limits/,
 // checked 2026-08-25), which is a limit on what can be stored, not a
 // defence. 5GB / 2MB is 2,560 events, and 2,560 events at 300/minute is
-// eight and a half minutes. See docs/budget.md for the full before/after.
+// eight and a half minutes. See CLAUDE.md "The budget" for the full before/after.
 //
 // Each cap is raisable or disablable through an environment variable
 // (see resolveLimit below), since none of these ceilings apply on a paid
@@ -112,7 +106,7 @@ export const MAX_GIFT_WRAPS = 2000;
 // rate limit in relay.ts (which counts REQ/CLOSE/AUTH too and is tuned
 // for connection-level spam, not specifically for rows-written risk). At
 // 100,000 rows-written/day and ~5 rows per stored gift wrap (see
-// docs/budget.md), an unthrottled flood could exhaust the daily write
+// CLAUDE.md "The budget"), an unthrottled flood could exhaust the daily write
 // budget in minutes; this window is generous for real DM traffic
 // (nobody legitimately sends more than a handful of messages a minute)
 // while keeping a sustained flood far below the daily ceiling.
@@ -128,7 +122,7 @@ export const MAX_GIFT_WRAPS_PER_IP_PER_WINDOW = 5;
 // be attached to.
 //
 // Sized against rows-written, not intuition. At the measured 13 rows per
-// stored event (docs/budget.md, the corrected figure) and the free tier's
+// stored event (CLAUDE.md "The budget", the corrected figure) and the free tier's
 // 100,000 rows-written/day:
 //
 //   100,000 / 13 = 7,692 events to exhaust the daily write budget
@@ -172,20 +166,234 @@ export function maxEventsPerPubkeyPerWindow(env: Env): number | null {
 // while keeping a DO's memory bounded regardless of traffic.
 export const PUBKEY_RATE_LIMIT_MAX_TRACKED = 10_000;
 
-// A filter with none of `ids`, `authors`, `kinds`, or a `#<letter>` tag
-// constraint has no equality condition to bound how much of the table
-// it can scan -- CLAUDE.md "Threat model": "Reject filters with no
-// authors and no kinds constraint." `ids` and tag filters are just as
-// bounding (both go through an index or direct equality -- see
-// filters.ts buildFilterQuery) so they count too; only a filter that is
-// nothing but since/until/limit is truly unconstrained.
-export function isUnconstrainedFilter(filter: Filter): boolean {
-  return (
-    filter.ids === undefined &&
-    filter.authors === undefined &&
-    filter.kinds === undefined &&
-    tagFilterEntries(filter).length === 0
-  );
+// ---------------------------------------------------------------------
+// The read-abuse guard, derived from the index set.
+//
+// The rule this replaces was `isUnconstrainedFilter`: reject a filter
+// carrying none of `ids`, `authors`, `kinds` or a `#<letter>` tag. It was
+// a list of permitted field combinations, and it was wrong in the way
+// every list of permitted shapes eventually is -- it reasoned about
+// whether a field was PRESENT and never about what the resulting query
+// COST. `{"kinds":[1],"limit":20}` satisfied it and read the entire
+// table; so did `{"authors":[owner],"limit":20}`, on a relay where every
+// row carries the owner's pubkey. 125 such REQs a day cleared the whole
+// 5,000,000 rows-read ceiling, and an ordinary client that re-subscribes
+// on reconnect issues far more than 125 (CLAUDE.md "The budget" "Rows read, by
+// path").
+//
+// What replaces it asks a different question: WHICH INDEX SERVES THIS
+// FILTER, AND WHAT DOES ITS `limit` COST AGAINST THAT INDEX. The answer
+// is computed from schema.ts INDEXES, so it is the real index set that
+// decides -- add an index and the filters it makes affordable become
+// legal, drop one and they stop being legal, with nothing here to edit
+// either way. That is the property the old rule lacked: its verdict and
+// the schema could drift apart silently, and they did, for two releases.
+//
+// The cost model, and why each term is what it is:
+//
+//   rows read  =  combinations x (2 x limit + 1)
+//
+// `combinations` is the number of queries filters.ts expandFilter will
+// actually run -- the cross-product of the filter's `authors` and
+// `kinds` values. One query per combination, each pinning its index key
+// columns to a single value, each stopping at `limit`.
+//
+// The 2 is measured, not assumed: an ordered index scan reads the index
+// entry and then the table row it points at, and a filter naming one
+// author and one kind at limit 20 reads 41 rows (test/read-cost.test.ts).
+// 2 x 20 + 1 = 41.
+//
+// An index qualifies only when EVERY key column ahead of its ordering
+// column is pinned to one value. `since`/`until` do not pin anything --
+// they bound a range, and a range ahead of the sort column still leaves
+// SQLite a sort to do -- which is why a filter of nothing but
+// since/until/limit remains rejected, exactly as before.
+// ---------------------------------------------------------------------
+
+// Cloudflare Workers Free's daily rows-READ ceiling, the companion to
+// DAILY_ROWS_WRITTEN_LIMIT below (developers.cloudflare.com/durable-objects/platform/limits/,
+// checked 2026-08-26). Named here because it is the number the relay
+// actually died on, and because the per-filter cap below is derived from
+// it rather than picked.
+export const DAILY_ROWS_READ_LIMIT = 5_000_000;
+
+// The most one REQ filter may read. A five-hundredth of the daily
+// ceiling: it takes 500 filters at the cap to spend a day's budget,
+// against the 125 it took before this guard existed. Not a ceiling on
+// what a connection can spend over time -- the per-IP message throttle in
+// relay.ts is what bounds that -- only on what any single filter can cost
+// in one go.
+export const MAX_FILTER_ROWS_READ = DAILY_ROWS_READ_LIMIT / 500;
+
+// Rows read per row returned by an ordered index scan: the index entry,
+// then the table row it points at. Measured (test/read-cost.test.ts), not
+// derived -- 41 rows for a limit of 20.
+const ROWS_READ_PER_MATCH = 2;
+
+// Which filter field pins which indexed column to a value.
+//
+// `created_at` is deliberately absent. `since`/`until` constrain it to a
+// range, and a range is not a pin: an index whose key columns are only
+// range-constrained still hands SQLite rows out of sort order, so every
+// match is read and sorted before LIMIT applies. Treating since/until as
+// bounding is precisely the mistake that let `{"since":0}`-shaped
+// reasoning feel safe.
+const PINS: Record<string, (filter: Filter) => readonly unknown[] | undefined> = {
+  pubkey: (filter) => filter.authors,
+  kind: (filter) => filter.kinds,
+};
+
+export interface FilterReadCost {
+  // Estimated rows read to answer this filter.
+  rowsRead: number;
+  // Which access path produces that estimate -- an index name, or the
+  // primary key. Carried so the test harness and any future diagnostic
+  // can say WHY a filter is cheap, not just that it is.
+  via: string;
+}
+
+// The cheapest bounded way to answer this filter, or null when nothing
+// bounds it below the size of the table.
+//
+// `limit` is taken as given: callers pass an already-clamped filter, and
+// boundFilter below is what does the clamping.
+export function filterReadCost(filter: Filter): FilterReadCost | null {
+  const limit = filter.limit ?? MAX_FILTER_LIMIT;
+  const candidates: FilterReadCost[] = [];
+
+  // The primary key. `id TEXT PRIMARY KEY` is a unique index, so an
+  // `ids` filter is one seek per id and needs no ordering at all -- the
+  // rows it can return are already bounded by how many ids were named.
+  if (filter.ids !== undefined && filter.ids.length > 0) {
+    candidates.push({ rowsRead: filter.ids.length, via: "events primary key" });
+  }
+
+  // Tag filters, through idx_event_tags_lookup. buildFilterQuery
+  // resolves these as `id IN (SELECT event_id FROM event_tags WHERE
+  // tag_name = ? AND tag_value IN (...))`, an exact seek per named
+  // value.
+  //
+  // Be honest about this one: it is the single estimate here that can be
+  // wrong LOW. The subquery is not bounded by `limit` -- it reads every
+  // tag row carrying a named value -- so a filter like
+  // `{"#p":[owner]}` on a relay where most events p-tag the owner costs
+  // far more than this says. It is modelled as limit-bounded because
+  // every tag value a real client asks about is a specific event id or
+  // pubkey matching a handful of rows (measured: 5 rows for one match),
+  // and because pricing it correctly would take a COUNT query, i.e. a
+  // read, to decide whether a read is affordable. Recorded rather than
+  // fixed, and unchanged from the behaviour before this guard -- tag
+  // filters were always accepted.
+  const tags = tagFilterEntries(filter);
+  if (tags.length > 0) {
+    const values = tags.reduce((n, [, v]) => n + v.length, 0);
+    if (values > 0) {
+      candidates.push({
+        rowsRead: values * ROWS_READ_PER_MATCH * limit,
+        via: "idx_event_tags_lookup",
+      });
+    }
+  }
+
+  // The ordered indexes on `events`. An index qualifies when every one
+  // of its key columns is pinned by the filter at all -- once
+  // filters.ts expandFilter has split the filter, each of those columns
+  // holds exactly one value in every query that actually runs.
+  //
+  // `combinations` is the number of queries filters.ts expandFilter will
+  // run, NOT the product of the chosen index's own key columns, and that
+  // distinction is a correctness condition rather than a nicety. A filter
+  // naming one author and two kinds runs TWO queries whichever index
+  // serves them; pricing it from idx_events_pubkey_created's single key
+  // column called it one query and understated the cost by half, which a
+  // test caught and reading did not.
+  //
+  // Counted arithmetically rather than as `expandFilter(filter).length`.
+  // Same number -- expandFilterCount and expandFilter are asserted equal
+  // in test/read-cost.test.ts -- but this function runs on every REQ
+  // filter from every client, before anything has decided the filter is
+  // affordable, and `authors` is an unbounded array off the wire
+  // (filters.ts parseFilter does not cap it). Materialising the
+  // cross-product to measure it would mean allocating ten thousand filter
+  // objects to discover that a filter is too expensive to run, which is a
+  // cheap denial of service against the guard that exists to prevent one.
+  const combinations = expandFilterCount(filter);
+  for (const index of indexesOn("events")) {
+    const qualifies = index.keyColumns.every((column) => {
+      const values = PINS[column]?.(filter);
+      return values !== undefined && values.length > 0;
+    });
+    if (!qualifies) continue;
+    candidates.push({
+      rowsRead: combinations * (ROWS_READ_PER_MATCH * limit + 1),
+      via: index.name,
+    });
+  }
+
+  if (candidates.length === 0) return null;
+  // SQLite picks one access path; the cheapest available is the honest
+  // estimate of what it will pick, and the pessimistic direction is
+  // already covered by rejecting anything above MAX_FILTER_ROWS_READ.
+  return candidates.reduce((best, c) => (c.rowsRead < best.rowsRead ? c : best));
+}
+
+export type FilterBound =
+  | { ok: true; filter: Filter; cost: FilterReadCost }
+  | { ok: false; reason: string };
+
+// Clamps a filter's `limit` until the query it produces is affordable,
+// and refuses it if no limit is small enough.
+//
+// Replaces the old clampFilterLimit + isUnconstrainedFilter pair, which
+// ran in that order and could not see each other: the clamp bounded how
+// many rows came BACK, and the guard bounded nothing at all about how
+// many were READ to produce them. On the shapes that broke this relay
+// those two numbers differed by three orders of magnitude.
+//
+// Clamping before refusing, deliberately. A client asking for 20 events
+// each from 400 follows is not abusive, it is a client with 400 follows;
+// reducing what it may ask for per author is a better answer than
+// refusing it. Refusal is reserved for the two cases no limit can fix:
+// a filter no index can serve at all, and one whose combination count
+// alone puts it over the cap at a limit of 1.
+export function boundFilter(filter: Filter): FilterBound {
+  const requested = filter.limit === undefined ? MAX_FILTER_LIMIT : Math.min(filter.limit, MAX_FILTER_LIMIT);
+
+  // Halving rather than solving for the largest affordable limit
+  // directly: the search does not need to know the shape of the cost
+  // function, so a change to that function cannot leave a stale inverse
+  // behind it. It terminates in at most nine steps from
+  // MAX_FILTER_LIMIT, and the cost of the coarseness is that a client
+  // occasionally gets 62 events where 100 would also have fit.
+  for (let limit = requested; limit >= 1; limit = Math.floor(limit / 2)) {
+    const candidate = { ...filter, limit };
+    const cost = filterReadCost(candidate);
+    if (cost === null) {
+      // Unbounded at any limit -- the limit is not what is wrong with it.
+      return {
+        ok: false,
+        reason:
+          "invalid: filter must constrain ids, kinds, authors or a #<letter> tag; " +
+          "since/until alone would scan the whole table",
+      };
+    }
+    if (cost.rowsRead <= MAX_FILTER_ROWS_READ) return { ok: true, filter: candidate, cost };
+  }
+
+  // Reached only when the cost does not fall with the limit. Two shapes
+  // do that: a cross-product of `authors` x `kinds` large enough that
+  // even one row each is too many, and an `ids` list long enough that
+  // seeking every id exceeds the cap on its own (an `ids` seek costs one
+  // row per id no matter how few of them the client says it wants back).
+  // The message names both rather than guessing which one applies, since
+  // guessing wrong sends the client to fix the field that was fine.
+  return {
+    ok: false,
+    reason:
+      `invalid: filter is too broad to answer within ${MAX_FILTER_ROWS_READ} rows read ` +
+      `at any limit; name fewer ids, or fewer authors x kinds combinations, ` +
+      `and split it across several REQs`,
+  };
 }
 
 // Live feed (ROADMAP.md chunk 7) caps -- unlike the nostr protocol path

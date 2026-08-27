@@ -121,7 +121,7 @@ export function buildRelayInfo(
       restricted_writes: true,
       max_subscriptions: MAX_SUBSCRIPTIONS_PER_CONNECTION,
       max_limit: MAX_FILTER_LIMIT,
-      // clampFilterLimit (limits.ts) defaults a filter's limit to this
+      // boundFilter (limits.ts) defaults a filter's limit to this
       // when the filter omits one.
       default_limit: MAX_FILTER_LIMIT,
       // A delta in seconds, not an absolute timestamp -- confirmed

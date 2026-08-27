@@ -6,7 +6,7 @@
 //
 // Phase one deliberately implemented only the methods that cost nothing
 // on the per-event write path. banpubkey/allowpubkey and their list
-// methods (phase two, docs/budget.md) are the one addition that costs a
+// methods (phase two, CLAUDE.md "The budget") are the one addition that costs a
 // per-event lookup, added only once a metrics baseline existed to compare
 // against. bothy pairs each with its own inverse (unbanpubkey,
 // unallowpubkey) for symmetry with blockip/unblockip, rather than

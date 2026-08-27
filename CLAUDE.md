@@ -12,7 +12,7 @@ A single-user nostr relay that deploys in one click and runs on the Cloudflare W
 - Gift wrap reads require NIP-42 AUTH as the p-tagged recipient. The gate re-runs the filter restricted to `kinds: [1059]` against real storage rather than pattern-matching the filter shape.
 - NIP-09 deletion and NIP-62 vanish requests both tombstone ids (`deleted_ids`) so a deleted event — gift wraps especially, since the sender keeps their own signed copy — can't be replayed back into storage.
 - Live feed (`/live`) is a separate, unauthenticated, push-only WebSocket channel for the admin page, capped at 5 concurrent connections and a 10-minute server-enforced lifetime (DO alarm). Never sends gift wraps or event content, only kind/time/truncated id.
-- NIP-86 relay management API: `banevent`/`allowevent`/`listbannedevents`, `banpubkey`/`unbanpubkey`/`listbannedpubkeys`, `allowpubkey`/`unallowpubkey`/`listallowedpubkeys`, `blockip`/`unblockip`/`listblockedips`, and `changerelayname`/`changerelaydescription`/`changerelayicon`, plus `supportedmethods`. Authenticated by a NIP-98 event ([src/nip98.ts](src/nip98.ts)) signed by the owner, with the `payload` tag required rather than optional; verification runs in the Worker so a forged request costs no DO time, and storage mutations go to the DO by RPC (`Relay.manage`). Phase one shipped only the methods that cost nothing on the per-event write path; phase two (`banpubkey`/`allowpubkey`) is the one addition that does, landed only once a metrics baseline existed to compare against — see docs/budget.md. The kind allowlist methods answer with an explanation rather than a generic unknown-method error, since bothy stores every kind deliberately.
+- NIP-86 relay management API: `banevent`/`allowevent`/`listbannedevents`, `banpubkey`/`unbanpubkey`/`listbannedpubkeys`, `allowpubkey`/`unallowpubkey`/`listallowedpubkeys`, `blockip`/`unblockip`/`listblockedips`, and `changerelayname`/`changerelaydescription`/`changerelayicon`, plus `supportedmethods`. Authenticated by a NIP-98 event ([src/nip98.ts](src/nip98.ts)) signed by the owner, with the `payload` tag required rather than optional; verification runs in the Worker so a forged request costs no DO time, and storage mutations go to the DO by RPC (`Relay.manage`). Phase one shipped only the methods that cost nothing on the per-event write path; phase two (`banpubkey`/`allowpubkey`) is the one addition that does, landed only once a metrics baseline existed to compare against — see CLAUDE.md "The budget". The kind allowlist methods answer with an explanation rather than a generic unknown-method error, since bothy stores every kind deliberately.
 - `banevent` writes both a `banned_events` row and a `deleted_ids` tombstone: the ban is what the operator reads back, the tombstone is what actually refuses a re-send or a backfill replay. `listbannedevents` reads `banned_events`, never `deleted_ids` — the latter holds NIP-09 and NIP-62 deletions too. `allowevent` is the one place in the codebase that deletes a tombstone.
 - `banpubkey`/`allowpubkey` are two independent lists (`banned_pubkeys`/`allowed_pubkeys`), not opposite ends of one — unlike `allowevent`, `unbanpubkey` and `unallowpubkey` each just delete their own row. `ownership.ts isAllowedWriter` checks `banned_pubkeys` before the follows lookup, unconditionally for every non-owner write, so a banned pubkey is refused even if it's also a follow; it checks `allowed_pubkeys` only on the path already about to reject (owner-only mode, or "not a follow"), so that lookup costs nothing on the common accept path. The owner's own pubkey can never be banned — `banpubkey` refuses the call outright rather than accepting it and having no effect.
 - IP blocks are checked exactly once per WebSocket connection in `Relay.fetch`, never per message, and never on the management endpoint — blocking your own address must not lock you out of the API that unblocks it. Blocking the caller's own address refuses once and names an exact confirmation string to pass back as the reason.
@@ -29,7 +29,7 @@ Everything optional is read defensively (`env.X ?? fallback`) and declared nowhe
 
 The three identity variables sit at the top of the resolution chain described above — they outrank a value stored through NIP-86, which outranks the owner's kind-0.
 
-`MAX_EVENT_BYTES`, `MAX_EVENTS_PER_PUBKEY_PER_MINUTE` and `NON_OWNER_STORAGE_BYTES` are the write-path abuse caps; each takes a number or the exact string `"off"`. What bounds a follow, and the before/after arithmetic, is in docs/budget.md.
+`MAX_EVENT_BYTES`, `MAX_EVENTS_PER_PUBKEY_PER_MINUTE` and `NON_OWNER_STORAGE_BYTES` are the write-path abuse caps; each takes a number or the exact string `"off"`. What bounds a follow, and the before/after arithmetic, is in CLAUDE.md "The budget".
 
 `ALLOW_FOLLOWS` defaults to on; must be set to the literal string `"false"` to disable it and fall back to owner-only writes. When on, the owner's kind-3 follow list gates writes. The cache refreshes immediately when the owner publishes a new contact list to this relay; hourly cron is the fallback for when it arrived some other way (backfill, or a client that published it elsewhere first).
 
@@ -37,13 +37,96 @@ Redeploying does not reset ownership or storage — DO storage survives `wrangle
 
 [.github/workflows/sync.yml](.github/workflows/sync.yml) ships in every downstream copy of this repo so the "Deploy to Cloudflare" button's clone can still pull in upstream changes (it no-ops in `sybenx/bothy` itself via the job-level `if` guard). The `git checkout HEAD -- wrangler.jsonc .github/` step is load-bearing — it restores the user's own Cloudflare resource IDs and this workflow after the upstream checkout overwrites them; don't remove or reorder it.
 
+## The budget
+
+Everything here runs on the Cloudflare Workers free tier, and the ceilings are
+what shape the design. Per day, per account: **100,000 rows written**,
+**5,000,000 rows read**, 5GB of SQLite storage per Durable Object, 10ms of
+Worker CPU per request. Allowances reset at 00:00 UTC. Rows written and rows
+read are the two that bind; storage and CPU are not close.
+
+Measured figures live in [docs/baselines.json](docs/baselines.json) and are
+asserted by [test/hibernation.test.ts](test/hibernation.test.ts) (rows written)
+and [test/read-cost.test.ts](test/read-cost.test.ts) (rows read). Below, **E**
+is rows in `events` and **T** is rows in `event_tags` (≈ 5E for real notes, which
+carry about five single-letter tags each).
+
+### Rows written, per stored event
+
+```
+5 + 2 × (single-letter tag count)
+```
+
+Five for the event row: one base row, one for the implicit unique index behind
+`id TEXT PRIMARY KEY` (a TEXT primary key is not a rowid alias), and one for each
+of the three declared indexes on `events`. Two per indexed tag row: the row and
+its index. A bare note costs 5, a reply carrying `#e` and `#p` costs 9. A delete
+is a write too, so a replacement or a NIP-09 deletion costs this shape again.
+
+`schema.ts eventRowCost` derives this from `INDEXES` rather than restating it, so
+adding an index updates the admin page, backfill's headroom guard and
+`BACKFILL_PAGE_SIZE`'s sizing at once. `events.row_cost` stamps the figure at
+insert time so `estimateRowsWritten24h` can sum a column.
+
+### Rows read, by path
+
+| Path | Rows read |
+|---|---|
+| REQ filter, `ids` | 1 per id |
+| REQ filter, `#<letter>` tag | ~2 per matching tag row |
+| REQ filter served by an index | combinations × (2 × limit + 1) |
+| Gift wrap gate probe, per filter, only when `kinds` is absent | 1–5 |
+| `estimateRowsWritten24h` | E |
+| `/api/stats`, cache miss | ~4E |
+| `/api/stats`, within `STATS_CACHE_TTL_MS` | ~1 |
+| Backfill tick | 2E + ~2 per event in the page |
+| Live write, regular kind | 0–2 |
+| **Replaceable/addressable replacement** | **T ≈ 5E** |
+| `giftWrapCount`, per gift wrap accepted | ~0 |
+| Cron refreshes | ~7 + 2F |
+| WebSocket connect | 1–2 |
+| NIP-11 document / NIP-98 owner lookup | 2 |
+| `initSchema`, per Durable Object constructor | ~66 |
+
+F is the follow count. `initSchema` runs in the constructor, so it is paid per
+wake from hibernation, not once per deploy.
+
+`combinations` is the number of queries `filters.ts expandFilter` runs for a
+filter — its `authors` × `kinds` cross-product. The `2` is the index entry plus
+the table row it points at.
+
+### Where the read ceiling actually binds
+
+Two paths scale with the accumulated table rather than with traffic, so both get
+worse as the relay fills whether or not anything else changes:
+
+- **The cron floor.** The hourly tick calls `estimateRowsWritten24h` twice, so
+  `2E × 24 = 48E` rows/day are spent with no client connected at all. That
+  reaches 5,000,000 at **E ≈ 104,000**.
+- **Replaceable replacement.** Each one scans `event_tags` in full: `5E × R`
+  rows/day, where R is replaceable events stored per day that supersede an
+  existing version. That reaches 5,000,000 at **E × R = 1,000,000** — E ≈ 20,000
+  at R = 50/day, E ≈ 100,000 at R = 10/day.
+
+So the replacement path is the binding constraint whenever R exceeds about
+**10/day**, which is inside the range a single active owner produces on their
+own. It is the next thing to fix and it is deliberately not fixed yet — the
+reasoning, the arithmetic and the estimate of R are in the comment on
+`deleteEventRow` in [src/storage.ts](src/storage.ts), beside the query they are
+about. `read-metrics.ts` counts replacements so R can be read off `/api/stats`
+instead of estimated.
+
+Traffic-driven paths are bounded by `limits.ts boundFilter`, which admits a REQ
+filter only at a limit some index can afford, and by the per-IP message throttle
+in `relay.ts`.
+
 ## Architecture map
 
 - [src/index.ts](src/index.ts) — Worker entry: routing, `/api/*`, `scheduled()` cron dispatch.
 - [src/relay.ts](src/relay.ts) — the `Relay` Durable Object: connection lifecycle, NIP-01 message handling, live feed, alarm.
 - [src/relay-stub.ts](src/relay-stub.ts) — the one `idFromName("relay")` accessor, shared so nothing else can shard it.
-- [src/storage.ts](src/storage.ts) / [src/schema.ts](src/schema.ts) — SQLite schema and all read/write queries, including the row-cost accounting. `events.ingested_at` is wall-clock write time and must never be conflated with `created_at`: rows-written accounting and backfill's headroom guard both measure `ingested_at`, because a backfilled event's `created_at` is years old and measuring that made backfill's own writes invisible to the guard restraining them. A column, not a counter table — a counter costs a row write per event, a column costs nothing. See docs/budget.md.
-- [src/filters.ts](src/filters.ts) — REQ filter parsing, SQL query building, in-memory match testing for live broadcast.
+- [src/storage.ts](src/storage.ts) / [src/schema.ts](src/schema.ts) — SQLite schema and all read/write queries, including the row-cost accounting. `events.ingested_at` is wall-clock write time and must never be conflated with `created_at`: rows-written accounting and backfill's headroom guard both measure `ingested_at`, because a backfilled event's `created_at` is years old and measuring that made backfill's own writes invisible to the guard restraining them. A column, not a counter table — a counter costs a row write per event, a column costs nothing. The same argument added `events.row_cost` in v0.7.2: each event's rows-written cost is stamped at insert time so `estimateRowsWritten24h` sums a column instead of rebuilding the figure from a `LEFT JOIN event_tags` with no index behind it, which read every tag row in the table to answer a question about the 24h window. See CLAUDE.md "The budget".
+- [src/filters.ts](src/filters.ts) — REQ filter parsing, SQL query building, in-memory match testing for live broadcast, and `expandFilter`, which splits one filter into the cross-product of its `authors` × `kinds` singletons. That split is what lets an index serve `ORDER BY created_at DESC LIMIT n`: a key column pinned to one value arrives sorted, `kind IN (1, 7)` does not, so a multi-kind filter defeats an index as thoroughly as no index at all. `storage.ts queryFilter` re-merges and re-slices to `limit`, so the split is invisible on the wire.
 - [src/nostr.ts](src/nostr.ts) — wire types and kind-range classifiers (replaceable/ephemeral/addressable).
 - [src/validate.ts](src/validate.ts) — event id computation and schnorr signature verification (`@noble/curves`).
 - [src/ownership.ts](src/ownership.ts) — owner pubkey resolution, TOFU claim, follow-list cache, profile/icon refresh.
@@ -51,7 +134,9 @@ Redeploying does not reset ownership or storage — DO storage survives `wrangle
 - [src/pubkey.ts](src/pubkey.ts) / [src/bech32.ts](src/bech32.ts) — npub/hex normalization.
 - [src/profile-lookup.ts](src/profile-lookup.ts) — best-effort kind-0 lookup from well-known relays, runs in the Worker only.
 - [src/backfill.ts](src/backfill.ts) / [src/backfill-worker.ts](src/backfill-worker.ts) — backfill state machine (DO-side, pure) and outbound fetch orchestration (Worker-side).
-- [src/limits.ts](src/limits.ts) — every numeric abuse/budget cap in the project, each commented with what it bounds. The three write-path caps (event size, per-pubkey rate, non-owner storage share) are enforced in `relay.ts acceptEvent` before id/signature verification, exempt the owner from two of the three, and are each raisable or disablable by env var — disabled only by the exact string `"off"`, never by any truthy value.
+- [src/limits.ts](src/limits.ts) — every numeric abuse/budget cap in the project, each commented with what it bounds. The three write-path caps (event size, per-pubkey rate, non-owner storage share) are enforced in `relay.ts acceptEvent` before id/signature verification, exempt the owner from two of the three, and are each raisable or disablable by env var — disabled only by the exact string `"off"`, never by any truthy value. Also `boundFilter`, the read-abuse guard: it prices a REQ filter (`combinations × (2 × limit + 1)`, where `combinations` comes from `expandFilter` itself) against the index set declared in `schema.ts`, clamps the limit until the query is affordable, and refuses only what no limit can fix. It replaced `isUnconstrainedFilter`, which asked whether a field was *present* rather than what the query *cost* and so admitted the two shapes that read the whole table.
+- [src/exhaustion.ts](src/exhaustion.ts) — classifies a Cloudflare free-tier allowance being consumed and names which one; `index.ts` wraps both `fetch` and `scheduled` with it. Exists because the last outage's only symptom was an admin page that loaded the word "bothy" and no numbers — `public/` is served from `env.ASSETS` and never touches the DO, so the one part still working was the part that proved nothing. Matching is substring signatures against error text Cloudflare does not document as stable, so it fails useful rather than silent: the raw message is always logged, the resource name only added when a signature matches. Non-exhaustion errors are logged and rethrown, never converted into a quiet 503.
+- [src/read-metrics.ts](src/read-metrics.ts) — **diagnostic, and expected to be removed**: in-memory attribution of rows *read* to the code path that caused them, surfaced as `reads` on `/api/stats`. Added after the live relay exhausted the 5,000,000 rows-read/day allowance under ordinary operation and nothing here could say which path spent it. Counters live in memory, never in storage — a counter costing a row write to measure a row read repeats the mistake CLAUDE.md "The budget" already rejected — so they reset on eviction and describe proportions, not daily totals. Every `SqlStorage` access in the DO goes through `instrumentSql`, so a query can be mislabelled into `unattributed` but never missed. See CLAUDE.md "The budget" for the per-call costs and the arithmetic against the ceiling.
 - [src/nip11.ts](src/nip11.ts) — relay info document, and the name/description/icon resolution chain shared with `/api/stats`.
 - [src/nip86.ts](src/nip86.ts) — management API method dispatch (runs in the DO; touches storage, opens nothing).
 - [src/nip98.ts](src/nip98.ts) — HTTP auth verification for the management API (runs in the Worker only).
@@ -62,10 +147,10 @@ Redeploying does not reset ownership or storage — DO storage survives `wrangle
 - TypeScript strict mode, no `any` in the event-handling path.
 - `@noble/curves` + `@noble/hashes` only — no second crypto dependency.
 - Protocol errors go back as `["OK", id, false, "reason: message"]` or `["CLOSED", subid, "reason: message"]` with the NIP-01 machine-readable prefix (`invalid:`, `restricted:`, `blocked:`, `rate-limited:`, `auth-required:`, `duplicate:`). Never fail silently.
-- Comments explain *why*, especially anything hibernation- or budget-related — most modules carry inline notes on their row-write cost or CPU cost and point at [docs/budget.md](docs/budget.md) for the measured baseline.
+- Comments explain *why*, especially anything hibernation- or budget-related — most modules carry inline notes on their row-write cost or CPU cost and point at CLAUDE.md "The budget" for the measured baseline.
 - Cheapest/most-certain rejections run before expensive ones on every write path: ownership check and tombstone check both precede schnorr verification.
-- SQLite has exactly one secondary index on `events` (`(pubkey, kind, created_at)`) and one on `event_tags` (`(tag_name, tag_value, created_at)`). Every accepted read filter is required to constrain on `authors`/`ids`/`kinds`/a tag. Do not add another index — it multiplies per-event write cost — without updating the schema.ts comment and docs/budget.md.
-- Verify Cloudflare's own platform limits against live docs before relying on a number in a file — they change between compatibility dates. docs/budget.md cites the source and date at each point of use rather than assuming a cached number still holds.
+- Indexes are declared once, as data, in `schema.ts INDEXES`, and two things read that declaration: `limits.ts boundFilter` (which filters are affordable) and `schema.ts eventRowCost` (what an event costs to write). Three on `events` — `(pubkey, kind, created_at)`, `(kind, created_at)`, `(pubkey, created_at)` — and one on `event_tags` — `(tag_name, tag_value, created_at)`. A fourth index therefore changes both the guard and the write accounting on its own; what it must NOT change silently is the measured baseline, so re-run `test/hibernation.test.ts`'s rows-written assertions and update the schema.ts comment and CLAUDE.md "The budget". Every accepted read filter must be answerable from one of these — that is enforced by cost, not by requiring a particular field.
+- Verify Cloudflare's own platform limits against live docs before relying on a number in a file — they change between compatibility dates. CLAUDE.md "The budget" cites the source and date at each point of use rather than assuming a cached number still holds.
 - Pin dependency versions; don't float to `latest` mid-project.
 
 ## Commands
@@ -84,7 +169,7 @@ npm run cf-typegen   # regenerate worker-configuration.d.ts
 Two kinds of assertion live in the same suite ([test/](test)):
 
 1. **Protocol conformance** — NIP-01 REQ/EVENT/CLOSE/EOSE, filters, replaceable/addressable/ephemeral storage rules, NIP-09/40/42/59/62, and NIP-86/98 management. Reject paths are asserted as carefully as accept paths.
-2. **Budget/hibernation regression** — [test/hibernation.test.ts](test/hibernation.test.ts) asserts the object becomes eligible to hibernate after the last message; write-cost and CPU-cost baselines are recorded in [docs/baselines.json](docs/baselines.json) and explained in [docs/budget.md](docs/budget.md).
+2. **Budget/hibernation regression** — [test/hibernation.test.ts](test/hibernation.test.ts) asserts the object becomes eligible to hibernate after the last message; write-cost and CPU-cost baselines are recorded in [docs/baselines.json](docs/baselines.json) and explained in CLAUDE.md "The budget".
 
 See [docs/test-notes.md](docs/test-notes.md) for suite layout, fixture rationale, and the couple of places tests drop below the wire protocol to real storage (documented exceptions, not the norm).
 

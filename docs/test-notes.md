@@ -4,7 +4,8 @@ Notes for whoever implements chunk 3 against the chunk 2 conformance suite.
 
 ## Layout
 
-- `test/skeleton.test.ts`, `test/hibernation.test.ts` — chunk 1 smoke tests. Don't add protocol assertions here.
+- `test/skeleton.test.ts` — chunk 1 smoke tests. Don't add protocol assertions here.
+- `test/hibernation.test.ts` — the hibernation smoke test, and the rows-**written** baseline: `eventRowCost`'s derivation from `schema.ts INDEXES` asserted against real `SqlStorageCursor.rowsWritten` on the real `storeEvent` path. That pairing is the point — the figure is derived so a new index updates every consumer of it at once, and measured so the derivation cannot be quietly wrong. This project shipped a rows-written figure that was off by 45× because nobody measured it.
 - `test/nip01-write.test.ts` — EVENT/OK: accept, duplicate, bad signature, id/content mismatch.
 - `test/nip01-subscriptions.test.ts` — REQ/EOSE/CLOSE lifecycle, real-time delivery, sub replacement.
 - `test/nip01-filters.test.ts` — ids/authors/kinds/`#tag`/since/until/limit, AND-within, OR-across, ordering.
@@ -14,7 +15,9 @@ Notes for whoever implements chunk 3 against the chunk 2 conformance suite.
 - `test/ownership.test.ts` — owner-only write gate (fixed OWNER_PUBKEY binding).
 - `test/claim.test.ts` — TOFU claim flow: HTTP behavior with OWNER_PUBKEY set (chunk 4's actual test env), plus claim atomicity and pubkey normalization tested directly against real storage.
 - `test/follows.test.ts` — ALLOW_FOLLOWS write gate, tested directly against real storage.
-- `test/read-limits.test.ts` — subscription cap, unconstrained-filter rejection, per-IP throttle.
+- `test/read-limits.test.ts` — subscription cap, rejection of a filter no index can serve, per-IP throttle.
+- `test/read-cost.test.ts` — rows read per query shape, before and after the v0.7.2 index/split/cache work, plus the `boundFilter` cost model and the read-path attribution buckets.
+- `test/exhaustion.test.ts` — the budget-exhaustion classifier: names the resource when it can, still reports exhaustion when the wording is unfamiliar, and never classifies an ordinary bug as exhaustion.
 - `test/stats.test.ts` — `/api/stats` shape, `/api/profile` validation, admin page fallback.
 - `test/helpers/` — shared fixtures (see below).
 
@@ -24,11 +27,14 @@ Notes for whoever implements chunk 3 against the chunk 2 conformance suite.
 - `event.ts` — `signEvent()` builds a correctly-signed NIP-01 event; `withCorruptSignature()`/`withTamperedContent()` build negative fixtures.
 - `socket.ts` — `connectRelay()` opens the hibernation-safe WS to the singleton DO; `publish()` and `collectStored()` wrap the send/await-response pattern.
 - `management.ts` — `callManagement()` sends a NIP-86 request through the Worker's fetch handler, signing the NIP-98 authorization for it. The management API is the one client path in this project that is plain HTTP rather than a WebSocket, so it does not go through `socket.ts` at all. Every field of `AuthOptions` overrides exactly one part of the authorization, so a reject-path test can break one rule at a time; the accept path is the same call with no overrides.
-- `isolate.ts` — `isolateStorage()` calls `reset()` in `afterEach`. **Call this at the top of every test file that writes events** — storage isolation in this vitest plugin is per file, not per test, and most files share the one owner pubkey.
+- `isolate.ts` — `isolateStorage()` calls `reset()` in `afterEach`, then clears the Durable Object's in-memory `/api/stats` cache. **Call this at the top of every test file that writes events** — storage isolation in this vitest plugin is per file, not per test, and most files share the one owner pubkey. The cache clear is needed because `reset()` empties storage without going through any write path the object can observe, so a test that resets and then reads `/api/stats` would otherwise be answered from a cache describing the database it just discarded. Nothing in production clears it that way; it expires on its own after `STATS_CACHE_TTL_MS`.
 
 ## Why some things look the way they do
 
 - Only the owner can write, so `authors`-filter tests use list membership (owner's key among others) rather than storing events from multiple authors — a second author's event can never reach storage in this relay.
+- `test/read-cost.test.ts` seeds `events`/`event_tags` with direct `INSERT`s via `runInDurableObject` rather than publishing over the wire, and is the third documented exception of this kind. Its subject is what a query costs at a table size where a full scan is unmistakably distinct from an index seek, and reaching that size through the protocol would mean thousands of schnorr signatures for rows whose read cost has nothing to do with how they were written.
+- That file measures each cost **both ways** — the pre-v0.7.2 form and the current one, against the same rows in the same Durable Object — so CLAUDE.md "The budget"'s before/after table is a measurement rather than two runs compared from memory. Where an index is the thing that changed, the "before" case is reproduced with SQLite's unary `+` operator, which suppresses index use on a term (sqlite.org/optoverview.html), rather than by dropping and recreating the index. Dropping it would leave the shared DO in a different state for whatever test ran next; `+kind` reproduces the old query plan and touches nothing.
+- One assertion there is still shaped as "this is expensive and scales with the table" rather than "this must stay under N": the `event_tags` delete. It records a measured fact that was deliberately **not** fixed — the reasoning, the arithmetic and the estimate of how often the path is hit are in the comment on `deleteEventRow` in `src/storage.ts`, beside the query they are about — and a test that pretended otherwise would hide it.
 - `test/nip40-expiration.test.ts`'s "does not return a stored event whose expiration has since passed" case inserts a row directly into the `events` table (via `runInDurableObject`) instead of going through the wire. That's the one deliberate exception to testing purely over the wire: there's no way to make an event expire *after* it was validly stored without controlling wall-clock time, and NIP-40's write-time and read-time rules are independent SHOULDs that need to be tested independently.
 - NIP-42 tests cover the AUTH message's own validation contract (kind, freshness, challenge match) rather than a full challenge/response round trip — this relay has no auth-gated resource yet, so there's no scenario where it issues a challenge for a test to receive.
 - `test/claim.test.ts` and `test/follows.test.ts` cannot exercise the *unclaimed* relay or ALLOW_FOLLOWS=true over the wire: the global test env's OWNER_PUBKEY/ALLOW_FOLLOWS bindings (vitest.config.ts) are fixed for the whole run, matching every other suite. Instead they call the pure functions in `ownership.ts` (`claimOwner`, `getOwnerPubkey`, `isAllowedWriter`, `refreshFollows`) directly against real `SqlStorage` obtained via `runInDurableObject`, passing a hand-built `env` object rather than the injected one. This is the same category of exception `nip40-expiration.test.ts` documents for its own reason: no wire-protocol path exists to reach that state, so the test drops one level to real storage instead of mocking it.

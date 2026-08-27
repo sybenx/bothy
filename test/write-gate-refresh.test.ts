@@ -1,5 +1,5 @@
 // Immediate follow cache refresh on an owner-authored kind-3
-// (docs/budget.md "immediate write-gate refresh"; CLAUDE.md "Owner-only
+// (CLAUDE.md "The budget" "immediate write-gate refresh"; CLAUDE.md "Owner-only
 // writes"). Before this, refreshFollows only ran on the hourly cron
 // (Relay.runCron), so a follow added moments ago couldn't write for up to
 // an hour, and a relay whose owner had never published a kind-3 here had a
