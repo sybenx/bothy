@@ -2,7 +2,11 @@
 // design, so these caps -- not authentication -- are what stands between
 // a normal deployment and a stranger burning the daily 5M rows-read /
 // 100k DO-requests ceiling.
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { buildFilterQuery, filterParamCount } from "../src/filters";
+import type { Filter } from "../src/nostr";
+import type { Relay } from "../src/relay";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
 import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX } from "./helpers/keys";
@@ -13,6 +17,7 @@ import {
   MAX_FILTER_LIMIT,
   MAX_FILTER_ROWS_READ,
   MAX_FILTERS_PER_REQ,
+  MAX_QUERY_BOUND_PARAMS,
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
 } from "../src/limits";
 
@@ -231,5 +236,87 @@ describe("connection state size", () => {
     expect(pushed[1]).toBe("sub-small");
     conn.close();
     publisher.close();
+  });
+});
+
+// filterReadCost prices `ids.length` and a #<letter> tag's value count by
+// ROWS READ, and that is a different quantity from how many `?` params
+// buildFilterQuery binds into one exec() call. Neither shrinks when
+// boundFilter halves `limit`, so an ids-only filter can pass
+// MAX_FILTER_ROWS_READ (one row per id, cheap) while its parameter count
+// blows past Cloudflare's own 100-bound-parameter ceiling per query --
+// which is exactly what happened on the live relay: "too many SQL
+// variables at offset 517: SQLITE_ERROR", uncaught.
+describe("bound-parameter cap", () => {
+  it("matches buildFilterQuery's actual parameter count, so the two cannot drift", () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const cases: Filter[] = [
+      { kinds: [1], limit: 20 },
+      { ids: Array.from({ length: 5 }, (_, i) => i.toString(16).padStart(64, "0")), limit: 20 },
+      { authors: [OWNER_PUBKEY_HEX], kinds: [1], since: 0, until: 100, limit: 20 },
+      { "#e": ["a".repeat(64), "b".repeat(64)], limit: 20 },
+      { ids: ["c".repeat(64)], "#p": [OWNER_PUBKEY_HEX], since: 0, limit: 5 },
+    ];
+    for (const filter of cases) {
+      const built = buildFilterQuery(filter, nowSec);
+      expect(built).not.toBeNull();
+      if (built) expect(filterParamCount(filter)).toBe(built.params.length);
+    }
+  });
+
+  it("refuses a filter naming enough ids to exceed the bound-parameter cap", async () => {
+    const conn = await connectRelay("10.0.0.18");
+    // Well past MAX_QUERY_BOUND_PARAMS, and priced by filterReadCost at
+    // one row per id -- cheap enough that rows-read pricing alone would
+    // have admitted it.
+    const ids = Array.from({ length: MAX_QUERY_BOUND_PARAMS + 10 }, (_, i) => i.toString(16).padStart(64, "0"));
+    conn.send(["REQ", "sub-too-many-ids", { ids }]);
+    const frame = await conn.nextMessage();
+
+    expect(frame[0]).toBe("CLOSED");
+    expect(frame[1]).toBe("sub-too-many-ids");
+    expect((frame[2] as string).startsWith("invalid:")).toBe(true);
+    conn.close();
+  });
+
+  it("refuses a tag filter naming enough values to exceed the same cap", async () => {
+    const conn = await connectRelay("10.0.0.19");
+    const values = Array.from({ length: MAX_QUERY_BOUND_PARAMS + 10 }, (_, i) => i.toString(16).padStart(64, "0"));
+    conn.send(["REQ", "sub-too-many-tag-values", { "#e": values, limit: 1 }]);
+    const frame = await conn.nextMessage();
+
+    expect(frame[0]).toBe("CLOSED");
+    expect(frame[1]).toBe("sub-too-many-tag-values");
+    expect((frame[2] as string).startsWith("invalid:")).toBe(true);
+    conn.close();
+  });
+
+  it("still admits an ordinary ids filter well under the cap", async () => {
+    const conn = await connectRelay("10.0.0.20");
+    const ids = Array.from({ length: 20 }, (_, i) => i.toString(16).padStart(64, "0"));
+    conn.send(["REQ", "sub-ids-ok", { ids }]);
+    const frame = await conn.nextMessage();
+
+    expect(frame[0]).toBe("EOSE");
+    conn.close();
+  });
+
+  it("reproduces the uncaught SQLITE_ERROR the cap now prevents", async () => {
+    // Proof the vulnerability was real, bypassing boundFilter entirely:
+    // buildFilterQuery has no cap of its own, so handing SQLite a query
+    // built straight from an oversized ids list throws the same error the
+    // live relay logged, rather than the clean CLOSED boundFilter now
+    // produces before this query is ever built.
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    await runInDurableObject(stub, async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const ids = Array.from({ length: 600 }, (_, i) => i.toString(16).padStart(64, "0"));
+      const nowSec = Math.floor(Date.now() / 1000);
+      const built = buildFilterQuery({ ids }, nowSec);
+      expect(built).not.toBeNull();
+      if (built) {
+        expect(() => sql.exec(built.sql, ...built.params)).toThrow(/too many SQL variables/);
+      }
+    });
   });
 });

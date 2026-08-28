@@ -306,8 +306,8 @@ Traffic-driven paths are bounded by `limits.ts boundFilter`, which admits a REQ
 filter only at a limit some index can afford, and by the per-IP message throttle
 in `relay.ts`.
 
-Three quantities bound one REQ, and they are three because pricing alone bounds
-none of the other two:
+Four quantities bound one REQ, and they are four because pricing alone bounds
+none of the other three:
 
 - **Rows read per REQ** — `MAX_FILTER_ROWS_READ`, 10,000, divided equally
   among the frame's filters and passed to `boundFilter` as a budget.
@@ -333,6 +333,15 @@ none of the other two:
   allowance. This cap bounds the statement count and keeps the per-filter share
   from thinning to uselessness; the *rows* are bounded by the shared budget
   above.
+- **Bound parameters per query** — `MAX_QUERY_BOUND_PARAMS`, 90, checked
+  against `filterParamCount` before the halving loop, for the same reason
+  `MAX_FILTER_COMBINATIONS` is: rows-read pricing bounds neither `ids.length`
+  nor a `#<letter>` tag's value count, and a lowered `limit` shrinks neither
+  either. A live deployment hit this directly — `{"ids":[<enough ids>]}` with
+  no `authors`/`kinds` priced at one row per id, so it passed
+  `MAX_FILTER_ROWS_READ` two orders of magnitude before it reached SQLite's
+  own 100-bound-parameter ceiling, and the resulting `SQLITE_ERROR` was
+  uncaught. See below for the platform limit it bounds.
 
 What none of this bounds is spend over TIME, and it is worth stating rather
 than leaving to be rediscovered. The per-IP message throttle
@@ -351,6 +360,23 @@ above — ran its query, sent its events, and then took an uncaught exception in
 place of the EOSE. `MAX_CONN_STATE_BYTES` checks the *would-be* state before
 storing it, so an oversized REQ is refused with `CLOSED` and leaves the
 subscriptions it could not join intact.
+
+A fifth bound is the same kind: a platform ceiling rather than a budget cap.
+Cloudflare's SQLite-backed Durable Object storage refuses any single query
+bound with more than 100 parameters
+(developers.cloudflare.com/durable-objects/platform/limits/, checked
+2026-08-28), and nothing checked it either, on the read path this time rather
+than the storage path. `filterReadCost` prices `ids.length` and a tag's value
+count by rows read, which is a different quantity from how many `?`
+placeholders `buildFilterQuery` binds into one `exec()` call — an `ids`
+filter with no `authors`/`kinds` prices at one row per id, so a filter naming
+enough ids passed `MAX_FILTER_ROWS_READ` while its parameter count blew past
+SQLite's own ceiling. Measured on the live relay: `"too many SQL variables
+at offset 517: SQLITE_ERROR"`, uncaught, in place of a clean refusal.
+`MAX_QUERY_BOUND_PARAMS` (`limits.ts`, 90 — a margin below the real 100 for
+the same reason `MAX_CONN_STATE_BYTES` sits below 16KiB) checks
+`filterParamCount`'s count before the query is ever built, refused with
+`CLOSED` alongside every other read-abuse rejection above.
 
 ### The HTTP side
 
@@ -450,7 +476,8 @@ usefully — what it structurally cannot do.
   includes the query count on every access path, and under a separate cap on
   that count, since statements cost CPU that rows-read pricing cannot see. Plus
   a cap on filters per REQ, a per-connection subscription cap, a bound on the
-  connection state a subscription may hold open, and a per-IP message throttle. On the HTTP
+  connection state a subscription may hold open, a cap on how many SQL bound
+  parameters one filter's query may need, and a per-IP message throttle. On the HTTP
   side, Cloudflare's Rate Limiting binding bounds every path that wakes the
   Durable Object, per IP, before the Worker's code runs; underneath it
   `/api/stats` is still defended by cost. **Every figure it reports is maintained
@@ -532,7 +559,7 @@ usefully — what it structurally cannot do.
 - [src/pubkey.ts](src/pubkey.ts) / [src/bech32.ts](src/bech32.ts) — npub/hex normalization.
 - [src/profile-lookup.ts](src/profile-lookup.ts) — best-effort kind-0 lookup from well-known relays, runs in the Worker only, plus the isolate-local cache in front of it (`lookupProfileCached`). The cache is not `caches.default`: the Cache API needs a custom domain (developers.cloudflare.com/workers/runtime-apis/cache/, checked 2026-08-27) and bothy deploys to `workers.dev`, so it would silently no-op on the deployment shape this project exists for. Negative results are cached and concurrent lookups for one pubkey are coalesced — without both, the cache would miss on exactly the traffic it exists to absorb.
 - [src/backfill.ts](src/backfill.ts) / [src/backfill-worker.ts](src/backfill-worker.ts) — backfill state machine (DO-side, pure) and outbound fetch orchestration (Worker-side).
-- [src/limits.ts](src/limits.ts) — every numeric abuse/budget cap in the project, each commented with what it bounds. The three write-path caps (event size, per-pubkey rate, non-owner storage share) are enforced in `relay.ts acceptEvent` before id/signature verification, exempt the owner from two of the three, and are each raisable or disablable by env var — disabled only by the exact string `"off"`, never by any truthy value. Also `boundFilter`, the read-abuse guard: it prices a REQ filter (`combinations × (2 × limit + 1)` on an index path, `combinations × ids.length` on the primary key, where `combinations` comes from `expandFilter` itself) against the index set declared in `schema.ts`, clamps the limit until the query is affordable, and refuses what no limit can fix — plus `MAX_FILTER_COMBINATIONS`, which refuses on query count alone, ahead of the price, because a lowered limit removes rows and never statements. It replaced `isUnconstrainedFilter`, which asked whether a field was *present* rather than what the query *cost* and so admitted the two shapes that read the whole table. The one cap NOT declared here is the HTTP rate limit: Cloudflare's runtime enforces it from `wrangler.jsonc` before any of this code runs, so a number here would be decorative and could silently disagree with the one in force — `limits.ts` carries the pointer and the reasoning instead.
+- [src/limits.ts](src/limits.ts) — every numeric abuse/budget cap in the project, each commented with what it bounds. The three write-path caps (event size, per-pubkey rate, non-owner storage share) are enforced in `relay.ts acceptEvent` before id/signature verification, exempt the owner from two of the three, and are each raisable or disablable by env var — disabled only by the exact string `"off"`, never by any truthy value. Also `boundFilter`, the read-abuse guard: it prices a REQ filter (`combinations × (2 × limit + 1)` on an index path, `combinations × ids.length` on the primary key, where `combinations` comes from `expandFilter` itself) against the index set declared in `schema.ts`, clamps the limit until the query is affordable, and refuses what no limit can fix — plus `MAX_FILTER_COMBINATIONS`, which refuses on query count alone, ahead of the price, because a lowered limit removes rows and never statements, and `MAX_QUERY_BOUND_PARAMS`, which refuses on the number of `?` placeholders the query would bind, ahead of the price, because a lowered limit removes neither `ids.length` nor a tag's value count — the shape a live filter naming enough ids exploited to pass `MAX_FILTER_ROWS_READ` while still exceeding SQLite's own 100-bound-parameter ceiling and crashing with an uncaught `SQLITE_ERROR`. It replaced `isUnconstrainedFilter`, which asked whether a field was *present* rather than what the query *cost* and so admitted the two shapes that read the whole table. The one cap NOT declared here is the HTTP rate limit: Cloudflare's runtime enforces it from `wrangler.jsonc` before any of this code runs, so a number here would be decorative and could silently disagree with the one in force — `limits.ts` carries the pointer and the reasoning instead.
 - [src/exhaustion.ts](src/exhaustion.ts) — classifies a Cloudflare free-tier allowance being consumed and names which one; `index.ts` wraps both `fetch` and `scheduled` with it. Exists because the last outage's only symptom was an admin page that loaded the word "bothy" and no numbers — `public/` is served from `env.ASSETS` and never touches the DO, so the one part still working was the part that proved nothing. Matching is substring signatures against error text Cloudflare does not document as stable, so it fails useful rather than silent: the raw message is always logged, the resource name only added when a signature matches. Non-exhaustion errors are logged and rethrown, never converted into a quiet 503.
 - [src/read-metrics.ts](src/read-metrics.ts) — **diagnostic, and expected to be removed**: in-memory attribution of rows *read* to the code path that caused them, surfaced as `reads` on `/api/stats`. Added after the live relay exhausted the 5,000,000 rows-read/day allowance under ordinary operation and nothing here could say which path spent it. Counters live in memory, never in storage — a counter costing a row write to measure a row read repeats the mistake CLAUDE.md "The budget" already rejected — so they reset on eviction and describe proportions, not daily totals. Every `SqlStorage` access in the DO goes through `instrumentSql`, so a query can be mislabelled into `unattributed` but never missed. See CLAUDE.md "The budget" for the per-call costs and the arithmetic against the ceiling.
 - [src/nip11.ts](src/nip11.ts) — relay info document, and the name/description/icon resolution chain shared with `/api/stats`.

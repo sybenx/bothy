@@ -193,6 +193,46 @@ function placeholders(count: number): string {
   return Array(count).fill("?").join(", ");
 }
 
+// How many bound `?` parameters ONE buildFilterQuery call binds, for a
+// filter already split by expandFilter -- the shape buildFilterQuery
+// actually runs against, via storage.ts runFilterQuery, where `authors`
+// and `kinds` are each at most a single value. Needed by limits.ts
+// boundFilter BEFORE the query is built, for the same reason
+// expandFilterCount exists: the guard has to price a filter that might be
+// malicious before running anything that could BE the abuse.
+//
+// `ids` and each `#<letter>` tag's value list are NOT touched by
+// expandFilter, so unlike `authors`/`kinds` they carry their full length
+// into every query -- and limits.ts filterReadCost prices both of those by
+// ROWS READ, which is a different quantity from how many `?` placeholders
+// end up in the statement. `combinations x ids.length` rows read admits
+// thousands of ids at a small enough `limit`, and none of them shrink the
+// placeholder count, which is fixed the moment the filter is parsed. See
+// limits.ts MAX_QUERY_BOUND_PARAMS for what this bounds and why it exists.
+//
+// Mirrors buildFilterQuery's own accumulation term for term rather than
+// estimating it, so the two cannot drift the way the old
+// isUnconstrainedFilter/clampFilterLimit pair did -- test/read-limits.test.ts
+// asserts this against the real params.length of a built query.
+export function filterParamCount(filter: Filter): number {
+  let count = 1; // the "(expiration IS NULL OR expiration > ?)" guard on every query
+  if (filter.ids !== undefined && filter.ids.length > 0) count += filter.ids.length;
+  if (filter.authors !== undefined && filter.authors.length > 0) count += 1;
+  if (filter.kinds !== undefined && filter.kinds.length > 0) count += 1;
+  if (filter.since !== undefined) count += 1;
+  if (filter.until !== undefined) count += 1;
+  for (const [, values] of tagFilterEntries(filter)) {
+    if (values.length === 0) continue;
+    count += 1; // tag_name
+    count += values.length;
+    if (filter.since !== undefined) count += 1;
+    if (filter.until !== undefined) count += 1;
+    if (filter.limit !== undefined) count += 1; // tagScanLimit
+  }
+  if (filter.limit !== undefined) count += 1;
+  return count;
+}
+
 // Splits one filter into the cross-product of its `authors` x `kinds`
 // singletons, so every query that reaches SQLite pins each index key
 // column to ONE value.

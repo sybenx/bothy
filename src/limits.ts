@@ -1,5 +1,5 @@
 import { tagFilterEntries, type Filter } from "./nostr";
-import { expandFilterCount, tagScanLimit } from "./filters";
+import { expandFilterCount, filterParamCount, tagScanLimit } from "./filters";
 import { eventRemovalBudget, eventRowCost, indexesOn } from "./schema";
 
 // Hijacking is not the threat here. Read abuse is. The write path is
@@ -370,6 +370,32 @@ export const TAG_ROWS_READ_PER_MATCH = 4;
 // the same ceiling apply to the one access path that was escaping it.
 export const MAX_FILTER_COMBINATIONS = Math.floor(MAX_FILTER_ROWS_READ / (ROWS_READ_PER_MATCH + 1));
 
+// Cloudflare's SQLite-backed Durable Object storage bounds every SqlStorage
+// query to at most 100 bound parameters
+// (developers.cloudflare.com/durable-objects/platform/limits/, checked
+// 2026-08-28), and nothing in this file priced that quantity -- a live
+// deployment hit it: "too many SQL variables at offset 517: SQLITE_ERROR",
+// uncaught, the same shape of bug MAX_CONN_STATE_BYTES exists to catch on
+// the subscription-storage side rather than let a WebSocket throw mid-reply.
+//
+// filterReadCost prices `ids.length` and each `#<letter>` tag's value count
+// by ROWS READ, and that is a different quantity from how many `?`
+// placeholders buildFilterQuery binds into one exec() call. An `ids`
+// filter with no `authors`/`kinds` prices at 1 row per id, so up to
+// MAX_FILTER_ROWS_READ (10,000) ids passed the cost check -- two orders of
+// magnitude past SQLite's own ceiling -- and neither of those array
+// lengths shrinks when boundFilter halves `limit`, so this has to be
+// checked once, structurally, the same way MAX_FILTER_COMBINATIONS is.
+//
+// Set below the real ceiling (100), not at it -- the same margin
+// MAX_CONN_STATE_BYTES leaves below the WebSocket attachment's real 16KiB,
+// and for the same reason: filterParamCount counts the query boundFilter
+// can see, but relay.ts's excludeGiftWraps adds one more `kind != ?`
+// parameter on an unauthenticated read AFTER boundFilter has already
+// admitted the filter, so a filter sized exactly to the real ceiling here
+// could still be pushed over it by that one later addition.
+export const MAX_QUERY_BOUND_PARAMS = 90;
+
 // Which filter field pins which indexed column to a value.
 //
 // `created_at` is deliberately absent. `since`/`until` constrain it to a
@@ -563,6 +589,24 @@ export function boundFilter(filter: Filter, budget: number = MAX_FILTER_ROWS_REA
   }
 
   const requested = filter.limit === undefined ? MAX_FILTER_LIMIT : Math.min(filter.limit, MAX_FILTER_LIMIT);
+
+  // Bound-parameter count, refused ahead of the cost model like
+  // `combinations` above and for the same reason: neither `ids.length` nor
+  // a tag's value count falls when `limit` is halved below, so a filter
+  // that binds too many parameters at the requested limit binds exactly as
+  // many at limit 1. Computed against `requested` rather than the smaller
+  // limit the halving loop might land on, since it is invariant to which
+  // one runs -- see filterParamCount.
+  const paramCount = filterParamCount({ ...filter, limit: requested });
+  if (paramCount > MAX_QUERY_BOUND_PARAMS) {
+    return {
+      ok: false,
+      reason:
+        `invalid: filter binds ${paramCount} SQL parameters, over the ` +
+        `${MAX_QUERY_BOUND_PARAMS} limit; name fewer ids, or fewer values in a ` +
+        `#<letter> tag condition, and split it across several REQs`,
+    };
+  }
 
   // Halving rather than solving for the largest affordable limit
   // directly: the search does not need to know the shape of the cost
