@@ -166,23 +166,18 @@
 <details id="diagnostics" hidden>
   <summary>Diagnostics</summary>
 
-  <!-- These two used to sit under "Live" below, and moving them is the
-       visible half of a budget fix: both read the ingest window
-       (~1,200 rows), GET /api/stats is unauthenticated, and anyone could
-       therefore spend the day's whole rows-read allowance in ~4,100
-       requests. They now come from a row refreshed at most every five
-       minutes (src/limits.ts LIVE_STATS_MAX_AGE_MS), so this panel says
-       when they were taken rather than presenting them as this
-       instant's. -->
-  <p class="diag-group-label">From the five-minute cache</p>
-  <dl class="diag-grid">
-    <dt>Cache taken</dt><dd id="diag-live-at">-</dd>
-    <dt>Events ingested, last 24h</dt><dd id="diag-ingested-24h">-</dd>
-    <dt>Write budget</dt><dd id="diag-write-budget">-</dd>
-  </dl>
-
+  <!-- These two spent a release under a "From the five-minute cache"
+       heading of their own, with a "Cache taken" timestamp beside them:
+       both read the ingest window (~1,200 rows), GET /api/stats is
+       unauthenticated, and anyone could therefore spend the day's whole
+       rows-read allowance in ~4,100 requests. They are hourly bucket
+       counters now (src/schema.ts ingest_hour_counts), read as at most
+       25 rows, so the cache, its clock and the label are all gone and
+       they rejoin the live figures below. -->
   <p class="diag-group-label">Live</p>
   <dl class="diag-grid">
+    <dt>Events ingested, last 24h</dt><dd id="diag-ingested-24h">-</dd>
+    <dt>Write budget</dt><dd id="diag-write-budget">-</dd>
     <!-- Maintained counters (src/schema.ts event_hour_counts), not a
          scan: 26 rows read at most, so this is current rather than
          snapshotted, and it counts by created_at in whole hours -- an
@@ -254,22 +249,27 @@ async function main() {
     // "events stored" was read back from a cache row up to six hours
     // old, because counting it cost a full scan of `events` and doing
     // that per visit is what exhausted the rows-read allowance. It is a
-    // maintained counter now (src/schema.ts event_counts): one row read,
+    // maintained counter now (src/schema.ts maintained_counts): one row read,
     // exact, and current as of this request, so labelling it "as of 4 h
     // ago" would be false.
     //
-    // Of the three figures beside it, only storage is read live. The
-    // other two -- events received and the write-budget bar -- come from
-    // a five-minute cache for a smaller version of the old reason
-    // (src/limits.ts LIVE_STATS_MAX_AGE_MS): each read the ingest window
-    // per request on an endpoint nothing gates. Five minutes needs no
-    // label up here, where a dashboard number that old reads as current
-    // to anybody; the diagnostics panel below dates it exactly.
+    // The three figures beside it are all current as of this request
+    // too. Two of them -- events received and the write-budget bar --
+    // came from a five-minute cache until they were bucketed by ingest
+    // hour (src/schema.ts ingest_hour_counts), for a smaller version of
+    // the old reason: each read the ingest window per request on an
+    // endpoint nothing gates. Nothing on this page is cached now.
     document.getElementById("stat-total-label").textContent = "events stored";
     document.getElementById("stat-ingested").textContent = stats.ingested24h;
 
     setBar("stat-storage", "bar-storage", stats.storageBytes, STORAGE_LIMIT, formatBytes(stats.storageBytes) + " used");
-    setBar("stat-rows", "bar-rows", stats.rowsWrittenToday, ROWS_WRITTEN_LIMIT, stats.rowsWrittenToday + " rows (est.)");
+    // No longer "(est.)": this was a SUM over the stamped per-event cost
+    // of storing events, blind to deletions, tombstones, the follow
+    // rebuild and every other write. It is measured now -- every cursor's
+    // rowsWritten, landed by src/storage.ts settleRowsWritten -- and
+    // reads slightly high rather than low, because a removal is charged
+    // the pessimistic figure (src/schema.ts eventRemovalBudget).
+    setBar("stat-rows", "bar-rows", stats.rowsWrittenToday, ROWS_WRITTEN_LIMIT, stats.rowsWrittenToday + " rows");
 
     renderWritePolicyStatus(stats);
     renderBackfillStatus(stats.backfill);
@@ -410,11 +410,10 @@ function renderDiagnostics(stats) {
         ? new Date(stats.followsListAt * 1000).toLocaleString()
         : "none stored";
 
-  // The two figures behind the `live_stats` row, with the one age they
-  // share -- relay.ts refreshLiveStats. The only age left on this panel:
-  // it used to sit beside a six-hour one over the counts that walked a
-  // table, and those are maintained counters now.
-  document.getElementById("diag-live-at").textContent = new Date(stats.liveAt * 1000).toLocaleString();
+  // Maintained, by ingest hour (src/schema.ts ingest_hour_counts). This
+  // panel used to carry an age for these two and a second age above it
+  // for the counts that walked a table; both caches are gone and there is
+  // no age on this document at all.
   document.getElementById("diag-ingested-24h").textContent = stats.ingested24h.toLocaleString();
 
   document.getElementById("diag-events-24h").textContent = stats.events24h.toLocaleString();
@@ -466,6 +465,10 @@ function renderDiagnostics(stats) {
   // -- not a rolling 24 hours. This line used to be able to read 85% at
   // 00:05 UTC on a budget that was empty, which is precisely the hour
   // someone reads this panel during a recovery.
+  // Every row this relay wrote today, not just the ones storing events:
+  // deletions, tombstones, counter updates, the follow rebuild, NIP-86
+  // calls and backfill's bookkeeping are all in it now
+  // (src/read-metrics.ts).
   document.getElementById("diag-write-budget").textContent =
     stats.rowsWrittenToday.toLocaleString() + " rows / " + ROWS_WRITTEN_LIMIT.toLocaleString() +
     " (" + formatPercent(stats.rowsWrittenToday, ROWS_WRITTEN_LIMIT) + ") since 00:00 UTC";
@@ -525,10 +528,10 @@ function formatReadWindow(sinceMs) {
 // whenever the Durable Object hibernates, so `sinceMs` can be a few
 // minutes rather than a day, and that is the normal case rather than a
 // fault. The window is kept prominent precisely so the reader can judge
-// the projection themselves -- the five-minute stats cache
-// (limits.ts LIVE_STATS_MAX_AGE_MS) keeps a page load to ~10 rows, so a
-// short window no longer means the projection is dominated by the
-// observer rather than the relay.
+// the projection themselves -- every figure on /api/stats is a maintained
+// counter, so a page load costs a bounded handful of rows and a short
+// window no longer means the projection is dominated by the observer
+// rather than the relay.
 function formatReadBudget(reads) {
   const windowLabel = formatReadWindow(reads.sinceMs);
   const base = reads.totalRowsRead.toLocaleString() + " rows read (sampled over " + windowLabel +

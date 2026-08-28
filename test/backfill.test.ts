@@ -21,7 +21,7 @@ import {
   utcDayStartSeconds,
 } from "../src/limits";
 import { eventRowCost } from "../src/schema";
-import { countIngested24h, estimateRowsWrittenSince } from "../src/storage";
+import { estimateRowsWrittenSince, readIngestCounts } from "../src/storage";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
 import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
@@ -120,7 +120,11 @@ describe("backfill write accounting", () => {
         .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events WHERE created_at > ?`, since)
         .toArray()[0]?.n;
       expect(byTimestamp).toBe(0);
-      expect(countIngested24h(sql, since)).toBe(1);
+      // And by ingest time it is exactly where it belongs. This used to
+      // be countIngested24h, a scan of the ingest window; it is an
+      // hourly bucket keyed by `ingested_at` now (schema.ts
+      // ingest_hour_counts), read at at most 25 rows.
+      expect(readIngestCounts(sql, NOW, NOW).ingested24h).toBe(1);
     });
   });
 

@@ -17,7 +17,6 @@ import {
   DAILY_ROWS_WRITTEN_LIMIT,
   GIFT_WRAP_RATE_LIMIT_WINDOW_MS,
   LIVE_FEED_MAX_LIFETIME_MS,
-  LIVE_STATS_MAX_AGE_MS,
   MAX_EVENTS_PER_REQ,
   maxEventBytes,
   maxEventsPerPubkeyPerWindow,
@@ -60,19 +59,17 @@ import { initSchema } from "./schema";
 import {
   applyDeletion,
   beginVanish,
-  computeLiveStats,
   auditMaintainedCounts,
   countEvents24h,
   followsListAt,
+  readIngestCounts,
   readMaintainedCounts,
+  settleRowsWritten,
   drainVanish,
   pendingVanishes,
   eventExists,
   expirationOf,
   getRelaySettings,
-  readLiveStats,
-  type LiveStats,
-  writeLiveStats,
   giftWrapCount,
   hasNonOwnerStorageHeadroom,
   isDeleted,
@@ -248,6 +245,10 @@ export class Relay extends DurableObject<Env> {
   }
 
   override async fetch(request: Request): Promise<Response> {
+    return this.metered(() => this.fetchInner(request));
+  }
+
+  private async fetchInner(request: Request): Promise<Response> {
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return new Response("expected websocket upgrade", { status: 426 });
     }
@@ -355,12 +356,14 @@ export class Relay extends DurableObject<Env> {
     const pubkey = normalizePubkey(rawPubkey);
     if (!pubkey) return { status: "invalid" };
 
-    return withReadPath("identity", () => {
-      const sql = this.sql;
-      if (host) recordHost(sql, host);
-      if (!claimOwner(sql, pubkey, profile)) return { status: "conflict" as const };
-      return { status: "claimed" as const, pubkey };
-    });
+    return this.metered(() =>
+      withReadPath("identity", () => {
+        const sql = this.sql;
+        if (host) recordHost(sql, host);
+        if (!claimOwner(sql, pubkey, profile)) return { status: "conflict" as const };
+        return { status: "claimed" as const, pubkey };
+      }),
+    );
   }
 
   // Backs the NIP-11 document's name/icon (src/nip11.ts) -- derived from
@@ -371,18 +374,20 @@ export class Relay extends DurableObject<Env> {
   async getIdentity(
     host?: string,
   ): Promise<{ profile: OwnerProfile; settings: RelaySettings; ownerPubkey: string | null }> {
-    return withReadPath("identity", () => {
-      const sql = this.sql;
-      if (host) recordHost(sql, host);
-      // The owner pubkey rides along rather than costing a second RPC:
-      // NIP-11 now publishes it (nip11.ts), and getOwnerPubkey is an
-      // env read plus at most one indexed row.
-      return {
-        profile: getOwnerProfile(sql, this.env),
-        settings: getRelaySettings(sql),
-        ownerPubkey: getOwnerPubkey(sql, this.env),
-      };
-    });
+    return this.metered(() =>
+      withReadPath("identity", () => {
+        const sql = this.sql;
+        if (host) recordHost(sql, host);
+        // The owner pubkey rides along rather than costing a second RPC:
+        // NIP-11 now publishes it (nip11.ts), and getOwnerPubkey is an
+        // env read plus at most one indexed row.
+        return {
+          profile: getOwnerProfile(sql, this.env),
+          settings: getRelaySettings(sql),
+          ownerPubkey: getOwnerPubkey(sql, this.env),
+        };
+      }),
+    );
   }
 
   // The owner pubkey on its own, for the Worker's NIP-98 check
@@ -391,7 +396,7 @@ export class Relay extends DurableObject<Env> {
   // deliberately happens in the Worker. Null when unclaimed, which
   // verifyNip98 turns into a 401.
   async getOwner(): Promise<string | null> {
-    return withReadPath("identity", () => getOwnerPubkey(this.sql, this.env));
+    return this.metered(() => withReadPath("identity", () => getOwnerPubkey(this.sql, this.env)));
   }
 
   // NIP-86 relay management (src/nip86.ts), write side. Reached only
@@ -402,8 +407,10 @@ export class Relay extends DurableObject<Env> {
   // ingestBackfillPage() do: the Durable Object owns every write, and it
   // opens no outbound connection to serve one.
   async manage(method: unknown, params: unknown[], callerIp: string): Promise<ManagementResponse> {
-    return withReadPath("management", () =>
-      handleManagementCall(this.sql, this.env, method, params, callerIp, nowSeconds()),
+    return this.metered(() =>
+      withReadPath("management", () =>
+        handleManagementCall(this.sql, this.env, method, params, callerIp, nowSeconds()),
+      ),
     );
   }
 
@@ -431,25 +438,31 @@ export class Relay extends DurableObject<Env> {
     events24h: number;
 
     // Events this relay actually wrote in the last 24h, backfill
-    // included (storage.ts countIngested24h). Cached for
-    // limits.ts LIVE_STATS_MAX_AGE_MS -- see `liveAt` below.
+    // included -- maintained, from per-hour buckets keyed by
+    // `ingested_at` (storage.ts readIngestCounts, schema.ts
+    // `ingest_hour_counts`). At most 25 rows read, shared with the figure
+    // below. Whole hours, so the window spans 24-25h.
     ingested24h: number;
     storageBytes: number;
-    // Rows written storing events since the last 00:00 UTC, when the
-    // free tier's allowances reset -- the write-budget meter, and the
-    // only figure here measured against a window the platform chose
-    // rather than one this relay chose. See storage.ts
-    // estimateRowsWrittenSince for what it does not count.
+    // Rows written since the last 00:00 UTC, when the free tier's
+    // allowances reset -- the write-budget meter, and the only figure
+    // here measured against a window the platform chose rather than one
+    // this relay chose.
+    //
+    // ROWS WRITTEN, all of them, as of the release that bucketed this:
+    // event rows and their index entries, tag rows, tombstones, counter
+    // updates, the follow-list rebuild, NIP-86 bans, backfill
+    // bookkeeping. It used to be a SUM over `events.row_cost`, which saw
+    // only the storing of events -- during a vanish drain it could miss
+    // tens of thousands of rows. Measured now, by the SqlStorage wrapper
+    // in read-metrics.ts, and landed by storage.ts settleRowsWritten;
+    // it reads slightly HIGH, because a removal is accounted at the
+    // pessimistic figure the cursor cannot confirm (schema.ts
+    // eventRemovalBudget), which is the safe direction for a budget.
+    //
+    // Exact at the boundary rather than approximate: a UTC day starts on
+    // a whole hour, so the day's buckets are exactly the day's writes.
     rowsWrittenToday: number;
-    // When `ingested24h` and `rowsWrittenToday` were computed (unix
-    // seconds). Those two come from the `live_stats` row and are up to
-    // limits.ts LIVE_STATS_MAX_AGE_MS old -- five minutes. They are the
-    // only fields on this document that are not current as of the
-    // request, which is why one age is now enough where there used to be
-    // two: `snapshotAt` dated a six-hour cache over the counts that
-    // walked a table, and every one of those is a maintained counter now
-    // or deleted.
-    liveAt: number;
     // The three Workers-free-tier ceilings limits.ts declares, transported
     // rather than left for public/index.html to hardcode a second copy of
     // -- see CLAUDE.md "The budget". Static per deployment (none of these
@@ -513,11 +526,13 @@ export class Relay extends DurableObject<Env> {
     // It now runs only on a `live_stats` cache miss, so a run of stats
     // requests that leaves its bucket flat is the cache working, and a
     // bucket climbing with the request count is that cache broken.
-    const stats = withReadPath("getStats", () => this.collectStats(host));
-    // Snapshotted after the scope closes so this call's own reads are
-    // included in what it reports -- a breakdown that excluded the
-    // request producing it would understate getStats by exactly one call.
-    return { ...stats, reads: readMetricsSnapshot() };
+    return this.metered(() => {
+      const stats = withReadPath("getStats", () => this.collectStats(host));
+      // Snapshotted after the scope closes so this call's own reads are
+      // included in what it reports -- a breakdown that excluded the
+      // request producing it would understate getStats by exactly one call.
+      return { ...stats, reads: readMetricsSnapshot() };
+    });
   }
 
   private collectStats(host?: string): Omit<Awaited<ReturnType<Relay["getStats"]>>, "reads"> {
@@ -531,12 +546,10 @@ export class Relay extends DurableObject<Env> {
     const nowSec = Math.floor(nowMs / 1000);
     // The last 00:00 UTC, because the rows-written ceiling this measures
     // against is an allowance that empties then -- see limits.ts
-    // utcDayStartSeconds. Computed here rather than inside
-    // refreshLiveStats because it is also the cache key: a cached figure
-    // measured from yesterday's boundary is invalid however fresh it
-    // looks. The other window in play, the rolling 24 hours behind
-    // `ingested24h`, has no reset to respect and so is derived where it
-    // is used (storage.ts computeLiveStats).
+    // utcDayStartSeconds. It used to be a cache key as well, since a
+    // figure computed before yesterday's boundary was invalid however
+    // fresh it looked; there is no cache to invalidate now, so it is
+    // simply where the day's ingest-hour buckets start.
     const budgetSince = utcDayStartSeconds(nowMs);
 
     // Every count this relay maintains, in one row read (schema.ts
@@ -544,9 +557,13 @@ export class Relay extends DurableObject<Env> {
     // and fall through to ~3E rows of recomputation; there is nothing
     // left here that can miss.
     const counts = readMaintainedCounts(sql);
-    // The one thing on this document still cached, and the only reason
-    // `liveAt` exists. See refreshLiveStats.
-    const live = this.refreshLiveStats(budgetSince);
+    // The last two computed figures on this document, now maintained as
+    // well -- both out of `ingest_hour_counts` in one statement, at most
+    // 25 rows. They were a cache row on a five-minute clock, because each
+    // read the ingest window (~1,200 rows) on an unauthenticated GET.
+    // With them bucketed there is nothing on this document behind a
+    // clock, and `liveAt` went with the last one that was.
+    const ingest = readIngestCounts(sql, nowSec, budgetSince);
 
     const profile = getOwnerProfile(sql, this.env);
     const settings = getRelaySettings(sql);
@@ -559,18 +576,14 @@ export class Relay extends DurableObject<Env> {
       // Current as of this request.
       totalEvents: counts.events,
       events24h: countEvents24h(sql, nowSec),
-      // Cached on a five-minute clock (schema.ts `live_stats`), not read
-      // per request. `ingested_at` is indexed as of v0.7.6
-      // (schema.ts idx_events_ingested) so neither of these reads the
-      // table, but both read the ingest WINDOW, which is ~1,200 rows on a
-      // working relay and was billed to every anonymous GET of this
-      // endpoint. They are still the two numbers most worth being current
-      // -- the second is the write-budget meter -- which is why their TTL
-      // is five minutes and not the snapshot's six hours.
-      ingested24h: live.ingested24h,
+      // Maintained, out of the ingest-hour buckets read above -- at most
+      // 25 rows for the pair, current as of this request. They were the
+      // two numbers most worth being current and the two that cost the
+      // most to be, which is what a cache was papering over; bucketing
+      // made the tension disappear rather than trading it.
+      ingested24h: ingest.ingested24h,
       storageBytes: sql.databaseSize,
-      rowsWrittenToday: live.rowsWrittenToday,
-      liveAt: live.computedAt,
+      rowsWrittenToday: ingest.rowsWrittenToday,
       storageBytesLimit: STORAGE_BYTES_LIMIT,
       dailyRowsWrittenLimit: DAILY_ROWS_WRITTEN_LIMIT,
       dailyRowsReadLimit: DAILY_ROWS_READ_LIMIT,
@@ -594,49 +607,44 @@ export class Relay extends DurableObject<Env> {
     };
   }
 
-  // The last cache on /api/stats, on the five-minute clock of limits.ts
-  // LIVE_STATS_MAX_AGE_MS, over `ingested24h` and `rowsWrittenToday`
-  // (schema.ts `live_stats`).
+  // ------------------------------------------------------------------
+  // THE WRITE METER'S LANDING, wrapped around every entry point into this
+  // object.
   //
-  // It had a sibling, refreshStatsSnapshot, gating a six-hour cache over
-  // the counts that walked a table. That one is gone with the table it
-  // guarded: every field it held is a maintained counter now or deleted,
-  // so there was a mechanism left rationing a cost that no longer
-  // existed. This one stays because what it caches genuinely cannot be
-  // maintained -- a rolling count by ingest time and a sum over a window
-  // that empties at 00:00 UTC are not quantities any single write knows
-  // how to increment toward.
+  // read-metrics.ts accumulates rows written from every cursor the
+  // wrapped SqlStorage hands out, in INSTANCE MEMORY -- and this object
+  // hibernates between messages, waking on the order of seventy times per
+  // cron interval. A total that was flushed on a timer, or deferred to
+  // the next cron tick, would therefore lose most of what it measured,
+  // and lose more of it the quieter the relay is: the failure mode nobody
+  // would notice, on the number an owner reads to decide whether the
+  // relay is out of allowance or actually broken. So the rule is that a
+  // total lands inside the execution context that produced it, before
+  // that context returns, and this is where that rule is enforced.
   //
-  // What it bounds is not the size of one read but the number of times a
-  // day the expensive one can happen at all: ~1,200 rows each on an
-  // unauthenticated GET, ~4,100 requests to spend the day's entire
-  // rows-read allowance from anywhere, for free. The request rate no
-  // longer sets the recompute rate, which is the only property that
-  // survives an attacker choosing that rate.
+  // A wrapper rather than a call at the end of each method body, for the
+  // reason read-metrics.ts wraps `sql.exec` rather than asking each query
+  // to report itself: an early return, a thrown error or a new entry
+  // point added later would each quietly skip a trailing call. `finally`
+  // covers all three.
   //
-  // Only reached from a stats request; the cron tick deliberately does
-  // not refresh this (limits.ts LIVE_STATS_MAX_AGE_MS). And no `force`:
-  // a bypass would be a way to spend the cost this gate exists to bound.
-  private refreshLiveStats(budgetSince: number): LiveStats {
-    const sql = this.sql;
-    const existing = readLiveStats(sql);
-    const nowSec = nowSeconds();
-    // Two conditions, and the second is not a refinement of the first.
-    // `budgetSince` is the 00:00 UTC boundary the rows-written figure was
-    // measured from; the allowance resets there, so a row computed at
-    // 23:59 is 120 seconds old at 00:01 and is reporting yesterday's
-    // consumption as today's -- the one moment an owner is most likely to
-    // be looking. Age cannot catch that, only the boundary can.
-    if (
-      existing !== null &&
-      existing.budgetSince === budgetSince &&
-      (nowSec - existing.computedAt) * 1000 < LIVE_STATS_MAX_AGE_MS
-    ) {
-      return existing;
+  // Nearly always free. storage.ts settleRowsWritten writes nothing when
+  // nothing is pending (every read-only path) and nothing when the
+  // residue is smaller than the landing itself -- which is the case right
+  // after an event write, since storing an event lands its own total
+  // through a bucket row it was writing anyway. What actually pays a row
+  // here is the cron tick, a NIP-86 call, the follow rebuild and the
+  // vanish drain: on the order of thirty a day.
+  //
+  // The cost of landing is itself measured, so it carries into the next
+  // landing rather than vanishing -- see read-metrics.ts.
+  // ------------------------------------------------------------------
+  private async metered<T>(fn: () => T | Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } finally {
+      settleRowsWritten(this.sql, nowSeconds());
     }
-    const fresh = computeLiveStats(sql, nowSec, budgetSince);
-    writeLiveStats(sql, fresh);
-    return fresh;
   }
 
   // Cron entry point (src/index.ts scheduled()) -- refreshes the
@@ -646,6 +654,10 @@ export class Relay extends DurableObject<Env> {
   // empty list; already refreshed today), so this stays cheap on most
   // ticks.
   async runCron(): Promise<void> {
+    return this.metered(() => this.runCronInner());
+  }
+
+  private async runCronInner(): Promise<void> {
     // Logged here, DO-side, and not left to the Worker's own catch in
     // src/index.ts scheduled(). A Durable Object exception does not
     // reliably carry its message across the RPC boundary: the Worker's
@@ -715,20 +727,24 @@ export class Relay extends DurableObject<Env> {
   // when unclaimed -- there's no owner pubkey to backfill and no relay
   // list to discover yet.
   async getBackfillState(): Promise<BackfillState | null> {
-    return withReadPath("backfillState", () => {
-      const sql = this.sql;
-      const owner = getOwnerPubkey(sql, this.env);
-      if (owner === null) return null;
-      const now = nowSeconds();
-      return { ...getBackfillStatus(sql), ownerPubkey: owner, canIngestNow: hasBackfillHeadroom(sql, now) };
-    });
+    return this.metered(() =>
+      withReadPath("backfillState", () => {
+        const sql = this.sql;
+        const owner = getOwnerPubkey(sql, this.env);
+        if (owner === null) return null;
+        const now = nowSeconds();
+        return { ...getBackfillStatus(sql), ownerPubkey: owner, canIngestNow: hasBackfillHeadroom(sql, now) };
+      }),
+    );
   }
 
   // Seeds backfill_relays from the owner's kind-10002 write relays, once
   // the Worker has resolved them from well-known relays (backfill-worker.ts
   // discoverWriteRelays). A pure write, no outbound connection here.
   async discoverBackfillRelays(relayUrls: string[]): Promise<void> {
-    withReadPath("backfillIngest", () => seedBackfillRelays(this.sql, relayUrls, nowSeconds()));
+    await this.metered(() =>
+      withReadPath("backfillIngest", () => seedBackfillRelays(this.sql, relayUrls, nowSeconds())),
+    );
   }
 
   // Stores one page of raw EVENT payloads the Worker already fetched over
@@ -748,15 +764,21 @@ export class Relay extends DurableObject<Env> {
     // -- one entry per cron tick, so `rowsPerCall` in the /api/stats
     // breakdown reads as "rows read per backfill tick", which is the unit
     // the arithmetic in CLAUDE.md "The budget" multiplies by 24.
-    return withReadPath("backfillIngest", () => {
-      const sql = this.sql;
-      const owner = getOwnerPubkey(sql, this.env);
-      if (owner === null) return null;
-      return applyBackfillPage(sql, owner, relayUrl, rawEvents, eose, nowSeconds(), refusals);
-    });
+    return this.metered(() =>
+      withReadPath("backfillIngest", () => {
+        const sql = this.sql;
+        const owner = getOwnerPubkey(sql, this.env);
+        if (owner === null) return null;
+        return applyBackfillPage(sql, owner, relayUrl, rawEvents, eose, nowSeconds(), refusals);
+      }),
+    );
   }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    return this.metered(() => this.webSocketMessageInner(ws, message));
+  }
+
+  private webSocketMessageInner(ws: WebSocket, message: string | ArrayBuffer): void {
     if (typeof message !== "string") return;
 
     // The live feed (LIVE_FEED_TAG) is push-only and never has an
@@ -1409,6 +1431,10 @@ export class Relay extends DurableObject<Env> {
   // keeps this from pinning the object -- see scheduleLiveFeedAlarm's
   // comment above.
   override async alarm(): Promise<void> {
+    return this.metered(() => this.alarmInner());
+  }
+
+  private async alarmInner(): Promise<void> {
     const now = Date.now();
     let nextExpiry: number | null = null;
     for (const ws of this.ctx.getWebSockets(LIVE_FEED_TAG)) {

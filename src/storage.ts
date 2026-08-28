@@ -1,6 +1,6 @@
 import { buildFilterQuery, compareEvents, expandFilter } from "./filters";
-import { eventRowCost } from "./schema";
-import { withReadPath } from "./read-metrics";
+import { eventRowCost, TOMBSTONE_ROW_COST } from "./schema";
+import { addRowsWritten, takeRowsWritten, unlandedRowsWritten, withReadPath } from "./read-metrics";
 import { normalizeIp } from "./ip";
 import {
   dTagValue,
@@ -111,6 +111,24 @@ function insertEventRow(
       event.created_at,
     );
   }
+  // LAST, and after the tag rows rather than beside the counters above,
+  // because this statement carries two things at once: the ingest-hour
+  // bucket behind `ingested24h`, and the write meter's running total
+  // (read-metrics.ts) landing in the same UPDATE. Everything this event
+  // cost has to have happened before the total is taken, or the tag rows
+  // would be attributed to the next event instead of this one.
+  //
+  // This is why the write meter is free on the event path: the bucket row
+  // is being written anyway, and `rows_written` is one more column on it.
+  // Only paths with no bucket of their own -- cron ticks, the follow
+  // rebuild, NIP-86 calls -- pay a write to land their total, and there
+  // are on the order of thirty of those a day (settleRowsWritten below).
+  //
+  // The total taken here includes whatever a removal in the same
+  // execution context put there: a replaceable replacement deletes the
+  // superseded version before reaching this line, and deleteEventRow
+  // accounts for that removal into the same accumulator.
+  bumpIngestCounters(sql, hourBucket(ingestedAt), 1, takeRowsWritten());
 }
 
 // ---------------------------------------------------------------------
@@ -186,21 +204,84 @@ function deleteEventRow(sql: SqlStorage, id: string): void {
   // Rows read: 1. Removals are rare next to insertions, and this is the
   // same index seek the DELETE below performs anyway.
   const row = sql
-    .exec<{ created_at: number }>(`SELECT created_at FROM events WHERE id = ?`, id)
+    .exec<{ created_at: number; ingested_at: number | null; row_cost: number | null }>(
+      `SELECT created_at, ingested_at, row_cost FROM events WHERE id = ?`,
+      id,
+    )
     .toArray()[0];
   sql.exec(`DELETE FROM event_tags WHERE event_id = ?`, id);
   sql.exec(`DELETE FROM events WHERE id = ?`, id);
   // After the DELETE, mirroring insertEventRow: a decrement that ran ahead
   // of a statement that then threw would leave the counters describing
   // fewer events than are stored.
-  if (row !== undefined) bumpEventCounters(sql, row.created_at, -1);
+  if (row === undefined) return;
+  bumpEventCounters(sql, row.created_at, -1);
+  // The ingest-hour bucket behind `ingested24h`, which counts events this
+  // relay took in and STILL HOLDS -- so a removal has to come back out of
+  // the hour it arrived in, not the hour it was removed in. A plain
+  // UPDATE rather than an upsert, for the reason bumpEventCounters gives:
+  // a decrement can only be for an event that was counted, so its bucket
+  // exists, and an upsert would quietly manufacture a -1 bucket if that
+  // ever stopped being true instead of leaving the audit something to
+  // find. `rows_written` on the same row is deliberately untouched -- a
+  // row that was written and then deleted was still written, and the
+  // allowance does not come back.
+  //
+  // Skipped for a NULL `ingested_at`, which only rows written before that
+  // column existed carry: they were never bucketed (schema.ts
+  // seedIngestCounts skips them too), so there is nothing to decrement.
+  if (row.ingested_at !== null) {
+    sql.exec(`UPDATE ingest_hour_counts SET n = n - 1 WHERE hour = ?`, hourBucket(row.ingested_at));
+  }
+  // ------------------------------------------------------------------
+  // THE ONE PLACE ROWS WRITTEN ARE ACCOUNTED BY HAND rather than
+  // measured, and it is here because the instrument is blind on this
+  // path. SqlStorageCursor reports index maintenance on INSERT and not on
+  // DELETE (schema.ts eventRemovalRowsWritten), so the wrapper in
+  // read-metrics.ts sees the base rows a removal retires and none of the
+  // index entries -- an undercount, on a budget meter, of the one
+  // operation this relay is not allowed to refuse (NIP-62 vanish).
+  //
+  // So the pessimistic figure is added on top: `row_cost` is what the
+  // INSERT actually cost, stamped at insert time, and adding
+  // TOMBSTONE_ROW_COST makes it exactly schema.ts eventRemovalBudget --
+  // the same number the vanish drain is already paced against, chosen
+  // there for the same reason and in the same direction. If Cloudflare
+  // bills what the cursor reports, this reads high; if it bills index
+  // maintenance both ways, this reads right. High is the safe way for a
+  // meter to be wrong.
+  //
+  // DOUBLE-COUNTS DELIBERATELY. The cursor already reported the base rows
+  // this DELETE retired, and they are in the accumulator; this adds the
+  // full estimate over the top rather than the difference. Tracking the
+  // difference would mean the meter carrying a second model of what the
+  // cursor can and cannot see -- a hand-maintained derivation of exactly
+  // the kind this project has got wrong before -- to shave a handful of
+  // rows off a figure that is intentionally pessimistic anyway.
+  //
+  // A NULL `row_cost` (a row written before that column existed) falls
+  // back to the cost of a bare note. It is a floor, like every other
+  // pre-migration figure in this file, and it is wrong for at most as
+  // long as those rows survive.
+  //
+  // Not landed here: this goes into the in-memory accumulator and is
+  // written by whichever landing comes next in the same execution context
+  // -- insertEventRow's bucket bump on a replacement, settleRowsWritten
+  // at the entry point otherwise. A landing of its own would be a row
+  // written per row removed, to record rows written.
+  addRowsWritten((row.row_cost ?? eventRowCost(0)) + TOMBSTONE_ROW_COST);
 }
 
-// One hour of `created_at`, as schema.ts `event_hour_counts` keys it.
+// One hour, as both bucket tables key themselves: `event_hour_counts` by
+// `created_at` and `ingest_hour_counts` by `ingested_at`. One function
+// because the arithmetic is identical and must stay so; WHICH timestamp
+// is handed to it is the distinction that matters, and it is made at each
+// call site rather than hidden in here (see schema.ts on why those two
+// clocks must never be conflated).
 //
 // Math.trunc, not Math.floor, because SQLite's integer `/` truncates
-// toward zero and the seed migration (schema.ts seedEventCounters) and the
-// daily audit below both bucket in SQL. They differ only for negative
+// toward zero and the seed migrations (schema.ts seedMaintainedCounts,
+// seedIngestCounts) and the daily audit below all bucket in SQL. They differ only for negative
 // created_at, which nothing rejects -- validate.ts
 // isCreatedAtTooFarInFuture is deliberately one-sided -- so matching the
 // SQL is what keeps an event from being seeded into one bucket and
@@ -235,6 +316,93 @@ function bumpEventCounters(sql: SqlStorage, createdAt: number, delta: 1 | -1): v
   } else {
     sql.exec(`UPDATE event_hour_counts SET n = n - 1 WHERE hour = ?`, hourBucket(createdAt));
   }
+}
+
+// The ingest-hour bucket behind `ingested24h` and `rowsWrittenToday`
+// (schema.ts `ingest_hour_counts`), moved by `events` (1 when an event
+// arrives, 0 when only rows-written is landing) and `rowsWritten`.
+//
+// One upsert, one row, no index entry: `hour` is a rowid alias. The
+// decrement side lives in deleteEventRow as a plain UPDATE, for the same
+// reason bumpEventCounters' does.
+function bumpIngestCounters(sql: SqlStorage, hour: number, events: number, rowsWritten: number): void {
+  sql.exec(
+    `INSERT INTO ingest_hour_counts (hour, n, rows_written) VALUES (?, ?, ?)
+       ON CONFLICT(hour) DO UPDATE SET n = n + excluded.n,
+                                       rows_written = rows_written + excluded.rows_written`,
+    hour,
+    events,
+    rowsWritten,
+  );
+}
+
+// A landing costs one row, so landing one pending row records one row of
+// writing at the price of one row of writing. Below this, the residue
+// carries to the next landing instead -- see the write meter's comment in
+// read-metrics.ts for what that costs (at most the landing statement's
+// own row, lost only if the object is evicted before the next one).
+const MIN_ROWS_WRITTEN_LANDING = 2;
+
+// Lands the write meter's running total into the CURRENT ingest hour.
+//
+// Called at every Durable Object entry point (relay.ts `metered`), inside
+// the same execution context as the writes it describes and before that
+// context returns. That timing is the correctness property, not a
+// nicety: the accumulator is instance memory, this object hibernates
+// between messages, and it wakes on the order of seventy times per cron
+// interval -- so a flush on a timer, or one deferred to the next cron
+// tick, would lose almost everything it measured, and lose more of it the
+// quieter the relay is.
+//
+// Almost always a no-op. An event write has already landed its own total
+// through insertEventRow's bucket bump, and a read-only request has
+// nothing pending; what reaches here is the cron tick, the follow
+// rebuild, a NIP-86 call, backfill's bookkeeping and the vanish drain --
+// on the order of thirty writes a day.
+//
+// Rows read: 1 for the upsert's conflict check, and only when something
+// actually lands. Scoped to "meter" so that trickle is named rather than
+// swelling `unattributed`, which is the instrument's gap detector.
+export function settleRowsWritten(sql: SqlStorage, nowSec: number): void {
+  if (unlandedRowsWritten() < MIN_ROWS_WRITTEN_LANDING) return;
+  withReadPath("meter", () => bumpIngestCounters(sql, hourBucket(nowSec), 0, takeRowsWritten()));
+}
+
+// /api/stats `ingested24h` and `rowsWrittenToday`, out of the ingest-hour
+// buckets in ONE statement.
+//
+// Both windows are suffixes of the same key range, which is why one seek
+// answers both: `budgetSince` is the last 00:00 UTC and therefore always
+// inside the last 24 hours, so its bucket is at or after the rolling
+// window's first bucket. The range runs from there to the current hour --
+// `ingested_at` is wall-clock write time, so nothing can be bucketed
+// ahead of now.
+//
+// Rows read: at most 25, whatever E is, however busy the relay is and
+// however many requests arrive. This replaced two window scans behind a
+// five-minute cache row (`live_stats`), which cost ~1,200 rows every time
+// the cache missed and made an unauthenticated GET worth rationing.
+//
+// `rowsWrittenToday` is exact at the boundary rather than approximate:
+// 00:00 UTC is a whole number of hours, so the day's buckets are exactly
+// the day's writes. `ingested24h` is whole hours and so spans 24-25h --
+// the same fidelity trade countEvents24h makes, against a number that
+// used to be up to five minutes stale.
+export function readIngestCounts(
+  sql: SqlStorage,
+  nowSec: number,
+  budgetSince: number,
+): { ingested24h: number; rowsWrittenToday: number } {
+  const row = sql
+    .exec<{ ingested: number | null; written: number | null }>(
+      `SELECT SUM(n) AS ingested,
+              SUM(CASE WHEN hour >= ? THEN rows_written ELSE 0 END) AS written
+         FROM ingest_hour_counts WHERE hour >= ?`,
+      hourBucket(budgetSince),
+      hourBucket(nowSec - 86400),
+    )
+    .toArray()[0];
+  return { ingested24h: row?.ingested ?? 0, rowsWrittenToday: row?.written ?? 0 };
 }
 
 // /api/stats `totalEvents` and `followCount`, both from the one
@@ -278,7 +446,7 @@ export function followsListAt(sql: SqlStorage): number | null {
 
 // /api/stats `events24h`: stored events whose own `created_at` falls in the
 // last 24 hours -- what the owner has been posting, not what this relay
-// took in (countIngested24h answers that one).
+// took in (readIngestCounts' `ingested24h` answers that one).
 //
 // Rows read: at most 26, whatever E is and however busy the relay is. The
 // range starts at the bucket containing (now - 86400) and cannot extend
@@ -313,10 +481,12 @@ export function countEvents24h(sql: SqlStorage, nowSec: number): number {
 // a day and a figure that stays wrong until somebody looks is the strictly
 // more useful failure.
 //
-// Rows read: E + F, once a day. One scan of `events` produces both event
-// figures -- deliberately one statement rather than two, since two would
-// be 2E for the same answer -- plus at most 26 bucket rows, plus a count
-// over `follows`. Against the ~12E a day the stats snapshot used to spend
+// Rows read: E + F, once a day. One scan of `events` produces all FOUR
+// event figures -- the total, the `created_at` window, the `ingested_at`
+// window and the stamped cost in that window -- deliberately one
+// statement rather than four, since each extra pass would be another E
+// for an answer this one already has in hand; plus at most 26 + 25 bucket
+// rows, plus a count over `follows`. Against the ~12E a day the stats snapshot used to spend
 // recomputing these same numbers four times over, this is a quarter of the
 // cost and it verifies rather than assumes.
 //
@@ -339,15 +509,29 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   if (state.audited_at !== null && nowSec - state.audited_at < 86400) return;
 
   const cutoff = hourBucket(nowSec - 86400);
+  // One scan of `events`, four figures. Two more than it produced before
+  // the ingest buckets existed, and deliberately in the same statement:
+  // a second scan would be a second E for numbers the first pass already
+  // has in hand.
   const actual = sql
-    .exec<{ total: number; windowed: number }>(
+    .exec<{ total: number; windowed: number; ingested: number; ingestedCost: number }>(
       `SELECT COUNT(*) AS total,
-              COALESCE(SUM(CASE WHEN created_at / 3600 >= ? THEN 1 ELSE 0 END), 0) AS windowed
+              COALESCE(SUM(CASE WHEN created_at / 3600 >= ? THEN 1 ELSE 0 END), 0) AS windowed,
+              COALESCE(SUM(CASE WHEN ingested_at / 3600 >= ? THEN 1 ELSE 0 END), 0) AS ingested,
+              COALESCE(SUM(CASE WHEN ingested_at / 3600 >= ? THEN row_cost ELSE 0 END), 0) AS ingestedCost
          FROM events`,
       cutoff,
+      cutoff,
+      cutoff,
     )
-    .toArray()[0] ?? { total: 0, windowed: 0 };
+    .toArray()[0] ?? { total: 0, windowed: 0, ingested: 0, ingestedCost: 0 };
   const counted24h = countEvents24h(sql, nowSec);
+  // The rolling half of the ingest buckets, on the same cutoff the scan
+  // above used. `budgetSince` is passed as the rolling cutoff too, so
+  // `rowsWrittenToday` here is a 24h figure rather than a since-midnight
+  // one -- which is what the floor check below wants: it is comparing
+  // against the cost of events ingested in the same 24 hours.
+  const ingestBuckets = readIngestCounts(sql, nowSec, nowSec - 86400);
   const actualFollows =
     sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM follows`).toArray()[0]?.n ?? 0;
 
@@ -371,6 +555,34 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   }
   if (actualFollows !== state.follows) {
     drift("maintained_counts.follows", state.follows, actualFollows, "refreshFollows");
+  }
+  if (actual.ingested !== ingestBuckets.ingested24h) {
+    drift(
+      "ingest_hour_counts, summed over the last 24h",
+      ingestBuckets.ingested24h,
+      actual.ingested,
+      "insertEventRow/deleteEventRow",
+    );
+  }
+  // A FLOOR, not an equality, and that asymmetry is the whole check.
+  // `rows_written` counts every row this relay wrote in the hour --
+  // deletions, tombstones, follow rebuilds, NIP-86 calls, backfill
+  // bookkeeping -- so it is expected to EXCEED the cost of the events
+  // still standing from that hour, often by a lot. What it can never
+  // legitimately do is fall below it: every one of those events was
+  // stored, and storing it cost the `row_cost` stamped on it. Below the
+  // floor means the meter lost writes, which is the one failure mode that
+  // matters here -- an entry point that landed nothing before returning,
+  // or a write reaching SQLite outside the wrapper.
+  //
+  // Detect only, like everything else in this function.
+  if (ingestBuckets.rowsWrittenToday < actual.ingestedCost) {
+    drift(
+      "ingest_hour_counts.rows_written, summed over the last 24h, is BELOW the cost of the events in it",
+      ingestBuckets.rowsWrittenToday,
+      actual.ingestedCost,
+      "the read-metrics.ts wrapper, landed by storage.ts settleRowsWritten at every entry point",
+    );
   }
 
   // Written whether or not anything disagreed: this records that the audit
@@ -713,93 +925,24 @@ export function drainVanish(sql: SqlStorage, requester: string, limit: number): 
 }
 
 // ---------------------------------------------------------------------
-// The last cached figures on /api/stats (schema.ts `live_stats`), on the
-// five-minute clock of limits.ts LIVE_STATS_MAX_AGE_MS.
+// `ingested24h` and `rowsWrittenToday` used to live here, in a cache row
+// (`live_stats`) on a five-minute clock, with readLiveStats/
+// computeLiveStats/writeLiveStats around it and a `liveAt` field on
+// /api/stats to state how stale they were.
 //
-// They sat beside a second cache, `stats_snapshot`, on a six-hour clock
-// over the counts that walked a table. That one is gone: every field it
-// held is a maintained counter now or deleted, so there is nothing left
-// for a clock to ration. These two survive because what they measure
-// genuinely cannot be maintained the same way -- `rowsWrittenToday` is a
-// sum over a window that empties at 00:00 UTC and `ingested24h` a rolling
-// count by ingest time, and neither is a quantity any single write knows
-// how to increment toward. Cached, therefore, rather than counted.
+// All of it is gone. Both figures are bucket counters now
+// (readIngestCounts above, schema.ts `ingest_hour_counts`), read at at
+// most 25 rows in one statement, so there is no expensive read left for a
+// clock to ration -- the same ending `stats_snapshot` came to when
+// `events24h` was bucketed, one release earlier. That is twice now, and
+// it is the lesson limits.ts records where costs get priced: a TTL over
+// an expensive read bounds how often you pay it, not what it costs, and
+// it survives only until somebody makes the read cheap. Reach for the
+// counter first and the clock second.
+//
+// Nothing on /api/stats answers to a clock any more, and `liveAt` went
+// with the last one that did.
 // ---------------------------------------------------------------------
-
-export interface LiveStats {
-  // Wall-clock seconds this was computed at -- /api/stats `liveAt`.
-  computedAt: number;
-  // The 00:00 UTC boundary `rowsWrittenToday` was measured from. See
-  // readLiveStats' caller: a row from yesterday is invalid however fresh.
-  budgetSince: number;
-  ingested24h: number;
-  rowsWrittenToday: number;
-}
-
-// Null when nothing has computed one yet. Same reasoning as
-// readStatsSnapshot: no seeded row, because a zeroed cache and a real one
-// would be indistinguishable and the zeroes would be a lie about the
-// relay's budget rather than a harmless placeholder.
-//
-// Rows read: 1.
-export function readLiveStats(sql: SqlStorage): LiveStats | null {
-  const row = sql
-    .exec<{
-      computed_at: number;
-      budget_since: number;
-      ingested_24h: number;
-      rows_written_today: number;
-    }>(`SELECT * FROM live_stats LIMIT 1`)
-    .toArray()[0];
-  if (row === undefined) return null;
-  return {
-    computedAt: row.computed_at,
-    budgetSince: row.budget_since,
-    ingested24h: row.ingested_24h,
-    rowsWrittenToday: row.rows_written_today,
-  };
-}
-
-// Rows read: the ingest window twice over -- roughly (events ingested in
-// the last 24h) + (events ingested since 00:00 UTC), both served by
-// idx_events_ingested and neither proportional to E. Measured at ~1,200
-// on the live relay. This is the whole cost the row exists to stop paying
-// per request; limits.ts LIVE_STATS_MAX_AGE_MS is the arithmetic for how
-// often paying it is affordable.
-//
-// estimateRowsWrittenSince keeps its own read-metrics scope inside here,
-// so the diagnostics on /api/stats still bill it separately -- which now
-// also means its bucket only moves on a cache MISS, and a run of stats
-// requests that leaves it flat is the cache working.
-export function computeLiveStats(
-  sql: SqlStorage,
-  nowSec: number,
-  budgetSince: number,
-): LiveStats {
-  return {
-    computedAt: nowSec,
-    budgetSince,
-    ingested24h: countIngested24h(sql, nowSec - 86400),
-    rowsWrittenToday: estimateRowsWrittenSince(sql, budgetSince),
-  };
-}
-
-// Replaced wholesale, like the snapshot above and for the same reason.
-//
-// Rows written: 2 (1 the first time, when there is nothing to delete).
-// The table carries no primary key and no index, so neither statement
-// pays for one.
-export function writeLiveStats(sql: SqlStorage, live: LiveStats): void {
-  sql.exec(`DELETE FROM live_stats`);
-  sql.exec(
-    `INSERT INTO live_stats (computed_at, budget_since, ingested_24h, rows_written_today)
-     VALUES (?, ?, ?, ?)`,
-    live.computedAt,
-    live.budgetSince,
-    live.ingested24h,
-    live.rowsWrittenToday,
-  );
-}
 
 export interface PendingVanish {
   pubkey: string;
@@ -917,52 +1060,40 @@ function runFilterQuery(sql: SqlStorage, filter: Filter, nowSec: number): NostrE
 // than there is, only more, and the reserved-half rule
 // (BACKFILL_ROWS_SHARE_LIMIT) is what absorbs the difference.
 //
-// IT COUNTS INSERTIONS ONLY. `row_cost` is stamped by insertEventRow and
-// nothing else, so no deletion this relay performs appears in this number
-// -- not the delete half of a replaceable replacement, not NIP-09, not
-// NIP-62 vanish, not NIP-86 banevent, and not the tombstone any of them
-// writes. Every one of those is a real write against the same 100,000/day
-// ceiling this figure exists to describe.
+// IT COUNTS INSERTIONS ONLY, AND IT IS NO LONGER THE WRITE-BUDGET
+// METER. `row_cost` is stamped by insertEventRow and nothing else, so no
+// deletion this relay performs appears in this number -- not the delete
+// half of a replaceable replacement, not NIP-09, not NIP-62 vanish, not
+// NIP-86 banevent, and not the tombstone any of them writes. Nor does
+// anything this relay writes that is not an event row: the follow cache
+// rebuild (ownership.ts refreshFollows, 900 rows at 300 follows), the
+// NIP-86 ban and settings tables, backfill's cursor bookkeeping. Every
+// one of those is a real write against the same 100,000/day ceiling.
 //
-// That is correct for the guard and wrong for the display, and the two
-// callers want different things from it:
+// This comment used to end by saying to read the number as "rows written
+// STORING events, not rows written", because /api/stats displayed it as
+// the write-budget meter and the understatement was on the page. That is
+// no longer where the meter comes from. `rowsWrittenToday` is now
+// MEASURED -- every cursor's rowsWritten, accumulated by the wrapper in
+// read-metrics.ts and landed in an ingest-hour bucket by
+// settleRowsWritten above -- so the display counts everything and this
+// function has exactly one caller left.
 //
-//   - backfill.ts hasBackfillHeadroom is asking "may backfill write
-//     more", and it compares against BACKFILL_ROWS_SHARE_LIMIT, half the
-//     ceiling. Deletion traffic is bounded by its own reserved share
-//     (limits.ts VANISH_ROWS_SHARE_LIMIT, a quarter) and so cannot eat
-//     into backfill's half however busy it gets. The guard does not need
-//     to see writes that are already bounded away from the budget it is
-//     protecting.
+// That caller is backfill.ts hasBackfillHeadroom, and the omission is
+// correct for it, which is why the function survives rather than being
+// replaced by the measured figure. The guard asks "may backfill write
+// more" and compares against BACKFILL_ROWS_SHARE_LIMIT, half the
+// ceiling; deletion traffic is bounded by its own reserved share
+// (limits.ts VANISH_ROWS_SHARE_LIMIT, a quarter) and cannot eat into
+// backfill's half however busy it gets. A guard protecting one share does
+// not need to see writes already bounded away from it.
 //
-//   - relay.ts getStats is asking "how much did this relay write today",
-//     and shows the answer on the admin page. There the omission is a
-//     real understatement, and the largest case is a vanish drain: while
-//     one is running this figure misses up to VANISH_ROWS_SHARE_LIMIT --
-//     25,000 rows/day as the drain is paced, ~9,000 as
-//     SqlStorageCursor actually counts a removal (see schema.ts
-//     eventRemovalRowsWritten and eventRemovalBudget for why those two
-//     numbers differ). Ordinary deletion traffic is far smaller -- a
-//     handful of replaceable republishes a day at 8 rows each -- but it
-//     is unbounded in principle, since nothing reserves a share for
-//     NIP-09.
-//
-// Deletion is not the only omission, and the other one is quieter: this
-// sums `events.row_cost`, so it sees nothing this relay writes that is
-// not an event row. The follow cache rebuild (ownership.ts
-// refreshFollows) is the largest of those -- 900 rows at 300 follows,
-// every time the owner's contact list changes, and once per cron tick
-// besides until v0.7.7 stopped it rebuilding a list that had not moved.
-// The NIP-86 ban and settings tables, backfill's cursor bookkeeping and
-// the stats snapshot are the rest, each small and none of them here.
-// Every one is a real write against the same 100,000/day ceiling.
-//
-// So: read this number as "rows written STORING events", not "rows
-// written". `/api/stats` reports draining vanish requests alongside it
-// (`vanishing`), which is the signal that the gap is currently wide.
-// Fixing it would mean stamping deletion cost somewhere, and the only
-// place to stamp it is a counter row -- a row write to measure a row
-// write, which is the trade schema.ts rejected for exactly this column.
+// So the two numbers are deliberately different and neither feeds the
+// other: this one is a projection over stamped per-event costs, sized to
+// a reservation, and the meter is a measurement of what was actually
+// spent. Wiring the meter into this guard would make backfill yield to
+// traffic it is already insulated from; wiring this into the meter would
+// put the old understatement back on the admin page.
 export function estimateRowsWrittenSince(sql: SqlStorage, sinceCutoff: number): number {
   return withReadPath("estimateRowsWrittenSince", () => estimateRowsWrittenSinceInner(sql, sinceCutoff));
 }
@@ -983,21 +1114,6 @@ function estimateRowsWrittenSinceInner(sql: SqlStorage, sinceCutoff: number): nu
         sinceCutoff,
       )
       .toArray()[0]?.total ?? 0
-  );
-}
-
-// How many events this relay actually took in during the window,
-// regardless of how old they are. The companion to the events24h count in
-// relay.ts getStats, which counts by `created_at` and so answers a
-// genuinely different question: "how much did the owner post lately"
-// versus "how much did this relay do lately". During a backfill those two
-// numbers differ by orders of magnitude, and reporting only the first one
-// made the admin page claim 9 events on a day it ingested thousands.
-export function countIngested24h(sql: SqlStorage, sinceCutoff: number): number {
-  return (
-    sql
-      .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events WHERE ingested_at > ?`, sinceCutoff)
-      .toArray()[0]?.n ?? 0
   );
 }
 

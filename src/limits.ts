@@ -663,102 +663,48 @@ export const MAX_CREATED_AT_FUTURE_SECONDS = 3600;
 // With nothing left that walked a table, `stats_snapshot`, this constant,
 // relay.ts refreshStatsSnapshot and its cron call were a mechanism
 // rationing a cost that no longer existed, and were removed together.
-// LIVE_STATS_MAX_AGE_MS below is the one stats cap left, over the two
-// figures that genuinely cannot be maintained.
 //
 // The general lesson, since this file is where costs get priced: a TTL
 // over an expensive read is a bound on how often you pay it, not on what
 // it costs, and it survives only as long as nobody can make the read
 // cheap. Reach for the counter first and the clock second.
 
-// How stale /api/stats' LIVE half may get -- `ingested24h` and
-// `rowsWrittenToday`, the two windowed scans left over once the
-// `stats_snapshot` half was moved into a row (schema.ts
-// `live_stats`, storage.ts computeLiveStats, relay.ts refreshLiveStats).
+// A second stats cap lived here after that one, LIVE_STATS_MAX_AGE_MS,
+// bounding how stale the other half of /api/stats could get:
+// `ingested24h` and `rowsWrittenToday`, the two windowed scans left when
+// the counts that walked a table became counters. It is gone too, and it
+// went the same way, one release later.
 //
-// A separate constant from the one above, not a reuse of it, and the
-// separation is the point. Six hours is fine for a total event count and
-// is far too stale for the write-budget meter, which is the one number on
-// this page an operator reads while deciding whether the relay is out of
-// allowance or actually broken. These two figures wanted to stay live for
-// that reason and did, until it turned out what "live" cost.
+// It guarded ~1,200 rows per refresh -- both figures seek
+// idx_events_ingested, so neither scaled with E, but both scaled with the
+// ingest WINDOW, and GET /api/stats is unauthenticated with nothing in
+// front of it. ~4,100 requests took the whole 5,000,000 rows-read/day
+// allowance, from anywhere, at no cost to the caller. Five minutes was
+// the arithmetic that bounded the recompute rate at 288/day however many
+// requests arrived, chosen against
 //
-// WHAT IT COSTS, and why a cache rather than a freshness preference. Both
-// queries read the ingest window via idx_events_ingested, so neither
-// scales with E -- measured on the live relay at 853 rows
-// (countIngested24h) plus 344 (estimateRowsWrittenSince), ~1,200 per
-// request with the ~11 rows of lookups beside them. GET /api/stats is
-// unauthenticated, reachable before anything gates it, and was billed
-// per request: ~4,100 requests took the 5,000,000 rows-read/day
-// allowance for the rest of the UTC day, from anywhere, at no cost to
-// the caller. That is the same shape as the gift wrap gate probe -- an
-// expensive read on the far side of no gate -- and the fix, where a
-// figure cannot simply be maintained, is to bound the RATE at which the
-// expensive thing runs so the request count stops being what sets it.
+//   flood floor = (86,400 / T) x 1.5D   (D = events ingested per day)
 //
-// A ROW, NOT MEMORY, and the reasoning is worth stating because the
-// obvious argument points the other way: hibernation clears memory, but a
-// flood keeps the object awake, so an in-memory cache would hit exactly
-// during the flood it exists to survive. That is true and it is not
-// enough. A flood is not the cheapest way to spend this budget -- pacing
-// requests slower than eviction is, and it defeats a memory cache
-// completely: at one request every ten seconds, 8,640 requests/day x
-// ~1,200 rows is 10,400,000 rows, twice the ceiling, from a single host
-// making six requests a minute. Storage is the only state in this object
-// that outlives eviction, so the bound has to live there or it is a
-// description of an intention. The `stats_snapshot` cache this file
-// used to declare a TTL for learned that the expensive way, by shipping
-// an in-memory cache first that measurement showed essentially never
-// hit; this is the same lesson applied before rather than after.
+// which at T = 60s admits only D <= 2,315 events/day and at T = 300s
+// admits D <= 11,574 -- above anything the 100,000 rows-written ceiling
+// lets this relay ingest.
 //
-// WHY FIVE MINUTES. A refresh does not cost a constant -- both queries
-// read the ingest window, so one costs roughly 1.5 x D, where D is
-// events ingested per day. The flood floor is therefore
-// (86,400 / T) x 1.5D rows/day, and asking that to stay under the
-// 5,000,000 ceiling gives the admissible D for a given T:
-//
-//   T =  60s   1,440 refreshes/day    D <=  2,315 events/day
-//   T = 300s     288 refreshes/day    D <= 11,574 events/day
-//   T = 600s     144 refreshes/day    D <= 23,148 events/day
-//
-// One minute is the interval the freshness argument alone would pick, and
-// it fails the arithmetic: a relay running a backfill ingests far more
-// than 2,315 events/day -- the 100,000 rows-written ceiling alone admits
-// ~16,600 at the cheapest 6 rows each -- so a 60-second TTL would put the
-// floor back over the ceiling on exactly the busy days the meter is being
-// watched. Five minutes holds for any ingest rate this relay can reach
-// while writing, and costs ~8.6% of the read ceiling at the live relay's
-// ingest rate even under a sustained flood.
-//
-// Five minutes is also finer than the thing it measures. During a
-// backfill `rowsWrittenToday` moves in hourly steps, because backfill
-// writes on the hourly cron tick; live traffic moves it continuously but
-// slowly. /api/stats reports `liveAt` beside these two so their age is
-// stated rather than implied -- and it is now the ONLY age on that
-// document, since every other field is either current or a maintained
-// counter.
-//
-// Refreshed ONLY on demand, deliberately -- the cron tick does not
-// refresh this. The tick fires hourly, which is
-// longer than this TTL, so it could not keep the row warm; all it would
-// add is a fixed 24-refresh/day floor paid on a relay nobody is looking
-// at.
-//
-// THE NEXT STEP, if this stops being enough: hourly bucket counters --
-// one row written per event into a per-hour bucket, and a windowed sum
-// that reads at most 24 rows. That makes a figure cheap outright rather
-// than cheap-on-average, and removes the staleness with it.
-//
-// That shape now exists: `events24h` is exactly it (schema.ts
-// `event_hour_counts`), and it retired the six-hour cache these two used
-// to sit beside. It has not been applied HERE because these two are
-// harder than `events24h` was, not because it was forgotten.
-// `ingested24h` would need a second bucket table keyed by ingest time --
-// a third row written per event, for a diagnostic -- and
+// Both figures are hourly bucket counters now (schema.ts
+// `ingest_hour_counts`), keyed by ingest time and read as at most 25 rows
+// in one statement. That was named in this file as THE NEXT STEP if the
+// TTL stopped being enough, with the caveat that these two were harder
+// than `events24h`: `ingested24h` would want its own bucket table, and
 // `rowsWrittenToday` is a sum over a window that empties at 00:00 UTC,
-// which no per-event increment expresses. So these two stay cached, and
-// the bucket tables stay where the arithmetic actually paid for them.
-export const LIVE_STATS_MAX_AGE_MS = 5 * 60 * 1000;
+// which no per-event increment expresses. Both objections dissolved in
+// the same table: one bucket row per ingest hour carries both figures, so
+// the "third row written per event" is the same row as the second, and a
+// UTC day boundary falls on a whole hour, so the reset is a range start
+// rather than something a counter has to express.
+//
+// So the lesson above got its second demonstration in two releases, which
+// is why it is stated as a rule rather than as a story: reach for the
+// counter first and the clock second. There is no stats cache left, and
+// nothing on /api/stats answers to a clock.
 
 // Backfill must yield to the owner's own live
 // traffic, never compete with it for the shared daily rows-written
