@@ -63,6 +63,7 @@ import {
   beginVanish,
   auditMaintainedCounts,
   countEvents24h,
+  type CountAuditStatus,
   followsListAt,
   readIngestCounts,
   readMaintainedCounts,
@@ -508,6 +509,21 @@ export class Relay extends DurableObject<Env> {
     // the same `maintained_counts` row as `totalEvents`, at no extra
     // read. It was a COUNT over `follows` behind a six-hour cache.
     followCount: number;
+    // Whether the daily counter audit (storage.ts auditMaintainedCounts)
+    // has ever run, and what it found last time -- out of the same
+    // `maintained_counts` row as `totalEvents`/`followCount`, at no extra
+    // read. Before this field existed, the only record of what that audit
+    // found was a console.error line nobody was reading; three releases
+    // of maintained counters ran with no way to check from the outside
+    // that the safety net under them had ever actually fired.
+    //
+    // `lastRanAt: null` means the audit has never run, and it MUST NOT be
+    // rendered as "no drift found" -- a guard reporting health before it
+    // has checked anything is worse than no guard, which is the specific
+    // failure this field exists to make impossible to draw by accident.
+    // See schema.ts's `last_drift` column comment and public/index.html's
+    // rendering of this field.
+    countAudit: CountAuditStatus;
     // The `created_at` of the owner's contact list as the follow cache
     // currently has it -- not when that cache was last refreshed, which
     // is no longer a thing that happens on a schedule (ownership.ts
@@ -624,6 +640,7 @@ export class Relay extends DurableObject<Env> {
       writePolicy: allowFollowsEnabled(this.env) ? "follows" : "owner",
       // Out of the same row as `totalEvents` above, at no additional read.
       followCount: counts.follows,
+      countAudit: { lastRanAt: counts.lastRanAt, drift: counts.drift },
       followsListAt: followsListAt(sql),
       vanishing: vanishSummary(sql),
     };

@@ -338,12 +338,40 @@ describe("maintained event counters", () => {
         sql.exec(`UPDATE maintained_counts SET events = 41, audited_at = NULL`);
         auditMaintainedCounts(sql, Math.floor(Date.now() / 1000));
         // Logged, and left wrong.
-        expect(readMaintainedCounts(sql).events).toBe(41);
+        const status = readMaintainedCounts(sql);
+        expect(status.events).toBe(41);
+        // Also persisted -- what /api/stats' countAudit reads back, since
+        // the console.error line above is invisible to anyone not tailing
+        // logs at the exact moment this ran.
+        expect(status.lastRanAt).not.toBeNull();
+        expect(status.drift).not.toBeNull();
+        expect(status.drift?.some((d) => d.includes("maintained_counts.events says 41"))).toBe(true);
       });
     } finally {
       console.error = original;
     }
     expect(errors.join("\n")).toContain("MAINTAINED COUNT DRIFT");
+  });
+
+  it("reports the audit as never having run until it first runs, and clean thereafter", async () => {
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    const now = Math.floor(Date.now() / 1000);
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      sql.exec(`UPDATE maintained_counts SET audited_at = NULL, last_drift = NULL`);
+      // Never audited must not read as "audited and clean" -- a null
+      // lastRanAt is a distinct state from an empty/null drift list, and
+      // public/index.html renders the two as different sentences.
+      const neverRun = readMaintainedCounts(sql);
+      expect(neverRun.lastRanAt).toBeNull();
+      expect(neverRun.drift).toBeNull();
+
+      auditMaintainedCounts(sql, now);
+      const clean = readMaintainedCounts(sql);
+      expect(clean.lastRanAt).toBe(now);
+      expect(clean.drift).toBeNull();
+    });
   });
 
   it("audits at most once a day", async () => {

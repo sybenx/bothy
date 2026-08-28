@@ -405,15 +405,34 @@ export function readIngestCounts(
   return { ingested24h: row?.ingested ?? 0, rowsWrittenToday: row?.written ?? 0 };
 }
 
-// /api/stats `totalEvents` and `followCount`, both from the one
-// `maintained_counts` row. Rows read: 1 for the pair, whatever E and F are.
-// Read together rather than separately because they live in one row and
-// collectStats wants both.
-export function readMaintainedCounts(sql: SqlStorage): { events: number; follows: number } {
+export interface CountAuditStatus {
+  // Null means the audit has never run -- see the `last_drift` column
+  // comment in schema.ts for why that must render differently from "ran
+  // and found nothing".
+  lastRanAt: number | null;
+  // One string per disagreement the last completed run found, or null if
+  // that run found none. Only meaningful when `lastRanAt` is non-null.
+  drift: string[] | null;
+}
+
+// /api/stats `totalEvents`, `followCount` and the audit's own status, all
+// from the one `maintained_counts` row. Rows read: 1 for the trio, whatever
+// E and F are. Read together rather than separately because they live in
+// one row and collectStats wants all of them.
+export function readMaintainedCounts(
+  sql: SqlStorage,
+): { events: number; follows: number } & CountAuditStatus {
   const row = sql
-    .exec<{ events: number; follows: number }>(`SELECT events, follows FROM maintained_counts`)
+    .exec<{ events: number; follows: number; audited_at: number | null; last_drift: string | null }>(
+      `SELECT events, follows, audited_at, last_drift FROM maintained_counts`,
+    )
     .toArray()[0];
-  return { events: row?.events ?? 0, follows: row?.follows ?? 0 };
+  return {
+    events: row?.events ?? 0,
+    follows: row?.follows ?? 0,
+    lastRanAt: row?.audited_at ?? null,
+    drift: row?.last_drift ? (JSON.parse(row.last_drift) as string[]) : null,
+  };
 }
 
 // The number of follows the write gate currently admits, maintained by
@@ -535,12 +554,19 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   const actualFollows =
     sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM follows`).toArray()[0]?.n ?? 0;
 
-  const drift = (what: string, said: number, is: number, where: string) =>
+  // Collected alongside the console.error this function already made,
+  // rather than replacing it: the console line is for whoever is
+  // tailing logs at the moment this runs, and `driftMessages` is what
+  // survives past that moment for /api/stats to read back tomorrow.
+  const driftMessages: string[] = [];
+  const drift = (what: string, said: number, is: number, where: string) => {
+    const message = `${what} says ${said}, the table says ${is} (off by ${said - is})`;
+    driftMessages.push(message);
     console.error(
-      `MAINTAINED COUNT DRIFT: ${what} says ${said}, the table says ${is} ` +
-        `(off by ${said - is}). NOT corrected -- see storage.ts auditMaintainedCounts. ` +
+      `MAINTAINED COUNT DRIFT: ${message}. NOT corrected -- see storage.ts auditMaintainedCounts. ` +
         `Every write to the counted table must go through ${where}.`,
     );
+  };
 
   if (actual.total !== state.events) {
     drift("maintained_counts.events", state.events, actual.total, "insertEventRow/deleteEventRow");
@@ -588,7 +614,19 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   // Written whether or not anything disagreed: this records that the audit
   // RAN, which is what paces the next one. Recording it only on success
   // would make a drifting relay recount E rows on every cron tick.
-  sql.exec(`UPDATE maintained_counts SET audited_at = ?`, nowSec);
+  //
+  // `last_drift` is stamped in the same statement as `audited_at` so the
+  // two can never describe different runs -- a reader must never be able
+  // to see this run's timestamp paired with a previous run's findings.
+  // NULL, not an empty array, when nothing disagreed: schema.ts's
+  // `last_drift` comment is why that distinction (never audited vs.
+  // audited-and-clean) has to survive into what gets stored, not just
+  // what gets displayed.
+  sql.exec(
+    `UPDATE maintained_counts SET audited_at = ?, last_drift = ?`,
+    nowSec,
+    driftMessages.length > 0 ? JSON.stringify(driftMessages) : null,
+  );
 }
 
 export function eventExists(sql: SqlStorage, id: string): boolean {

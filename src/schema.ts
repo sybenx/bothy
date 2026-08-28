@@ -553,6 +553,21 @@ export const TABLES: readonly TableSpec[] = [
       // daily recount is paced by the data rather than by how often the
       // cron happens to fire. NULL until the first audit.
       col("audited_at", "INTEGER"),
+      // What the last audit found, as a JSON array of one string per
+      // disagreement -- the same text auditMaintainedCounts already logs
+      // with console.error, kept here because a console line is read by
+      // nobody: this is the only durable record of what a daily check
+      // that runs unattended on a cron actually found. NULL means the
+      // last run found nothing wrong, and it means that ONLY when
+      // `audited_at` is non-null -- a relay that has never audited also
+      // has `last_drift` NULL, and /api/stats must tell those two states
+      // apart (relay.ts getStats' `countAudit`) rather than let "never
+      // checked" read as "checked, clean". Written by the same UPDATE
+      // that stamps `audited_at`, so the two can never describe different
+      // runs. Display only: nothing reads this column back to correct
+      // anything, matching the detect-don't-heal rule the column it sits
+      // beside already established.
+      col("last_drift", "TEXT"),
     ],
   },
   {

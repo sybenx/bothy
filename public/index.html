@@ -192,6 +192,7 @@
     <dt>Follow list published</dt><dd id="diag-follows-at">-</dd>
     <dt>Storage used</dt><dd id="diag-storage">-</dd>
     <dt id="diag-vanishing-label" hidden>Vanishing</dt><dd id="diag-vanishing" hidden>-</dd>
+    <dt>Counter audit</dt><dd id="diag-count-audit">-</dd>
     <dt>Backfill</dt><dd id="diag-backfill-at">-</dd>
     <dt>Read budget</dt><dd id="diag-read-budget">-</dd>
   </dl>
@@ -443,6 +444,29 @@ function renderDiagnostics(stats) {
         ? ""
         : ", oldest requested " + new Date(vanishing.oldestRequestedAt * 1000).toLocaleDateString()) +
       ")";
+  }
+
+  // src/relay.ts getStats' `countAudit`: whether the daily counter audit
+  // (src/storage.ts auditMaintainedCounts) has ever run, and what it found
+  // last time. Before this existed, the only record of that audit was a
+  // console.error line nobody was reading -- the only safety net under
+  // three releases of maintained counters was an ephemeral log line.
+  //
+  // `lastRanAt === null` is rendered as its own sentence, deliberately
+  // never folded into the "no drift found" case: a guard that has not
+  // checked anything yet is not the same claim as a guard that checked
+  // and found the counters correct, and reading the first as the second
+  // is exactly the failure this line exists to make impossible to see by
+  // accident.
+  const audit = stats.countAudit;
+  const auditEl = document.getElementById("diag-count-audit");
+  if (audit.lastRanAt === null) {
+    auditEl.textContent = "has not run yet";
+  } else {
+    const when = new Date(audit.lastRanAt * 1000).toLocaleString();
+    auditEl.textContent = audit.drift && audit.drift.length > 0
+      ? "ran " + when + " -- DRIFT FOUND: " + audit.drift.join("; ")
+      : "ran " + when + ", no drift found";
   }
 
   // "<when> (pulls N events)" -- N is limits.ts BACKFILL_PAGE_SIZE, read
