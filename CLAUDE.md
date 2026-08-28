@@ -580,6 +580,8 @@ See [docs/test-notes.md](docs/test-notes.md) for suite layout, fixture rationale
 
 `package.json`'s `version` is the single source of truth, imported directly (`resolveJsonModule`) into NIP-11's `version` field and `/api/stats`, which the admin page displays. Never hardcode the version string elsewhere. Cutting a release means bumping `package.json`'s `version` to match the release tag — every release must do this, or the deployed relay reports the wrong version.
 
+Tags must be annotated (`git tag -a`), never lightweight (`git tag`). `git push` with `--follow-tags` — the form this project's push workflow uses — only pushes annotated tags; a lightweight one is silently skipped, so the tag exists locally, `git ls-remote --tags origin` shows nothing, and nobody notices until they go looking for a release that was never actually pushed. This happened to v0.7.9: `git tag` made a lightweight tag, the push skipped it, and by the time it was caught `main` had moved a commit past it (a docs-only commit, but the tag still has to name the commit that is actually deployed) — fixed by deleting the local tag and recreating it annotated at the right commit before pushing. Verify a tag actually reached the remote with `git ls-remote --tags origin <tag>` rather than trusting that the push succeeded.
+
 ## Attribution
 
 MIT licensed, original implementation. See [README.md](README.md) "Attribution" for the full statement and the rule for any reference reading (Nosflare, khatru, haven, strfry): read to understand the protocol, never paste.
