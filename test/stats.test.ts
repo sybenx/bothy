@@ -10,6 +10,7 @@ import { profileCacheSize, resetProfileCache } from "../src/profile-lookup";
 import type { Relay } from "../src/relay";
 import {
   auditMaintainedCounts,
+  beginVanish,
   countEvents24h,
   readIngestCounts,
   readMaintainedCounts,
@@ -732,6 +733,37 @@ describe("/api/stats has no cache left", () => {
 
     await runInDurableObject(stub(), async (_instance, state) => {
       expect(readMaintainedCounts(state.storage.sql).events).toBe(after.totalEvents);
+    });
+  });
+});
+
+// /api/stats is public and unauthenticated, and it used to publish the
+// `vanishing` rows verbatim -- so anybody could read off which identities
+// had asked this relay to erase them, which is close to the opposite of
+// what asking for a vanish buys.
+describe("/api/stats vanish reporting", () => {
+  const fetchStats = async () =>
+    (await (await exports.default.fetch("https://example.com/api/stats")).json()) as {
+      vanishing: { pending: number; deletedSoFar: number; oldestRequestedAt: number | null };
+    };
+
+  it("publishes a count and never the pubkeys of pending vanish requests", async () => {
+    const stranger = randomKeypair();
+    await runInDurableObject(env.RELAY.get(env.RELAY.idFromName("relay")), async (_i, state) => {
+      beginVanish(state.storage.sql, stranger.pubkeyHex, 1_700_000_000, 1_700_000_000);
+    });
+
+    const stats = await fetchStats();
+    const serialized = JSON.stringify(stats);
+
+    expect(stats.vanishing.pending).toBe(1);
+    expect(stats.vanishing.oldestRequestedAt).toBe(1_700_000_000);
+    // The property, stated against the whole document rather than the one
+    // field: the requester's identity appears nowhere on it.
+    expect(serialized).not.toContain(stranger.pubkeyHex);
+
+    await runInDurableObject(env.RELAY.get(env.RELAY.idFromName("relay")), async (_i, state) => {
+      state.storage.sql.exec(`DELETE FROM vanishing WHERE pubkey = ?`, stranger.pubkeyHex);
     });
   });
 });

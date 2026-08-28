@@ -1,4 +1,4 @@
-import { type Filter, type NostrEvent, tagFilterEntries } from "./nostr";
+import { GIFT_WRAP_KIND, type Filter, type NostrEvent, tagFilterEntries } from "./nostr";
 
 // How many tag rows one `#<letter>` condition is allowed to look at, per
 // event the client asked for.
@@ -65,9 +65,59 @@ export function tagScanLimit(limit: number): number {
 // kinds go through equality/membership on `events` directly. No prefix
 // matching for ids/authors -- NIP-01 only says relays MAY support it, and
 // this suite doesn't require it (see docs/test-notes.md).
+export interface FilterQueryOptions {
+  // Omit kind-1059 rows from the result instead of returning them.
+  //
+  // This is the read gate on gift wraps for a session that is not
+  // authenticated as their recipient, and it is expressed as OMISSION
+  // rather than as refusal on purpose. The gate used to probe storage --
+  // re-run the filter restricted to kind 1059, refuse the REQ if
+  // anything came back -- and a refusal that depends on what is stored
+  // IS the answer to the question it refuses. An unauthenticated
+  // `{"#p":[owner],"since":S,"until":U,"limit":1}` got `auth-required`
+  // when a gift wrap fell inside the window and `EOSE` when none did, so
+  // bisecting since/until yielded exact arrival times and an exact inbox
+  // count, without the filter ever naming kind 1059. Omitting the rows
+  // answers the same filter the same way whether or not the inbox holds
+  // anything, which is the property the probe could not have.
+  //
+  // Applied only when the filter does not name `kinds` at all. A filter
+  // that names 1059 explicitly is refused by the caller (relay.ts
+  // handleReqInner) from `kinds` alone with no storage access -- refusing
+  // there leaks nothing, since the client already stated what it wanted
+  // -- and a filter naming other kinds cannot return a wrap anyway.
+  //
+  // What it costs, stated plainly, because it is the one place a query
+  // can read more than limits.ts filterReadCost prices it at. A skipped
+  // row is still a read row, so a filter whose matches are mostly gift
+  // wraps reads past them to reach what it may return. Two shapes, both
+  // measured at a 2,000-wrap inbox (test/read-cost.test.ts):
+  //
+  //   {"#p":[owner],"limit":20}       priced 400   reads 301   no overshoot
+  //   {"authors":[X],"limit":20}      priced  41   reads 2,002 bounded by
+  //                                                            the inbox
+  //
+  // The tag shape cannot overshoot: its subquery carries its own LIMIT
+  // (tagScanLimit above), so the candidate set is bounded before the
+  // exclusion applies. The index-driven shape can, up to the number of
+  // gift wraps the named author holds -- which is why limits.ts
+  // maxGiftWraps is now bounded by MAX_FILTER_ROWS_READ and not by the
+  // storage share alone. The price is a floor for that one shape; the
+  // ceiling is the inbox cap, and it is inside the per-filter cap by
+  // construction.
+  //
+  // NOT done in memory after the query, which would keep the price exact
+  // and would reintroduce the leak in a worse form: a client asking for
+  // 20 and receiving 8 has counted the gift wraps in its own window. The
+  // rows have to be gone before the LIMIT applies, or the LIMIT reports
+  // them.
+  excludeGiftWraps?: boolean;
+}
+
 export function buildFilterQuery(
   filter: Filter,
   nowSec: number,
+  options: FilterQueryOptions = {},
 ): { sql: string; params: unknown[] } | null {
   const conditions: string[] = ["(expiration IS NULL OR expiration > ?)"];
   const params: unknown[] = [nowSec];
@@ -86,6 +136,14 @@ export function buildFilterQuery(
     if (filter.kinds.length === 0) return null;
     conditions.push(`kind IN (${placeholders(filter.kinds.length)})`);
     params.push(...filter.kinds);
+  }
+  // See FilterQueryOptions.excludeGiftWraps. `kinds` absent only: with
+  // it present the caller has already settled the question, and adding a
+  // redundant `kind != ?` to every kinds-bearing query would price and
+  // plan for nothing.
+  if (options.excludeGiftWraps && filter.kinds === undefined) {
+    conditions.push("kind != ?");
+    params.push(GIFT_WRAP_KIND);
   }
   if (filter.since !== undefined) {
     conditions.push("created_at >= ?");

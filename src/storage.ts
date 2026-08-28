@@ -1,4 +1,4 @@
-import { buildFilterQuery, compareEvents, expandFilter } from "./filters";
+import { buildFilterQuery, compareEvents, expandFilter, type FilterQueryOptions } from "./filters";
 import { eventRowCost, TOMBSTONE_ROW_COST } from "./schema";
 import { addRowsWritten, takeRowsWritten, unlandedRowsWritten, withReadPath } from "./read-metrics";
 import { normalizeIp } from "./ip";
@@ -866,6 +866,84 @@ export function beginVanish(
   );
 }
 
+// The set of events one vanish request covers, as one query, so
+// drainVanish (which removes them) and hasVanishTargets (which asks
+// whether there are any) cannot disagree about what a vanish means.
+//
+// Both NIP-62 clauses in one statement: events the requester authored,
+// and (nips/62.md: "Relays SHOULD delete all NIP-59 Gift Wraps that
+// p-tagged the .pubkey") gift wraps addressed to them. UNION rather than
+// two queries so a single `limit` bounds the whole operation, and so a
+// caller cannot finish the first clause, report done, and leave the
+// second.
+function vanishTargets(
+  sql: SqlStorage,
+  requester: string,
+  cutoffCreatedAt: number,
+  limit: number,
+): { id: string }[] {
+  return sql
+    .exec<{ id: string }>(
+      `SELECT id FROM events WHERE pubkey = ? AND created_at <= ?
+       UNION
+       SELECT id FROM events WHERE kind = ? AND created_at <= ?
+         AND id IN (SELECT event_id FROM event_tags WHERE tag_name = 'p' AND tag_value = ?)
+       LIMIT ?`,
+      requester,
+      cutoffCreatedAt,
+      GIFT_WRAP_KIND,
+      cutoffCreatedAt,
+      requester,
+      limit,
+    )
+    .toArray();
+}
+
+// Whether this relay holds anything a vanish request would remove.
+//
+// A READ standing in front of a WRITE, and that is the whole point.
+// beginVanish below used to be called unconditionally, so a vanish from
+// a pubkey with nothing stored still wrote a checkpoint row -- which
+// drainVanish then deleted again on finding no targets, having deleted
+// nothing. Measured over the wire: 4 rows written per request, from a
+// path that runs before every write gate the relay has (NIP-62 binds
+// write-restricted relays to honour a vanish "regardless of the user's
+// status", so that ordering is correct and cannot change) and needs no
+// prior relationship with the relay at all. At the ~20 requests/second
+// the per-IP message throttle permits, that is ~1,730,000 rows/day
+// against a 100,000/day ceiling: the owner stops being able to publish
+// about ninety minutes in.
+//
+// NIP-62 requires the relay to honour the request. It does not require
+// paying rows to remember a request with nothing to do -- a vanish over
+// an empty set is complete the moment it is asked, and the honest answer
+// costs one seek.
+export function hasVanishTargets(sql: SqlStorage, requester: string, cutoffCreatedAt: number): boolean {
+  return vanishTargets(sql, requester, cutoffCreatedAt, 1).length > 0;
+}
+
+// The cutoff of a vanish already checkpointed for this pubkey, or null if
+// none is pending.
+//
+// Backs handleVanish's dedupe: a signed vanish event is replayable by
+// anyone who has ever seen it, forever, and each replay re-ran
+// beginVanish (a write) and a fresh drain batch (up to VANISH_BATCH_SIZE
+// removals) for a request already in progress. Read back and compared
+// against the incoming request's own cutoff, a replay is recognised for
+// what it is and costs one row read. Only a request that would WIDEN the
+// pending one gets to write, which is the same rule beginVanish's
+// ON CONFLICT already applies -- stated as a read in front of the write
+// rather than as a write that happens to change nothing.
+export function pendingVanishCutoff(sql: SqlStorage, requester: string): number | null {
+  const row = sql
+    .exec<{ cutoff_created_at: number }>(
+      `SELECT cutoff_created_at FROM vanishing WHERE pubkey = ?`,
+      requester,
+    )
+    .toArray()[0];
+  return row?.cutoff_created_at ?? null;
+}
+
 export interface VanishProgress {
   deleted: number;
   // True once nothing is left to remove for this pubkey, at which point
@@ -877,10 +955,9 @@ export interface VanishProgress {
 // the checkpoint once nothing is left. Safe to call repeatedly; calling
 // it for a pubkey with no `vanishing` row is a no-op.
 //
-// Both NIP-62 clauses drain through one query so a single limit bounds
-// the whole operation: events the requester authored, and gift wraps
-// p-tagging them. Deleting the union in one pass also means the caller
-// cannot finish the first clause, report done, and leave the second.
+// Both NIP-62 clauses drain through one query (vanishTargets above) so a
+// single limit bounds the whole operation, and so "what a vanish covers"
+// has one definition that hasVanishTargets asks the same question of.
 export function drainVanish(sql: SqlStorage, requester: string, limit: number): VanishProgress {
   const row = sql
     .exec<{ cutoff_created_at: number; deleted_so_far: number }>(
@@ -890,21 +967,7 @@ export function drainVanish(sql: SqlStorage, requester: string, limit: number): 
     .toArray()[0];
   if (!row) return { deleted: 0, done: true };
 
-  const targets = sql
-    .exec<{ id: string }>(
-      `SELECT id FROM events WHERE pubkey = ? AND created_at <= ?
-       UNION
-       SELECT id FROM events WHERE kind = ? AND created_at <= ?
-         AND id IN (SELECT event_id FROM event_tags WHERE tag_name = 'p' AND tag_value = ?)
-       LIMIT ?`,
-      requester,
-      row.cutoff_created_at,
-      GIFT_WRAP_KIND,
-      row.cutoff_created_at,
-      requester,
-      limit,
-    )
-    .toArray();
+  const targets = vanishTargets(sql, requester, row.cutoff_created_at, limit);
 
   for (const target of targets) deleteAndTombstone(sql, target.id);
 
@@ -951,9 +1014,12 @@ export interface PendingVanish {
 }
 
 // Vanish requests still draining -- read by relay.ts runCron to resume
-// them, and surfaced on /api/stats so a stalled one is visible rather
-// than inferred. Oldest first, so a request cannot be starved by newer
-// ones arriving.
+// them. Oldest first, so a request cannot be starved by newer ones
+// arriving.
+//
+// INTERNAL ONLY: these rows name pubkeys, and pubkeys are what a vanish
+// request exists to disassociate from this relay. /api/stats takes
+// vanishSummary below instead.
 export function pendingVanishes(sql: SqlStorage): PendingVanish[] {
   return sql
     .exec<{ pubkey: string; deleted_so_far: number; requested_at: number }>(
@@ -963,21 +1029,68 @@ export function pendingVanishes(sql: SqlStorage): PendingVanish[] {
     .map((r) => ({ pubkey: r.pubkey, deletedSoFar: r.deleted_so_far, requestedAt: r.requested_at }));
 }
 
-export function queryFilter(sql: SqlStorage, filter: Filter, nowSec: number): NostrEvent[] {
+export interface VanishSummary {
+  // How many pubkeys have a drain in progress.
+  pending: number;
+  // Events removed so far across all of them.
+  deletedSoFar: number;
+  // When the oldest pending request arrived, or null if none is pending
+  // -- what makes a stalled drain visible.
+  oldestRequestedAt: number | null;
+}
+
+// What /api/stats publishes about vanish requests, and deliberately not
+// pendingVanishes above.
+//
+// /api/stats is unauthenticated and public, and it used to carry the
+// `vanishing` rows verbatim, pubkey included -- so anyone could read off
+// which identities had asked this relay to erase them, which is close to
+// the opposite of what asking bought them. The operational question the
+// admin page asks ("is a drain stuck?") is answered by a count, a
+// progress total and an age; none of those name anyone.
+//
+// One row read: three aggregates over a table that is empty except while
+// a vanish is draining.
+export function vanishSummary(sql: SqlStorage): VanishSummary {
+  const row = sql
+    .exec<{ pending: number; deleted: number; oldest: number | null }>(
+      `SELECT COUNT(*) AS pending, COALESCE(SUM(deleted_so_far), 0) AS deleted,
+              MIN(requested_at) AS oldest
+         FROM vanishing`,
+    )
+    .toArray()[0];
+  return {
+    pending: row?.pending ?? 0,
+    deletedSoFar: row?.deleted ?? 0,
+    oldestRequestedAt: row?.oldest ?? null,
+  };
+}
+
+export function queryFilter(
+  sql: SqlStorage,
+  filter: Filter,
+  nowSec: number,
+  options?: FilterQueryOptions,
+): NostrEvent[] {
   const parts = expandFilter(filter);
   const only = parts[0];
-  if (parts.length === 1 && only !== undefined) return runFilterQuery(sql, only, nowSec);
+  if (parts.length === 1 && only !== undefined) return runFilterQuery(sql, only, nowSec, options);
 
   const byId = new Map<string, NostrEvent>();
   for (const part of parts) {
-    for (const event of runFilterQuery(sql, part, nowSec)) byId.set(event.id, event);
+    for (const event of runFilterQuery(sql, part, nowSec, options)) byId.set(event.id, event);
   }
   const merged = [...byId.values()].sort(compareEvents);
   return filter.limit === undefined ? merged : merged.slice(0, filter.limit);
 }
 
-function runFilterQuery(sql: SqlStorage, filter: Filter, nowSec: number): NostrEvent[] {
-  const query = buildFilterQuery(filter, nowSec);
+function runFilterQuery(
+  sql: SqlStorage,
+  filter: Filter,
+  nowSec: number,
+  options?: FilterQueryOptions,
+): NostrEvent[] {
+  const query = buildFilterQuery(filter, nowSec, options);
   if (query === null) return [];
   return sql
     .exec<EventRow>(query.sql, ...query.params)
@@ -1121,10 +1234,15 @@ function estimateRowsWrittenSinceInner(sql: SqlStorage, sinceCutoff: number): nu
 // deduped/re-sorted as a single result set, newest-first with ties
 // broken by lowest id -- matching the ordering a single filter's query
 // would produce.
-export function queryFilters(sql: SqlStorage, filters: Filter[], nowSec: number): NostrEvent[] {
+export function queryFilters(
+  sql: SqlStorage,
+  filters: Filter[],
+  nowSec: number,
+  options?: FilterQueryOptions,
+): NostrEvent[] {
   const byId = new Map<string, NostrEvent>();
   for (const filter of filters) {
-    for (const event of queryFilter(sql, filter, nowSec)) {
+    for (const event of queryFilter(sql, filter, nowSec, options)) {
       byId.set(event.id, event);
     }
   }

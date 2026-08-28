@@ -1,5 +1,6 @@
 import type { OwnerProfile } from "./nip11";
 import type { Profile } from "./profile-lookup";
+import { normalizePubkey } from "./pubkey";
 import { isPubkeyAllowed, isPubkeyBanned, setFollowCount } from "./storage";
 
 // Kind-3 is NIP-01/NIP-02's contact list; its `p` tags are the follow set.
@@ -22,8 +23,40 @@ export function allowFollowsEnabled(env: Env): boolean {
   return env.ALLOW_FOLLOWS !== "false";
 }
 
+// Memoised per isolate, keyed on the raw string, because this function
+// is on the write path: every event compares its author against the
+// owner, and an `npub1...` value would otherwise pay a bech32 decode per
+// event. The key is the raw value, so a changed variable cannot be
+// served a stale answer.
+let normalizedEnvOwner: { raw: string; hex: string | null } | undefined;
+
+function envOwnerPubkey(raw: string): string | null {
+  if (normalizedEnvOwner?.raw !== raw) {
+    normalizedEnvOwner = { raw, hex: normalizePubkey(raw) };
+  }
+  return normalizedEnvOwner.hex;
+}
+
+// The owner's pubkey as lowercase hex, or null while unclaimed.
+//
+// OWNER_PUBKEY is normalized here rather than trusted verbatim, which is
+// the same rule every other pubkey boundary in this project follows
+// (pubkey.ts normalizePubkey: /api/claim, NIP-86's banpubkey, the
+// bech32 forms clients paste). It was the one boundary that did not, and
+// the value it returns is compared against `event.pubkey` -- always
+// lowercase hex, since validate.ts checks the id against the serialized
+// event. So an operator who set an npub, or hex with a capital letter,
+// got a relay where the string never matched anything: the owner could
+// not write, could not read their own gift wraps, and no gift wrap could
+// be addressed to them, with nothing anywhere saying why.
+//
+// A malformed value yields null -- the relay reads as unclaimed and does
+// nothing, rather than half-working. It cannot be claimed out from under
+// the operator by that: index.ts gates /api/claim on `env.OWNER_PUBKEY`
+// being SET, not on this resolving, so a broken value fails loudly and
+// closed instead of quietly opening TOFU to a stranger.
 export function getOwnerPubkey(sql: SqlStorage, env: Env): string | null {
-  if (env.OWNER_PUBKEY) return env.OWNER_PUBKEY;
+  if (env.OWNER_PUBKEY) return envOwnerPubkey(env.OWNER_PUBKEY);
   const row = sql.exec<{ pubkey: string }>(`SELECT pubkey FROM owner LIMIT 1`).toArray()[0];
   return row?.pubkey ?? null;
 }

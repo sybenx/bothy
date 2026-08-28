@@ -32,6 +32,11 @@
 interface Env {
   RATE_LIMIT_API?: RateLimit;
   RATE_LIMIT_PROFILE?: RateLimit;
+  // `npub1...` or lowercase hex -- ownership.ts getOwnerPubkey runs it
+  // through pubkey.ts normalizePubkey, like every other pubkey boundary.
+  // A value that does not normalize resolves to null, which reads as
+  // unclaimed; the claim endpoint stays disabled either way, since
+  // index.ts gates it on this being set rather than on it resolving.
   OWNER_PUBKEY?: string;
   RELAY_NAME?: string;
   RELAY_DESCRIPTION?: string;

@@ -52,10 +52,6 @@ export const READ_PATHS = [
   // Client REQ handling: storage.ts queryFilters, one query per filter
   // in the REQ frame (relay.ts handleReq).
   "req",
-  // The NIP-42 gift wrap read gate's existence probe -- the per-filter
-  // `kinds: [1059], limit: 1` re-run that only fires when the client's
-  // own filter omits `kinds` (relay.ts handleReq, CLAUDE.md "The budget").
-  "giftWrapGate",
   // GET /api/stats (relay.ts getStats), excluding the nested
   // estimateRowsWrittenSince below, which reports separately.
   "getStats",

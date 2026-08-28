@@ -11,10 +11,11 @@
 // test/nip59-deletion.test.ts for the gift wrap accept/delete paths this
 // gate protects.
 import { describe, expect, it } from "vitest";
+import type { NostrEvent } from "../src/nostr";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
 import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
-import { connectRelay, publish } from "./helpers/socket";
+import { connectRelay, type Frame, publish } from "./helpers/socket";
 
 isolateStorage();
 
@@ -192,22 +193,24 @@ describe("NIP-42 gift wrap read gate", () => {
   });
 });
 
-// The gate (relay.ts handleReq) re-runs each filter restricted to
-// kind 1059 against real storage rather than pattern-matching the
-// filter's shape, specifically because an earlier, shape-based version
-// missed the ids-only case below: an id is an unguessable content hash,
-// so "an ids-only filter can't be a discovery vector" is true for anyone
-// who doesn't already have the event -- but that's not the rule this
-// relay actually promises (CLAUDE.md "What it is": serve gift wraps only to
-// the authenticated p-tagged recipient", no carve-out for "unless you
-// already know the id"), and the old gate let it through unauthenticated.
-// These five lock in the shapes that matter: two that must be gated
-// despite not naming 1059 as the *only* kind, one that must be gated
-// despite carrying no kind or `#p` constraint at all, one that must be
-// gated despite the gift wrap sitting deeper in the tag index than the
-// probe's own default limit would reach, and one that must NOT be gated
-// because its `kinds` structurally excludes 1059 regardless of what else
-// the filter asks for.
+// The gate (relay.ts handleReqInner) answers to two rules, and which one
+// applies is decided by the filter alone, never by what is stored.
+//
+// A filter NAMING kind 1059 is refused with auth-required, read off
+// `f.kinds` with no storage access. A filter that names no kinds is
+// answered normally with the gift wraps omitted from the result
+// (filters.ts excludeGiftWraps).
+//
+// The second half used to be a refusal too, decided by probing storage:
+// re-run the filter restricted to kind 1059, refuse if anything came
+// back. That gate leaked the thing it protected. Its answer varied with
+// the contents of the inbox, so the refusal WAS the answer -- an
+// unauthenticated `{"#p":[owner],"since":S,"until":U,"limit":1}` said
+// auth-required when a wrap fell in the window and EOSE when none did,
+// and bisecting since/until yielded arrival times and an exact count
+// without ever naming 1059. The oracle test below is the regression, and
+// the two "omits" tests are what replaced the probe: the shapes that once
+// forced a refusal are now served, minus the wraps.
 // The REQ-time gate above proves nothing about *future* events: a filter
 // that matches no stored gift wrap at registration time (most simply,
 // any `#p` filter naming the owner while the inbox is empty) registers
@@ -308,7 +311,15 @@ describe("NIP-42 gift wrap read gate: filter-shape coverage", () => {
     conn.close();
   });
 
-  it("gates an ids-only filter naming a stored gift wrap's id", async () => {
+  it("omits a gift wrap from an ids-only filter naming it, rather than refusing", async () => {
+    // An id is an unguessable content hash, so an ids-only filter is no
+    // discovery vector for anyone who does not already hold the event --
+    // but that is not the rule this relay promises (CLAUDE.md "What it
+    // is": gift wraps go only to the authenticated p-tagged recipient,
+    // with no carve-out for "unless you already know the id"). The rule
+    // is kept; what changed is that keeping it no longer requires saying
+    // so. The client asked for an id and gets nothing back, which is what
+    // it would get for an id this relay never stored.
     const conn = await connectRelay();
     const giftWrap = signEvent(randomKeypair().secretKeyHex, {
       kind: 1059,
@@ -320,22 +331,21 @@ describe("NIP-42 gift wrap read gate: filter-shape coverage", () => {
     conn.send(["REQ", "shapeC", { ids: [giftWrap.id] }]);
     const frame = await conn.nextMessage();
 
-    expect(frame[0]).toBe("AUTH");
+    expect(frame[0]).toBe("EOSE");
     conn.close();
   });
 
-  it("gates a gift wrap sitting deeper in the tag index than a limit-1 probe would look", async () => {
-    // The gate probes storage by re-running the client's filter
-    // restricted to kind 1059, and it used to do that at `limit: 1` on
-    // the grounds that only existence mattered. That was true while
-    // every query was complete. It stopped being true when filters.ts
-    // began bounding a tag subquery to TAG_SCAN_DEPTH x limit rows: at
-    // limit 1 the probe looks at five tag rows, so a gift wrap sitting
-    // any deeper than that is invisible to the probe and returned by the
-    // REQ, which is the gate failing open on exactly the filter NIP-17
-    // clients send. The probe now shares the REQ's own limit whenever a
-    // tag condition is present, so it can never look at less than what
-    // it is gating.
+  it("omits a gift wrap from a #p filter while still serving the events beside it", async () => {
+    // The shape a NIP-17 client's relay list produces, and the one the
+    // probe was worst at. The probe had to look at least as far into the
+    // tag index as the REQ itself could -- so it ran at the REQ's own
+    // limit, which made the common kinds-less REQ pay a bounded but
+    // limit-proportional read on every send (141 rows measured at limit
+    // 20 against a 500-wrap inbox) purely to decide whether to refuse.
+    //
+    // Nothing probes now. The wrap is dropped by the query that was
+    // already running, and the ten ordinary notes sitting in the same tag
+    // range come back, which the refusal used to take with it.
     const conn = await connectRelay();
     const now = Math.floor(Date.now() / 1000);
     const giftWrap = signEvent(randomKeypair().secretKeyHex, {
@@ -346,7 +356,8 @@ describe("NIP-42 gift wrap read gate: filter-shape coverage", () => {
     });
     await publish(conn, giftWrap);
     // Ten newer events carrying the same `#p` value, so the gift wrap is
-    // the eleventh row of the tag range rather than the first.
+    // the eleventh row of the tag range rather than the first -- deeper
+    // than a limit-1 probe would ever have looked.
     for (let i = 0; i < 10; i++) {
       await publish(
         conn,
@@ -360,9 +371,60 @@ describe("NIP-42 gift wrap read gate: filter-shape coverage", () => {
     }
 
     conn.send(["REQ", "shapeE", { "#p": [OWNER_PUBKEY_HEX], limit: 20 }]);
-    const frame = await conn.nextMessage();
+    const events: NostrEvent[] = [];
+    for (;;) {
+      const frame = await conn.nextMessage();
+      if (frame[0] === "EOSE") break;
+      expect(frame[0]).toBe("EVENT");
+      events.push(frame[2] as NostrEvent);
+    }
 
-    expect(frame[0]).toBe("AUTH");
+    expect(events.some((e) => e.id === giftWrap.id)).toBe(false);
+    expect(events.every((e) => e.kind !== 1059)).toBe(true);
+    expect(events.length).toBe(10);
+    conn.close();
+  });
+
+  it("answers a windowed #p probe identically whether or not a gift wrap falls inside it", async () => {
+    // The oracle, and the reason refusal was the wrong shape for this
+    // gate. Two windows, one holding a gift wrap and one holding nothing
+    // at all: under the storage probe the first answered `auth-required`
+    // and the second `EOSE`, which is a one-bit read of the owner's inbox
+    // per REQ, and bisecting since/until turns those bits into exact
+    // arrival times and an exact count. Neither filter names kind 1059,
+    // so nothing in the request says the client is asking about gift
+    // wraps -- the gate volunteered it.
+    //
+    // Asserted as an equality between the two answers rather than against
+    // a literal, because the property is indistinguishability: whatever
+    // the relay says about a window, it must say the same thing about a
+    // window whose only difference is a gift wrap.
+    const conn = await connectRelay();
+    const occupied = 1_600_000_000;
+    const empty = 1_500_000_000;
+    await publish(
+      conn,
+      signEvent(randomKeypair().secretKeyHex, {
+        kind: 1059,
+        tags: [["p", OWNER_PUBKEY_HEX]],
+        content: "x",
+        created_at: occupied,
+      }),
+    );
+
+    async function probe(sub: string, at: number): Promise<Frame> {
+      conn.send(["REQ", sub, { "#p": [OWNER_PUBKEY_HEX], since: at - 60, until: at + 60, limit: 1 }]);
+      for (;;) {
+        const frame = await conn.nextMessage();
+        if (frame[1] === sub) return frame;
+      }
+    }
+
+    const hit = await probe("oracleHit", occupied);
+    const miss = await probe("oracleMiss", empty);
+
+    expect(hit[0]).toBe("EOSE");
+    expect(hit[0]).toBe(miss[0]);
     conn.close();
   });
 

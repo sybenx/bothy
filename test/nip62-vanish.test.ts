@@ -22,6 +22,19 @@ import { connectRelay, publish } from "./helpers/socket";
 
 isolateStorage();
 
+// The relay's own rows-written meter (relay.ts getStats, out of
+// schema.ts `ingest_hour_counts`) -- what the daily budget actually sees.
+async function rowsWrittenToday(): Promise<number> {
+  const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+  let total = 0;
+  await runInDurableObject(stub, async (instance) => {
+    total = (
+      await (instance as unknown as { getStats(): Promise<{ rowsWrittenToday: number }> }).getStats()
+    ).rowsWrittenToday;
+  });
+  return total;
+}
+
 async function stillExists(id: string): Promise<boolean> {
   const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
   let result = false;
@@ -49,6 +62,119 @@ describe("NIP-62 request to vanish", () => {
     // gift wrap p-tagged to anyone but the owner), which is fine: the
     // spec's rule still applies, it just has no matching rows here.
     expect(ok).toBe(true);
+    conn.close();
+  });
+
+  it("writes nothing for a vanish from a pubkey with nothing stored", async () => {
+    // The cost side of the test above. handleVanish runs before every
+    // write gate this relay has -- correctly, NIP-62 binds
+    // write-restricted relays "regardless of the user's status" -- and it
+    // also ran before any check that there was anything to do, so
+    // beginVanish wrote a checkpoint that drainVanish deleted again on
+    // finding no targets. Measured over the wire: 4 rows written per
+    // request, ~20 requests/second at the per-IP throttle, ~1,730,000
+    // rows/day against a 100,000/day ceiling -- the owner stops being able
+    // to publish about ninety minutes in.
+    //
+    // Measured through /api/stats's own rowsWrittenToday, which is the
+    // relay's real meter (schema.ts `ingest_hour_counts`), so this asserts
+    // what the budget actually saw rather than what a proxy around a few
+    // chosen statements saw.
+    const stranger = randomKeypair();
+    const conn = await connectRelay();
+    const before = await rowsWrittenToday();
+
+    for (let i = 0; i < 10; i++) {
+      const [, , ok] = await publish(
+        conn,
+        signEvent(stranger.secretKeyHex, {
+          kind: 62,
+          tags: [["relay", "wss://example.com"]],
+          content: "",
+          created_at: 1_700_000_000 + i,
+        }),
+      );
+      // Still honoured, still true -- a vanish over an empty set is
+      // complete when it is asked. What changed is that saying so is free.
+      expect(ok).toBe(true);
+    }
+
+    expect(await rowsWrittenToday()).toBe(before);
+    conn.close();
+  });
+
+  it("writes nothing for a replay of a vanish that has already completed", async () => {
+    // A vanish event is signed, so anyone who has ever seen it can replay
+    // it forever. Each replay used to re-run beginVanish and take another
+    // drain batch for a request already pending -- spending writes, and
+    // draining faster than the reserved share paces for.
+    const conn = await connectRelay();
+    const owner = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "mine", created_at: 1_700_000_100 });
+    await publish(conn, owner);
+
+    const vanish = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 62,
+      tags: [["relay", "wss://example.com"]],
+      content: "",
+      created_at: 1_700_000_200,
+    });
+    const [, , first] = await publish(conn, vanish);
+    expect(first).toBe(true);
+    expect(await stillExists(owner.id)).toBe(false);
+
+    // The identical event again: nothing left to remove, so it does not
+    // reach beginVanish at all and writes nothing.
+    const before = await rowsWrittenToday();
+    for (let i = 0; i < 5; i++) {
+      const [, , ok] = await publish(conn, vanish);
+      expect(ok).toBe(true);
+    }
+    expect(await rowsWrittenToday()).toBe(before);
+    conn.close();
+  });
+
+  it("recognises a replay of a vanish still draining, and neither writes nor drains again", async () => {
+    // The other half of the replay case: a checkpoint exists and the
+    // drain has not finished. Each replay used to re-run beginVanish (a
+    // write) and take another VANISH_BATCH_SIZE removals, so a requester
+    // could drain far faster than the reserved share paces for -- and
+    // anyone holding a copy of their signed event could do it for them.
+    //
+    // The checkpoint is planted directly rather than by publishing more
+    // than VANISH_BATCH_SIZE events over the wire; docs/test-notes.md
+    // records this kind of drop to storage as a deliberate exception, and
+    // the alternative here is thousands of schnorr signatures to reach a
+    // state beginVanish reaches in one call.
+    const conn = await connectRelay();
+    const note = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "pending", created_at: 1_700_001_000 });
+    await publish(conn, note);
+
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      beginVanish(state.storage.sql, OWNER_PUBKEY_HEX, 1_700_001_100, 1_700_001_100);
+    });
+
+    const before = await rowsWrittenToday();
+    const [, , ok, message] = await publish(
+      conn,
+      signEvent(OWNER_SECRET_KEY_HEX, {
+        kind: 62,
+        tags: [["relay", "wss://example.com"]],
+        content: "",
+        created_at: 1_700_001_100,
+      }),
+    );
+
+    expect(ok).toBe(true);
+    expect(message).toContain("already accepted");
+    expect(await rowsWrittenToday()).toBe(before);
+    // Not drained by the replay: the pending request is what removes it,
+    // on a cron tick, at the pace the reserved share sets.
+    expect(await stillExists(note.id)).toBe(true);
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      drainVanish(state.storage.sql, OWNER_PUBKEY_HEX, VANISH_BATCH_SIZE);
+    });
     conn.close();
   });
 

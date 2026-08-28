@@ -38,8 +38,10 @@ import { buildFilterQuery, expandFilter, expandFilterCount, tagScanLimit } from 
 import {
   boundFilter,
   filterReadCost,
+  MAX_FILTER_COMBINATIONS,
   MAX_FILTER_LIMIT,
   MAX_FILTER_ROWS_READ,
+  maxGiftWraps,
   TAG_ROWS_READ_PER_MATCH,
 } from "../src/limits";
 import type { Filter } from "../src/nostr";
@@ -918,5 +920,143 @@ describe("read attribution", () => {
     // read every tag row in the table. Now it reads the handful the
     // replaced event actually carried.
     expect(write?.rowsRead ?? 0).toBeLessThan(TAG_ROWS / 10);
+  });
+});
+
+// The `ids` access path was priced as though the filter ran once. It runs
+// filters.ts expandFilterCount times, and every one of those queries
+// carries the same `id IN (...)` list.
+describe("ids access path pricing", () => {
+  it("prices an ids filter at what the expanded queries actually read", async () => {
+    const AUTHORS = 50;
+    const authors = Array.from({ length: AUTHORS }, (_, i) => i.toString(16).padStart(64, "9"));
+    const filter: Filter = { ids: ["0".repeat(64)], authors, limit: 500 };
+
+    // The mispricing: one row, whatever the author count.
+    expect(filter.ids?.length).toBe(1);
+    const cost = filterReadCost(filter);
+    expect(cost?.via).toBe("events primary key");
+    expect(cost?.rowsRead).toBe(AUTHORS);
+
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      let measured = 0;
+      const cursors: { rowsRead: number }[] = [];
+      for (const part of expandFilter(filter)) {
+        const query = buildFilterQuery(part, now);
+        const cursor = sql.exec(query!.sql, ...query!.params);
+        cursor.toArray();
+        cursors.push(cursor);
+      }
+      measured = cursors.reduce((n, c) => n + c.rowsRead, 0);
+      // What the price now says, and what it used to say (1).
+      expect(measured).toBe(AUTHORS);
+    });
+  });
+
+  it("refuses a filter whose query count exceeds the cap, with or without an id to hide behind", async () => {
+    // The whole attack in two lines: the same filter, priced 5,005,000
+    // and refused without the id, priced 1 and admitted with it.
+    const authors = Array.from({ length: MAX_FILTER_COMBINATIONS + 1 }, (_, i) =>
+      i.toString(16).padStart(64, "8"),
+    );
+    expect(boundFilter({ authors, limit: 500 }).ok).toBe(false);
+    expect(boundFilter({ ids: ["0".repeat(64)], authors, limit: 500 }).ok).toBe(false);
+    // And the shape below the cap is still admitted, at a price that is
+    // now the truth rather than a hundredth of it.
+    const under = boundFilter({ ids: ["0".repeat(64)], authors: authors.slice(0, 100), limit: 500 });
+    expect(under.ok).toBe(true);
+    if (under.ok) expect(under.cost.rowsRead).toBe(100);
+  });
+});
+
+// The NIP-42 gift wrap gate omits kind-1059 rows from an unauthenticated
+// read instead of refusing it, which removed a storage probe from every
+// kinds-less REQ and replaced it with a condition on the query that was
+// already running. A skipped row is still a read row, so what the
+// exclusion costs is measured here rather than assumed.
+describe("gift wrap exclusion cost", () => {
+  it("adds nothing to a tag-driven filter, whose candidate set is already bounded", async () => {
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      const filter: Filter = { "#p": [OWNER_PUBKEY_HEX], limit: 20 };
+      const priced = filterReadCost(filter)!.rowsRead;
+
+      const plain = buildFilterQuery(filter, now)!;
+      const excluded = buildFilterQuery(filter, now, { excludeGiftWraps: true })!;
+
+      // The tag subquery carries its own LIMIT (filters.ts tagScanLimit),
+      // so the exclusion narrows what survives rather than widening what
+      // is scanned.
+      expect(rowsRead(sql, excluded.sql, ...excluded.params)).toBeLessThanOrEqual(
+        rowsRead(sql, plain.sql, ...plain.params),
+      );
+      expect(rowsRead(sql, excluded.sql, ...excluded.params)).toBeLessThanOrEqual(priced);
+    });
+  });
+
+  it("reads past the skipped wraps on an authors-pinned filter, bounded by the inbox", async () => {
+    // The one shape that CAN read past its price: `authors` pinned with
+    // no `kinds`, against a pubkey whose stored events are all gift
+    // wraps. The scan reads every one of them to reach the first event it
+    // may return.
+    //
+    // Seeded and removed inside this test rather than in the shared
+    // fixture: several assertions in this file are written against the
+    // exact size of that fixture.
+    const WRAPS = 500;
+    const AUTHOR = "c".repeat(64);
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      for (let i = 0; i < WRAPS; i++) {
+        sql.exec(
+          `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ("d" + i.toString(16)).padStart(64, "e"),
+          AUTHOR,
+          now - i,
+          1059,
+          "[]",
+          "x",
+          "sig",
+          null,
+          now - 200_000,
+        );
+      }
+
+      const filter: Filter = { authors: [AUTHOR], limit: 20 };
+      const priced = filterReadCost(filter)!.rowsRead;
+      const plain = buildFilterQuery(filter, now)!;
+      const excluded = buildFilterQuery(filter, now, { excludeGiftWraps: true })!;
+
+      expect(rowsRead(sql, plain.sql, ...plain.params)).toBe(priced);
+      // Every wrap is read and discarded, so this scales with the inbox
+      // and not with the limit -- the price is a floor for this one shape.
+      const overshoot = rowsRead(sql, excluded.sql, ...excluded.params);
+      expect(overshoot).toBeGreaterThan(WRAPS);
+      // And it is inside the per-filter cap, which is the property that
+      // has to hold: the inbox count is the ceiling on the overshoot, so
+      // the inbox cap is what bounds it.
+      expect(overshoot).toBeLessThanOrEqual(MAX_FILTER_ROWS_READ);
+
+      sql.exec(`DELETE FROM events WHERE pubkey = ?`, AUTHOR);
+    });
+  });
+
+  it("bounds the gift wrap inbox so that overshoot cannot exceed the per-filter cap", async () => {
+    // Two rows per skipped wrap: the index entry and the table row behind
+    // it. limits.ts maxGiftWraps is bounded by MAX_FILTER_ROWS_READ for
+    // this reason and not by the storage share alone -- the share is a
+    // write-path cap, and this is the read cost it turned out to carry.
+    expect(maxGiftWraps({} as Env) * 2).toBeLessThanOrEqual(MAX_FILTER_ROWS_READ);
+    // The bound binds only under a configuration that would otherwise
+    // lift the inbox far past it: a 1KB event cap prices ~131,000 wraps
+    // into the same storage share.
+    expect(maxGiftWraps({ MAX_EVENT_BYTES: "1024" } as unknown as Env) * 2).toBeLessThanOrEqual(
+      MAX_FILTER_ROWS_READ,
+    );
   });
 });

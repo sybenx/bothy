@@ -18,6 +18,9 @@ import {
   GIFT_WRAP_RATE_LIMIT_WINDOW_MS,
   LIVE_FEED_MAX_LIFETIME_MS,
   MAX_EVENTS_PER_REQ,
+  MAX_CONN_STATE_BYTES,
+  MAX_FILTER_ROWS_READ,
+  MAX_FILTERS_PER_REQ,
   maxEventBytes,
   maxEventsPerPubkeyPerWindow,
   maxGiftWraps,
@@ -39,7 +42,6 @@ import {
   GIFT_WRAP_KIND,
   type NostrEvent,
   pTagValues,
-  tagFilterEntries,
   VANISH_KIND,
 } from "./nostr";
 import {
@@ -66,7 +68,11 @@ import {
   readMaintainedCounts,
   settleRowsWritten,
   drainVanish,
+  hasVanishTargets,
+  pendingVanishCutoff,
   pendingVanishes,
+  vanishSummary,
+  type VanishSummary,
   eventExists,
   expirationOf,
   getRelaySettings,
@@ -74,7 +80,6 @@ import {
   hasNonOwnerStorageHeadroom,
   isDeleted,
   isIpBlocked,
-  queryFilter,
   queryFilters,
   type RelaySettings,
   storeEvent,
@@ -143,6 +148,16 @@ function getState(ws: WebSocket): ConnState {
 
 function setState(ws: WebSocket, state: ConnState): void {
   ws.serializeAttachment(state);
+}
+
+// Whether this state will fit in the WebSocket attachment, checked before
+// storing it rather than discovered by serializeAttachment throwing --
+// see limits.ts MAX_CONN_STATE_BYTES. Only handleReqInner needs to ask:
+// it is the one path that adds an unbounded amount to the state, and the
+// filters it would add are the client's own, so refusing is an answer the
+// client can act on.
+function stateFits(state: ConnState): boolean {
+  return new TextEncoder().encode(JSON.stringify(state)).length <= MAX_CONN_STATE_BYTES;
 }
 
 // NIP-42 (nips/42.md "Signed Event Verification"): "checking if the
@@ -504,12 +519,19 @@ export class Relay extends DurableObject<Env> {
     // scales with how many that is -- so a stalled drain is visible here
     // rather than inferred. See the comment on storage.ts deleteEventRow.
     //
+    // Aggregated, never itemised. This field used to carry the pending
+    // rows verbatim, pubkey included, on an endpoint that is public and
+    // unauthenticated -- publishing exactly which identities had asked to
+    // be erased from this relay, to anybody who asked for the page. A
+    // count, a progress total and an age answer the operational question
+    // ("is a drain stuck?") and name nobody. See storage.ts vanishSummary.
+    //
     // It used to sit beside `largestNonOwnerAuthor`, which reported the
     // largest such exposure before one was requested. That field is gone:
     // it cost a GROUP BY over every event to produce, nothing acted on
     // it, and the exposure it described is bounded by the write gate and
     // the storage cap rather than by knowing the number.
-    vanishing: { pubkey: string; deletedSoFar: number; requestedAt: number }[];
+    vanishing: VanishSummary;
     // DIAGNOSTIC, and expected to be removed with src/read-metrics.ts.
     // Rows read attributed to the code path that caused them, since the
     // relay's last outage was the 5,000,000 rows-read/day ceiling and
@@ -603,7 +625,7 @@ export class Relay extends DurableObject<Env> {
       // Out of the same row as `totalEvents` above, at no additional read.
       followCount: counts.follows,
       followsListAt: followsListAt(sql),
-      vanishing: pendingVanishes(sql),
+      vanishing: vanishSummary(sql),
     };
   }
 
@@ -1014,11 +1036,50 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
+    // Two reads in front of the write, because everything below this
+    // point is reachable by anyone, forever, with no prior relationship
+    // with this relay and no gate above it. The dispatch order is
+    // correct and cannot change -- NIP-62 binds write-restricted relays
+    // to honour a vanish "regardless of the user's status" -- so the
+    // available control is not WHETHER to honour the request but whether
+    // honouring it has to cost a row.
+    //
+    // First: is this request already checkpointed? A vanish event is
+    // signed, so it is replayable by anyone who has ever seen it. Each
+    // replay used to re-run beginVanish and take another drain batch for
+    // a request already in progress, which both spent writes and drained
+    // faster than the reserved share paces for. A pending request at or
+    // wider than this one is already the promise this request is asking
+    // for, so the honest answer is the progress report, at one row read.
+    const pendingCutoff = pendingVanishCutoff(this.sql, event.pubkey);
+    if (pendingCutoff !== null && pendingCutoff >= event.created_at) {
+      ok(
+        ws,
+        event.id,
+        true,
+        "vanish already accepted and in progress: the rest will be removed on subsequent cron ticks",
+      );
+      return;
+    }
+
+    // Second: is there anything to remove? beginVanish used to be called
+    // unconditionally, so a request from a pubkey with nothing stored
+    // wrote a checkpoint that the drain immediately deleted again, having
+    // removed nothing -- 4 rows written, measured, to record and forget a
+    // request about an empty set. See storage.ts hasVanishTargets for the
+    // arithmetic against the daily ceiling. A vanish over nothing is
+    // complete when it is asked; saying so is a truthful OK, not a
+    // refusal, and NIP-62 asks for the events to be gone rather than for
+    // the asking to be remembered.
+    if (!hasVanishTargets(this.sql, event.pubkey, event.created_at)) {
+      ok(ws, event.id, true, "");
+      return;
+    }
+
     // Recorded before anything is deleted, then drained one bounded batch
     // at a time -- see storage.ts beginVanish. A vanish is the only
-    // request whose size the sender chooses and this relay cannot refuse
-    // (NIP-62 binds write-restricted relays "regardless of the user's
-    // status"), so doing all of it inline would let one request run past
+    // request whose size the sender chooses and this relay cannot refuse,
+    // so doing all of it inline would let one request run past
     // the daily write budget partway through, leaving the pubkey
     // half-vanished while this OK frame claimed success. "Fully delete"
     // is the spec's requirement; finishing across cron ticks meets it,
@@ -1191,6 +1252,34 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
+    // Filters per frame, bounded before any of them is parsed or priced.
+    //
+    // limits.ts MAX_FILTER_ROWS_READ caps what ONE filter may read, and
+    // nothing capped how many filters a REQ could carry -- so the ceiling
+    // that reads like a per-message bound was a per-filter one, and a
+    // single message could stack it as many times as fit in a 1MiB frame
+    // while the per-IP throttle in this file counted the message once.
+    // Measured before this check: a REQ carrying 200 filters was answered
+    // with EOSE. See MAX_FILTERS_PER_REQ for why the two caps are stated
+    // as a product now.
+    //
+    // Note this is NOT the same quantity as MAX_SUBSCRIPTIONS_PER_CONNECTION
+    // above, which the reuse of an existing subId legitimately skips:
+    // NIP-01 says a REQ on a live subscription id replaces its filters
+    // (nips/01.md), so a reused id cannot raise the open-subscription
+    // count and there is nothing there to close. What one message could
+    // make the relay DO was never bounded by that cap in the first place;
+    // it is bounded here.
+    const rawFilters = frame.slice(2);
+    if (rawFilters.length > MAX_FILTERS_PER_REQ) {
+      send(ws, [
+        "CLOSED",
+        subId,
+        `invalid: too many filters in one REQ (${rawFilters.length}), at most ${MAX_FILTERS_PER_REQ}`,
+      ]);
+      return;
+    }
+
     // One pass, not two. The old code clamped the limit and separately
     // asked whether the filter was "unconstrained", and neither step
     // could see the other -- the clamp bounded rows RETURNED and the
@@ -1198,14 +1287,25 @@ export class Relay extends DurableObject<Env> {
     // does both against one cost model derived from the index set, so a
     // filter is admitted only at a limit its access path can actually
     // afford.
+    // MAX_FILTER_ROWS_READ shared out across this frame's filters, not
+    // handed to each of them. It is the number this relay has always
+    // claimed for a REQ ("it takes 500 filters at the cap to spend a
+    // day's budget"), and applying it per filter is what made the claim
+    // false: ten filters each admitted at the cap is ten times the cap.
+    //
+    // Equal shares rather than a running budget spent in order, so two
+    // clients sending the same filters in a different order get the same
+    // answer. At the common single-filter REQ the share IS the cap, so
+    // nothing about the ordinary case moves.
+    const perFilterBudget = Math.floor(MAX_FILTER_ROWS_READ / Math.max(1, rawFilters.length));
     const filters: Filter[] = [];
-    for (const raw of frame.slice(2)) {
+    for (const raw of rawFilters) {
       const filter = parseFilter(raw);
       if (!filter) {
         send(ws, ["CLOSED", subId, "error: malformed filter"]);
         return;
       }
-      const bound = boundFilter(filter);
+      const bound = boundFilter(filter, perFilterBudget);
       if (!bound.ok) {
         send(ws, ["CLOSED", subId, bound.reason]);
         return;
@@ -1213,32 +1313,41 @@ export class Relay extends DurableObject<Env> {
       filters.push(bound.filter);
     }
 
-    // NIP-42 gate on gift wrap reads (CLAUDE.md
-    // "Threat model": "an anonymous query returns every DM envelope the
-    // owner has received, leaking volume and timing"). Rather than
-    // guessing which filter shapes (kinds/authors/ids/tags, in whatever
-    // combination) could surface a kind-1059 row, ask storage directly:
-    // re-run the filter restricted to kind 1059 and see if anything comes
-    // back. An earlier version of this gate tried to reason about it
-    // instead ("ids/authors alone can't leak, since a gift wrap's id/
-    // pubkey is unguessable without already possessing it") and missed
-    // that an ids-only filter naming a real, already-known gift wrap id
-    // sailed straight through ungated -- true that nothing *new* leaks to
-    // someone who already has the event, but that's not the rule this
-    // relay promises: gift wraps go only to the authenticated p-tagged
-    // recipient, with no exception for "unless you already know the id"
-    // (CLAUDE.md "What it is").
-    // Reusing the real query engine here means the gate can't drift out
-    // of sync with whatever storage.ts actually considers a match, the
-    // way the hand-rolled version did.
+    // NIP-42 gate on gift wrap reads (CLAUDE.md "Threat model": "an
+    // anonymous query returns every DM envelope the owner has received,
+    // leaking volume and timing"), in two halves that answer to two
+    // different rules.
     //
-    // The AUTH check comes FIRST, and the probe only runs when it can
-    // still change the outcome. The owner is allowed to read gift wraps,
-    // so for them the probe decides nothing and is pure rows read on
-    // every REQ they send; a filter naming kind 1059 outright is refused
-    // without touching storage at all.
-    const owner = getOwnerPubkey(this.sql, this.env);
-    if (state.authedPubkey !== owner && this.requestsGiftWraps(filters, owner)) {
+    // A filter that NAMES kind 1059 is refused, from `f.kinds` alone,
+    // with no storage access at all. Refusing here leaks nothing: the
+    // client said what it wanted, and being told it needs to authenticate
+    // for it is not information it did not already have.
+    //
+    // A filter that does not name `kinds` is answered normally with the
+    // gift wraps OMITTED (filters.ts excludeGiftWraps). It used to be
+    // refused too, on the strength of a storage probe -- re-run the
+    // filter restricted to kind 1059, refuse if anything came back -- and
+    // that probe made the refusal itself the answer. Measured: an
+    // unauthenticated `{"#p":[owner],"since":S,"until":U,"limit":1}`
+    // returned `auth-required` when a gift wrap fell inside the window
+    // and `EOSE` when none did, so bisecting since/until yielded exact
+    // arrival windows and an exact inbox count without the filter ever
+    // naming 1059 -- the gate answering the exact question it existed to
+    // refuse. Refusal leaks; omission does not, because omission returns
+    // the same thing whether or not the inbox holds anything.
+    //
+    // Deleting the probe also deletes it from the COMMON path: it ran on
+    // every REQ that omitted `kinds`, including the owner's own, and
+    // measured 141 rows read on a `#p` REQ at limit 20 against a
+    // 500-wrap inbox -- scaling with the filter's limit, since the probe
+    // had to look as far into the tag index as the REQ itself could.
+    //
+    // The owner lookup is now inside the authenticated branch, so an
+    // unauthenticated REQ -- every public read this relay serves -- pays
+    // neither the probe nor the owner's two rows.
+    const mayReadGiftWraps =
+      state.authedPubkey !== undefined && state.authedPubkey === getOwnerPubkey(this.sql, this.env);
+    if (!mayReadGiftWraps && filters.some((f) => f.kinds?.includes(GIFT_WRAP_KIND))) {
       if (state.authedPubkey === undefined) {
         if (!state.challenge) {
           state.challenge = crypto.randomUUID();
@@ -1252,45 +1361,41 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
-    state.subs[subId] = filters;
-    setState(ws, state);
+    // Registered only once it is known to fit. Subscriptions live in the
+    // WebSocket attachment so they survive hibernation, and that
+    // attachment has a hard 16KiB ceiling that serializeAttachment
+    // enforces by throwing -- which, for a filter big enough to reach it,
+    // meant the query ran, the events were sent, and then the connection
+    // took an uncaught exception instead of an EOSE. Every cap in
+    // limits.ts admitted `{"authors":[<400 keys>],"kinds":[1]}`, and it
+    // serializes to ~26KB.
+    //
+    // Checked against a copy, so a refusal leaves the connection exactly
+    // as it was -- a REQ that cannot be stored must not evict the
+    // subscriptions that could.
+    const next: ConnState = { ...state, subs: { ...state.subs, [subId]: filters } };
+    if (!stateFits(next)) {
+      send(ws, [
+        "CLOSED",
+        subId,
+        "invalid: filters are too large to hold open; name fewer authors or ids, " +
+          "and split the request across several REQs",
+      ]);
+      return;
+    }
+    setState(ws, next);
 
-    const events = queryFilters(this.sql, filters, nowSeconds()).slice(0, MAX_EVENTS_PER_REQ);
+    // The same rule this stored read applies is applied to the PUSH path
+    // by broadcast() below, which drops kind-1059 events for any socket
+    // not authenticated as the owner -- a subscription registered here
+    // stays open, so the two have to agree.
+    const events = queryFilters(this.sql, filters, nowSeconds(), {
+      excludeGiftWraps: !mayReadGiftWraps,
+    }).slice(0, MAX_EVENTS_PER_REQ);
     for (const event of events) {
       send(ws, ["EVENT", subId, event]);
     }
     send(ws, ["EOSE", subId]);
-  }
-
-  // Whether any filter in this REQ could surface a kind-1059 event.
-  // Answered from `kinds` alone where that settles it, and otherwise by
-  // re-running the filter against real storage restricted to gift wraps
-  // -- see the gate in handleReqInner for why the question is asked of
-  // storage rather than of the filter's shape.
-  //
-  // The probe's `limit` is the filter's own whenever the filter carries a
-  // tag condition, and 1 otherwise, and the difference is load-bearing
-  // rather than a tuning choice. filters.ts bounds a tag subquery to
-  // tagScanLimit(limit) rows, so how far a filter can reach into the tag
-  // index depends on its limit: probing `{"#p":[owner]}` at limit 1 would
-  // look at five tag rows and clear a REQ that goes on to read a hundred,
-  // and a gift wrap sitting anywhere past the fifth would be handed to an
-  // unauthenticated client. Probing at the same limit looks at exactly
-  // the rows the REQ itself can return. Every other filter shape is
-  // complete at any limit -- existence does not depend on it -- so 1 is
-  // still enough there, and the common kinds-less REQ keeps paying three
-  // rows for its gate.
-  private requestsGiftWraps(filters: Filter[], owner: string | null): boolean {
-    return filters.some((f) => {
-      if (f.kinds !== undefined) return f.kinds.includes(GIFT_WRAP_KIND);
-      if (owner === null) return false;
-      const limit = tagFilterEntries(f).length > 0 ? (f.limit ?? 1) : 1;
-      return withReadPath(
-        "giftWrapGate",
-        () =>
-          queryFilter(this.sql, { ...f, kinds: [GIFT_WRAP_KIND], limit }, nowSeconds()).length > 0,
-      );
-    });
   }
 
   private handleClose(ws: WebSocket, subId: unknown): void {

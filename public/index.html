@@ -424,17 +424,25 @@ function renderDiagnostics(stats) {
   // BACKFILL_ROWS_SHARE_LIMIT's sibling on the vanish side) -- there was
   // previously nowhere on this page it showed at all. Hidden entirely
   // when nothing is draining, which is the common case.
+  //
+  // A count and an age, never the pubkeys. /api/stats is public and
+  // unauthenticated, so itemising the requests here published the list of
+  // identities that had asked this relay to erase them -- and this page
+  // is the only consumer, which is why the endpoint could simply stop
+  // sending them. Everything a stalled drain looks like (it is still
+  // pending, and it has been pending since <date>) survives the change.
   const vanishing = stats.vanishing;
   const vanishingLabel = document.getElementById("diag-vanishing-label");
   const vanishingEl = document.getElementById("diag-vanishing");
-  vanishingLabel.hidden = vanishingEl.hidden = vanishing.length === 0;
-  if (vanishing.length > 0) {
-    vanishingEl.textContent = vanishing
-      .map((v) =>
-        v.pubkey.slice(0, 12) + "… (" + v.deletedSoFar.toLocaleString() + " deleted so far, requested " +
-        new Date(v.requestedAt * 1000).toLocaleDateString() + ")",
-      )
-      .join("; ");
+  vanishingLabel.hidden = vanishingEl.hidden = vanishing.pending === 0;
+  if (vanishing.pending > 0) {
+    vanishingEl.textContent =
+      vanishing.pending.toLocaleString() + (vanishing.pending === 1 ? " request" : " requests") +
+      " (" + vanishing.deletedSoFar.toLocaleString() + " deleted so far" +
+      (vanishing.oldestRequestedAt === null
+        ? ""
+        : ", oldest requested " + new Date(vanishing.oldestRequestedAt * 1000).toLocaleDateString()) +
+      ")";
   }
 
   // "<when> (pulls N events)" -- N is limits.ts BACKFILL_PAGE_SIZE, read
