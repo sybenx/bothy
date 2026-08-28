@@ -58,15 +58,26 @@ which carry about five single-letter tags each).
 ### Rows written, per stored event
 
 ```
-6 + 3 × (single-letter tag count)
+8 + 3 × (single-letter tag count)
 ```
 
 Six for the event row: one base row, one for the implicit unique index behind
 `id TEXT PRIMARY KEY` (a TEXT primary key is not a rowid alias), and one for each
-of the four declared indexes on `events`. Three per indexed tag row: the row and
-its two indexes. A bare note costs 6, a reply carrying `#e` and `#p` costs 12, a
-real note carrying about five tags costs 21. A delete is a write too, so a
-replacement or a NIP-09 deletion costs this shape again, plus 2 for a tombstone.
+of the four declared indexes on `events`. Two more for the maintained counters
+(`maintained_counts` and `event_hour_counts`, both unindexed or rowid-aliased, so one
+row apiece). Three per indexed tag row: the row and its two indexes. A bare note
+costs 8, a reply carrying `#e` and `#p` costs 14, a real note carrying about five
+tags costs 23. A delete is a write too, so a replacement or a NIP-09 deletion
+costs this shape again, plus 2 for a tombstone.
+
+The two counter rows are the price of `/api/stats` no longer scanning the table
+to report `totalEvents` and `events24h` — 2 rows written per event against
+~1,100 events/day here, so ~2,200 of 100,000, to remove a ~3E read that grew
+without bound. `schema.ts EVENT_COUNTER_ROW_COST` declares it and `eventRowCost`
+folds it in, so backfill's page sizing, the vanish drain's pacing and the admin
+page's budget bar all see it; a counter cost paid at the write site but hidden
+from those guards would be the same shape of error that made
+`estimateRowsWrittenSince` wrong by 45x.
 
 `schema.ts eventRowCost` derives this from `INDEXES` rather than restating it, so
 adding an index updates the admin page, backfill's headroom guard and
@@ -82,11 +93,14 @@ insert time so `estimateRowsWrittenSince` can sum a column.
 | REQ filter served by an index | combinations × (2 × limit + 1) |
 | Gift wrap gate probe, per filter, only when `kinds` is absent | 1–5 |
 | `estimateRowsWrittenSince` | bounded by today's ingest count, not E (`idx_events_ingested`) |
-| `/api/stats`, snapshot stale (recomputes) | ~3E |
-| `/api/stats`, live half stale (recomputes) | ~2 × today's ingest count |
-| `/api/stats`, both caches warm | ~8–12, independent of E and of the ingest window |
+| `totalEvents` + `followCount` (`readMaintainedCounts`) | 1 for the pair, maintained |
+| `events24h` (`countEvents24h`) | ≤ 26 bucket rows, maintained |
+| `followsListAt` | 1 |
+| `/api/stats`, live cache stale (recomputes) | ~2 × today's ingest count |
+| `/api/stats`, live cache warm | ~10–36, independent of E, F and of the ingest window |
+| `auditMaintainedCounts`, once a day | E + F (one scan of `events`, one of `follows`) |
 | Backfill tick | bounded by today's ingest count (headroom check) + ~2 per event in the page |
-| Live write, regular kind | 0–2 |
+| Live write, regular kind | 0–2, plus 2 for the counter updates |
 | Replaceable/addressable replacement | ~2 per tag on the replaced event |
 | NIP-62 vanish, per event removed | ~2 per tag on that event |
 | `giftWrapCount`, per gift wrap accepted | ~0 |
@@ -142,11 +156,60 @@ removing an event costs its tag rows, its own row and a tombstone.
 That is why vanish requests are checkpointed and drained across cron ticks rather
 than attempted inside the request — see `beginVanish`/`drainVanish`.
 
-The one path left that scales with E is the `/api/stats` snapshot recompute
-(~3E, `storage.ts computeStatsSnapshot`), and it stays gated behind
-`STATS_SNAPSHOT_MAX_AGE_MS` (six hours) precisely to keep it there: four
-refreshes a day is `12E`/day, which does not reach the 5,000,000 ceiling until
-**E ≈ 416,000**.
+The `/api/stats` snapshot recompute used to be the last path that scaled with E
+(~3E + 2F, gated to four refreshes a day behind `STATS_SNAPSHOT_MAX_AGE_MS` for
+`12E`/day). **It is gone, and so is the snapshot.** `totalEvents` and
+`followCount` are maintained counters in one `maintained_counts` row;
+`events24h` is per-`created_at`-hour buckets in `event_hour_counts` summed over
+at most 26 keys; `followsListAt` answers from `LIMIT 1`, since every row in
+`follows` carries the same value; and `largestNonOwnerAuthor`, an E-row
+`GROUP BY` answering a question nothing asked, was deleted. With nothing left
+that walked a table, `stats_snapshot`, `STATS_SNAPSHOT_MAX_AGE_MS`,
+`refreshStatsSnapshot` and its cron call were a mechanism rationing a cost that
+no longer existed, and were removed together.
+
+That is the general lesson, and it is why `limits.ts` records it where costs get
+priced: a TTL over an expensive read bounds how often you pay it, not what it
+costs, and it survives only as long as nobody makes the read cheap. Reach for the
+counter first and the clock second. `live_stats` is the one stats cache left,
+over the two figures that genuinely resist a counter — `ingested24h` would need a
+second bucket table keyed by ingest time (a third row written per event, for a
+diagnostic), and `rowsWrittenToday` is a sum over a window that empties at 00:00
+UTC, which no per-event increment expresses.
+
+Buckets rather than a scalar because `events24h` is a **rolling** window: an
+event leaves it by the clock moving, with nothing happening to the event, and no
+single counter can express that. Keyed by `created_at` and never by
+`ingested_at`, which is the whole subtlety — a backfilled note signed in 2021 and
+stored this morning belongs in a 2021 bucket, and incrementing "the current hour"
+on arrival would have made a backfill look like a posting spree, the mirror image
+of the bug `ingested_at` exists to fix. The window is whole hours, so it spans
+24–25h rather than exactly 24; it replaced a figure exact to the second and up to
+six hours stale, so the number moved closer to the truth, not further.
+
+The one path that still scales with E is `storage.ts auditMaintainedCounts`, and
+it is deliberate: once a day the cron tick recounts `events` in a single scan and
+`follows` beside it, and logs loudly if any counter disagrees. **Detect only — it
+never repairs.** A
+counter that silently corrects itself erases the evidence of whatever broke it,
+so the drift returns on the next occurrence and is swallowed again, and the only
+symptom is a number quietly wrong between repairs. E + F once a day, against the
+`12E + 8F`/day the snapshot spent assuming these same numbers, is a quarter of
+the cost for an answer that is checked rather than assumed.
+
+A maintained count is only correct if nothing can change the counted table
+without passing the counter, and each holds structurally. For `events`:
+`storage.ts insertEventRow` and `deleteEventRow` are the only two functions in
+the codebase that write to it, the counter writes sit inside them rather than
+beside their callers, and every removal path — replaceable replacement, NIP-09,
+NIP-62 vanish, NIP-86 `banevent` — reaches them. `deleteEventRow` reads the row's
+`created_at` itself rather than taking it from the caller, because `banEvent` can
+be handed an id that was never stored and must not decrement a bucket for it. For
+`follows`: `ownership.ts refreshFollows` is the only function that writes it, and
+the counter moves in each of its two write branches — the rebuild and the clear —
+rather than at the function's exit, which two early returns on the common path
+would otherwise skip. That a refresh finding an unchanged contact list writes zero
+rows, counter included, is asserted in `test/follows.test.ts`.
 
 The rest of `/api/stats` scaled with something else, and closing it took a
 second cache beside the snapshot. `ingested24h` and `rowsWrittenToday` both seek
@@ -169,12 +232,17 @@ D ≤ 2,315 events/day before the floor alone reaches the ceiling, which a
 backfilling relay exceeds; at 300s it admits D ≤ 11,574, above anything the
 100,000 rows-written ceiling permits this relay to ingest. A warm load
 costs 8 rows measured (`test/read-cost.test.ts`), so the endpoint went from
-~4,100 loads/day to ~387,000. In a row and not in memory for the reason
-`stats_snapshot` is: a flood keeps the object awake, but pacing one request
-every ten seconds misses an in-memory cache every time and still reaches
-twice the ceiling. Hourly bucket counters are the better long-term shape —
-one row written per event, windowed sums reading at most 24 rows, no
-staleness — and are the next step if the cache stops being enough.
+~4,100 loads/day to ~387,000. In a row and not in memory for the reason the
+`stats_snapshot` cache beside it was: a flood keeps the object awake, but
+pacing one request every ten seconds misses an in-memory cache every time
+and still reaches twice the ceiling. Hourly bucket counters are the better
+shape where they fit — one row written per event, windowed sums reading at
+most 26 rows, no staleness — and `events24h` is now exactly that. It does
+not fit these two: `ingested24h` would need a second bucket table keyed by
+ingest time, a third row written per event for a diagnostic, and
+`rowsWrittenToday` is a sum over a window that empties at 00:00 UTC, which
+no per-event increment expresses. So these stay cached and this is the one
+stats cache left.
 
 Traffic-driven paths are bounded by `limits.ts boundFilter`, which admits a REQ
 filter only at a limit some index can afford, and by the per-IP message throttle
@@ -202,8 +270,8 @@ The per-request cost of each HTTP path, after the pass that added it:
 | Path | Reaches the DO? | Outbound? | Rows read | Per-IP limit |
 |---|---|---|---|---|
 | `GET /` and other static assets | no | no | 0 | none — free and unmetered |
-| `GET /api/stats`, both caches warm | yes | no | ~8–12 | 60/min |
-| `GET /api/stats`, a cache stale | yes | no | ~3E or ~2 × today's ingest | 60/min |
+| `GET /api/stats`, live cache warm | yes | no | ~10–36 | 60/min |
+| `GET /api/stats`, live cache stale | yes | no | ~2 × today's ingest | 60/min |
 | `POST /api/claim`, `OWNER_PUBKEY` set | **no** | **no** | 0 | 60/min |
 | `POST /api/claim`, malformed pubkey | no | no | 0 | 60/min |
 | `POST /api/claim`, already claimed | yes | **no** | 1–2 | 60/min |
@@ -278,9 +346,10 @@ usefully — what it structurally cannot do.
   per-connection subscription cap and a per-IP message throttle. On the HTTP
   side, Cloudflare's Rate Limiting binding bounds every path that wakes the
   Durable Object, per IP, before the Worker's code runs; underneath it
-  `/api/stats` is still defended by cost, with both halves cached in rows
-  (`stats_snapshot`, `live_stats`) so the recompute rate is set by two TTLs
-  rather than by the request rate.
+  `/api/stats` is still defended by cost. Every count it reports is maintained
+  rather than computed, so no request walks a table at all; the two figures that
+  resist a counter are cached in a row (`live_stats`) so their recompute rate is
+  set by a TTL rather than by the request rate.
 - **Being made into an amplifier.** `/api/profile` is the only path whose cost
   lands on somebody else's infrastructure — two outbound WebSockets to
   well-known relays per uncached miss. It is scoped to the pre-claim window,
@@ -312,8 +381,8 @@ usefully — what it structurally cannot do.
   calls, so an ex-follow keeps both their stored events and the ability to
   trigger it. Cost is the only available control, which is why
   `idx_event_tags_event` exists and why the drain is checkpointed. `/api/stats`
-  reports the largest number of events any single non-owner pubkey holds, since
-  that is the worst case a given deployment is actually exposed to.
+  reports vanish requests still draining, so a stalled one is visible rather
+  than inferred.
 - **Anyone reading anything that is not a gift wrap.** There is no read
   authentication and none is planned; a personal relay's contents are as public
   as the notes in it.
@@ -336,7 +405,7 @@ usefully — what it structurally cannot do.
 - [src/index.ts](src/index.ts) — Worker entry: routing, `/api/*`, `scheduled()` cron dispatch.
 - [src/relay.ts](src/relay.ts) — the `Relay` Durable Object: connection lifecycle, NIP-01 message handling, live feed, alarm.
 - [src/relay-stub.ts](src/relay-stub.ts) — the one `idFromName("relay")` accessor, shared so nothing else can shard it.
-- [src/storage.ts](src/storage.ts) / [src/schema.ts](src/schema.ts) — SQLite schema and all read/write queries, including the row-cost accounting. `events.ingested_at` is wall-clock write time and must never be conflated with `created_at`: rows-written accounting and backfill's headroom guard both measure `ingested_at`, because a backfilled event's `created_at` is years old and measuring that made backfill's own writes invisible to the guard restraining them. A column, not a counter table — a counter costs a row write per event, a column costs nothing. The same argument added `events.row_cost` in v0.7.2: each event's rows-written cost is stamped at insert time so `estimateRowsWrittenSince` sums a column instead of rebuilding the figure from a `LEFT JOIN event_tags` with no index behind it, which read every tag row in the table to answer a question about the 24h window. See CLAUDE.md "The budget".
+- [src/storage.ts](src/storage.ts) / [src/schema.ts](src/schema.ts) — SQLite schema and all read/write queries, including the row-cost accounting. `events.ingested_at` is wall-clock write time and must never be conflated with `created_at`: rows-written accounting and backfill's headroom guard both measure `ingested_at`, because a backfilled event's `created_at` is years old and measuring that made backfill's own writes invisible to the guard restraining them. A column, not a counter table — a counter costs a row write per event, a column costs nothing. The same argument added `events.row_cost` in v0.7.2: each event's rows-written cost is stamped at insert time so `estimateRowsWrittenSince` sums a column instead of rebuilding the figure from a `LEFT JOIN event_tags` with no index behind it, which read every tag row in the table to answer a question about the 24h window. The same argument runs the other way for `maintained_counts`/`event_hour_counts`, which DO pay a row write per event: there the alternative was a read that grew without bound, so 2 fixed rows against an event already costing 6 to 21 is the cheaper side. See CLAUDE.md "The budget".
 - [src/filters.ts](src/filters.ts) — REQ filter parsing, SQL query building, in-memory match testing for live broadcast, and `expandFilter`, which splits one filter into the cross-product of its `authors` × `kinds` singletons. That split is what lets an index serve `ORDER BY created_at DESC LIMIT n`: a key column pinned to one value arrives sorted, `kind IN (1, 7)` does not, so a multi-kind filter defeats an index as thoroughly as no index at all. `storage.ts queryFilter` re-merges and re-slices to `limit`, so the split is invisible on the wire.
 - [src/nostr.ts](src/nostr.ts) — wire types and kind-range classifiers (replaceable/ephemeral/addressable).
 - [src/validate.ts](src/validate.ts) — event id computation and schnorr signature verification (`@noble/curves`).

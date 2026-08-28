@@ -8,7 +8,13 @@ import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers
 import { refreshFollows } from "../src/ownership";
 import { profileCacheSize, resetProfileCache } from "../src/profile-lookup";
 import type { Relay } from "../src/relay";
-import { readLiveStats, readStatsSnapshot } from "../src/storage";
+import {
+  auditMaintainedCounts,
+  countEvents24h,
+  readLiveStats,
+  readMaintainedCounts,
+} from "../src/storage";
+import { forgetSchemaHash, initSchema } from "../src/schema";
 import { connectRelay, publish } from "./helpers/socket";
 import { version } from "../package.json";
 import {
@@ -170,76 +176,229 @@ describe("admin page fallback", () => {
   });
 });
 
-// The vanish exposure signal (v0.7.3). A NIP-62 vanish removes every
-// event its sender authored, the relay cannot refuse one, and the cost
-// scales with how many that is -- so the worst case a deployment is
-// exposed to is the largest number of events any single non-owner pubkey
-// holds. Reported rather than assumed.
-describe("largestNonOwnerAuthor", () => {
-  it("is null when nobody but the owner has written anything", async () => {
+// The maintained event counters (schema.ts `event_counts` and
+// `event_hour_counts`). `totalEvents` and `events24h` are no longer counted
+// per request; they are moved by storage.ts insertEventRow and
+// deleteEventRow, the only two functions in the codebase that write to
+// `events`.
+//
+// That single-choke-point property is the entire safety argument for a
+// maintained count, so it is asserted here rather than described: every
+// removal path in the relay -- replaceable replacement, NIP-09, NIP-62
+// vanish, NIP-86 banevent -- has to bring the counters back down, and a
+// path that grew its own DELETE would fail these.
+describe("maintained event counters", () => {
+  const fetchCounts = async () =>
+    (await (await exports.default.fetch("https://example.com/api/stats")).json()) as {
+      totalEvents: number;
+      events24h: number;
+    };
+
+  it("counts a stored event, and counts it in the 24h window by created_at", async () => {
     const conn = await connectRelay();
-    await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "owner only" }));
+    await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "one" }));
+    await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "two" }));
     conn.close();
 
-    const response = await exports.default.fetch("https://example.com/api/stats");
-    const body = (await response.json()) as { largestNonOwnerAuthor: unknown };
-    expect(body.largestNonOwnerAuthor).toBeNull();
+    const body = await fetchCounts();
+    expect(body.totalEvents).toBe(2);
+    expect(body.events24h).toBe(2);
   });
 
-  it("names the non-owner pubkey holding the most events, and how many", async () => {
+  it("keeps a backfill-aged event out of the 24h window while still counting it", async () => {
+    // The wrinkle the bucket table exists for. `events24h` counts by
+    // `created_at`, so an event signed years ago and stored this morning
+    // belongs to a years-old bucket -- incrementing "the current hour" on
+    // arrival would have made a backfill look like a posting spree. This
+    // is the mirror image of the bug `ingested_at` exists to fix, and the
+    // reason the two windows need two different mechanisms.
+    const conn = await connectRelay();
+    const old = Math.floor(Date.now() / 1000) - 400 * 86400;
+    await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "old", created_at: old }));
+    await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "new" }));
+    conn.close();
+
+    const body = await fetchCounts();
+    expect(body.totalEvents).toBe(2);
+    expect(body.events24h).toBe(1);
+  });
+
+  it("decrements when a replaceable event is replaced", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const conn = await connectRelay();
+    await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 0, content: "{}", created_at: now }));
+    await publish(
+      conn,
+      signEvent(OWNER_SECRET_KEY_HEX, { kind: 0, content: '{"name":"a"}', created_at: now + 10 }),
+    );
+    conn.close();
+
+    // Two events published, one row standing: the replacement removed the
+    // first through deleteEventRow, so both counters must show one.
+    const body = await fetchCounts();
+    expect(body.totalEvents).toBe(1);
+    expect(body.events24h).toBe(1);
+  });
+
+  it("decrements on a NIP-09 deletion", async () => {
+    const conn = await connectRelay();
+    const target = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "delete me" });
+    await publish(conn, target);
+    await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 5, tags: [["e", target.id]] }));
+    conn.close();
+
+    // The kind-5 deletion request is itself stored, so one row goes and
+    // one arrives: the total stays at 1 rather than dropping to 0, and
+    // that is the correct answer rather than a wash that hides a bug --
+    // the next test removes the deletion request too.
+    const body = await fetchCounts();
+    expect(body.totalEvents).toBe(1);
+  });
+
+  it("decrements on a NIP-86 banevent, and not for an id that was never stored", async () => {
     const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
-    const heavy = randomKeypair();
-    const light = randomKeypair();
+    const conn = await connectRelay();
+    const target = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "ban me" });
+    await publish(conn, target);
+    conn.close();
+
+    expect((await fetchCounts()).totalEvents).toBe(1);
+
+    await runInDurableObject(stub, (instance: Relay) =>
+      instance.manage("banevent", [target.id, "spam"], "1.2.3.4"),
+    );
+    expect((await fetchCounts()).totalEvents).toBe(0);
+
+    // banevent tombstones an id whether or not it is stored, which is the
+    // one caller of deleteEventRow that can be handed an id with no row
+    // behind it. It must not decrement for one -- which is why the
+    // created_at lookup lives inside deleteEventRow rather than being
+    // passed in by callers that happen to know it.
+    await runInDurableObject(stub, (instance: Relay) =>
+      instance.manage("banevent", ["a".repeat(64), "never stored"], "1.2.3.4"),
+    );
+    expect((await fetchCounts()).totalEvents).toBe(0);
+  });
+
+  it("seeds once from a real count, and never recounts after that", async () => {
+    // The migration in schema.ts seedMaintainedCounts. A relay that has been
+    // running for months must not start from zero -- and, just as
+    // importantly, must not re-seed on the next schema change, because a
+    // recount would silently repair drift that auditEventCounters is
+    // supposed to report.
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
     const now = Math.floor(Date.now() / 1000);
 
     await runInDurableObject(stub, async (_instance, state) => {
       const sql = state.storage.sql;
-      const insert = (id: string, pubkey: string, kind: number) =>
+      // Pre-counter rows, inserted the way an older deployment left them.
+      sql.exec(`DELETE FROM maintained_counts`);
+      sql.exec(`DELETE FROM event_hour_counts`);
+      for (let i = 0; i < 4; i++) {
         sql.exec(
           `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost)
-           VALUES (?, ?, ?, ?, '[]', 'x', 's', NULL, ?, 5)`,
-          id, pubkey, now, kind, now,
+           VALUES (?, 'p', ?, 1, '[]', 'x', 's', NULL, ?, 6)`,
+          `s${i}`.padStart(64, "0"),
+          now,
+          now,
         );
-      for (let i = 0; i < 7; i++) insert(`h${i}`.padStart(64, "0"), heavy.pubkeyHex, 1);
-      for (let i = 0; i < 2; i++) insert(`l${i}`.padStart(64, "0"), light.pubkeyHex, 1);
-      // Gift wraps are excluded: every one is signed by a fresh one-time
-      // key (NIP-59), so counting them would report a crowd of pubkeys
-      // holding one event each and bury the number being looked for.
-      for (let i = 0; i < 50; i++) insert(`g${i}`.padStart(64, "0"), randomKeypair().pubkeyHex, 1059);
-    });
+      }
+      forgetSchemaHash(sql);
+      initSchema(sql);
+      expect(readMaintainedCounts(sql).events).toBe(4);
+      expect(countEvents24h(sql, now)).toBe(4);
 
-    const response = await exports.default.fetch("https://example.com/api/stats");
-    const body = (await response.json()) as {
-      largestNonOwnerAuthor: { pubkey: string; events: number } | null;
-    };
-    expect(body.largestNonOwnerAuthor?.pubkey).toBe(heavy.pubkeyHex);
-    expect(body.largestNonOwnerAuthor?.events).toBe(7);
+      // A second reconcile pass -- what a later schema change causes --
+      // must leave the counters exactly where they are, even after they
+      // have been made wrong on purpose.
+      sql.exec(`UPDATE maintained_counts SET events = 99`);
+      forgetSchemaHash(sql);
+      initSchema(sql);
+      expect(readMaintainedCounts(sql).events).toBe(99);
+    });
+  });
+
+  it("logs a drift it cannot have caused, and does not repair it", async () => {
+    // Detect only. A counter that repairs itself erases the evidence of
+    // whatever broke it: the drift returns on the next occurrence of the
+    // same bug and is swallowed again, and the only symptom is a number
+    // that is quietly wrong between repairs.
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    const conn = await connectRelay();
+    await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "drift" }));
+    conn.close();
+
+    const errors: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => errors.push(args.join(" "));
+    try {
+      await runInDurableObject(stub, async (_instance, state) => {
+        const sql = state.storage.sql;
+        sql.exec(`UPDATE maintained_counts SET events = 41, audited_at = NULL`);
+        auditMaintainedCounts(sql, Math.floor(Date.now() / 1000));
+        // Logged, and left wrong.
+        expect(readMaintainedCounts(sql).events).toBe(41);
+      });
+    } finally {
+      console.error = original;
+    }
+    expect(errors.join("\n")).toContain("MAINTAINED COUNT DRIFT");
+  });
+
+  it("audits at most once a day", async () => {
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    const now = Math.floor(Date.now() / 1000);
+    const conn = await connectRelay();
+    await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "paced" }));
+    conn.close();
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      auditMaintainedCounts(sql, now);
+      const first = sql
+        .exec<{ audited_at: number | null }>(`SELECT audited_at FROM maintained_counts`)
+        .toArray()[0]?.audited_at;
+      expect(first).toBe(now);
+
+      // An hour later is not a day later: the recount is an E-row scan and
+      // the cron fires hourly, so pacing it by the data rather than by the
+      // tick is what keeps it at E/day instead of 24E/day.
+      auditMaintainedCounts(sql, now + 3600);
+      expect(
+        sql.exec<{ audited_at: number | null }>(`SELECT audited_at FROM maintained_counts`).toArray()[0]
+          ?.audited_at,
+      ).toBe(now);
+
+      auditMaintainedCounts(sql, now + 86400);
+      expect(
+        sql.exec<{ audited_at: number | null }>(`SELECT audited_at FROM maintained_counts`).toArray()[0]
+          ?.audited_at,
+      ).toBe(now + 86400);
+    });
   });
 });
 
-// The counts above are served from a row (schema.ts `stats_snapshot`)
-// rather than recomputed per request, and the tests in this block are
-// about that arrangement rather than about any individual number.
+// The one cache left on /api/stats (schema.ts `live_stats`), and the tests
+// in this block are about that arrangement rather than about any
+// individual number.
 //
-// It replaced a 15-second in-memory cache that measurement showed
-// essentially never hit: the Durable Object hibernates between admin page
-// visits, in-memory state does not survive eviction, and two page loads
-// on the live relay produced two full 17,601-row scans and zero cache
-// hits. Storage is the only state in this object that outlives
-// hibernation, so a cache spanning page loads has to live there.
-//
-// Every test above this point passes precisely because isolateStorage()
-// clears that row between tests, which is worth stating: the fresh
-// numbers they assert on are the "no snapshot yet, compute one" path,
-// and the ones below are the "snapshot exists" path.
-describe("/api/stats snapshot", () => {
+// It had a companion, `stats_snapshot`, on a six-hour clock over the
+// counts that walked a table -- itself a replacement for a 15-second
+// in-memory cache that measurement showed essentially never hit, since
+// the Durable Object hibernates between admin page visits. Both are gone:
+// every field that cache held is a maintained counter now or deleted, so
+// there was a TTL, a table, a refresh function and a cron call rationing
+// a cost that no longer existed. What is asserted below is that the
+// SURVIVING cache still behaves, and that nothing else on the document
+// answers to a clock any more.
+describe("/api/stats live cache", () => {
   const stub = () => env.RELAY.get(env.RELAY.idFromName("relay"));
 
   const fetchStats = async () =>
     (await (await exports.default.fetch("https://example.com/api/stats")).json()) as {
-      snapshotAt: number;
       liveAt: number;
       totalEvents: number;
+      followCount: number;
       ingested24h: number;
       rowsWrittenToday: number;
     };
@@ -247,28 +406,29 @@ describe("/api/stats snapshot", () => {
   // Nothing in production clears this row -- it expires on its own after
   // limits.ts LIVE_STATS_MAX_AGE_MS, and adding a method so a test could
   // clear it would be inventing a code path. Dropped through storage
-  // directly instead, the same exception test/read-cost.test.ts already
-  // takes for `stats_snapshot`.
+  // directly instead, the same exception test/read-cost.test.ts documents
+  // for its own fixtures.
   const expireLiveStats = async () =>
     runInDurableObject(stub(), async (_instance: Relay, state) => {
       state.storage.sql.exec(`DELETE FROM live_stats`);
     });
 
-  it("dates the snapshotted counts so their age is stated, not assumed", async () => {
+  it("dates the cached figures so their age is stated, not assumed", async () => {
     const conn = await connectRelay();
     await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "dated" }));
     conn.close();
 
     const body = await fetchStats();
-    // Some fields on this document are up to
-    // limits.ts STATS_SNAPSHOT_MAX_AGE_MS old and the rest are current.
-    // A consumer that cannot tell which is which has to assume the whole
-    // document describes one instant, and it does not.
-    expect(body.snapshotAt).toBeGreaterThan(0);
-    expect(body.snapshotAt).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 1);
+    // Two fields on this document are up to LIVE_STATS_MAX_AGE_MS old and
+    // every other one is current. A consumer that cannot tell which is
+    // which has to assume the whole document describes one instant, and
+    // it does not. There used to be a second age here, `snapshotAt`;
+    // it went with the cache it dated.
+    expect(body.liveAt).toBeGreaterThan(0);
+    expect(body.liveAt).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 1);
   });
 
-  it("holds both cached halves steady between requests, on their own two clocks", async () => {
+  it("holds the cached figures steady between requests while the counters move", async () => {
     const conn = await connectRelay();
     await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "first" }));
     conn.close();
@@ -281,13 +441,12 @@ describe("/api/stats snapshot", () => {
 
     const after = await fetchStats();
 
-    // The trade, asserted rather than described. `totalEvents` is a count
-    // over `events` and costs O(E) to produce, so it is snapshotted and
-    // does not move until the snapshot is older than
-    // STATS_SNAPSHOT_MAX_AGE_MS. An hour-old event count on a dashboard
-    // is fine; a full table scan per page load is not.
-    expect(after.totalEvents).toBe(before.totalEvents);
-    expect(after.snapshotAt).toBe(before.snapshotAt);
+    // `totalEvents` used to be THE example of a snapshotted figure here:
+    // a count over `events` costing O(E), cached for six hours, so a page
+    // load could legitimately show a stale number. It is a maintained
+    // counter now, so it tracks the second event immediately and the
+    // staleness that had to be traded for is simply gone.
+    expect(after.totalEvents).toBe(before.totalEvents + 1);
 
     // The write-budget meter holds still too, and used to be the
     // counter-example here: it was read live precisely because an owner
@@ -296,7 +455,8 @@ describe("/api/stats snapshot", () => {
     // nothing in front of it -- ~4,100 requests to spend the entire
     // 5,000,000/day rows-read allowance. The concession to what it is
     // for is the CLOCK, not an exemption: five minutes
-    // (LIVE_STATS_MAX_AGE_MS) against the snapshot's six hours.
+    // (LIVE_STATS_MAX_AGE_MS), and it is the only clock left on this
+    // document.
     expect(after.ingested24h).toBe(before.ingested24h);
     expect(after.rowsWrittenToday).toBe(before.rowsWrittenToday);
     expect(after.liveAt).toBe(before.liveAt);
@@ -307,20 +467,6 @@ describe("/api/stats snapshot", () => {
     const refreshed = await fetchStats();
     expect(refreshed.ingested24h).toBe(before.ingested24h + 1);
     expect(refreshed.rowsWrittenToday).toBeGreaterThan(before.rowsWrittenToday);
-    // The snapshotted half is untouched by any of that -- two caches,
-    // two clocks, one document. `liveAt` and `snapshotAt` are both
-    // reported so a consumer can tell which age applies to which field.
-    expect(refreshed.snapshotAt).toBe(before.snapshotAt);
-  });
-
-  it("dates the live figures separately from the snapshotted ones", async () => {
-    const conn = await connectRelay();
-    await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "two ages" }));
-    conn.close();
-
-    const body = await fetchStats();
-    expect(body.liveAt).toBeGreaterThan(0);
-    expect(body.liveAt).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 1);
   });
 
   it("discards a cached write-budget figure measured from a previous UTC day", async () => {
@@ -371,48 +517,47 @@ describe("/api/stats snapshot", () => {
     expect(row?.budgetSince).toBe(utcDayStartSeconds(Date.now()));
   });
 
-  it("computes the snapshot on a cron tick, so a page load does not have to", async () => {
+  it("leaves no snapshot table behind for a cron tick to fill", async () => {
+    // The cron tick used to refresh `stats_snapshot` so an admin page load
+    // would find one already computed and pay nothing for it. There is
+    // nothing to precompute now: a stats request reads one
+    // `maintained_counts` row and at most 26 buckets, which is cheaper
+    // than the cache read the snapshot itself cost. The table is dropped
+    // by initSchema (schema.ts), so this asserts its absence rather than
+    // its contents.
     const conn = await connectRelay();
     await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "cron" }));
     conn.close();
 
-    // No snapshot yet: the relay has served no stats request. This is the
-    // state of a freshly deployed relay, and the cron tick is what is
-    // supposed to fill it so the first admin page load costs nothing.
-    await runInDurableObject(stub(), async (_instance, state) => {
-      expect(readStatsSnapshot(state.storage.sql)).toBeNull();
-    });
-
     await runInDurableObject(stub(), (instance: Relay) => instance.runCron());
 
     await runInDurableObject(stub(), async (_instance, state) => {
-      const row = readStatsSnapshot(state.storage.sql);
-      expect(row?.totalEvents).toBe(1);
-      expect(row?.events24h).toBe(1);
+      const present = state.storage.sql
+        .exec<{ name: string }>(
+          `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'stats_snapshot'`,
+        )
+        .toArray();
+      expect(present).toEqual([]);
     });
   });
 
-  it("does not recompute on a cron tick while the snapshot is still fresh", async () => {
-    // The gate that makes the cadence a bound rather than a hope. An
-    // hourly cron recomputing ~3E rows read every tick would be 72E rows
-    // read per day with nobody watching -- larger than the 48E cron floor
-    // v0.7.6 removed by indexing `ingested_at`, which would have been a
-    // trade in the wrong direction. See limits.ts
-    // STATS_SNAPSHOT_MAX_AGE_MS for the arithmetic.
+  it("does not cache the maintained counts behind any clock", async () => {
+    // What replaced the two cron tests that used to sit here: they
+    // asserted that a fresh snapshot was NOT recomputed, which was the
+    // whole value of the six-hour gate. The property now is the opposite
+    // and stronger -- every count is current on every request, with no
+    // gate to outrun.
+    const before = await fetchStats();
+
     const conn = await connectRelay();
-    await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "fresh" }));
+    await publish(conn, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "immediate" }));
     conn.close();
 
-    const first = await fetchStats();
+    const after = await fetchStats();
+    expect(after.totalEvents).toBe(before.totalEvents + 1);
 
-    const conn2 = await connectRelay();
-    await publish(conn2, signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "later" }));
-    conn2.close();
-
-    await runInDurableObject(stub(), (instance: Relay) => instance.runCron());
-
-    const second = await fetchStats();
-    expect(second.snapshotAt).toBe(first.snapshotAt);
-    expect(second.totalEvents).toBe(first.totalEvents);
+    await runInDurableObject(stub(), async (_instance, state) => {
+      expect(readMaintainedCounts(state.storage.sql).events).toBe(after.totalEvents);
+    });
   });
 });

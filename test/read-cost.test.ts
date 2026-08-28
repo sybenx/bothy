@@ -43,7 +43,7 @@ import {
   TAG_ROWS_READ_PER_MATCH,
 } from "../src/limits";
 import type { Filter } from "../src/nostr";
-import { queryFilter, readLiveStats, readStatsSnapshot } from "../src/storage";
+import { queryFilter, readLiveStats, readMaintainedCounts } from "../src/storage";
 import { readMetricsSnapshot, resetReadMetrics } from "../src/read-metrics";
 import type { Relay } from "../src/relay";
 import { signEvent } from "./helpers/event";
@@ -638,7 +638,56 @@ describe("read attribution", () => {
     expect(stats.reads.paths.map((p) => p.path)).toContain("getStats");
   });
 
-  it("serves a second /api/stats load without rescanning `events`", async () => {
+  it("bounds the events24h window read at 26 rows however deep the history", async () => {
+    // The claim the bucket table exists to make, and the one an absolute
+    // "less than 36" bound elsewhere in this file cannot make on its own:
+    // the cost of `events24h` is set by the WINDOW, not by how much
+    // history the relay holds or how busy it has been.
+    //
+    // Seeded with a bucket per hour across five years -- 43,800 rows in
+    // `event_hour_counts`, far more than any fixture here puts in
+    // `events` -- so a read that scanned the table would be unmistakable.
+    // Inserted straight into the counter table for the same reason the
+    // rest of this file inserts straight into `events`: reaching this
+    // shape through the protocol would take five years of signatures, and
+    // nothing about the read cost depends on how the rows got there.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const nowSec = Math.floor(Date.now() / 1000);
+      const nowBucket = Math.trunc(nowSec / 3600);
+      const HOURS = 5 * 365 * 24;
+      for (let i = 1; i <= HOURS; i++) {
+        sql.exec(
+          `INSERT INTO event_hour_counts (hour, n) VALUES (?, 1)
+             ON CONFLICT(hour) DO UPDATE SET n = n + 1`,
+          nowBucket - i,
+        );
+      }
+
+      const cost = rowsRead(
+        sql,
+        `SELECT SUM(n) AS n FROM event_hour_counts WHERE hour >= ?`,
+        Math.trunc((nowSec - 86400) / 3600),
+      );
+      const total = rowsRead(sql, `SELECT SUM(n) AS n FROM event_hour_counts`);
+
+      console.log(`MEASURED events24h window=${cost} allBuckets=${total} buckets=${HOURS}`);
+      // 26 keys at most: the bucket holding (now - 86400) up to the one
+      // an hour ahead of now, which limits.ts MAX_CREATED_AT_FUTURE_SECONDS
+      // makes the highest reachable. `hour INTEGER PRIMARY KEY` is a rowid
+      // alias, so this is a range seek over consecutive integers.
+      expect(cost).toBeLessThanOrEqual(26);
+      // The same query without the range reads every bucket, which is
+      // what "bounded by the window" is being asserted against.
+      expect(total).toBeGreaterThanOrEqual(HOURS);
+
+      // Left clean for whatever runs next -- this fixture's buckets would
+      // otherwise show up in another test's counts.
+      sql.exec(`DELETE FROM event_hour_counts WHERE hour < ?`, nowBucket);
+    });
+  });
+
+  it("never scans `events` to serve /api/stats", async () => {
     // The counts behind /api/stats were memoized in memory for 15
     // seconds (relay.ts statsCache), and measured on the live relay that
     // cache essentially never hit: the Durable Object hibernates between
@@ -648,18 +697,19 @@ describe("read attribution", () => {
     // lifetime is shorter than the gap between the requests it exists to
     // serve is not a cache.
     //
-    // It is now the `stats_snapshot` row (schema.ts), which is storage
-    // and so outlives eviction by construction. This test can only
-    // observe the in-process half of that, so it asserts the part it can
-    // see -- the second load does not rescan -- and the assertion below
-    // it covers the part that made the old arrangement fail.
-    // Tests in this file share one Durable Object and earlier ones have
-    // already loaded /api/stats, so the snapshot has to be cleared for
-    // "first load" to mean anything. Dropped through storage rather than
-    // through any relay API: nothing in production deletes this row, and
-    // adding a method so a test could would be inventing a code path.
-    await runInDurableObject(stub(), async (_instance: Relay, state) => {
-      state.storage.sql.exec(`DELETE FROM stats_snapshot`);
+    // It became the `stats_snapshot` row, which outlives eviction and
+    // bounded the scan to four times a day instead of once a load. This
+    // test asserted that: a cold load cost ~3E, a warm one ~17.
+    //
+    // It does not assert it any more, because the scan is gone and so is
+    // the cache. Every O(E) or O(F) field that row held is a maintained
+    // counter now (`totalEvents`, `events24h`, `followCount`), answered
+    // from one row (`followsListAt`), or deleted
+    // (`largestNonOwnerAuthor`). There is no cold state left to
+    // distinguish from a warm one: EVERY load costs what the warm one
+    // used to, and the claim is therefore stronger than the one it
+    // replaces and needs no cache to hold it up.
+    await runInDurableObject(stub(), async () => {
       resetReadMetrics();
     });
 
@@ -671,19 +721,19 @@ describe("read attribution", () => {
     const second = await runInDurableObject(stub(), async () => readMetricsSnapshot());
     const secondCost = (second.paths.find((p) => p.path === "getStats")?.rowsRead ?? 0) - firstCost;
 
-    // Measured at E = 1,000: 3,019 to compute a snapshot, 17 to read one
-    // back. The second figure is the one that matters, and what matters
-    // about it is that it contains no term in E.
+    console.log(`MEASURED stats first=${firstCost} secondDelta=${secondCost} E=${EVENTS}`);
 
-    // The first load has no snapshot to read and computes one: ~3E.
-    expect(firstCost).toBeGreaterThan(EVENTS);
-    // The second reads it back. What it still pays is the live half --
-    // the snapshot row, the owner and settings rows, the backfill tables,
-    // pendingVanishes, recordHost -- all of which are bounded by their
-    // own table sizes and none of which is proportional to E. The whole
-    // point is that this number does not grow with the relay.
-    console.log(`MEASURED stats first=${firstCost} secondDelta=${secondCost}`);
+    // Both loads, and they should now be the same number: there is no
+    // cache to warm. What each pays is the counter row, at most 26 bucket
+    // rows, the follows row, the owner and settings rows, the backfill
+    // tables, pendingVanishes and recordHost -- every one bounded by its
+    // own table size and none of them proportional to E.
+    expect(firstCost).toBeLessThan(100);
     expect(secondCost).toBeLessThan(100);
+    // Stated against E as well, because a bound of 100 would pass on a
+    // relay that happened to hold nothing. At E = 1,000 a cold load that
+    // still scanned would be three orders of magnitude above this.
+    expect(firstCost).toBeLessThan(EVENTS / 10);
   });
 
   it("does not bill the ingest window to every /api/stats request", async () => {
@@ -720,11 +770,11 @@ describe("read attribution", () => {
             sql.exec(`UPDATE events SET ingested_at = ? WHERE id = ?`, now - 100, id);
           }
         }
-        // Both caches cleared, not just the live one: a cold snapshot
-        // would otherwise add its own ~3E to the first load and bury the
-        // figure being measured.
+        // Only one cache left to clear. There used to be a second, and a
+        // cold `stats_snapshot` would add its own ~3E to the first load
+        // and bury the figure being measured; every field it held is a
+        // maintained counter now or deleted.
         sql.exec(`DELETE FROM live_stats`);
-        sql.exec(`DELETE FROM stats_snapshot`);
         resetReadMetrics();
       });
 
@@ -768,8 +818,16 @@ describe("read attribution", () => {
       // reads back, and no term in the window at all. This is the
       // property -- a page load costs a bounded small number of rows no
       // matter how many arrive.
-      expect(second).toBeLessThan(10);
-      expect(third).toBeLessThan(10);
+      //
+      // Measured at 10, up from 8 when this bound was written: the two
+      // maintained counters added one row for `maintained_counts` and one for
+      // the single `event_hour_counts` bucket this fixture's events all
+      // fall into. They bought the removal of a 3E snapshot recompute, so
+      // the endpoint got cheaper by three orders of magnitude and this
+      // number went up by two. The bucket term is what could still move
+      // it -- at most 26, whatever the relay does.
+      expect(second).toBeLessThanOrEqual(36);
+      expect(third).toBeLessThanOrEqual(36);
       // Stated as a ratio as well, because the absolute bound above
       // would still pass on a relay whose window happened to be tiny.
       expect(second * 20).toBeLessThan(afterFirst);
@@ -795,22 +853,40 @@ describe("read attribution", () => {
     expect(row?.computedAt).toBeGreaterThan(0);
   });
 
-  it("keeps the stats snapshot in storage, where it survives eviction", async () => {
+  it("keeps the maintained counts in storage, where they survive eviction", async () => {
     // The property the in-memory cache could not have, stated directly
     // rather than inferred from a cost. A Durable Object that hibernates
-    // loses every field on the instance and keeps every row in SQLite,
-    // so "the cache is a row" IS the fix -- the read costs above are the
-    // consequence, not the claim.
+    // loses every field on the instance and keeps every row in SQLite.
+    //
+    // That reasoning produced the `stats_snapshot` cache, and this test
+    // used to assert its row existed. It asserts the counters instead:
+    // they answer the same question the cache did, out of storage for the
+    // same reason, and they answer it exactly rather than within six
+    // hours. The recomputation rate that constant used to bound is not a
+    // quantity any more -- there is no recomputation.
+    //
+    // The absolute value is not asserted, and the reason is this file's
+    // own fixture: it seeds `events` with direct INSERTs rather than
+    // publishing over the wire (see the header), so those rows never pass
+    // through insertEventRow and the counter does not see them. That is
+    // the documented exception working as documented -- and it is exactly
+    // the disagreement storage.ts auditMaintainedCounts exists to log. So
+    // what is asserted is that the counter is storage-backed and moves
+    // with a real write.
     await SELF.fetch("https://example.com/api/stats");
-    const row = await runInDurableObject(stub(), async (_instance: Relay, state) =>
-      readStatsSnapshot(state.storage.sql),
+    const before = await runInDurableObject(stub(), async (_instance: Relay, state) =>
+      readMaintainedCounts(state.storage.sql),
     );
-    expect(row).not.toBeNull();
-    expect(row?.totalEvents).toBe(EVENTS);
-    // Recomputation is bounded by limits.ts STATS_SNAPSHOT_MAX_AGE_MS and
-    // by nothing else -- in particular not by how often anyone loads the
-    // page, which is exactly what set the rate before.
-    expect(row?.computedAt).toBeGreaterThan(0);
+
+    const conn = await connectRelay();
+    conn.send(["EVENT", signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "counted" })]);
+    await conn.nextMessage();
+    conn.close();
+
+    const after = await runInDurableObject(stub(), async (_instance: Relay, state) =>
+      readMaintainedCounts(state.storage.sql),
+    );
+    expect(after.events).toBe(before.events + 1);
   });
 
   it("bills a replaceable replacement to the write path, now at index-seek cost", async () => {

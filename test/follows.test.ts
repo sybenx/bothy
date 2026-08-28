@@ -14,7 +14,7 @@ import { isAllowedWriter, refreshFollows } from "../src/ownership";
 import { isolateStorage } from "./helpers/isolate";
 import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
 import { publish, connectRelay } from "./helpers/socket";
-import { allowPubkey, banPubkey, storeEvent } from "../src/storage";
+import { allowPubkey, banPubkey, readMaintainedCounts, storeEvent } from "../src/storage";
 
 isolateStorage();
 
@@ -152,14 +152,80 @@ describe("NIP-86 banpubkey/allowpubkey write gate (phase two)", () => {
       storeEvent(sql, contacts, Math.floor(Date.now() / 1000));
 
       const build = measureRowsWritten(sql, (s) => refreshFollows(s, FOLLOWS_ENV));
-      // 2 per follow to insert (the row and its primary key index), and
-      // nothing to delete on a cache that was empty.
-      expect(build).toBe(2 * follows.length);
+      // 2 per follow to insert (the row and its primary key index),
+      // nothing to delete on a cache that was empty, and 1 for the
+      // maintained follow count (schema.ts `maintained_counts`) -- one row
+      // against the hundred this rebuild already costs, and the reason
+      // /api/stats no longer counts `follows` per request.
+      expect(build).toBe(2 * follows.length + 1);
 
       const unchanged = measureRowsWritten(sql, (s) => refreshFollows(s, FOLLOWS_ENV));
+      // Zero, counter included. This is the assertion that says the
+      // counter write lives INSIDE the rebuild branch rather than at the
+      // function's exit: parked at the exit it would fire on every cron
+      // tick, turning a free no-op into 24 rows/day to restate a number
+      // that had not changed.
       expect(unchanged).toBe(0);
       // And the cache it declined to rebuild is still the right one.
       expect(isAllowedWriter(sql, FOLLOWS_ENV, follows[0]!).allowed).toBe(true);
+      expect(readMaintainedCounts(sql).follows).toBe(follows.length);
+    });
+  });
+
+  it("maintains the follow count through every branch that writes the table", async () => {
+    // `followCount` on /api/stats was a COUNT over `follows` behind a
+    // six-hour cache; it is maintained here now, and removing that last
+    // walked table is what let `stats_snapshot` be deleted outright.
+    //
+    // refreshFollows has exactly two branches that write, and both are
+    // exercised: the rebuild, and the clear when the contact list is gone.
+    // A counter that only tracked the first would drift the moment an
+    // owner deleted their kind-3 -- and would report follows the write
+    // gate no longer admits.
+    const follows = Array.from({ length: 3 }, () => randomKeypair().pubkeyHex);
+    const now = Math.floor(Date.now() / 1000);
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+
+      // Nothing stored: the counter starts where the table does.
+      refreshFollows(sql, FOLLOWS_ENV);
+      expect(readMaintainedCounts(sql).follows).toBe(0);
+
+      storeEvent(
+        sql,
+        signEvent(OWNER_SECRET_KEY_HEX, {
+          kind: 3,
+          tags: follows.map((pubkey) => ["p", pubkey]),
+          created_at: now,
+        }),
+        now,
+      );
+      refreshFollows(sql, FOLLOWS_ENV);
+      expect(readMaintainedCounts(sql).follows).toBe(3);
+
+      // A newer, shorter list: the count follows it down as well as up.
+      storeEvent(
+        sql,
+        signEvent(OWNER_SECRET_KEY_HEX, {
+          kind: 3,
+          tags: [["p", follows[0]!]],
+          created_at: now + 10,
+        }),
+        now + 10,
+      );
+      refreshFollows(sql, FOLLOWS_ENV);
+      expect(readMaintainedCounts(sql).follows).toBe(1);
+
+      // The contact list is gone -- deleted, vanished, or never stored.
+      // The clear branch is a write too, and the counter moves with it.
+      sql.exec(`DELETE FROM events WHERE kind = 3`);
+      refreshFollows(sql, FOLLOWS_ENV);
+      expect(readMaintainedCounts(sql).follows).toBe(0);
+      expect(
+        sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM follows`).toArray()[0]?.n,
+      ).toBe(0);
     });
   });
 

@@ -88,8 +88,8 @@
   #diagnostics { font-size: 0.8rem; opacity: 0.6; margin-bottom: 3rem; }
   #diagnostics summary { cursor: pointer; }
   /* Same weight/opacity vocabulary the panel already uses for dt --
-     groups the snapshot-derived rows from the live ones without a new
-     heading level or a new colour. */
+     groups the cached rows from the live ones without a new heading
+     level or a new colour. */
   #diagnostics .diag-group-label { font-weight: 600; opacity: 0.7; margin: 0.8rem 0 0.1rem; }
   #diagnostics .diag-group-label:first-of-type { margin-top: 0.6rem; }
   #diagnostics .diag-grid { display: grid; grid-template-columns: auto 1fr; gap: 0.2rem 0.75rem; margin: 0.2rem 0; }
@@ -166,19 +166,6 @@
 <details id="diagnostics" hidden>
   <summary>Diagnostics</summary>
 
-  <!-- These five come from the stats_snapshot row and share one age,
-       shown on the first line -- CLAUDE.md "The budget" / relay.ts
-       getStats. During a heavy backfill totalStored (live, top of page)
-       can visibly run ahead of these, which is expected staleness, not
-       a bug. -->
-  <p class="diag-group-label">From the stats snapshot</p>
-  <dl class="diag-grid">
-    <dt>Snapshot taken</dt><dd id="diag-snapshot-at">-</dd>
-    <dt>Events, last 24h (by created_at)</dt><dd id="diag-events-24h">-</dd>
-    <dt>Follow list published</dt><dd id="diag-follows-at">-</dd>
-    <dt>Largest non-owner author</dt><dd id="diag-largest-author">-</dd>
-  </dl>
-
   <!-- These two used to sit under "Live" below, and moving them is the
        visible half of a budget fix: both read the ingest window
        (~1,200 rows), GET /api/stats is unauthenticated, and anyone could
@@ -196,6 +183,18 @@
 
   <p class="diag-group-label">Live</p>
   <dl class="diag-grid">
+    <!-- Maintained counters (src/schema.ts event_hour_counts), not a
+         scan: 26 rows read at most, so this is current rather than
+         snapshotted, and it counts by created_at in whole hours -- an
+         event signed 24h40m ago still counts until the clock leaves its
+         bucket. -->
+    <dt>Events, last 24h (by created_at)</dt><dd id="diag-events-24h">-</dd>
+    <!-- These two used to sit above, under a "From the stats snapshot"
+         group on a six-hour clock. Every field that group held is a
+         maintained counter now or deleted, so the snapshot, its TTL and
+         its cron refresh are gone and what is left is simply live --
+         CLAUDE.md "The budget". -->
+    <dt>Follow list published</dt><dd id="diag-follows-at">-</dd>
     <dt>Storage used</dt><dd id="diag-storage">-</dd>
     <dt id="diag-vanishing-label" hidden>Vanishing</dt><dd id="diag-vanishing" hidden>-</dd>
     <dt>Backfill</dt><dd id="diag-backfill-at">-</dd>
@@ -251,22 +250,22 @@ async function main() {
     });
 
     document.getElementById("stat-total").textContent = stats.totalEvents;
-    // "events stored" is read back from a snapshot row refreshed on the
-    // cron tick (src/schema.ts stats_snapshot), not counted per page
-    // load -- counting it costs a full scan of `events`, and doing that
-    // on every visit is what exhausted the rows-read allowance. So the
-    // number can be hours old, and the label says so rather than letting
-    // it read as current.
+    // No age suffix any more, and the missing suffix is the point.
+    // "events stored" was read back from a cache row up to six hours
+    // old, because counting it cost a full scan of `events` and doing
+    // that per visit is what exhausted the rows-read allowance. It is a
+    // maintained counter now (src/schema.ts event_counts): one row read,
+    // exact, and current as of this request, so labelling it "as of 4 h
+    // ago" would be false.
     //
     // Of the three figures beside it, only storage is read live. The
-    // other two -- events received and the write-budget bar -- now come
-    // from a five-minute cache for a smaller version of the same reason
+    // other two -- events received and the write-budget bar -- come from
+    // a five-minute cache for a smaller version of the old reason
     // (src/limits.ts LIVE_STATS_MAX_AGE_MS): each read the ingest window
     // per request on an endpoint nothing gates. Five minutes needs no
     // label up here, where a dashboard number that old reads as current
     // to anybody; the diagnostics panel below dates it exactly.
-    document.getElementById("stat-total-label").textContent =
-      "events stored" + snapshotAge(stats.snapshotAt);
+    document.getElementById("stat-total-label").textContent = "events stored";
     document.getElementById("stat-ingested").textContent = stats.ingested24h;
 
     setBar("stat-storage", "bar-storage", stats.storageBytes, STORAGE_LIMIT, formatBytes(stats.storageBytes) + " used");
@@ -280,18 +279,6 @@ async function main() {
     document.getElementById("unclaimed-view").hidden = false;
     wireClaimForm();
   }
-}
-
-// How stale the snapshotted counts are, in words, or "" when they were
-// computed within the last few minutes -- there is no useful difference
-// between "just now" and "four minutes ago" on a dashboard, and saying
-// so for every load would be noise on the common case.
-function snapshotAge(snapshotAt) {
-  if (!snapshotAt) return "";
-  const minutes = Math.floor(Date.now() / 1000 - snapshotAt) / 60;
-  if (minutes < 5) return "";
-  if (minutes < 90) return " (as of " + Math.round(minutes) + " min ago)";
-  return " (as of " + Math.round(minutes / 60) + " h ago)";
 }
 
 // Sets the browser tab's favicon from the owner's kind-0 picture
@@ -412,34 +399,25 @@ function renderBackfillStatus(backfill) {
 function renderDiagnostics(stats) {
   document.getElementById("diagnostics").hidden = false;
 
-  // The five stats_snapshot fields, one age line for all of them --
-  // relay.ts getStats: totalEvents, events24h, followCount,
-  // followsListAt and largestNonOwnerAuthor are all computed together.
-  document.getElementById("diag-snapshot-at").textContent = new Date(stats.snapshotAt * 1000).toLocaleString();
-  document.getElementById("diag-events-24h").textContent = stats.events24h.toLocaleString();
   // The contact list's own created_at, not a refresh time -- see
-  // storage.ts StatsSnapshot.followsListAt. "none stored" rather than
-  // "never" because the absence being reported is a missing kind-3, not
-  // a refresh that has not run.
+  // storage.ts followsListAt. "none stored" rather than "never" because
+  // the absence being reported is a missing kind-3, not a refresh that
+  // has not run.
   document.getElementById("diag-follows-at").textContent =
     stats.writePolicy !== "follows"
       ? "n/a (owner-only writes)"
       : stats.followsListAt
         ? new Date(stats.followsListAt * 1000).toLocaleString()
         : "none stored";
-  document.getElementById("diag-largest-author").textContent = stats.largestNonOwnerAuthor
-    ? stats.largestNonOwnerAuthor.pubkey.slice(0, 12) + "… (" +
-      stats.largestNonOwnerAuthor.events.toLocaleString() + " events)"
-    : "none";
 
   // The two figures behind the `live_stats` row, with the one age they
-  // share -- relay.ts refreshLiveStats. Five minutes, not the snapshot's
-  // six hours, and a separate line rather than one combined age because
-  // presenting a five-minute number and a six-hour number under one
-  // timestamp would be wrong about one of them.
+  // share -- relay.ts refreshLiveStats. The only age left on this panel:
+  // it used to sit beside a six-hour one over the counts that walked a
+  // table, and those are maintained counters now.
   document.getElementById("diag-live-at").textContent = new Date(stats.liveAt * 1000).toLocaleString();
   document.getElementById("diag-ingested-24h").textContent = stats.ingested24h.toLocaleString();
 
+  document.getElementById("diag-events-24h").textContent = stats.events24h.toLocaleString();
   document.getElementById("diag-storage").textContent = formatMB(stats.storageBytes);
 
   // A vanish drains across cron ticks and can run for days, taking up to

@@ -492,60 +492,134 @@ export const TABLES: readonly TableSpec[] = [
     columns: [col("pubkey", "TEXT PRIMARY KEY"), col("reason", "TEXT"), col("allowed_at", "INTEGER NOT NULL")],
   },
   {
-    // The expensive half of /api/stats, computed on a cron tick and read
-    // back from here (storage.ts readStatsSnapshot/writeStatsSnapshot,
-    // relay.ts collectStats). At most one row, replaced wholesale; no row
-    // at all until the first computation, which is the correct state for
-    // a relay that has never served a stats request or run a cron tick.
+    // Every count /api/stats reports that is maintained rather than
+    // computed. Exactly one row.
     //
-    // A row, and this file has twice refused to put a cached number in
-    // one -- rejecting a rows-written counter table, and rejecting it
-    // again for read-metrics.ts's counters. The rule those refusals set
-    // is not "never cache in storage", it is "never pay a row write PER
-    // EVENT to measure something". This row is written on a cron tick,
-    // gated by limits.ts STATS_SNAPSHOT_MAX_AGE_MS: 2 rows written per
-    // refresh, four refreshes a day, 8 rows against a 100,000/day
-    // ceiling. It is not on the per-event write path at all.
+    // `events` and `follows` are here for the same reason and were made
+    // maintained in that order: each was a COUNT over a table nothing
+    // indexed for counting, each was read by an unauthenticated endpoint,
+    // and each therefore had to be rationed behind a cache clock instead
+    // of simply being cheap. `stats_snapshot` was that cache, and moving
+    // the last field out of it is what let it be deleted -- along with
+    // its TTL, its refresh function and its cron call, a mechanism whose
+    // whole job was rationing a cost that no longer exists.
     //
-    // What it replaces was in memory, and that is the whole point. The
-    // 15-second in-memory cache it succeeds was measured on the live
-    // relay never hitting: the Durable Object hibernates between admin
-    // page visits, in-memory state does not survive eviction, and two
-    // page loads therefore paid two full scans of `events` apiece. A
-    // cache whose lifetime is shorter than the gap between the requests
-    // it exists to serve is not a cache. Storage is the only state in
-    // this object that outlives hibernation, so a cache that must span
-    // page loads has to live here or nowhere.
+    // Seeded once by initSchema from real counts and thereafter only ever
+    // moved by the code that writes the table it counts -- never
+    // recomputed, and never repaired. storage.ts auditMaintainedCounts
+    // recounts once a day and logs a disagreement; it deliberately does
+    // not fix one, because a counter that silently repairs itself hides
+    // whatever broke it, and "the number was wrong for a day" is a much
+    // smaller problem than "the number is wrong and always looks right".
     //
-    // Every column is a count over `events` or `follows` costing O(E) or
-    // O(F) rows read to produce -- that is the criterion for being in
-    // here, not whether the number looks stale-tolerant. Fields that cost
-    // nothing to read live (`sql.databaseSize`, the owner row, the tiny
-    // backfill tables) are deliberately absent and stay live, so the page
-    // keeps showing a current storage bar and current backfill progress.
-    name: "stats_snapshot",
+    // One row for both, rather than a table each, because a stats request
+    // reads them together and one row read answers for both -- and
+    // because a single `audited_at` is then what paces one daily audit
+    // over everything this relay maintains, rather than two gates that
+    // could drift apart.
+    //
+    // WHAT MAY WRITE HERE. `events` moves only in storage.ts
+    // insertEventRow/deleteEventRow, the only two statements in the
+    // codebase that touch `events`. `follows` moves only in ownership.ts
+    // refreshFollows, the only function that writes the `follows` table,
+    // and in both of its write branches rather than at its exit. In each
+    // case the counter write sits inside the function that performs the
+    // row write, not beside its callers, so there is no path that can
+    // change a table without moving its counter. That property is what
+    // makes a maintained count safe, and it is asserted rather than
+    // assumed (test/stats.test.ts, test/follows.test.ts).
+    //
+    // `events` PAYS A ROW WRITE PER EVENT, which is the trade this file
+    // has refused twice (a rows-written counter table; read-metrics.ts's
+    // counters). Both refusals were about measuring the relay's own
+    // plumbing -- paying a permanent per-event write to observe a
+    // per-event write, where the thing measured and the cost of measuring
+    // it grow together and the answer is a diagnostic. This is not that.
+    // `totalEvents` is the oldest number on the admin page, the
+    // alternative is a scan of `events` that grows without bound, and the
+    // price is fixed at 1 row against an event that already costs 6 to
+    // 21. The earlier refusals stand; this is a different question with a
+    // different answer, not a reversal.
+    //
+    // `follows` does not pay per event at all: it moves when the owner's
+    // contact list changes, which is rare, and costs 1 row against the
+    // hundreds refreshFollows writes rebuilding the list in the same
+    // breath.
+    name: "maintained_counts",
     columns: [
-      // Wall-clock seconds when this row was computed. Read by
-      // collectStats to decide whether to recompute, and reported on
-      // /api/stats as `snapshotAt` so the admin page can say how old
-      // these numbers are rather than presenting them as current.
-      col("computed_at", "INTEGER NOT NULL"),
-      col("total_events", "INTEGER NOT NULL"),
-      col("events_24h", "INTEGER NOT NULL"),
-      col("follow_count", "INTEGER NOT NULL"),
-      col("follows_refreshed_at", "INTEGER"),
-      // storage.ts largestNonOwnerAuthor, flattened. Both null when no
-      // non-owner has written anything, which is the normal state.
-      col("largest_author_pubkey", "TEXT"),
-      col("largest_author_events", "INTEGER"),
+      col("events", "INTEGER NOT NULL"),
+      col("follows", "INTEGER NOT NULL"),
+      // Wall-clock seconds of the last auditMaintainedCounts run, so the
+      // daily recount is paced by the data rather than by how often the
+      // cron happens to fire. NULL until the first audit.
+      col("audited_at", "INTEGER"),
     ],
   },
   {
-    // The other half of /api/stats: the two figures that stayed live when
-    // `stats_snapshot` above was introduced, cached here on a much
-    // shorter clock (limits.ts LIVE_STATS_MAX_AGE_MS, five minutes
-    // against that one's six hours). At most one row, replaced wholesale,
-    // absent until the first stats request computes one.
+    // `events24h` on /api/stats: one row per hour of `created_at`
+    // history, holding how many stored events carry a `created_at` in
+    // that hour.
+    //
+    // Buckets rather than a single counter because `events24h` is a
+    // ROLLING window and a scalar cannot express one -- an event leaves
+    // the window by the clock moving, with nothing happening to the
+    // event. Bucketing is what lets a maintained count answer a moving
+    // question: the window is a range of bucket keys, and it costs the
+    // number of buckets in it rather than the number of events.
+    //
+    // Keyed by `created_at`, NOT `ingested_at`, and that is the whole
+    // subtlety of this table. `events24h` answers "what has the owner
+    // posted lately"; a backfilled note signed in 2021 and stored this
+    // morning belongs in a 2021 bucket and must not appear in the current
+    // window at all. Incrementing on arrival would have made backfill
+    // look like a posting spree -- the mirror image of the bug
+    // `ingested_at` exists to fix (see `events.ingested_at` above), and
+    // the reason these two windows need two different mechanisms.
+    //
+    // The companion to `maintained_counts.events` above: that row is the
+    // grand total, these rows are the same events indexed by when they
+    // were signed. Both move in the same two functions.
+    //
+    // `hour INTEGER PRIMARY KEY` is a rowid alias, so an upsert here
+    // writes 1 row and no index entry, and a window read is a range seek
+    // over consecutive integer keys.
+    //
+    // Rows read for a 24h window: at most 26. The cutoff is the bucket
+    // containing (now - 86400) and the highest reachable bucket is the
+    // one an hour ahead of now (limits.ts MAX_CREATED_AT_FUTURE_SECONDS
+    // refuses anything further), so the range spans 26 keys whatever the
+    // relay's size or activity.
+    //
+    // Rows never leave this table. A bucket that decrements to zero is
+    // kept rather than deleted: deleting it would be a second row write
+    // on the removal path to save one row read on a window that includes
+    // at most 26 of them, and outside the window it is never read at all.
+    // Table size is one row per hour in which the owner published
+    // something ever, which for a decade of history is thousands of rows
+    // and nothing reads them.
+    name: "event_hour_counts",
+    columns: [
+      // floor(created_at / 3600). storage.ts hourBucket derives it in JS
+      // with Math.trunc, matching SQLite's integer `/`, so the seed
+      // below, the daily audit and the per-event increments all agree on
+      // which bucket a given created_at belongs to -- including for the
+      // negative created_at nothing rejects (validate.ts
+      // isCreatedAtTooFarInFuture is deliberately one-sided).
+      col("hour", "INTEGER PRIMARY KEY"),
+      col("n", "INTEGER NOT NULL"),
+    ],
+  },
+  {
+    // The last cached figure on /api/stats, and now the only one:
+    // `ingested24h` and `rowsWrittenToday`, on the five-minute clock of
+    // limits.ts LIVE_STATS_MAX_AGE_MS. At most one row, replaced
+    // wholesale, absent until the first stats request computes one.
+    //
+    // It had a companion, `stats_snapshot`, on a six-hour clock over the
+    // counts that walked a table. That one is gone: every field it held
+    // is either a maintained counter now (`maintained_counts` above) or
+    // deleted. This row survives because what it caches genuinely cannot
+    // be maintained -- see below.
     //
     // They stayed live because they are the write-budget meter and an
     // owner reading it during an outage needs it current -- a good
@@ -575,8 +649,9 @@ export const TABLES: readonly TableSpec[] = [
     name: "live_stats",
     columns: [
       // Wall-clock seconds this row was computed at, reported on
-      // /api/stats as `liveAt` so these two numbers carry their age the
-      // way the snapshotted five carry `snapshotAt`.
+      // /api/stats as `liveAt` so these two numbers carry their age --
+      // the only age on that document now that every other field is
+      // either current or a maintained counter.
       col("computed_at", "INTEGER NOT NULL"),
       // The 00:00 UTC boundary `rows_written_today` was measured from,
       // stored because age alone cannot invalidate this row correctly.
@@ -800,6 +875,16 @@ export function indexesOn(table: string): readonly IndexSpec[] {
 // costs its own index), plus one row per declared index on `events`.
 export const EVENT_BASE_ROW_COST = 2 + indexesOn("events").length;
 
+// The two maintained counters storage.ts insertEventRow moves alongside
+// every stored event: one row in `maintained_counts` (one row, no index) and
+// one in `event_hour_counts` (rowid-aliased primary key, so no index
+// entry either). Declared here rather than as a bare `+ 2` in
+// eventRowCost below because this number is what makes the counters'
+// price visible in the one place the project prices a write -- backfill's
+// page sizing and the vanish drain's pacing both read it, and the admin
+// page's budget bar is summed from it.
+export const EVENT_COUNTER_ROW_COST = 2;
+
 // One base row per `event_tags` row, plus one per index on that table.
 export const TAG_ROW_COST = 1 + indexesOn("event_tags").length;
 
@@ -807,8 +892,16 @@ export const TAG_ROW_COST = 1 + indexesOn("event_tags").length;
 // single-letter tags. Stamped into `events.row_cost` at insert time
 // (storage.ts insertEventRow) so estimateRowsWrittenSince can sum a column
 // instead of rebuilding this from a join.
+//
+// The counter cost is INSIDE this figure rather than accounted separately,
+// which is the point of putting it here: backfill.ts prices a page against
+// eventRowCost, the vanish drain paces against eventRemovalBudget which
+// calls it, and the admin page's write-budget bar sums the stamped column.
+// A counter cost added at the write site but not to this number would be
+// two rows per event that every one of those guards was blind to -- the
+// same shape of error that made estimateRowsWrittenSince wrong by 45x.
 export function eventRowCost(indexedTagCount: number): number {
-  return EVENT_BASE_ROW_COST + TAG_ROW_COST * indexedTagCount;
+  return EVENT_BASE_ROW_COST + EVENT_COUNTER_ROW_COST + TAG_ROW_COST * indexedTagCount;
 }
 
 // Rows written by tombstoning one id: the `deleted_ids` row, plus the
@@ -831,8 +924,12 @@ export const TOMBSTONE_ROW_COST = 2 + indexesOn("deleted_ids").length;
 //   DELETE FROM event_tags (2 rows)        2   <- 2, not 6
 //   DELETE FROM events (1 row)             1   <- 1, not 5
 //   INSERT OR IGNORE INTO deleted_ids      2
+//   UPDATE maintained_counts / event_hour_counts 2
 //
-// So a removal reports one row per base row deleted, plus the tombstone.
+// So a removal reports one row per base row deleted, plus the tombstone,
+// plus the two counter updates -- which are plain UPDATEs on unindexed
+// one-row-per-key tables and so cost the same going down as coming up,
+// unlike everything above them.
 // Both functions below are real; which one to use depends on whether you
 // are reporting or budgeting.
 // ---------------------------------------------------------------------
@@ -841,7 +938,7 @@ export const TOMBSTONE_ROW_COST = 2 + indexesOn("deleted_ids").length;
 // rows, the event row, and the tombstone. Asserted against a real cursor
 // in test/hibernation.test.ts.
 export function eventRemovalRowsWritten(indexedTagCount: number): number {
-  return indexedTagCount + 1 + TOMBSTONE_ROW_COST;
+  return indexedTagCount + 1 + TOMBSTONE_ROW_COST + EVENT_COUNTER_ROW_COST;
 }
 
 // What the NIP-62 vanish drain is PACED against, and deliberately the
@@ -1050,6 +1147,45 @@ export function forgetSchemaHash(sql: SqlStorage): void {
   sql.exec(`DROP TABLE IF EXISTS ${SCHEMA_META_TABLE}`);
 }
 
+// The one-time migration behind `maintained_counts`/`event_hour_counts`:
+// counts what is already stored so the maintained counters start from the
+// truth rather than from zero on a relay that has been running for months.
+//
+// Guarded on `maintained_counts` being EMPTY, not on the schema hash, and
+// the difference matters. initSchema's reconcile pass runs again on every
+// future schema change, and a seed keyed to that would recount each time --
+// which would also silently repair any drift the counters had accumulated,
+// defeating storage.ts auditMaintainedCounts before it ever got to report
+// it. Seeding once means a wrong counter stays wrong and gets logged, which
+// is the whole design (see `maintained_counts` in TABLES).
+//
+// Ordering is load-bearing: the hour buckets are filled first and the event
+// total is then summed FROM those buckets, so the two cannot disagree at
+// birth even if the table changed underneath a longer scan. It also means
+// `events` is scanned exactly once.
+//
+// Rows read: E + F, once per deployment, on the wake that upgrades to this.
+// Zero on a fresh database, where both scans find nothing.
+function seedMaintainedCounts(sql: SqlStorage): void {
+  if (sql.exec(`SELECT 1 FROM maintained_counts LIMIT 1`).toArray().length > 0) return;
+  // Clears a seed that died between the statements below. `hour` is a
+  // primary key, so a retry over a half-filled bucket table would throw on
+  // the first duplicate and keep throwing on every subsequent wake. Reached
+  // only when `maintained_counts` is empty, so it can never discard buckets
+  // a completed seed produced.
+  sql.exec(`DELETE FROM event_hour_counts`);
+  sql.exec(
+    `INSERT INTO event_hour_counts (hour, n)
+       SELECT created_at / 3600, COUNT(*) FROM events GROUP BY created_at / 3600`,
+  );
+  sql.exec(
+    `INSERT INTO maintained_counts (events, follows, audited_at)
+       SELECT (SELECT COALESCE(SUM(n), 0) FROM event_hour_counts),
+              (SELECT COUNT(*) FROM follows),
+              NULL`,
+  );
+}
+
 export function initSchema(sql: SqlStorage): void {
   ensureSchemaMetaTable(sql);
   const hash = currentSchemaHash();
@@ -1069,6 +1205,13 @@ export function initSchema(sql: SqlStorage): void {
   // the now-orphaned table on deployed relays that still carry it from
   // before the removal. Idempotent and a no-op on a fresh database.
   sql.exec(`DROP TABLE IF EXISTS mutes`);
+  // `stats_snapshot` cached the two counts over `events` and the two over
+  // `follows` behind a six-hour clock, because each walked a table. All
+  // four are maintained counters now or deleted outright, so the cache
+  // has nothing to hold and the clock nothing to ration. Dropped rather
+  // than left orphaned, the same way `mutes` above is: an unused table is
+  // a thing a future reader has to work out the status of.
+  sql.exec(`DROP TABLE IF EXISTS stats_snapshot`);
   // backfill_meta must have exactly one row to hold status -- seeded here
   // rather than by whichever code path happens to run first, so every
   // reader (getBackfillStatus, /api/stats) can assume it exists.
@@ -1077,6 +1220,7 @@ export function initSchema(sql: SqlStorage): void {
   // getOwnHost/recordHost (src/host.ts) never have to special-case "no
   // row yet".
   sql.exec(`INSERT INTO relay_meta (host) SELECT NULL WHERE NOT EXISTS (SELECT 1 FROM relay_meta)`);
+  seedMaintainedCounts(sql);
 
   // Stored only now that every statement above has run without throwing --
   // see the header comment on this function for why that ordering is the

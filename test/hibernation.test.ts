@@ -9,6 +9,7 @@ import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import {
   EVENT_BASE_ROW_COST,
+  EVENT_COUNTER_ROW_COST,
   eventRemovalBudget,
   eventRemovalRowsWritten,
   eventRowCost,
@@ -106,9 +107,13 @@ describe("rows written per stored event", () => {
         storeEvent(sql, note, Math.floor(Date.now() / 1000)),
       );
       // 1 base row + 1 implicit PK index (id is TEXT, not a rowid alias)
-      // + 1 per declared index on `events`.
+      // + 1 per declared index on `events`, + the two maintained counters
+      // storage.ts insertEventRow moves in the same breath as the row
+      // (schema.ts EVENT_COUNTER_ROW_COST). The counters are part of what
+      // storing an event costs, so they are part of what this asserts --
+      // they are not free and the budget must not be told they are.
       expect(measured).toBe(eventRowCost(0));
-      expect(measured).toBe(2 + indexesOn("events").length);
+      expect(measured).toBe(2 + indexesOn("events").length + EVENT_COUNTER_ROW_COST);
     });
   });
 
@@ -128,7 +133,7 @@ describe("rows written per stored event", () => {
         storeEvent(sql, reply, Math.floor(Date.now() / 1000)),
       );
       expect(measured).toBe(eventRowCost(2));
-      expect(measured).toBe(EVENT_BASE_ROW_COST + 2 * TAG_ROW_COST);
+      expect(measured).toBe(EVENT_BASE_ROW_COST + EVENT_COUNTER_ROW_COST + 2 * TAG_ROW_COST);
     });
   });
 

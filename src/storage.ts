@@ -85,6 +85,23 @@ function insertEventRow(
     ingestedAt,
     eventRowCost(indexedTags.length),
   );
+  // Immediately after the row exists and before anything else can fail.
+  //
+  // Not a separate step a caller could skip: this is one of the two
+  // statements in the codebase that touch `events` (the other is
+  // deleteEventRow), so "an event was stored" and "the counters moved" are
+  // the same three lines of code. Placed after the INSERT rather than
+  // before so a duplicate id -- which throws, and which backfill.ts
+  // applyBackfillPage catches and continues past -- leaves the counters
+  // untouched rather than counting an event that was never stored. Placed
+  // before the tag loop for the same reason in the other direction: if a
+  // tag insert throws, the event row is real and the counters must say so.
+  //
+  // Rows written: 2 per stored event, on top of the 6 + 3T the row itself
+  // costs -- see schema.ts eventRowCost. The UPDATE is one row in a
+  // one-row table with no index; the upsert is one row in a rowid-aliased
+  // table with no index. CLAUDE.md "The budget" carries the arithmetic.
+  bumpEventCounters(sql, event.created_at, 1);
   for (const tag of indexedTags) {
     sql.exec(
       `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at) VALUES (?, ?, ?, ?)`,
@@ -156,8 +173,210 @@ function insertEventRow(
 // amplifier.
 // ---------------------------------------------------------------------
 function deleteEventRow(sql: SqlStorage, id: string): void {
+  // Read before the delete, and read HERE rather than taken from the
+  // caller. Four of the five callers already hold the row's `created_at`
+  // (the replaceable and addressable replacement paths, applyDeletion,
+  // applyAddressDeletion) and could pass it, but banEvent does not: it
+  // tombstones an id that may never have been stored at all, and a caller
+  // that guessed would decrement a bucket for an event that does not
+  // exist. One PK seek at the choke point is what makes the decrement
+  // correct for every caller including that one -- and `undefined` here is
+  // the honest answer to "there was nothing to remove", not an error.
+  //
+  // Rows read: 1. Removals are rare next to insertions, and this is the
+  // same index seek the DELETE below performs anyway.
+  const row = sql
+    .exec<{ created_at: number }>(`SELECT created_at FROM events WHERE id = ?`, id)
+    .toArray()[0];
   sql.exec(`DELETE FROM event_tags WHERE event_id = ?`, id);
   sql.exec(`DELETE FROM events WHERE id = ?`, id);
+  // After the DELETE, mirroring insertEventRow: a decrement that ran ahead
+  // of a statement that then threw would leave the counters describing
+  // fewer events than are stored.
+  if (row !== undefined) bumpEventCounters(sql, row.created_at, -1);
+}
+
+// One hour of `created_at`, as schema.ts `event_hour_counts` keys it.
+//
+// Math.trunc, not Math.floor, because SQLite's integer `/` truncates
+// toward zero and the seed migration (schema.ts seedEventCounters) and the
+// daily audit below both bucket in SQL. They differ only for negative
+// created_at, which nothing rejects -- validate.ts
+// isCreatedAtTooFarInFuture is deliberately one-sided -- so matching the
+// SQL is what keeps an event from being seeded into one bucket and
+// decremented out of another.
+export function hourBucket(createdAt: number): number {
+  return Math.trunc(createdAt / 3600);
+}
+
+// The maintained counters behind /api/stats' `totalEvents` and
+// `events24h`, moved by `delta` (+1 on insert, -1 on removal).
+//
+// Private on purpose, and called from exactly two places: insertEventRow
+// and deleteEventRow, the only two functions in the codebase that write to
+// `events`. Nothing else may call it -- a second caller would be a way for
+// the counters to move without the table moving, which is the one failure
+// mode the daily audit exists to catch and the one this arrangement exists
+// to prevent.
+//
+// The bucket row is upserted on the way up and plain-UPDATEd on the way
+// down: a decrement can only ever be for an event that was counted, so its
+// bucket necessarily exists, and an upsert there would silently create a
+// -1 bucket if that ever stopped being true rather than leaving the audit
+// something to find.
+function bumpEventCounters(sql: SqlStorage, createdAt: number, delta: 1 | -1): void {
+  sql.exec(`UPDATE maintained_counts SET events = events + ?`, delta);
+  if (delta === 1) {
+    sql.exec(
+      `INSERT INTO event_hour_counts (hour, n) VALUES (?, 1)
+         ON CONFLICT(hour) DO UPDATE SET n = n + 1`,
+      hourBucket(createdAt),
+    );
+  } else {
+    sql.exec(`UPDATE event_hour_counts SET n = n - 1 WHERE hour = ?`, hourBucket(createdAt));
+  }
+}
+
+// /api/stats `totalEvents` and `followCount`, both from the one
+// `maintained_counts` row. Rows read: 1 for the pair, whatever E and F are.
+// Read together rather than separately because they live in one row and
+// collectStats wants both.
+export function readMaintainedCounts(sql: SqlStorage): { events: number; follows: number } {
+  const row = sql
+    .exec<{ events: number; follows: number }>(`SELECT events, follows FROM maintained_counts`)
+    .toArray()[0];
+  return { events: row?.events ?? 0, follows: row?.follows ?? 0 };
+}
+
+// The number of follows the write gate currently admits, maintained by
+// ownership.ts refreshFollows. Rows written: 1, and only when the owner's
+// contact list actually changes.
+//
+// Exported for refreshFollows and for nothing else. It lives here beside
+// the counter it moves rather than in ownership.ts so the read and the
+// write of this column sit in one file, the way the event counters do --
+// but it is CALLED from inside refreshFollows' own write branches, not
+// from its caller, which is the property that matters.
+export function setFollowCount(sql: SqlStorage, follows: number): void {
+  sql.exec(`UPDATE maintained_counts SET follows = ?`, follows);
+}
+
+// The `created_at` of the contact list the follow cache reflects -- not
+// when that cache was last rebuilt, which is no longer a thing that
+// happens on a schedule (ownership.ts refreshFollows).
+//
+// Rows read: 1. Every row in `follows` carries the same value (see
+// schema.ts `follows`), so `LIMIT 1` is not a sample of the column, it IS
+// the column -- which is why this needs no counter of its own. It was
+// `MAX(fetched_at)` and cost F rows to pick one of F identical numbers.
+export function followsListAt(sql: SqlStorage): number | null {
+  return (
+    sql.exec<{ fetched_at: number }>(`SELECT fetched_at FROM follows LIMIT 1`).toArray()[0]
+      ?.fetched_at ?? null
+  );
+}
+
+// /api/stats `events24h`: stored events whose own `created_at` falls in the
+// last 24 hours -- what the owner has been posting, not what this relay
+// took in (countIngested24h answers that one).
+//
+// Rows read: at most 26, whatever E is and however busy the relay is. The
+// range starts at the bucket containing (now - 86400) and cannot extend
+// past the bucket an hour ahead of now, since limits.ts
+// MAX_CREATED_AT_FUTURE_SECONDS refuses anything further ahead.
+//
+// The window is whole hours, so it covers between 24 and 25 hours rather
+// than exactly 24 -- an event signed 24h40m ago still counts until the
+// clock leaves its bucket. That is the one fidelity cost of the bucket
+// table, and it replaces a figure that was exact to the second and up to
+// SIX HOURS stale (it came from `stats_snapshot`), so the number on the
+// page got considerably closer to the truth rather than further from it.
+export function countEvents24h(sql: SqlStorage, nowSec: number): number {
+  return (
+    sql
+      .exec<{ n: number | null }>(
+        `SELECT SUM(n) AS n FROM event_hour_counts WHERE hour >= ?`,
+        hourBucket(nowSec - 86400),
+      )
+      .toArray()[0]?.n ?? 0
+  );
+}
+
+// Once-a-day proof that every maintained counter still matches the table
+// it counts, called from relay.ts runCron.
+//
+// DETECT ONLY. It logs and returns; it never writes a corrected figure.
+// A counter that repairs itself is a counter that erases the evidence of
+// whatever broke it -- the drift would come back on the next occurrence of
+// the same bug and be silently swallowed again, and the only symptom would
+// be a number that is quietly wrong between repairs. A loud log line once
+// a day and a figure that stays wrong until somebody looks is the strictly
+// more useful failure.
+//
+// Rows read: E + F, once a day. One scan of `events` produces both event
+// figures -- deliberately one statement rather than two, since two would
+// be 2E for the same answer -- plus at most 26 bucket rows, plus a count
+// over `follows`. Against the ~12E a day the stats snapshot used to spend
+// recomputing these same numbers four times over, this is a quarter of the
+// cost and it verifies rather than assumes.
+//
+// `follows` is audited here rather than trusted because it is maintained
+// by a different function in a different file (ownership.ts
+// refreshFollows) with its own two write branches. A counter's safety
+// argument is about its choke point, and a second choke point is a second
+// thing that can be wrong -- so it gets the same daily check, at F rows,
+// which is the cost this whole change removed from the per-request path.
+//
+// Paced by `maintained_counts.audited_at` rather than by the cron's own
+// frequency, so it stays daily whatever the cron schedule becomes.
+export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
+  const state = sql
+    .exec<{ events: number; follows: number; audited_at: number | null }>(
+      `SELECT events, follows, audited_at FROM maintained_counts`,
+    )
+    .toArray()[0];
+  if (state === undefined) return;
+  if (state.audited_at !== null && nowSec - state.audited_at < 86400) return;
+
+  const cutoff = hourBucket(nowSec - 86400);
+  const actual = sql
+    .exec<{ total: number; windowed: number }>(
+      `SELECT COUNT(*) AS total,
+              COALESCE(SUM(CASE WHEN created_at / 3600 >= ? THEN 1 ELSE 0 END), 0) AS windowed
+         FROM events`,
+      cutoff,
+    )
+    .toArray()[0] ?? { total: 0, windowed: 0 };
+  const counted24h = countEvents24h(sql, nowSec);
+  const actualFollows =
+    sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM follows`).toArray()[0]?.n ?? 0;
+
+  const drift = (what: string, said: number, is: number, where: string) =>
+    console.error(
+      `MAINTAINED COUNT DRIFT: ${what} says ${said}, the table says ${is} ` +
+        `(off by ${said - is}). NOT corrected -- see storage.ts auditMaintainedCounts. ` +
+        `Every write to the counted table must go through ${where}.`,
+    );
+
+  if (actual.total !== state.events) {
+    drift("maintained_counts.events", state.events, actual.total, "insertEventRow/deleteEventRow");
+  }
+  if (actual.windowed !== counted24h) {
+    drift(
+      "event_hour_counts, summed over the last 24h",
+      counted24h,
+      actual.windowed,
+      "insertEventRow/deleteEventRow",
+    );
+  }
+  if (actualFollows !== state.follows) {
+    drift("maintained_counts.follows", state.follows, actualFollows, "refreshFollows");
+  }
+
+  // Written whether or not anything disagreed: this records that the audit
+  // RAN, which is what paces the next one. Recording it only on success
+  // would make a drifting relay recount E rows on every cron tick.
+  sql.exec(`UPDATE maintained_counts SET audited_at = ?`, nowSec);
 }
 
 export function eventExists(sql: SqlStorage, id: string): boolean {
@@ -493,214 +712,18 @@ export function drainVanish(sql: SqlStorage, requester: string, limit: number): 
   return { deleted: targets.length, done };
 }
 
-export interface LargestNonOwnerAuthor {
-  pubkey: string;
-  events: number;
-}
-
-// The largest number of stored events held by any single pubkey that is
-// not the owner, and whose pubkey that is.
-//
-// This is the signal for whether the vanish exposure is live or latent.
-// A vanish request removes every event its sender authored, and the cost
-// of doing so scales with how many that is -- so the worst case this
-// relay is actually exposed to is not a hypothetical N, it is this
-// number. Reported on /api/stats rather than reasoned about, because
-// "I'd expect non-owner events to be spread thin" is a guess, and the
-// last three problems in this codebase were all things nobody had
-// measured.
-//
-// Null when no non-owner has written anything, which is the normal state
-// for a relay with ALLOW_FOLLOWS on but no follow actually publishing
-// here.
-//
-// Gift wraps are excluded deliberately, and their exclusion is the whole
-// reason this reads the way it does. Every gift wrap is signed by a fresh
-// one-time key (NIP-59), so counting them would report thousands of
-// pubkeys holding exactly one event each -- true, useless, and it would
-// bury the number being looked for. A gift wrap sender also cannot use
-// their key to vanish anything but that single event.
-//
-// Cost: E rows read, measured. `pubkey` leads idx_events_pubkey_created,
-// so the GROUP BY is served in index order and needs no sort -- but it
-// still walks every entry, so this is E, not the size of the answer.
-// There is no cheaper form: counting per author means visiting every
-// author's rows.
-//
-// That E is acceptable only because this is computed into the
-// `stats_snapshot` row (computeStatsSnapshot below) rather than per
-// request. It used to say the same thing about relay.ts' in-memory
-// stats cache, and that justification turned out to be false in
-// production: the Durable Object hibernates between admin page visits,
-// so the cache almost never hit and this scan was paid on essentially
-// every page load. Whatever bounds the recomputation rate has to survive
-// eviction, or this comment is describing an intention rather than a
-// cost.
-export function largestNonOwnerAuthor(sql: SqlStorage, owner: string | null): LargestNonOwnerAuthor | null {
-  const row = sql
-    .exec<{ pubkey: string; n: number }>(
-      `SELECT pubkey, COUNT(*) AS n FROM events
-        WHERE kind != ? AND pubkey != ?
-        GROUP BY pubkey ORDER BY n DESC LIMIT 1`,
-      GIFT_WRAP_KIND,
-      // An unclaimed relay has no owner to exclude; a pubkey that cannot
-      // exist excludes nothing, which is the correct answer rather than a
-      // special case.
-      owner ?? "",
-    )
-    .toArray()[0];
-  return row ? { pubkey: row.pubkey, events: row.n } : null;
-}
-
 // ---------------------------------------------------------------------
-// /api/stats' expensive half, persisted (schema.ts `stats_snapshot`).
+// The last cached figures on /api/stats (schema.ts `live_stats`), on the
+// five-minute clock of limits.ts LIVE_STATS_MAX_AGE_MS.
 //
-// Everything in here costs O(E) or O(F) rows read to produce, and every
-// one of these numbers is a dashboard rather than a gate -- nothing on a
-// correctness path reads them. backfill.ts hasBackfillHeadroom, the one
-// figure on /api/stats that IS a gate, deliberately calls
-// estimateRowsWrittenSince directly and is not snapshotted.
-//
-// The membership rule is measured cost, not stale-tolerance: a field is
-// in here because reading it walks a table, not because an hour-old
-// answer would be acceptable. Fields that are merely stale-tolerant but
-// cheap (`sql.databaseSize`, the backfill tables) stay live, because
-// making a free number stale buys nothing.
-// ---------------------------------------------------------------------
-
-export interface StatsSnapshot {
-  // Wall-clock seconds this was computed at. Surfaced on /api/stats so
-  // the age of these numbers is visible rather than implied.
-  computedAt: number;
-  totalEvents: number;
-  events24h: number;
-  followCount: number;
-  // The `created_at` of the contact list the follow cache reflects. The
-  // column behind it is still called `follows_refreshed_at`: it held a
-  // refresh timestamp until v0.7.7, when refreshFollows stopped
-  // rebuilding a list that had not changed and there ceased to be a
-  // refresh time to report. Renaming a stored column would mean a
-  // migration for a diagnostic, so the column keeps its name and this is
-  // where the two are reconciled.
-  followsListAt: number | null;
-  largestNonOwnerAuthor: LargestNonOwnerAuthor | null;
-}
-
-// Null when nothing has computed one yet -- a relay that has never served
-// a stats request and never run a cron tick. Callers recompute in that
-// case; there is no seeded row, because a zeroed snapshot and a real one
-// would be indistinguishable and the zeroes would be wrong.
-//
-// Rows read: 1.
-export function readStatsSnapshot(sql: SqlStorage): StatsSnapshot | null {
-  const row = sql
-    .exec<{
-      computed_at: number;
-      total_events: number;
-      events_24h: number;
-      follow_count: number;
-      follows_refreshed_at: number | null;
-      largest_author_pubkey: string | null;
-      largest_author_events: number | null;
-    }>(`SELECT * FROM stats_snapshot LIMIT 1`)
-    .toArray()[0];
-  if (row === undefined) return null;
-  return {
-    computedAt: row.computed_at,
-    totalEvents: row.total_events,
-    events24h: row.events_24h,
-    followCount: row.follow_count,
-    followsListAt: row.follows_refreshed_at,
-    largestNonOwnerAuthor:
-      row.largest_author_pubkey === null || row.largest_author_events === null
-        ? null
-        : { pubkey: row.largest_author_pubkey, events: row.largest_author_events },
-  };
-}
-
-// Rows read: ~3E + 2F. This is the whole cost the snapshot exists to stop
-// paying per page load, gathered in one place so it is obvious what a
-// refresh costs and what raising the refresh rate would cost.
-//
-//   totalEvents            E -- COUNT(*) over the smallest index
-//   events24h              E -- `created_at` leads no index, so a scan
-//   largestNonOwnerAuthor  E -- a GROUP BY visits every author's rows
-//   follows                2F
-//
-// `events24h` is the one that could in principle be indexed away, the way
-// `ingested_at` just was. It is deliberately not: a fourth index on
-// `events` keyed by `created_at` alone would cost another row per stored
-// event to make a number cheaper that is now read four times a day. The
-// snapshot is the cheaper answer to the same problem, and it is worth
-// noticing that it is available whenever the index is not.
-//
-// `owner` is passed in rather than resolved here: ownership.ts imports
-// this module, so reaching the other way would be a cycle.
-export function computeStatsSnapshot(
-  sql: SqlStorage,
-  owner: string | null,
-  nowSec: number,
-): StatsSnapshot {
-  const since = nowSec - 86400;
-  return {
-    computedAt: nowSec,
-    totalEvents: sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events`).toArray()[0]?.n ?? 0,
-    events24h:
-      sql
-        .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events WHERE created_at > ?`, since)
-        .toArray()[0]?.n ?? 0,
-    followCount: sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM follows`).toArray()[0]?.n ?? 0,
-    // The `created_at` of the contact list the cache currently reflects
-    // (schema.ts `follows`), not the moment it was last rebuilt -- there
-    // is no longer such a moment to report, since refreshFollows only
-    // writes when the list has actually changed. Every row carries the
-    // same value; MAX is how one is picked, not an aggregate over
-    // different ones.
-    followsListAt:
-      sql.exec<{ t: number | null }>(`SELECT MAX(fetched_at) AS t FROM follows`).toArray()[0]?.t ??
-      null,
-    largestNonOwnerAuthor: largestNonOwnerAuthor(sql, owner),
-  };
-}
-
-// Replaced wholesale, never updated in place -- the row is a single
-// consistent reading of the table at one instant, and half-updating it
-// would produce a snapshot describing no moment that ever existed.
-//
-// Rows written: 2 (the DELETE and the INSERT; 1 the very first time,
-// when there is nothing to delete). The table carries no primary key and
-// no index, so neither statement pays for one. Called at most once per
-// STATS_SNAPSHOT_MAX_AGE_MS -- see the table's comment in schema.ts for
-// why a cached number in a row is acceptable here and was not for a
-// per-event counter.
-export function writeStatsSnapshot(sql: SqlStorage, snapshot: StatsSnapshot): void {
-  sql.exec(`DELETE FROM stats_snapshot`);
-  sql.exec(
-    `INSERT INTO stats_snapshot
-       (computed_at, total_events, events_24h, follow_count, follows_refreshed_at,
-        largest_author_pubkey, largest_author_events)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    snapshot.computedAt,
-    snapshot.totalEvents,
-    snapshot.events24h,
-    snapshot.followCount,
-    snapshot.followsListAt,
-    snapshot.largestNonOwnerAuthor?.pubkey ?? null,
-    snapshot.largestNonOwnerAuthor?.events ?? null,
-  );
-}
-
-// ---------------------------------------------------------------------
-// /api/stats' live half, also persisted (schema.ts `live_stats`), on the
-// five-minute clock of limits.ts LIVE_STATS_MAX_AGE_MS rather than the
-// six-hour one above.
-//
-// Two tables and two TTLs rather than one of each, because the two halves
-// answer to different constraints. The snapshot's cost is ~3E and its
-// contents tolerate a stale hour; these two cost the size of the ingest
-// window and are the write-budget meter, which does not. Merging them
-// would mean either paying 3E every five minutes or reading a six-hour-old
-// budget line during an outage, and both are worse than a second row.
+// They sat beside a second cache, `stats_snapshot`, on a six-hour clock
+// over the counts that walked a table. That one is gone: every field it
+// held is a maintained counter now or deleted, so there is nothing left
+// for a clock to ration. These two survive because what they measure
+// genuinely cannot be maintained the same way -- `rowsWrittenToday` is a
+// sum over a window that empties at 00:00 UTC and `ingested24h` a rolling
+// count by ingest time, and neither is a quantity any single write knows
+// how to increment toward. Cached, therefore, rather than counted.
 // ---------------------------------------------------------------------
 
 export interface LiveStats {

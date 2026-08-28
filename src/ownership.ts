@@ -1,6 +1,6 @@
 import type { OwnerProfile } from "./nip11";
 import type { Profile } from "./profile-lookup";
-import { isPubkeyAllowed, isPubkeyBanned } from "./storage";
+import { isPubkeyAllowed, isPubkeyBanned, setFollowCount } from "./storage";
 
 // Kind-3 is NIP-01/NIP-02's contact list; its `p` tags are the follow set.
 // Exported so relay.ts can recognize an owner kind-3 write and refresh the
@@ -177,7 +177,17 @@ export function refreshFollows(sql: SqlStorage, env: Env): void {
     // The contact list is gone -- deleted, vanished, or never stored.
     // Only pay for the DELETE if there is something to delete; an empty
     // cache on a relay with no kind-3 is already the right answer.
-    if (cachedFrom !== undefined) sql.exec(`DELETE FROM follows`);
+    //
+    // The counter moves with the DELETE and inside the same branch, not
+    // after the `if`: this is one of exactly two places that write the
+    // `follows` table (see schema.ts `maintained_counts`), and a counter
+    // update parked at the function's exit would be a separate step that
+    // an early return could skip -- which is precisely what the two
+    // returns above it do on the common path.
+    if (cachedFrom !== undefined) {
+      sql.exec(`DELETE FROM follows`);
+      setFollowCount(sql, 0);
+    }
     return;
   }
   if (cachedFrom === latest.created_at) return;
@@ -190,6 +200,18 @@ export function refreshFollows(sql: SqlStorage, env: Env): void {
   for (const pubkey of follows) {
     sql.exec(`INSERT INTO follows (pubkey, fetched_at) VALUES (?, ?)`, pubkey, latest.created_at);
   }
+  // After the inserts, so a rebuild that threw partway leaves a count that
+  // is too low rather than one claiming rows that were never written --
+  // and either way the daily audit (storage.ts auditMaintainedCounts) has
+  // something to report. `follows.size`, not `tags.length`: the Set is
+  // what was actually inserted, since a contact list may repeat a pubkey
+  // and the table's PRIMARY KEY would collapse the duplicates.
+  //
+  // Rows written: 1, on top of the hundreds this rebuild already costs,
+  // and only when the list has genuinely changed -- the equality check
+  // above returns before reaching here on every other call. That is the
+  // whole price of `/api/stats` no longer counting `follows` per request.
+  setFollowCount(sql, follows.size);
 }
 
 // Re-derives the cached name/picture (backing NIP-11's icon and

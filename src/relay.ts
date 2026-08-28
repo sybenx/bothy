@@ -29,7 +29,6 @@ import {
   nonOwnerStorageLimit,
   PUBKEY_RATE_LIMIT_MAX_TRACKED,
   PUBKEY_RATE_LIMIT_WINDOW_MS,
-  STATS_SNAPSHOT_MAX_AGE_MS,
   STORAGE_BYTES_LIMIT,
   utcDayStartSeconds,
 } from "./limits";
@@ -62,12 +61,12 @@ import {
   applyDeletion,
   beginVanish,
   computeLiveStats,
-  computeStatsSnapshot,
+  auditMaintainedCounts,
+  countEvents24h,
+  followsListAt,
+  readMaintainedCounts,
   drainVanish,
   pendingVanishes,
-  readStatsSnapshot,
-  type StatsSnapshot,
-  writeStatsSnapshot,
   eventExists,
   expirationOf,
   getRelaySettings,
@@ -413,19 +412,24 @@ export class Relay extends DurableObject<Env> {
     version: string;
     claimed: boolean;
     ownerPubkey: string | null;
+    // Maintained, not counted: storage.ts readMaintainedCounts reads one
+    // row of `maintained_counts`, which insertEventRow and deleteEventRow
+    // move. Exact and current -- it was a COUNT(*) over `events` served
+    // from a six-hour snapshot until the counters landed.
     totalEvents: number;
     // Events whose own created_at falls in the last 24h -- what the owner
     // has been posting lately. NOT what this relay took in: a backfilled
     // event is years old by created_at and lands here as zero. See
     // ingested24h below, which is the other half of that sentence.
+    //
+    // Also maintained (storage.ts countEvents24h), from per-hour buckets
+    // keyed by `created_at` -- which is what makes the sentence above
+    // true of the counter and not just of the old scan. At most 26 rows
+    // read, whatever E is and however busy the relay is. The window is
+    // whole hours, so it spans 24-25h rather than exactly 24; see
+    // countEvents24h for why that is an improvement on what it replaced.
     events24h: number;
-    // When `totalEvents`, `events24h`, `followCount`,
-    // `followsListAt` and `largestNonOwnerAuthor` were computed
-    // (unix seconds). Those five come from the `stats_snapshot` row and
-    // are up to limits.ts STATS_SNAPSHOT_MAX_AGE_MS old; every other
-    // field here is read live. Reported so a consumer can tell the two
-    // apart instead of assuming the whole document describes one instant.
-    snapshotAt: number;
+
     // Events this relay actually wrote in the last 24h, backfill
     // included (storage.ts countIngested24h). Cached for
     // limits.ts LIVE_STATS_MAX_AGE_MS -- see `liveAt` below.
@@ -439,11 +443,12 @@ export class Relay extends DurableObject<Env> {
     rowsWrittenToday: number;
     // When `ingested24h` and `rowsWrittenToday` were computed (unix
     // seconds). Those two come from the `live_stats` row and are up to
-    // limits.ts LIVE_STATS_MAX_AGE_MS old -- five minutes, not the six
-    // hours `snapshotAt` above describes. Two ages on one document
-    // because there are two caches on two clocks, and a consumer that
-    // cannot tell them apart would have to assume the stalest one
-    // applies to everything.
+    // limits.ts LIVE_STATS_MAX_AGE_MS old -- five minutes. They are the
+    // only fields on this document that are not current as of the
+    // request, which is why one age is now enough where there used to be
+    // two: `snapshotAt` dated a six-hour cache over the counts that
+    // walked a table, and every one of those is a maintained counter now
+    // or deleted.
     liveAt: number;
     // The three Workers-free-tier ceilings limits.ts declares, transported
     // rather than left for public/index.html to hardcode a second copy of
@@ -470,20 +475,27 @@ export class Relay extends DurableObject<Env> {
     // that silently blocks every follow) has a visible signal instead of
     // a mystery.
     writePolicy: "owner" | "follows";
+    // Maintained by ownership.ts refreshFollows, which is the only
+    // function that writes the `follows` table -- so this comes out of
+    // the same `maintained_counts` row as `totalEvents`, at no extra
+    // read. It was a COUNT over `follows` behind a six-hour cache.
     followCount: number;
     // The `created_at` of the owner's contact list as the follow cache
     // currently has it -- not when that cache was last refreshed, which
     // is no longer a thing that happens on a schedule (ownership.ts
-    // refreshFollows).
+    // refreshFollows). One row read: every row in `follows` carries the
+    // same value, so this needs no counter of its own.
     followsListAt: number | null;
-    // The largest number of stored events held by one non-owner pubkey,
-    // and NIP-62 vanish requests still draining. Both are here for the
-    // same reason: a vanish removes every event its sender authored, the
-    // relay cannot refuse one, and the cost scales with how many that is
-    // -- so this is the worst case the deployment is actually exposed to,
-    // reported rather than assumed. See storage.ts largestNonOwnerAuthor
-    // and the comment on deleteEventRow.
-    largestNonOwnerAuthor: { pubkey: string; events: number } | null;
+    // NIP-62 vanish requests still draining. A vanish removes every event
+    // its sender authored, the relay cannot refuse one, and the cost
+    // scales with how many that is -- so a stalled drain is visible here
+    // rather than inferred. See the comment on storage.ts deleteEventRow.
+    //
+    // It used to sit beside `largestNonOwnerAuthor`, which reported the
+    // largest such exposure before one was requested. That field is gone:
+    // it cost a GROUP BY over every event to produce, nothing acted on
+    // it, and the exposure it described is bounded by the write gate and
+    // the storage cap rather than by knowing the number.
     vanishing: { pubkey: string; deletedSoFar: number; requestedAt: number }[];
     // DIAGNOSTIC, and expected to be removed with src/read-metrics.ts.
     // Rows read attributed to the code path that caused them, since the
@@ -516,6 +528,7 @@ export class Relay extends DurableObject<Env> {
     const sql = this.sql;
     const owner = getOwnerPubkey(sql, this.env);
     const nowMs = Date.now();
+    const nowSec = Math.floor(nowMs / 1000);
     // The last 00:00 UTC, because the rows-written ceiling this measures
     // against is an allowance that empties then -- see limits.ts
     // utcDayStartSeconds. Computed here rather than inside
@@ -526,15 +539,13 @@ export class Relay extends DurableObject<Env> {
     // is used (storage.ts computeLiveStats).
     const budgetSince = utcDayStartSeconds(nowMs);
 
-    // The expensive half, read back from `stats_snapshot` rather than
-    // recomputed. Recomputed here only when the cron tick has not done it
-    // -- a relay deployed minutes ago, or one whose cron has not fired
-    // since the snapshot aged out. See limits.ts STATS_SNAPSHOT_MAX_AGE_MS
-    // for why the bound is where it is, and schema.ts `stats_snapshot`
-    // for why this lives in a row rather than in memory.
-    const snapshot = this.refreshStatsSnapshot(owner);
-    // The cheap half -- but only relative to the snapshot above. See
-    // refreshLiveStats.
+    // Every count this relay maintains, in one row read (schema.ts
+    // `maintained_counts`). This used to be a cache read that could miss
+    // and fall through to ~3E rows of recomputation; there is nothing
+    // left here that can miss.
+    const counts = readMaintainedCounts(sql);
+    // The one thing on this document still cached, and the only reason
+    // `liveAt` exists. See refreshLiveStats.
     const live = this.refreshLiveStats(budgetSince);
 
     const profile = getOwnerProfile(sql, this.env);
@@ -544,13 +555,10 @@ export class Relay extends DurableObject<Env> {
       version,
       claimed: owner !== null,
       ownerPubkey: owner,
-      totalEvents: snapshot.totalEvents,
-      events24h: snapshot.events24h,
-      // When the counts above were taken. They are up to
-      // STATS_SNAPSHOT_MAX_AGE_MS old and the fields beside them are
-      // current, so the age is reported rather than left to be assumed --
-      // the admin page shows it next to the total.
-      snapshotAt: snapshot.computedAt,
+      // Both maintained: the row read above, plus at most 26 bucket rows.
+      // Current as of this request.
+      totalEvents: counts.events,
+      events24h: countEvents24h(sql, nowSec),
       // Cached on a five-minute clock (schema.ts `live_stats`), not read
       // per request. `ingested_at` is indexed as of v0.7.6
       // (schema.ts idx_events_ingested) so neither of these reads the
@@ -579,59 +587,36 @@ export class Relay extends DurableObject<Env> {
       icon: resolveIcon(this.env, settings, profile),
       relayName: resolveName(this.env, settings, profile),
       writePolicy: allowFollowsEnabled(this.env) ? "follows" : "owner",
-      followCount: snapshot.followCount,
-      followsListAt: snapshot.followsListAt,
-      largestNonOwnerAuthor: snapshot.largestNonOwnerAuthor,
+      // Out of the same row as `totalEvents` above, at no additional read.
+      followCount: counts.follows,
+      followsListAt: followsListAt(sql),
       vanishing: pendingVanishes(sql),
     };
   }
 
-  // Returns a snapshot no older than STATS_SNAPSHOT_MAX_AGE_MS,
-  // recomputing and storing one if what is there is older than that or
-  // absent.
+  // The last cache on /api/stats, on the five-minute clock of limits.ts
+  // LIVE_STATS_MAX_AGE_MS, over `ingested24h` and `rowsWrittenToday`
+  // (schema.ts `live_stats`).
   //
-  // Both callers go through here, and that is what makes the bound real:
-  // the cron tick refreshes a stale snapshot so page loads normally find
-  // a fresh one, and a page load refreshes a stale snapshot so a relay
-  // whose cron has not fired yet still shows real numbers. Neither can
-  // recompute more often than the constant allows, however often it is
-  // called -- unlike the in-memory cache this replaced, whose
-  // recomputation rate was set by the page-load rate, because the object
-  // hibernated between loads and lost the cache every time.
+  // It had a sibling, refreshStatsSnapshot, gating a six-hour cache over
+  // the counts that walked a table. That one is gone with the table it
+  // guarded: every field it held is a maintained counter now or deleted,
+  // so there was a mechanism left rationing a cost that no longer
+  // existed. This one stays because what it caches genuinely cannot be
+  // maintained -- a rolling count by ingest time and a sum over a window
+  // that empties at 00:00 UTC are not quantities any single write knows
+  // how to increment toward.
   //
-  // No `force`. Nothing should be able to ask for a recomputation outside
-  // the gate: a bypass would be a way to spend 3E rows read per call, and
-  // the reason this exists is that something already could.
-  private refreshStatsSnapshot(owner: string | null): StatsSnapshot {
-    const sql = this.sql;
-    const existing = readStatsSnapshot(sql);
-    const nowSec = nowSeconds();
-    if (existing !== null && (nowSec - existing.computedAt) * 1000 < STATS_SNAPSHOT_MAX_AGE_MS) {
-      return existing;
-    }
-    const fresh = computeStatsSnapshot(sql, owner, nowSec);
-    writeStatsSnapshot(sql, fresh);
-    return fresh;
-  }
-
-  // The same gate as refreshStatsSnapshot above, on the five-minute clock
-  // of limits.ts LIVE_STATS_MAX_AGE_MS, over `ingested24h` and
-  // `rowsWrittenToday` (schema.ts `live_stats`).
-  //
-  // It exists for a different reason than that one does. The snapshot
-  // caches a cost that grows with the accumulated table; this caches a
-  // cost that is modest per request and was multiplied by an
-  // unauthenticated GET nothing rate-limits -- ~1,200 rows each, ~4,100
-  // requests to spend the day's entire rows-read allowance from anywhere,
-  // for free. What is bounded here is not the size of one read but the
-  // number of times per day the expensive one can happen at all, which is
-  // the only property that survives an attacker choosing the request
-  // rate.
+  // What it bounds is not the size of one read but the number of times a
+  // day the expensive one can happen at all: ~1,200 rows each on an
+  // unauthenticated GET, ~4,100 requests to spend the day's entire
+  // rows-read allowance from anywhere, for free. The request rate no
+  // longer sets the recompute rate, which is the only property that
+  // survives an attacker choosing that rate.
   //
   // Only reached from a stats request; the cron tick deliberately does
-  // not refresh this (limits.ts LIVE_STATS_MAX_AGE_MS). And no `force`,
-  // for the reason refreshStatsSnapshot has none: a bypass would be a way
-  // to spend the cost this gate exists to bound.
+  // not refresh this (limits.ts LIVE_STATS_MAX_AGE_MS). And no `force`:
+  // a bypass would be a way to spend the cost this gate exists to bound.
   private refreshLiveStats(budgetSince: number): LiveStats {
     const sql = this.sql;
     const existing = readLiveStats(sql);
@@ -688,19 +673,26 @@ export class Relay extends DurableObject<Env> {
       // be what happens last or backfill would spend the next tick
       // fetching its own history from itself. See purgeSelfRelay.
         purgeSelfRelay(sql);
-        // Refreshed here so an admin page load normally finds a snapshot
-        // already computed and pays nothing for it. Gated by
-        // STATS_SNAPSHOT_MAX_AGE_MS rather than run on every tick: the
-        // computation is ~3E rows read (storage.ts computeStatsSnapshot),
-        // and doing it hourly would have cost 72E rows/day with nobody
-        // watching -- more than the 48E cron floor this release removed
-        // by indexing `ingested_at`. Same shape as refreshProfile above,
-        // which is likewise gated below the cron's own frequency.
+        // Once a day (paced by maintained_counts.audited_at, not by this
+        // tick's frequency), recount `events` and `follows` and log if the
+        // maintained counters disagree. E + F rows read, once -- against
+        // the ~12E a day the stats snapshot spent recomputing these same
+        // numbers four times over before they were maintained, this is a
+        // quarter of the cost and it checks the answer instead of
+        // assuming it. Detect only: see storage.ts auditMaintainedCounts
+        // for why it must not self-correct.
+        //
+        // This tick used to refresh the stats snapshot here as well, so
+        // an admin page load would find one already computed. There is no
+        // snapshot any more and nothing to precompute: a stats request
+        // reads a row and at most 26 buckets, which is cheaper than the
+        // cache read the snapshot cost.
         //
         // Before the vanish drain, deliberately: the drain is the step
-        // that can consume the tick's budget, and a stale stats page is a
-        // better failure than a stalled vanish.
-        this.refreshStatsSnapshot(getOwnerPubkey(sql, this.env));
+        // that can consume the tick's budget, and everything the relay
+        // does for itself goes ahead of the step a stranger's request
+        // sizes.
+        auditMaintainedCounts(sql, now);
         // Last, and deliberately so: this is the only step whose cost is
         // set by a stranger's request rather than by the relay's own
         // state, and everything above gates the owner's own writes.

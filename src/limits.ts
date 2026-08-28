@@ -641,42 +641,39 @@ export const DAILY_ROWS_WRITTEN_LIMIT = 100_000;
 // two-sided window for auth events only.
 export const MAX_CREATED_AT_FUTURE_SECONDS = 3600;
 
-// How stale /api/stats' expensive counts may get before something
-// recomputes them -- schema.ts `stats_snapshot`, storage.ts
-// computeStatsSnapshot, relay.ts collectStats.
+// This file used to declare a second stats cap here,
+// STATS_SNAPSHOT_MAX_AGE_MS, bounding how stale /api/stats' expensive
+// counts could get. It is gone, and the reason it is gone belongs in the
+// file that priced it.
 //
-// This is a READ-budget cap, not a freshness preference, and it is set by
-// the only arithmetic that matters here: a refresh costs ~3E rows read
-// (storage.ts computeStatsSnapshot itemises them), so refreshing every
-// hourly cron tick would cost 72E rows/day with nobody watching. That is
-// larger than the 48E cron floor this same release just deleted by
-// indexing `ingested_at` -- it would have replaced one cost that grows
-// with the accumulated table with a bigger one. At six hours it is
-// 12E/day: four refreshes, ~51,000 rows read/day at the live relay's
-// E = 4,232, and it does not reach the 5,000,000 ceiling until
-// E ~= 416,000.
+// It guarded ~3E rows read per refresh: a COUNT over `events`, a scan by
+// `created_at`, and a GROUP BY over every author. Six hours was the
+// arithmetic that made four refreshes a day (12E) fit under the ceiling.
+// But rationing the RATE of an expensive read is the second-best answer;
+// the best is for the read not to be expensive, and every one of those
+// three fields could be. `totalEvents` and `events24h` became maintained
+// counters (schema.ts `maintained_counts`/`event_hour_counts`),
+// `largestNonOwnerAuthor` was deleted as a scan answering a question
+// nothing asked, and `followCount` followed the same route -- maintained
+// by ownership.ts refreshFollows, the only function that writes the table
+// it counts, at one row per contact-list change. `followsListAt` needed
+// no counter at all: every row in `follows` carries the same value, so
+// `LIMIT 1` is the column rather than a sample of it.
 //
-// Enforced on both sides, so nothing can outrun it. The cron tick
-// refreshes a snapshot older than this and skips one that is not, the
-// way ownership.ts refreshProfile is gated to once a day regardless of
-// how often the hourly cron fires; a stats request recomputes only if
-// the cron has not, which is what covers a fresh deployment with no
-// snapshot yet. Between them the recomputation rate is bounded by this
-// constant and by nothing else -- in particular not by how often anyone
-// loads the admin page, which is precisely what went wrong with the
-// in-memory cache this replaced.
+// With nothing left that walked a table, `stats_snapshot`, this constant,
+// relay.ts refreshStatsSnapshot and its cron call were a mechanism
+// rationing a cost that no longer existed, and were removed together.
+// LIVE_STATS_MAX_AGE_MS below is the one stats cap left, over the two
+// figures that genuinely cannot be maintained.
 //
-// Six hours of staleness is fine for what these numbers are: a total
-// event count, a 24h event count, a follow count. /api/stats reports
-// `snapshotAt` alongside them so their age is stated rather than
-// implied, and the figures that genuinely want to be current --
-// storage used, rows written today, backfill progress -- are not in the
-// snapshot at all.
-export const STATS_SNAPSHOT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+// The general lesson, since this file is where costs get priced: a TTL
+// over an expensive read is a bound on how often you pay it, not on what
+// it costs, and it survives only as long as nobody can make the read
+// cheap. Reach for the counter first and the clock second.
 
 // How stale /api/stats' LIVE half may get -- `ingested24h` and
 // `rowsWrittenToday`, the two windowed scans left over once the
-// STATS_SNAPSHOT_MAX_AGE_MS half above was moved into a row (schema.ts
+// `stats_snapshot` half was moved into a row (schema.ts
 // `live_stats`, storage.ts computeLiveStats, relay.ts refreshLiveStats).
 //
 // A separate constant from the one above, not a reuse of it, and the
@@ -695,9 +692,9 @@ export const STATS_SNAPSHOT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 // per request: ~4,100 requests took the 5,000,000 rows-read/day
 // allowance for the rest of the UTC day, from anywhere, at no cost to
 // the caller. That is the same shape as the gift wrap gate probe -- an
-// expensive read on the far side of no gate -- and the fix is the same
-// one the snapshot above already applies: bound the RATE at which the
-// expensive thing runs, so the request count stops being what sets it.
+// expensive read on the far side of no gate -- and the fix, where a
+// figure cannot simply be maintained, is to bound the RATE at which the
+// expensive thing runs so the request count stops being what sets it.
 //
 // A ROW, NOT MEMORY, and the reasoning is worth stating because the
 // obvious argument points the other way: hibernation clears memory, but a
@@ -709,9 +706,10 @@ export const STATS_SNAPSHOT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 // ~1,200 rows is 10,400,000 rows, twice the ceiling, from a single host
 // making six requests a minute. Storage is the only state in this object
 // that outlives eviction, so the bound has to live there or it is a
-// description of an intention. `stats_snapshot` above learned this the
-// expensive way (see its comment in schema.ts); this is the same lesson
-// applied before rather than after.
+// description of an intention. The `stats_snapshot` cache this file
+// used to declare a TTL for learned that the expensive way, by shipping
+// an in-memory cache first that measurement showed essentially never
+// hit; this is the same lesson applied before rather than after.
 //
 // WHY FIVE MINUTES. A refresh does not cost a constant -- both queries
 // read the ingest window, so one costs roughly 1.5 x D, where D is
@@ -735,23 +733,31 @@ export const STATS_SNAPSHOT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 // Five minutes is also finer than the thing it measures. During a
 // backfill `rowsWrittenToday` moves in hourly steps, because backfill
 // writes on the hourly cron tick; live traffic moves it continuously but
-// slowly. /api/stats reports `liveAt` beside these two the way it reports
-// `snapshotAt` beside the snapshotted five, so the age is stated rather
-// than implied.
+// slowly. /api/stats reports `liveAt` beside these two so their age is
+// stated rather than implied -- and it is now the ONLY age on that
+// document, since every other field is either current or a maintained
+// counter.
 //
-// Refreshed ONLY on demand, deliberately -- unlike the snapshot above,
-// the cron tick does not refresh this. The tick fires hourly, which is
+// Refreshed ONLY on demand, deliberately -- the cron tick does not
+// refresh this. The tick fires hourly, which is
 // longer than this TTL, so it could not keep the row warm; all it would
 // add is a fixed 24-refresh/day floor paid on a relay nobody is looking
 // at.
 //
 // THE NEXT STEP, if this stops being enough: hourly bucket counters --
 // one row written per event into a per-hour bucket, and a windowed sum
-// that reads at most 24 rows. That makes both figures cheap outright
-// rather than cheap-on-average, and removes the staleness with them. It
-// is the better long-term shape and it needs a schema change and a write
-// on the per-event path; this cache closes the abuse without either, so
-// it comes first.
+// that reads at most 24 rows. That makes a figure cheap outright rather
+// than cheap-on-average, and removes the staleness with it.
+//
+// That shape now exists: `events24h` is exactly it (schema.ts
+// `event_hour_counts`), and it retired the six-hour cache these two used
+// to sit beside. It has not been applied HERE because these two are
+// harder than `events24h` was, not because it was forgotten.
+// `ingested24h` would need a second bucket table keyed by ingest time --
+// a third row written per event, for a diagnostic -- and
+// `rowsWrittenToday` is a sum over a window that empties at 00:00 UTC,
+// which no per-event increment expresses. So these two stay cached, and
+// the bucket tables stay where the arithmetic actually paid for them.
 export const LIVE_STATS_MAX_AGE_MS = 5 * 60 * 1000;
 
 // Backfill must yield to the owner's own live
