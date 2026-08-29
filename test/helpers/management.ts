@@ -57,6 +57,26 @@ export interface ManagementReply {
   error?: string;
 }
 
+// Management calls go through the same per-IP limiter as every other HTTP
+// path (index.ts rateLimited(env.RATE_LIMIT_API, ...)), and this helper is
+// shared by three test files that between them make well over a hundred
+// calls. A caller that doesn't ask for a particular address used to fall
+// through to no header at all, which index.ts reads as the literal string
+// "unknown" -- so every one of those calls landed in the same bucket, and
+// nothing kept that bucket under the shared 60/minute allowance as the
+// suite grew (docs/test-notes.md). Auto-assigning a fresh address per call
+// means no two calls can ever collide on "unknown" by omission; a test that
+// wants a *specific* or *shared* address still gets one by passing `ip`
+// explicitly (see the blockip tests below, which do this on purpose).
+// Private-range and sequential rather than random, so a failure is
+// reproducible and never mistaken for the 203.0.113.0/24 and 198.51.100.0/24
+// addresses other tests use deliberately.
+let nextSyntheticIp = 0;
+function syntheticIp(): string {
+  nextSyntheticIp++;
+  return `10.${(nextSyntheticIp >> 16) & 0xff}.${(nextSyntheticIp >> 8) & 0xff}.${nextSyntheticIp & 0xff}`;
+}
+
 export async function callManagement(
   method: unknown,
   params: unknown[] = [],
@@ -66,7 +86,7 @@ export async function callManagement(
   const headers: Record<string, string> = { "Content-Type": MANAGEMENT_CONTENT_TYPE };
   if (opts.authHeader !== undefined) headers.Authorization = opts.authHeader;
   else if (!opts.omitAuthHeader) headers.Authorization = nip98Header(body, opts);
-  if (opts.ip) headers["CF-Connecting-IP"] = opts.ip;
+  headers["CF-Connecting-IP"] = opts.ip ?? syntheticIp();
 
   const response = await exports.default.fetch(
     new Request(opts.requestUrl ?? MANAGEMENT_URL, { method: "POST", headers, body }),
