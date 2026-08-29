@@ -908,7 +908,7 @@ export class Relay extends DurableObject<Env> {
     if (this.ctx.getTags(ws).includes(LIVE_FEED_TAG)) return;
 
     if (this.isRateLimited(ws)) {
-      send(ws, ["NOTICE", "rate-limited: slow down"]);
+      this.handleRateLimitedMessage(ws, message);
       return;
     }
 
@@ -955,6 +955,39 @@ export class Relay extends DurableObject<Env> {
     }
     entry.count++;
     return entry.count > RATE_LIMIT_MAX_MESSAGES;
+  }
+
+  // A rate-limited EVENT frame used to get only the NOTICE below, with no
+  // per-event verdict -- fine for a human at a keyboard, bad for a machine
+  // client. A WebRTC signalling client blocks on OK to know a candidate was
+  // delivered; measured in a signalling spike, 30 throttled events sat in
+  // the client's pending-OK map forever, stalling ICE with nothing to
+  // diagnose. So a frame that parses far enough to name an id gets OK false
+  // with a rate-limited: prefix instead. The size check runs against the
+  // raw frame BEFORE JSON.parse, the same ordering acceptEvent and
+  // handleJoin use for their own copy of this check -- parsing and
+  // extracting an id costs nothing like the schnorr verify this throttle
+  // exists to avoid, and that has to stay true even for the frames this
+  // throttle is refusing. Anything that isn't a parseable EVENT frame
+  // falls back to the plain NOTICE.
+  private handleRateLimitedMessage(ws: WebSocket, message: string): void {
+    const byteCap = maxEventBytes(this.env);
+    if (byteCap === null || message.length <= byteCap) {
+      let frame: unknown;
+      try {
+        frame = JSON.parse(message);
+      } catch {
+        frame = null;
+      }
+      if (Array.isArray(frame) && frame[0] === "EVENT") {
+        const event = parseEventShape(frame[1]);
+        if (event) {
+          ok(ws, event.id, false, "rate-limited: slow down");
+          return;
+        }
+      }
+    }
+    send(ws, ["NOTICE", "rate-limited: slow down"]);
   }
 
   // Scoped as one "write" entry per EVENT frame (read-metrics.ts), which
