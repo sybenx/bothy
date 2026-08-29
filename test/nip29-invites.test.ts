@@ -33,6 +33,7 @@ import {
   applyModeration,
   CREATE_INVITE_KIND,
   handleJoinRequest,
+  JOIN_REFUSAL_MESSAGE,
   JOIN_REQUEST_KIND,
   PUT_USER_KIND,
   REMOVE_USER_KIND,
@@ -444,6 +445,39 @@ describe("kind-9021 join request", () => {
 
     const second = (await invites()).find((i) => i.code === "second-invite-code-aaaa")!;
     expect(second.redeemed_at).toBeNull();
+  });
+
+  // The bug this test guards: the owner-or-member check used to run AFTER
+  // the no-code refusal, so the owner joining their own group -- who by
+  // definition holds no invite code -- got the same uniform refusal a
+  // stranger gets. A member retrying, or a second device, is the same
+  // case: neither one ever holds a code either.
+  it("admits the owner and an existing member with no code, but still refuses a stranger", async () => {
+    const conn = await connectRelay();
+    const member = randomKeypair();
+    await publish(conn, createInviteEvent());
+    expect((await publish(conn, join(member.secretKeyHex)))[2]).toBe(true);
+
+    const [, , ownerAccepted, ownerMessage] = await publish(conn, join(OWNER_SECRET_KEY_HEX, null));
+    expect(ownerAccepted).toBe(true);
+    expect(ownerMessage).toContain("already a member");
+
+    const [, , memberAccepted, memberMessage] = await publish(conn, join(member.secretKeyHex, null));
+    expect(memberAccepted).toBe(true);
+    expect(memberMessage).toContain("already a member");
+
+    const [, , strangerAccepted, strangerMessage] = await publish(
+      conn,
+      join(randomKeypair().secretKeyHex, null),
+    );
+    expect(strangerAccepted).toBe(false);
+    expect(strangerMessage).toBe(JOIN_REFUSAL_MESSAGE);
+    conn.close();
+
+    // Neither the owner's nor the member's no-code request spent the live
+    // invite or changed who is in the group.
+    expect((await lists()).members).toEqual([member.pubkeyHex]);
+    expect((await invites())[0]!.redeemed_at).not.toBeNull();
   });
 
   it("refuses a banned pubkey without spending the code", async () => {

@@ -528,30 +528,44 @@ export function handleJoinRequest(
     return { accepted: false, message: JOIN_REFUSAL_MESSAGE, generated: [] };
   };
 
-  // Free checks first -- these read nothing, and a request naming another
-  // relay's group or carrying no code at all is refused before any of the
-  // storage below. Both get the same uniform message: answering "wrong
-  // group id" would confirm which id this relay does host.
+  // The group-id check is free -- it reads nothing -- and stays first: a
+  // request naming another relay's group is refused before any storage,
+  // with the uniform message, since answering "wrong group id" would
+  // confirm which id this relay does host.
   if (groupIdOf(event) !== TOP_LEVEL_GROUP_ID) return refuse("not this relay's group", null);
   const code = codeTagValue(event.tags);
+
+  const owner = getOwnerPubkey(sql, env);
+  if (owner === null) return refuse("relay is unclaimed", code);
+
+  // Already in? Then the code stays unspent, whatever it is or whether one
+  // was even presented. A member re-sending a join request -- a client
+  // retrying, a second device -- has no code either, and neither does the
+  // owner, who is a member by exemption rather than by row
+  // (authorizeGroupWrite above) and is checked as the same case. Saying so
+  // plainly is safe: the request is signed, so this tells the signer only
+  // about themselves.
+  //
+  // THIS RUNS BEFORE THE NO-CODE REFUSAL BELOW, which inverts
+  // cheapest-first a second time in this function -- the first is the
+  // schnorr-before-invite-lookup ordering noted above this function, and
+  // that one exists to close an oracle. This one is for correctness, not
+  // secrecy: the owner and an existing member never hold a code, so
+  // refusing on a missing code before checking membership made the owner
+  // unable to join their own group and a member's retry indistinguishable
+  // from a stranger's. The cost is two storage reads -- this lookup and
+  // the one above it -- on every refused uninvited join instead of zero,
+  // and both paths still return the identical uniform message, so a
+  // stranger paying that cost learns nothing new for it.
+  if (event.pubkey === owner || isGroupMember(sql, event.pubkey)) {
+    return { accepted: true, message: "already a member of this group", generated: [] };
+  }
+
   // NIP-29: "If a group is `closed`, join requests are not honored unless
   // they include an invite code." This group is closed and has no other
   // admission path -- there is nobody to hold an uninvited request open
   // for, since a moderator queue is not a thing this relay has.
   if (code === null) return refuse("no invite code", null);
-
-  const owner = getOwnerPubkey(sql, env);
-  if (owner === null) return refuse("relay is unclaimed", code);
-
-  // Already in? Then the code stays unspent. A member re-sending a join
-  // request -- a client retrying, a second device -- must not consume an
-  // invite that could still admit somebody, and the owner is a member by
-  // exemption rather than by row (authorizeGroupWrite above), so they are
-  // checked as the same case. Saying so plainly is safe: the request is
-  // signed, so this tells the signer only about themselves.
-  if (event.pubkey === owner || isGroupMember(sql, event.pubkey)) {
-    return { accepted: true, message: "already a member of this group", generated: [] };
-  }
 
   // Before redeeming, so a banned pubkey does not burn a live invite on
   // its way to being refused. It gets the uniform message like every
