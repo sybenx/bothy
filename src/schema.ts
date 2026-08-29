@@ -302,9 +302,8 @@ export const TABLES: readonly TableSpec[] = [
       // Without it the subquery's own LIMIT (filters.ts tagScanLimit) runs
       // before the exclusion does, so the candidate set is filled with
       // group events and then emptied by the outer query -- measured at
-      // 50,000 group events, a client asking for 20 got 1
-      // (docs/group-exclusion.md). The rows have to be excluded where they
-      // are counted, not after.
+      // 50,000 group events, a client asking for 20 got 1. The rows have
+      // to be excluded where they are counted, not after.
       //
       // Zero additional rows written: the lookup index below is a partial
       // PAIR on this column rather than a second index, so a tag row still
@@ -858,7 +857,7 @@ export interface IndexSpec {
   // can use neither half. That is not a subtlety to be careful about, it
   // is the invariant -- storage.ts states it once and every lookup obeys
   // it, because the alternative is a full scan (51,500 rows against 2,
-  // measured at 50,000 group events; docs/group-exclusion.md).
+  // measured at 50,000 group events).
   readonly where?: string;
 }
 
@@ -878,7 +877,7 @@ export const INDEXES: readonly IndexSpec[] = [
   // this column existed, and a query pinning the other one gets the
   // mirror image. Measured across every shape this relay serves, the
   // public path is unchanged or cheaper and the authorised path costs at
-  // most 2x (two partitions instead of one) -- docs/group-exclusion.md.
+  // most 2x (two partitions instead of one).
   //
   // And why pairs rather than one partial index over the public rows
   // alone: rows written. A lone `WHERE is_group = 0` index would leave

@@ -132,8 +132,7 @@ export interface FilterQueryOptions {
   // column, so a query naming no partition can use neither half of any
   // pair and falls back to scanning `events`. Measured at 50,000 group
   // events, an authenticated `{"kinds":[1],"limit":20}` with no pin read
-  // 92,033 rows; pinned, and run once per partition, it reads 82
-  // (docs/group-exclusion.md).
+  // 92,033 rows; pinned, and run once per partition, it reads 82.
   //
   // A reader entitled to both partitions therefore runs the filter TWICE,
   // once per scope -- storage.ts queryFilter merges and re-slices, exactly

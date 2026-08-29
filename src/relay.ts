@@ -672,7 +672,7 @@ export class Relay extends DurableObject<Env> {
       //                      counters move with group REQs like any other.
       //
       // All three are coarser channels than a per-event counter, and all
-      // three remain. See docs/group-exclusion.md.
+      // three remain.
       totalEvents: counts.events - counts.groupEvents,
       events24h: windowed.total - windowed.group,
       // Maintained, out of the ingest-hour buckets read above -- at most

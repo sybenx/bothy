@@ -1092,7 +1092,7 @@ describe("gift wrap exclusion cost", () => {
 // because it runs once per partition. Both are asserted here rather than
 // argued, since the whole reason for choosing partial pairs over a widened
 // index was that a widened index moved a shape nobody had measured (an
-// authenticated `#p` read went 601 -> 204,701; docs/group-exclusion.md).
+// authenticated `#p` read went 601 -> 204,701; see src/groups.ts).
 describe("rows read by partition", () => {
   it("costs an unauthenticated read exactly what the same filter cost before the partition existed", async () => {
     await runInDurableObject(stub(), async (_instance: Relay, state) => {

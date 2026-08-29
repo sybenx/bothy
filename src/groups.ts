@@ -26,7 +26,14 @@ export const GROUP_TAG = "h";
 // three REQ-serving indexes are partial pairs keyed on this column. A query
 // that names no partition can use neither half of a pair and scans the
 // table instead: measured at 51,500 rows against 2 for the same lookup with
-// the pin (docs/group-exclusion.md).
+// the pin. Carrying is_group as a leading KEY column instead of a partial
+// pair would have made this cheap at the cost of every query that does not
+// pin it -- measured, the owner's own authenticated {"#p":[owner],
+// "kinds":[1059]} read went from 601 rows to 204,701 with is_group in the
+// key, because SQLite abandoned the primary-key seek for a partition scan.
+// A partial pair leaves the key columns untouched, so that same read costs
+// 567: a query pinning the partition gets the plan it had before the
+// column existed, and a query pinning the other one gets the mirror image.
 export const PUBLIC_SCOPE = 0;
 export const GROUP_SCOPE = 1;
 export type GroupScope = typeof PUBLIC_SCOPE | typeof GROUP_SCOPE;

@@ -816,7 +816,7 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
 //   pinned to neither         no index qualifies; SCAN events
 //
 // Measured at 50,000 group events, `SELECT id FROM events WHERE pubkey = ?
-// AND kind = ?`: 2 rows read pinned, 51,500 unpinned (docs/group-exclusion.md).
+// AND kind = ?`: 2 rows read pinned, 51,500 unpinned.
 //
 // A lookup that is not about one partition in particular therefore runs
 // once per partition and concatenates, which costs one extra seek and
