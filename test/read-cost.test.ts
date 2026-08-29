@@ -1151,4 +1151,53 @@ describe("rows read by partition", () => {
       expect(halfCost * 2).toBeLessThanOrEqual(wholeCost + 2);
     });
   });
+
+  // What widening the read gate to members added to the REQ path, priced.
+  //
+  // The gate resolves three permissions now (relay.ts handleReqInner) and
+  // one of them is a storage read: `group_members` keyed by the
+  // authenticated pubkey. It is a primary-key seek, so it is 1 row, and
+  // it is paid only by a client that has completed AUTH and is not the
+  // owner -- the owner short-circuits on the `||`, and an unauthenticated
+  // REQ never reaches it. That last part is the property the gift wrap
+  // gate was rewritten to have, and it is why this is asserted rather
+  // than assumed: a lookup that crept onto the unauthenticated path would
+  // be an unmetered read behind no gate at all, which is the shape this
+  // whole file exists to catch.
+  it("prices the member lookup the group read gate now runs at one indexed row", async () => {
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const member = "b".repeat(64);
+      sql.exec(`INSERT INTO group_members (pubkey, added_at) VALUES (?, ?)`, member, 0);
+      expect(rowsRead(sql, `SELECT 1 FROM group_members WHERE pubkey = ?`, member)).toBe(1);
+      // A pubkey that is not a member costs LESS than one that is -- the
+      // seek lands between index entries and reads nothing. So the gate
+      // is cheapest for exactly the callers there are most of, and a
+      // stranger cannot make it expensive by failing it.
+      expect(rowsRead(sql, `SELECT 1 FROM group_members WHERE pubkey = ?`, "c".repeat(64))).toBe(0);
+      sql.exec(`DELETE FROM group_members WHERE pubkey = ?`, member);
+    });
+  });
+
+  it("does not run it at all for an unauthenticated REQ", async () => {
+    resetReadMetrics();
+    const conn = await connectRelay("10.0.0.61");
+    conn.send(["REQ", "anon", { kinds: [1], limit: 5 }]);
+    for (;;) if ((await conn.nextMessage())[0] === "EOSE") break;
+    conn.close();
+
+    // The QUERY and nothing else -- 2 rows per returned event plus 1, the
+    // same figure this file's first assertion pins for the same shape run
+    // straight against storage. Both lookups the read gate can make sit
+    // behind `authedPubkey !== undefined`, so an unauthenticated REQ
+    // reaches neither: not the membership lookup this widening added, and
+    // not the owner lookup that was already there.
+    //
+    // Pinned exactly rather than bounded, because this is the path with no
+    // gate in front of it and the failure worth catching is a storage read
+    // creeping onto it -- which a `toBeLessThan` would let through until
+    // it got large.
+    const req = readMetricsSnapshot().paths.find((p) => p.path === "req");
+    expect(req?.rowsRead).toBe(2 * 5 + 1);
+  });
 });

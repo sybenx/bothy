@@ -493,10 +493,14 @@ export const MAX_FILTER_COMBINATIONS = Math.floor(MAX_FILTER_ROWS_READ / (ROWS_R
 // Set below the real ceiling (100), not at it -- the same margin
 // MAX_CONN_STATE_BYTES leaves below the WebSocket attachment's real 16KiB,
 // and for the same reason: filterParamCount counts the query boundFilter
-// can see, but relay.ts's excludeGiftWraps adds one more `kind != ?`
-// parameter on an unauthenticated read AFTER boundFilter has already
-// admitted the filter, so a filter sized exactly to the real ceiling here
-// could still be pushed over it by that one later addition.
+// can see, but the read gate's own exclusions each add a `kind != ?`
+// parameter AFTER boundFilter has already admitted the filter, so a filter
+// sized exactly to the real ceiling here could still be pushed over it by
+// one of those later additions. There are two of them now -- excludeGiftWraps
+// on an unauthenticated read and excludeInvites on a member's read -- and
+// both apply at once on a member's kinds-less filter, which is the
+// worst case at TWO parameters over what this counts. Ten is still four
+// times that.
 export const MAX_QUERY_BOUND_PARAMS = 90;
 
 // Which filter field pins which indexed column to a value.

@@ -1,5 +1,5 @@
 import { GIFT_WRAP_KIND, type Filter, type NostrEvent, tagFilterEntries } from "./nostr";
-import { type GroupScope, PUBLIC_SCOPE } from "./groups";
+import { CREATE_INVITE_KIND, type GroupScope, PUBLIC_SCOPE } from "./groups";
 
 // How many tag rows one `#<letter>` condition is allowed to look at, per
 // event the client asked for.
@@ -121,6 +121,34 @@ export interface FilterQueryOptions {
   // them.
   excludeGiftWraps?: boolean;
 
+  // Omit kind-9009 create-invite rows from the result instead of
+  // returning them. The read gate on invite codes, for every session that
+  // is not the owner's -- see groups.ts CREATE_INVITE_KIND for why a
+  // member of the group is on the wrong side of it.
+  //
+  // Applied WHATEVER the filter's `kinds` says, which is the one place
+  // this differs from excludeGiftWraps above. A filter naming 1059 never
+  // reaches the SQL at all, because the caller refuses it from `kinds`
+  // alone; a filter naming 9009 is not refused -- refusal there would be
+  // a new signal on the unauthenticated path, where `{"kinds":[9009]}` is
+  // answered with a plain EOSE today -- so the exclusion is what has to
+  // answer it, and gating it on `kinds === undefined` would let the one
+  // filter that asks for invites by name straight through.
+  //
+  // Emitted on the public half of a two-partition read as well as the
+  // group half, where it can match nothing: a kind-9009 carries an `h`
+  // tag (nip29.ts refuses one that does not) and so is always a group
+  // event. That redundancy is deliberate -- a read gate that is correct
+  // only because the WRITE gate holds is a gate with a dependency nobody
+  // can see, and this codebase already pays a condition rather than take
+  // that trade (relay.ts refuses an h-tagged gift wrap by isGroupEvent,
+  // the same predicate the partition uses, rather than by a narrower
+  // rule that happens to agree today). It costs one bound parameter on
+  // reads by a member, and nothing at all on any other read: the caller
+  // sets it only for a session authorised for the group partition and not
+  // for the invites in it.
+  excludeInvites?: boolean;
+
   // Which partition of `events` this query reads: the public rows, or one
   // group's-worth of rows (src/groups.ts). Defaults to the public
   // partition, which is what every unauthenticated read gets.
@@ -192,6 +220,13 @@ export function buildFilterQuery(
   if (options.excludeGiftWraps && filter.kinds === undefined) {
     conditions.push("kind != ?");
     params.push(GIFT_WRAP_KIND);
+  }
+  // See FilterQueryOptions.excludeInvites. Unconditional on `kinds`,
+  // unlike the gift wrap exclusion directly above, because a filter
+  // naming kind 9009 is answered by omission rather than refused.
+  if (options.excludeInvites) {
+    conditions.push("kind != ?");
+    params.push(CREATE_INVITE_KIND);
   }
   if (filter.since !== undefined) {
     conditions.push("created_at >= ?");

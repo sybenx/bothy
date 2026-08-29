@@ -127,10 +127,10 @@ async function lists(): Promise<{
 
 // Completes a NIP-42 handshake as whoever holds `secretKeyHex`. Takes a
 // key rather than assuming the owner, because the member-read block below
-// turns on the difference between a connection that is AUTHENTICATED and
-// one that is authenticated AS THE OWNER -- the relay accepts a member's
-// auth event perfectly happily, and then declines to widen anything on the
-// strength of it, which is the property being asserted.
+// turns on the difference between three identities the relay now tells
+// apart: a stranger who has authenticated (reads nothing of the group), a
+// member (reads the group), and the owner (reads the invite codes in it
+// as well).
 async function authenticateAs(conn: RelayConn, secretKeyHex: string): Promise<void> {
   conn.send(["REQ", "challengeTrigger", { kinds: [1059] }]);
   const [, challenge] = await conn.nextMessage();
@@ -699,34 +699,34 @@ describe("rows written", () => {
   });
 });
 
-// THE TRIPWIRE UNDER THE READ GATE, and the reason it is a test rather
-// than the comment at relay.ts `mayReadGroups`.
+// THE TRIPWIRE UNDER THE READ GATE -- and it fired, which is why this
+// block reads differently now.
 //
 // A kind-9009 is a stored, served group event carrying its code in a
-// `code` tag, so it lives in the partition that gate guards. Today that
-// gate admits the OWNER alone -- NIP-29 membership is not modelled on the
-// read side, so a member can write to the group and cannot read it back
-// (CLAUDE.md "What it structurally cannot defend against"). That
-// asymmetry is the only reason storing the code is safe.
+// `code` tag, so it lives in the partition the read gate guards. That
+// gate used to admit the OWNER alone, because NIP-29 membership was not
+// modelled on the read side at all, and the assertions here were that a
+// member -- who could already write to the group -- got nothing back from
+// any filter that could reach a 9009. They were written to FAIL the day
+// member-side reads landed, on the reasoning that an invite code is a
+// BEARER TOKEN: reading one is as good as being handed it, so a member
+// who could read the group could mint memberships at will and owner-only
+// invites would stop being owner-only with no line of the write path
+// changing.
 //
-// It is also load-bearing in a way nothing else states. The moment
-// member-side reads land -- already named in CLAUDE.md as a widening of
-// `mayReadGroups` and `broadcast()` together -- every member can read
-// every unused invite code. An invite code is a BEARER TOKEN: reading one
-// is as good as being handed it, so a member who can read the group can
-// mint memberships at will, and owner-only invites quietly stop being
-// owner-only without one line of the write path changing.
-//
-// These assertions fail if that gate widens without the 9009 being dealt
-// with first. That is the entire point: a comment only works on somebody
-// who happens to read it, and the person widening this gate will be
-// reading the gate, not the invite code that happens to sit behind it.
+// They failed exactly there, on exactly that assertion, and the answer
+// was to keep kind-9009 owner-only INSIDE a partition members now read
+// (groups.ts CREATE_INVITE_KIND). So the shape of this block has moved by
+// one step and its subject has not: it no longer asserts that a member
+// reads nothing of the group, it asserts that a member reads the group
+// and never reads a code. The absence assertions are held down by two
+// controls, because an absence passes just as well when the feature is
+// broken -- one below proving the member really does read the group, one
+// at the end proving the owner really does read the code in full.
 describe("what a member can read", () => {
   // A member in the fullest sense the relay has: in `group_members`, in
   // `allowed_pubkeys`, writing to the group successfully, and holding a
-  // live NIP-42 session. Everything short of the read permission that
-  // does not exist yet -- so if any of it ever starts admitting them,
-  // this is the shape it will admit.
+  // live NIP-42 session.
   async function seedMemberAndInvite(): Promise<{ member: Keypair; conn: RelayConn }> {
     const setup = await connectRelay();
     const member = randomKeypair();
@@ -771,32 +771,76 @@ describe("what a member can read", () => {
     const { member, conn } = await seedMemberAndInvite();
 
     // Every shape that could reach a kind-9009: by its kind, by its
-    // author, by the member's own p tag, and by an `authors` sweep of the
-    // owner's events. None of these NAME a group (`filterNamesGroup` is
-    // `#h` and the 39000-series kinds), so each is answered by omission
-    // rather than refused -- which is what makes an empty result the
-    // assertion and not an artefact of the refusal.
+    // author, by the member's own p tag, by an `authors` sweep of the
+    // owner's events, and -- since members read the group now -- by
+    // naming the group outright. The last one is served rather than
+    // refused, which is the widening; the others were served before it
+    // and are served after it. Not one of them may carry a code.
     for (const filter of [
       { kinds: [CREATE_INVITE_KIND] },
       { authors: [OWNER_PUBKEY_HEX], limit: 50 },
       { "#p": [member.pubkeyHex], limit: 50 },
       { kinds: [CREATE_INVITE_KIND], authors: [OWNER_PUBKEY_HEX] },
+      { "#h": [TOP_LEVEL_GROUP_ID], limit: 50 },
     ]) {
+      // collectStored throws on a CLOSED frame, so reaching the
+      // assertions at all is the proof that every one of these was
+      // answered by OMISSION rather than by refusal -- including the two
+      // that name kind 9009 in as many words. A refusal there would be a
+      // new signal on the unauthenticated path, where the same filter is
+      // answered with a plain EOSE.
       const events = await collectStored(conn, `m${JSON.stringify(filter)}`, [filter]);
-      // Stated twice on purpose. The count is what fails if the gate
-      // widens; the tag scan is what fails if some future change serves a
-      // redacted or re-shaped invite event that still carries its code.
-      expect(events).toEqual([]);
+      // Stated twice on purpose, and the two fail for different reasons.
+      // The kind scan is what fails if the invite event itself starts
+      // being served; the tag scan is what fails if some future change
+      // serves a redacted or re-shaped one that still carries its code.
+      expect(events.map((e) => e.kind)).not.toContain(CREATE_INVITE_KIND);
       expect(events.flatMap((e) => e.tags).filter((t) => t[0] === "code")).toEqual([]);
     }
 
-    // Naming the group outright is refused rather than emptied, which is
-    // the omit-don't-refuse split working as designed: this filter has
-    // already said what it wants.
+    // Naming the kind alone still returns nothing at all, which is the
+    // strongest form the assertion takes: the member cannot even count
+    // the group's outstanding invites.
+    expect(await collectStored(conn, "byKind", [{ kinds: [CREATE_INVITE_KIND] }])).toEqual([]);
+    conn.close();
+  });
+
+  // The control for the control. Every assertion above is about what a
+  // member does NOT get back, and all of them would pass just as well if
+  // the read gate had never widened at all -- which is exactly the state
+  // this block used to pin. This is the one that fails if a member stops
+  // being able to read the group.
+  it("while reading the rest of the group it is a member of", async () => {
+    const { conn } = await seedMemberAndInvite();
+
+    const events = await collectStored(conn, "group", [{ "#h": [TOP_LEVEL_GROUP_ID], limit: 50 }]);
+    // Its own note and the owner's put-user, both `h`-tagged into a
+    // partition an unauthenticated client is not served from at all.
+    expect(events.map((e) => e.content)).toContain("written by a real member");
+    expect(events.map((e) => e.kind)).toContain(PUT_USER_KIND);
+    // The relay-generated member list, which names the group in `d`
+    // rather than in `h`, reached by its kind.
+    const state = await collectStored(conn, "state", [{ kinds: [GROUP_MEMBERS_KIND] }]);
+    expect(state.length).toBe(1);
+    conn.close();
+  });
+
+  // A stranger who authenticates as themselves is not a member, and gets
+  // the refusal the member no longer gets. Without this, "members may
+  // read the group" could be implemented as "anyone who has completed
+  // AUTH may read the group" and every other test here would still pass.
+  it("but a signed-in stranger is still refused", async () => {
+    await seedMemberAndInvite();
+
+    const conn = await connectRelay();
+    await authenticateAs(conn, randomKeypair().secretKeyHex);
     conn.send(["REQ", "named", { "#h": [TOP_LEVEL_GROUP_ID] }]);
     const [frameType, , reason] = await conn.nextMessage();
     expect(frameType).toBe("CLOSED");
     expect(String(reason)).toContain("restricted:");
+    // And the omission half: a filter that does not name the group is
+    // answered normally, with the group's rows simply absent.
+    expect(await collectStored(conn, "byP", [{ "#p": [OWNER_PUBKEY_HEX], limit: 50 }])).toEqual([]);
     conn.close();
   });
 

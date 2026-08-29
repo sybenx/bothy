@@ -34,6 +34,7 @@
 // storeEvent reimplemented is half of the budget accounting missing, and
 // the accounting is the part nothing would notice was wrong.
 import {
+  CREATE_INVITE_KIND,
   GROUP_ADMINS_KIND,
   GROUP_MEMBERS_KIND,
   GROUP_METADATA_KIND,
@@ -76,7 +77,11 @@ import { computeEventId } from "./validate";
 export const PUT_USER_KIND = 9000;
 export const REMOVE_USER_KIND = 9001;
 export const EDIT_METADATA_KIND = 9002;
-export const CREATE_INVITE_KIND = 9009;
+// Defined in groups.ts and re-exported here, so the write side still
+// names it from one place. It lives over there because the READ gate is
+// what has to recognise it -- see its comment for the bearer-token
+// reasoning and for the import cycle that decides the file.
+export { CREATE_INVITE_KIND };
 
 // kind-9021, the one NIP-29 event a NON-member sends: "Any user can send
 // a kind 9021 event to the relay in order to request admission to the
@@ -147,11 +152,19 @@ const METADATA_FIELDS = ["name", "picture", "banner", "about"] as const;
 // emitted unconditionally and a kind-9002 carrying or omitting them
 // changes nothing. Each one is true here today:
 //
-//   private     only members may read group messages. True, and stronger
-//               than the word suggests: reads are gated on the owner's own
-//               NIP-42 identity because membership is not yet modelled on
-//               the read side (relay.ts handleReqInner), so a member is
-//               currently as unauthorised as a stranger.
+//   private     only members may read group messages. True, and true in
+//               the ordinary sense of the word now: relay.ts
+//               handleReqInner gates group reads on the same
+//               `group_members` list authorizeGroupWrite gates writes on,
+//               so a pubkey admitted to the group reads it back. It used
+//               to be true only in a stronger and less useful sense --
+//               reads were gated on the OWNER's NIP-42 identity, because
+//               membership was not modelled on the read side at all, and
+//               a member was as unauthorised as a stranger. One exception
+//               survives inside the partition: a kind-9009 create-invite
+//               is owner-only however private the group is, because its
+//               `code` tag is a bearer token (groups.ts
+//               CREATE_INVITE_KIND).
 //   restricted  only members may write. True -- authorizeGroupWrite below.
 //   hidden      relays should hide group metadata from non-members. True,
 //               and it is the whole reason groups.ts recognises this kind

@@ -13,6 +13,7 @@ import { matchesAnyFilter, parseFilter } from "./filters";
 import { recordHost } from "./host";
 import {
   ALL_SCOPES,
+  CREATE_INVITE_KIND,
   filterNamesGroup,
   type GroupScope,
   isGroupEvent,
@@ -98,6 +99,7 @@ import {
   giftWrapCount,
   hasNonOwnerStorageHeadroom,
   isDeleted,
+  isGroupMember,
   isIpBlocked,
   queryFilters,
   type RelaySettings,
@@ -1183,10 +1185,12 @@ export class Relay extends DurableObject<Env> {
     );
     ok(ws, event.id, result.accepted, result.message);
     // The regenerated member list, if this join changed one. Group state
-    // is group state: broadcast() drops it for any socket not
-    // authenticated as the owner, and it is deliberately not routed
-    // through liveBroadcast -- the same handling acceptEvent gives the
-    // events applyModeration returns.
+    // is group state: broadcast() drops it for any socket that is neither
+    // the owner nor a member, and it is deliberately not routed through
+    // liveBroadcast -- the same handling acceptEvent gives the events
+    // applyModeration returns. The pubkey that just joined IS a member by
+    // the time this runs, so a client that joined and subscribed sees its
+    // own admission land.
     for (const generated of result.generated) {
       this.broadcast(generated);
     }
@@ -1514,11 +1518,12 @@ export class Relay extends DurableObject<Env> {
       this.liveBroadcast(result.stored);
     }
     // Group state is group state: broadcast() drops these for any socket
-    // not authenticated as the owner, and liveBroadcast refuses them
-    // outright, both on the strength of groups.ts isGroupEvent -- which now
-    // recognises the relay-generated 39000-series by kind. Deliberately not
-    // routed through liveBroadcast at all, since it would refuse them
-    // anyway and calling it would only invite someone to "fix" that later.
+    // that is neither the owner nor a member of the group, and
+    // liveBroadcast refuses them outright whoever is listening, both on
+    // the strength of groups.ts isGroupEvent -- which now recognises the
+    // relay-generated 39000-series by kind. Deliberately not routed
+    // through liveBroadcast at all, since it would refuse them anyway and
+    // calling it would only invite someone to "fix" that later.
     for (const event of generated) {
       this.broadcast(event);
     }
@@ -1592,35 +1597,50 @@ export class Relay extends DurableObject<Env> {
     // nothing about the ordinary case moves.
     const perFilterBudget = Math.floor(MAX_FILTER_ROWS_READ / Math.max(1, rawFilters.length));
 
-    // Who this connection is, resolved once and used by both read gates
-    // below. One owner lookup rather than two, and none at all on the
-    // unauthenticated path -- `authedPubkey` is undefined there, so the
-    // `&&` short-circuits before the storage read, which is the property
-    // the gift wrap gate was rewritten to have and must not lose.
+    // Who this connection is, resolved once and used by all three read
+    // gates below. One owner lookup rather than three, and none at all on
+    // the unauthenticated path -- `authedPubkey` is undefined there, so
+    // the `&&` short-circuits before the storage read, which is the
+    // property the gift wrap gate was rewritten to have and must not lose.
     //
-    // Group reads are gated on the same identity as gift wrap reads for
-    // now, because that is the only identity this relay knows: NIP-29
-    // membership is not modelled yet. When it is, this is the line that
-    // widens -- and broadcast() below has to widen with it, or a member
-    // subscribed before an event arrives gets nothing.
+    // THREE permissions, not one, and they are three because the group is
+    // no longer a single thing to be let into:
     //
-    // WIDENING THIS TO MEMBERS HANDS THEM EVERY UNUSED INVITE CODE, and
-    // that is a security decision rather than a scope one. A kind-9009
-    // create-invite is a stored, served group event carrying its code in
-    // a `code` tag (nip29.ts), so it sits in the partition this line
-    // guards. An invite code is a BEARER TOKEN: reading one is as good as
-    // being handed it, so a member who can read the group can mint
-    // memberships, and owner-only invites stop being owner-only without
-    // anything in the write path changing. Widen this and the 9009 needs
-    // an answer FIRST -- keep it owner-only, strip the code from what is
-    // served, or stop storing it as a served event. test/nip29-invites.ts
-    // ("what a member can read") fails if this line widens without one,
-    // deliberately, so the discovery is a red suite and not a comment
-    // somebody had to happen to read.
+    //   gift wraps   the owner alone. The p-tagged recipient of every wrap
+    //                this relay accepts is the owner (handleGiftWrap), so
+    //                there is nobody else it could widen to.
+    //   the group    the owner OR a member, checked against `group_members`
+    //                -- the same inner list nip29.ts authorizeGroupWrite
+    //                consults on the write side, so a pubkey admitted to
+    //                write to the group is by construction admitted to read
+    //                it back. Before this, a member could write and could
+    //                not read, which made the group unusable by anyone but
+    //                the owner.
+    //   invite codes the owner alone, INSIDE a partition members may now
+    //                read. A kind-9009 create-invite carries its code in a
+    //                `code` tag and an invite code is a bearer token, so a
+    //                member who could read one could mint memberships and
+    //                owner-only invites would stop being owner-only with no
+    //                change to the write path at all. Withheld by omission
+    //                rather than refusal -- see groups.ts
+    //                CREATE_INVITE_KIND, and filters.ts
+    //                FilterQueryOptions.excludeInvites for the SQL.
+    //
+    // The membership lookup is one indexed row and it is paid only by an
+    // authenticated non-owner: the owner short-circuits on the `||`, and
+    // an unauthenticated client never reaches either read.
+    //
+    // broadcast() below enforces all three again, and has to: a
+    // subscription registered here is never re-examined, so a permission
+    // widened in this function and not in that one silently pushes events
+    // to sockets this gate would have refused.
+    const authedPubkey = state.authedPubkey;
     const authedAsOwner =
-      state.authedPubkey !== undefined && state.authedPubkey === getOwnerPubkey(this.sql, this.env);
+      authedPubkey !== undefined && authedPubkey === getOwnerPubkey(this.sql, this.env);
     const mayReadGiftWraps = authedAsOwner;
-    const mayReadGroups = authedAsOwner;
+    const mayReadInvites = authedAsOwner;
+    const mayReadGroups =
+      authedAsOwner || (authedPubkey !== undefined && isGroupMember(this.sql, authedPubkey));
     // Which partitions this read covers. Passed into boundFilter because
     // it multiplies the query count -- storage.ts runs the filter once per
     // partition -- so an authorised reader is priced for what it actually
@@ -1739,6 +1759,13 @@ export class Relay extends DurableObject<Env> {
     // stays open, so the two have to agree.
     const events = queryFilters(this.sql, filters, nowSeconds(), {
       excludeGiftWraps: !mayReadGiftWraps,
+      // Only where it can match something, which is a read that covers the
+      // group partition at all. An unauthenticated read never sees a
+      // kind-9009 -- it is a group event, and the partition already omits
+      // it -- so setting this there would add a condition and a bound
+      // parameter to every public read on this relay to exclude rows that
+      // are not in the partition being read.
+      excludeInvites: mayReadGroups && !mayReadInvites,
       scopes,
     }).slice(0, MAX_EVENTS_PER_REQ);
     for (const event of events) {
@@ -1803,33 +1830,57 @@ export class Relay extends DurableObject<Env> {
   }
 
   private broadcast(event: NostrEvent): void {
-    // The NIP-42 gate in handleReq proves nothing about *future* events:
-    // it probes storage at REQ time, so a filter that matches no stored
-    // gift wrap when registered (most simply, a `#p` filter naming the
-    // owner while the inbox is empty) is accepted ungated -- and every
-    // gift wrap accepted afterward necessarily p-tags the owner
-    // (handleGiftWrap), so it matches. This push path must therefore
-    // enforce the same authenticated-recipient rule itself, exactly as
-    // liveBroadcast below already refuses kind 1059 for its permanently
-    // unauthenticated channel. Owner looked up only on the gated kind so
-    // the common path stays free of the extra read.
-    // Group events are gated here for exactly the reason gift wraps are,
-    // and it is worth restating because this is the surface an exclusion
-    // applied only to REQ results would miss entirely: a subscription
-    // registered BEFORE an event arrives is never re-examined by the
-    // REQ-time gate. `{"kinds":[1]}` from an unauthenticated client is a
-    // standing request that matches the group's kind-1 events as they are
-    // stored, and without this line every one of them would be pushed
-    // down that socket the moment it lands.
+    // The gate in handleReqInner decides a REQ once, when the REQ arrives,
+    // and nothing re-examines the subscription it leaves open. So it
+    // proves nothing about events stored afterwards, and this path has to
+    // enforce every one of its rules itself.
     //
-    // Same identity as handleReqInner's gate, and it has to widen with it
-    // when NIP-29 membership lands -- including the invite-code hazard
-    // stated in full there. A kind-9009 reaches this line the moment the
-    // owner publishes one, so widening HERE leaks a live code to any
-    // member holding a matching subscription, without a REQ ever being
-    // sent. Both gates, one decision.
-    const gated = event.kind === GIFT_WRAP_KIND || isGroupEvent(event);
+    // Both gated kinds show the shape. `{"#p":[owner]}` registered while
+    // the inbox is empty is admitted with nothing to withhold, and every
+    // gift wrap accepted afterwards necessarily p-tags the owner
+    // (handleGiftWrap), so it matches. `{"kinds":[1]}` from an
+    // unauthenticated client is a standing request that matches the
+    // group's kind-1 events as they are stored. Without the check below,
+    // each of those sockets receives what its REQ was never allowed to
+    // ask for. Owner looked up only on a gated kind, so the common path
+    // stays free of the extra read.
+    //
+    // The same three permissions handleReqInner resolves, enforced again
+    // here because this path never consults that one. The two must agree
+    // exactly: a permission widened there and not here refuses a stored
+    // read and then pushes the same event down the same socket seconds
+    // later, and one widened here and not there does the reverse.
+    //
+    //   gift wrap    owner only.
+    //   kind-9009    owner only, even though the group around it is not.
+    //                A create-invite reaches this line the moment the
+    //                owner publishes one, so a member holding
+    //                `{"kinds":[9009]}` would be handed a live code with
+    //                no REQ ever sent -- the surface a REQ-time gate
+    //                cannot cover, which is the whole reason this
+    //                function has a copy of the rule.
+    //   other group  owner or member, against the same `group_members`
+    //                list the REQ gate and the write gate both use.
+    //
+    // Memoised per broadcast rather than per socket: a member with three
+    // open connections is one lookup, not three, and a broadcast to
+    // sockets that are all the owner's or all unauthenticated does none.
+    const giftWrap = event.kind === GIFT_WRAP_KIND;
+    const gated = giftWrap || isGroupEvent(event);
+    const ownerOnly = giftWrap || event.kind === CREATE_INVITE_KIND;
     const owner = gated ? getOwnerPubkey(this.sql, this.env) : null;
+    const membership = new Map<string, boolean>();
+    const mayReceive = (authed: string | undefined): boolean => {
+      if (authed === undefined) return false;
+      if (owner !== null && authed === owner) return true;
+      if (ownerOnly) return false;
+      let member = membership.get(authed);
+      if (member === undefined) {
+        member = isGroupMember(this.sql, authed);
+        membership.set(authed, member);
+      }
+      return member;
+    };
     for (const ws of this.ctx.getWebSockets()) {
       // ctx.getWebSockets() with no tag argument returns every socket,
       // live feed ones included -- those carry a LiveFeedState
@@ -1837,10 +1888,7 @@ export class Relay extends DurableObject<Env> {
       // they're routed to liveBroadcast instead, never here.
       if (this.ctx.getTags(ws).includes(LIVE_FEED_TAG)) continue;
       const state = getState(ws);
-      // Same condition handleReq's gate enforces for stored reads:
-      // kind-1059 events go only to the connection authenticated as the
-      // owner (the p-tagged recipient, per handleGiftWrap's accept rule).
-      if (gated && state.authedPubkey !== owner) continue;
+      if (gated && !mayReceive(state.authedPubkey)) continue;
       for (const [subId, filters] of Object.entries(state.subs)) {
         if (matchesAnyFilter(event, filters)) {
           send(ws, ["EVENT", subId, event]);
@@ -1866,6 +1914,15 @@ export class Relay extends DurableObject<Env> {
     // permanently the unauthenticated case. Even the redacted notice this
     // sends -- kind, time, eight hex characters of id -- would time every
     // message in the group to the second for anyone who opened the page.
+    //
+    // This is what MIRRORING the owner-or-member widening looks like on a
+    // channel with no identity in it: nothing changes. A live feed socket
+    // cannot be a member, because it cannot be anybody -- there is no
+    // AUTH on this path and no ConnState to hold an authenticated pubkey
+    // -- so the widened rule evaluates to the refusal that was already
+    // here. Stated rather than left implicit, so a later reading of
+    // "members may now read the group" does not arrive at this function
+    // and take the absence of a member case for an oversight.
     if (event.kind === GIFT_WRAP_KIND || isGroupEvent(event)) return;
     const live = this.ctx.getWebSockets(LIVE_FEED_TAG);
     if (live.length === 0) return;

@@ -75,6 +75,37 @@ export const GROUP_METADATA_KIND = 39000;
 export const GROUP_ADMINS_KIND = 39001;
 export const GROUP_MEMBERS_KIND = 39002;
 
+// NIP-29 kind-9009 create-invite: the one group event the group's own
+// MEMBERS may not read.
+//
+// A kind-9009 carries the invite code it mints in a `code` tag, and an
+// invite code is a BEARER TOKEN -- this relay cannot authenticate who
+// presents one, which is the whole point of it (limits.ts, the invite
+// block). Reading a code is therefore as good as being handed it, so a
+// member who could read the group's 9009s could mint memberships at will
+// and owner-only invites would stop being owner-only without one line of
+// the write path changing. Withheld from everyone but the owner, on both
+// read surfaces: filters.ts FilterQueryOptions.excludeInvites for stored
+// reads, relay.ts broadcast() for the push.
+//
+// Withheld by OMISSION and never by refusal, which is where it differs
+// from the group partition around it. A filter naming the group is
+// refused because the client has already said what it wants; a filter
+// naming kind 9009 gets no such treatment, because the only reader
+// entitled to one is the owner and refusing everyone else would put a
+// new signal on the UNAUTHENTICATED path, where `{"kinds":[9009]}` is
+// answered with a plain EOSE today. Omission answers that filter the
+// same way whoever sends it.
+//
+// Named here rather than beside the other moderation kinds in nip29.ts
+// because the READ gate is what needs it, and nip29.ts is not reachable
+// from the read gate: filters.ts builds the exclusion, and
+// filters.ts -> nip29.ts -> limits.ts -> filters.ts is a cycle. groups.ts
+// is the read side of NIP-29 (nip29.ts says so in its own header), so a
+// kind the read gate has to recognise belongs here; nip29.ts re-exports
+// it so the write side still names it from one place.
+export const CREATE_INVITE_KIND = 9009;
+
 // Which partition of `events`/`event_tags` a row lives in. Stored as
 // `is_group`, and PINNED BY EVERY QUERY -- see schema.ts INDEXES, where the
 // three REQ-serving indexes are partial pairs keyed on this column. A query

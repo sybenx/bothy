@@ -25,12 +25,13 @@ import { env, exports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { buildFilterQuery } from "../src/filters";
-import { GROUP_SCOPE, isGroupEvent, PUBLIC_SCOPE } from "../src/groups";
+import { GROUP_SCOPE, isGroupEvent, PUBLIC_SCOPE, TOP_LEVEL_GROUP_ID } from "../src/groups";
+import { PUT_USER_KIND } from "../src/nip29";
 import type { Relay } from "../src/relay";
 import { auditMaintainedCounts, readMaintainedCounts } from "../src/storage";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
-import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
+import { type Keypair, OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
 import { connectLiveFeed, connectRelay, publish, type RelayConn } from "./helpers/socket";
 
 isolateStorage();
@@ -69,6 +70,30 @@ async function authenticateAsOwner(conn: RelayConn, secretKeyHex = OWNER_SECRET_
   conn.send(["AUTH", authEvent]);
   const [, , ok] = await conn.nextMessage();
   expect(ok).toBe(true);
+}
+
+// Puts a pubkey into the group through the path the owner actually uses:
+// a kind-9000 put-user, which writes BOTH nested lists (src/nip29.ts).
+// Tagged with TOP_LEVEL_GROUP_ID rather than the GROUP_ID these tests
+// write their notes under, because membership is one relay-wide list and
+// the partition is id-agnostic -- which is exactly why a member admitted
+// to `_` reads this file's group traffic as well.
+async function makeMember(): Promise<Keypair> {
+  const member = randomKeypair();
+  const conn = await connectRelay();
+  const [, , ok] = await publish(
+    conn,
+    signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: PUT_USER_KIND,
+      tags: [
+        ["h", TOP_LEVEL_GROUP_ID],
+        ["p", member.pubkeyHex],
+      ],
+    }),
+  );
+  expect(ok).toBe(true);
+  conn.close();
+  return member;
 }
 
 async function collect(conn: RelayConn, subId: string, filter: unknown): Promise<string[]> {
@@ -227,6 +252,33 @@ describe("surface 1: REQ results", () => {
     expect(both.sort()).toEqual([group.id, plain.id].sort());
     conn.close();
   });
+
+  // The widening, and the whole point of it: a pubkey the group admitted
+  // on the WRITE side reads the group back. Before this, membership was
+  // enforced by nip29.ts authorizeGroupWrite and ignored by this gate, so
+  // a member could publish into a group they could not see -- which made
+  // the group unusable by anyone but the owner.
+  it("serves them to a member, on the same membership the write gate uses", async () => {
+    const member = await makeMember();
+
+    const writer = await connectRelay();
+    const group = groupNote("group");
+    const plain = publicNote("public");
+    await publish(writer, group);
+    await publish(writer, plain);
+    writer.close();
+
+    const conn = await connectRelay();
+    await authenticateAsOwner(conn, member.secretKeyHex);
+
+    // Naming the group is answered rather than refused now -- the same
+    // filter the "restricts, rather than challenges" test above sends
+    // from a pubkey that authenticated and is not a member.
+    expect(await collect(conn, "memberGroup", { "#h": [GROUP_ID] })).toEqual([group.id]);
+    const both = await collect(conn, "memberKinds", { kinds: [1] });
+    expect(both.sort()).toEqual([group.id, plain.id].sort());
+    conn.close();
+  });
 });
 
 describe("surface 2: broadcast() to an existing subscription", () => {
@@ -272,6 +324,31 @@ describe("surface 2: broadcast() to an existing subscription", () => {
     subscriber.close();
     writer.close();
   });
+
+  // The half of the widening that a REQ-time test cannot reach. This
+  // subscription is registered while the relay holds no group event at
+  // all, so nothing about it is re-examined when one arrives: if
+  // broadcast() had kept the owner-only rule while handleReqInner widened,
+  // a member would read the group's history and never see a live message
+  // in it, and every stored-read assertion above would still pass.
+  it("pushes it to a member's standing subscription", async () => {
+    const member = await makeMember();
+
+    const subscriber = await connectRelay();
+    await authenticateAsOwner(subscriber, member.secretKeyHex);
+    subscriber.send(["REQ", "memberStanding", { kinds: [1] }]);
+    expect((await subscriber.nextMessage())[0]).toBe("EOSE");
+
+    const writer = await connectRelay();
+    const group = groupNote("live, to a member");
+    await publish(writer, group);
+
+    const frame = await subscriber.nextMessage();
+    expect(frame[0]).toBe("EVENT");
+    expect((frame[2] as { id: string }).id).toBe(group.id);
+    subscriber.close();
+    writer.close();
+  });
 });
 
 describe("surface 3: the /live admin feed", () => {
@@ -290,6 +367,34 @@ describe("surface 3: the /live admin feed", () => {
     const notice = await live.nextMessage();
     expect(notice.id).toBe(plain.id.slice(0, 8));
 
+    conn.close();
+    live.close();
+  });
+
+  // What "mirror the widening here" comes to on a channel with no
+  // identity: nothing. A /live socket cannot be a member because it
+  // cannot be anybody -- there is no AUTH on that path and no connection
+  // state to hold an authenticated pubkey -- so a group that now has
+  // readers still has none here. Asserted with a real member watching the
+  // event land on their own socket, so the silence is the live feed's and
+  // not the relay's.
+  it("stays silent even while a member is being pushed the same event", async () => {
+    const member = await makeMember();
+
+    const subscriber = await connectRelay();
+    await authenticateAsOwner(subscriber, member.secretKeyHex);
+    subscriber.send(["REQ", "memberLive", { kinds: [1] }]);
+    expect((await subscriber.nextMessage())[0]).toBe("EOSE");
+
+    const live = await connectLiveFeed();
+    const conn = await connectRelay();
+    const group = groupNote("read by a member, announced to nobody");
+    await publish(conn, group);
+
+    expect((await subscriber.nextMessage())[2]).toMatchObject({ id: group.id });
+    await expect(live.nextMessage(200)).rejects.toThrow();
+
+    subscriber.close();
     conn.close();
     live.close();
   });
@@ -324,6 +429,36 @@ describe("surface 4: the public counters on /api/stats", () => {
     expect(afterPublic.totalEvents).toBe(before.totalEvents + 1);
     expect(afterPublic.events24h).toBe(before.events24h + 1);
     expect(afterPublic.ingested24h).toBe(before.ingested24h + 1);
+    conn.close();
+  });
+
+  // /api/stats is unauthenticated HTTP: it has no reader identity to
+  // widen, so the widening cannot reach it. Asserted rather than reasoned
+  // about, because the counters are what a poller watches advance, and a
+  // member is now a second kind of writer whose events could plausibly
+  // have been thought "readable, therefore countable".
+  it("does not start counting group events once the group has members", async () => {
+    const member = await makeMember();
+    const before = (await (
+      await exports.default.fetch("https://example.com/api/stats")
+    ).json()) as { totalEvents: number; events24h: number; ingested24h: number };
+
+    const conn = await connectRelay();
+    await publish(
+      conn,
+      signEvent(member.secretKeyHex, {
+        kind: 1,
+        content: "written by a member, counted by nobody",
+        tags: [["h", GROUP_ID]],
+      }),
+    );
+
+    const after = (await (
+      await exports.default.fetch("https://example.com/api/stats")
+    ).json()) as { totalEvents: number; events24h: number; ingested24h: number };
+    expect(after.totalEvents).toBe(before.totalEvents);
+    expect(after.events24h).toBe(before.events24h);
+    expect(after.ingested24h).toBe(before.ingested24h);
     conn.close();
   });
 

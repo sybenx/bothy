@@ -1403,6 +1403,11 @@ export function vanishSummary(sql: SqlStorage): VanishSummary {
 // query, for the reason filters.ts FilterQueryOptions.scope gives.
 export interface ReadOptions {
   excludeGiftWraps?: boolean;
+  // Owner-only, and NOT implied by `scopes` covering the group partition:
+  // a member reads the group and does not read the invite codes in it
+  // (groups.ts CREATE_INVITE_KIND). Two separate permissions, so two
+  // separate options.
+  excludeInvites?: boolean;
   scopes?: readonly GroupScope[];
 }
 
@@ -1416,6 +1421,7 @@ export function queryFilter(
   const parts = expandFilter(filter);
   const perQuery = (scope: GroupScope): FilterQueryOptions => ({
     ...(options.excludeGiftWraps === undefined ? {} : { excludeGiftWraps: options.excludeGiftWraps }),
+    ...(options.excludeInvites === undefined ? {} : { excludeInvites: options.excludeInvites }),
     scope,
     // The tag scan budget is shared across the partitions this read
     // covers, so an authorised read costs what limits.ts prices a tag
