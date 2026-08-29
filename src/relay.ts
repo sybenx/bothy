@@ -74,7 +74,14 @@ import {
 } from "./ownership";
 import type { Profile } from "./profile-lookup";
 import { normalizePubkey } from "./pubkey";
-import { instrumentSql, readMetricsSnapshot, type ReadMetricsSnapshot, withReadPath } from "./read-metrics";
+import {
+  instrumentSql,
+  readMetricsSnapshot,
+  type ReadMetricsSnapshot,
+  withReadPath,
+  writeMetricsSnapshot,
+  type WriteMetricsSnapshot,
+} from "./read-metrics";
 import { getRelayPubkey } from "./relay-identity";
 import { initSchema } from "./schema";
 import {
@@ -606,6 +613,12 @@ export class Relay extends DurableObject<Env> {
     // for proportions, and read `projected24h` as an extrapolation of
     // exactly that sample, not as a measurement.
     reads: ReadMetricsSnapshot;
+    // The write-side twin, over the same in-memory counters. Answers what
+    // `rowsWrittenToday` on its own cannot: WHICH path is spending the
+    // write budget, not just how much of it is spent. `rowsWrittenToday`
+    // stays the authoritative, durable figure -- this is a diagnostic
+    // breakdown of it, with the same reset-on-eviction caveat as `reads`.
+    writes: WriteMetricsSnapshot;
   }> {
     // Scoped to "getStats" rather than measured per query: the nested
     // estimateRowsWrittenSince declares its own scope and so reports
@@ -616,14 +629,14 @@ export class Relay extends DurableObject<Env> {
     // bucket climbing with the request count is that cache broken.
     return this.metered(() => {
       const stats = withReadPath("getStats", () => this.collectStats(host));
-      // Snapshotted after the scope closes so this call's own reads are
-      // included in what it reports -- a breakdown that excluded the
+      // Snapshotted after the scope closes so this call's own reads/writes
+      // are included in what it reports -- a breakdown that excluded the
       // request producing it would understate getStats by exactly one call.
-      return { ...stats, reads: readMetricsSnapshot() };
+      return { ...stats, reads: readMetricsSnapshot(), writes: writeMetricsSnapshot() };
     });
   }
 
-  private collectStats(host?: string): Omit<Awaited<ReturnType<Relay["getStats"]>>, "reads"> {
+  private collectStats(host?: string): Omit<Awaited<ReturnType<Relay["getStats"]>>, "reads" | "writes"> {
     // recordHost is a write, and it is a no-op once the host is already
     // known (src/host.ts), so it costs nothing to keep honest.
     if (host) recordHost(this.sql, host);

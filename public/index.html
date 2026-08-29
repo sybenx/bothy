@@ -203,6 +203,17 @@
     </thead>
     <tbody id="diag-read-paths"></tbody>
   </table>
+
+  <!-- The write-side twin of the table above, over the same in-memory,
+       reset-on-eviction sample -- see src/read-metrics.ts
+       WriteMetricsSnapshot. `rowsWrittenToday` above stays the
+       authoritative, durable figure; this says which path is spending it. -->
+  <table>
+    <thead><tr><th id="diag-write-paths-heading" colspan="3">write paths</th></tr>
+      <tr><th>path</th><th>rows/call</th><th id="diag-write-share-heading">share</th></tr>
+    </thead>
+    <tbody id="diag-write-paths"></tbody>
+  </table>
 </details>
 
 <script>
@@ -529,6 +540,29 @@ function renderDiagnostics(stats) {
     share.textContent = longEnough ? (p.share * 100).toFixed(1) + "%" : "-";
     tr.append(path, perCall, share);
     tbody.appendChild(tr);
+  }
+
+  // Same window, same sample, same caveats as the read breakdown above --
+  // stats.writes and stats.reads come from one in-memory snapshot taken
+  // at the same instant (src/relay.ts getStats), so sinceMs/longEnough
+  // apply to both without re-deriving them.
+  const writePathsHeading = document.getElementById("diag-write-paths-heading");
+  writePathsHeading.textContent = "write paths (sampled over " + windowLabel + ")";
+  document.getElementById("diag-write-share-heading").textContent =
+    longEnough ? "share" : "share (n/a, window too short)";
+
+  const writeTbody = document.getElementById("diag-write-paths");
+  writeTbody.textContent = "";
+  for (const p of stats.writes.paths) {
+    const tr = document.createElement("tr");
+    const path = document.createElement("td");
+    path.textContent = p.path;
+    const perCall = document.createElement("td");
+    perCall.textContent = p.rowsWrittenPerCall === null ? "-" : p.rowsWrittenPerCall.toFixed(1);
+    const share = document.createElement("td");
+    share.textContent = longEnough ? (p.share * 100).toFixed(1) + "%" : "-";
+    tr.append(path, perCall, share);
+    writeTbody.appendChild(tr);
   }
 }
 

@@ -113,6 +113,14 @@ export type ReadPath = (typeof READ_PATHS)[number];
 interface PathCounters {
   // Rows read, summed from SqlStorageCursor.rowsRead.
   rowsRead: number;
+  // Rows written, summed the same way from SqlStorageCursor.rowsWritten
+  // plus deleteEventRow's addRowsWritten top-up -- the per-path mirror of
+  // pendingRowsWritten below. Unlike pendingRowsWritten this is never
+  // taken/reset by a landing: it is a lifetime (since last eviction)
+  // diagnostic total, exactly like rowsRead beside it, so the two can
+  // share one bucket and one snapshot shape instead of the write side
+  // needing its own map and its own gap detector.
+  rowsWritten: number;
   // Individual sql.exec calls made inside this path.
   queries: number;
   // Times this path was entered. rowsRead/calls is the per-call cost to
@@ -129,7 +137,7 @@ let startedAtMs: number | null = null;
 function bucket(path: ReadPath): PathCounters {
   let entry = counters.get(path);
   if (!entry) {
-    entry = { rowsRead: 0, queries: 0, calls: 0 };
+    entry = { rowsRead: 0, rowsWritten: 0, queries: 0, calls: 0 };
     counters.set(path, entry);
   }
   if (startedAtMs === null) startedAtMs = Date.now();
@@ -140,13 +148,19 @@ function bucket(path: ReadPath): PathCounters {
 // THE WRITE METER. Rows written since the last landing, accumulated by
 // the same cursor wrapper the read attribution uses.
 //
-// NOT a diagnostic and not attributed per path: this is the number
-// /api/stats reports as `rowsWrittenToday`, measured against a ceiling
-// Cloudflare empties at 00:00 UTC. It used to be a SUM over
-// `events.row_cost`, which is the cost of storing events and nothing
-// else -- it could not see a deletion, a tombstone, a follow-list
-// rebuild, a NIP-86 ban or backfill's own bookkeeping, every one of
-// which is a real row against the same 100,000/day allowance.
+// NOT A DIAGNOSTIC ITSELF, though `record`'s per-path bucket now mirrors
+// it row for row: `pendingRowsWritten` below is the number /api/stats
+// reports as `rowsWrittenToday`, measured against a ceiling Cloudflare
+// empties at 00:00 UTC, and it is durable -- landed by
+// storage.ts settleRowsWritten into `ingest_hour_counts`, which survives
+// eviction. `WriteMetricsSnapshot` at the bottom of this file is the
+// in-memory, per-path breakdown of the same deltas, with the read
+// attribution's caveats: it resets on eviction and is for proportions,
+// not a second ledger. It used to be a SUM over `events.row_cost`, which
+// is the cost of storing events and nothing else -- it could not see a
+// deletion, a tombstone, a follow-list rebuild, a NIP-86 ban or
+// backfill's own bookkeeping, every one of which is a real row against
+// the same 100,000/day allowance.
 //
 // MEASURED AT THE WRAPPER, NOT REPORTED BY EACH PATH, and that is the
 // whole design. A path that has to remember to report its own writes is
@@ -195,6 +209,11 @@ export function takeRowsWritten(): number {
 // how close the relay is to a ceiling.
 export function addRowsWritten(rows: number): void {
   pendingRowsWritten += rows;
+  // Attributed to whatever path is active when deleteEventRow calls this
+  // -- always one of "write", "cron", "groupState" or "join", the same
+  // scopes trackCursor's own write-tracking uses, never "unattributed":
+  // deleteEventRow is reached only from inside one of those.
+  record(currentPath, 0, 0, rows);
 }
 
 // What has not landed yet. For settleRowsWritten's own threshold and for
@@ -224,9 +243,10 @@ export function withReadPath<T>(path: ReadPath, fn: () => T): T {
   }
 }
 
-function record(path: ReadPath, rows: number, queries: number): void {
+function record(path: ReadPath, rowsRead: number, queries: number, rowsWritten = 0): void {
   const entry = bucket(path);
-  entry.rowsRead += rows;
+  entry.rowsRead += rowsRead;
+  entry.rowsWritten += rowsWritten;
   entry.queries += queries;
 }
 
@@ -261,7 +281,13 @@ function trackCursor<T extends Record<string, SqlStorageValue>>(
     // settled later.
     const written = cursor.rowsWritten;
     if (written > countedWritten) {
-      pendingRowsWritten += written - countedWritten;
+      const delta = written - countedWritten;
+      pendingRowsWritten += delta;
+      // The per-path lifetime mirror of the accumulator just above --
+      // same delta, same tick, but never taken/reset by a landing. This
+      // is what lets /api/stats say WHICH path is spending the write
+      // budget instead of only how much of it is spent in total.
+      record(path, 0, 0, delta);
       countedWritten = written;
     }
   };
@@ -369,6 +395,68 @@ export function readMetricsSnapshot(): ReadMetricsSnapshot {
     sinceMs,
     totalRowsRead,
     projected24h: sinceMs > 0 ? Math.round((totalRowsRead * 86_400_000) / sinceMs) : 0,
+    paths,
+  };
+}
+
+export interface WritePathReport {
+  path: ReadPath;
+  rowsWritten: number;
+  queries: number;
+  calls: number;
+  // Rows written per entry into this path -- the figure to multiply by a
+  // daily call frequency when projecting against the 100,000/day ceiling.
+  // Null when the path has not been entered.
+  rowsWrittenPerCall: number | null;
+  // Share of the total, so the dominant consumer of the write budget is
+  // readable without arithmetic. 0-1.
+  share: number;
+}
+
+// The write-side twin of ReadMetricsSnapshot, over the same in-memory
+// counters and the same caveats: resets on eviction, sinceMs says how
+// long the sample covers, and this is for PROPORTIONS. It answers the
+// question `rowsWrittenToday` on its own cannot -- that figure is exact
+// and durable (schema.ts `ingest_hour_counts`), but it is one number, and
+// a relay spending far more of its write budget than its stored event
+// count would suggest has no way to say which path is doing the
+// spending. This does, at the same in-memory cost as the read
+// attribution beside it: nothing here is a new instrument, only a second
+// field the existing wrapper already had the numbers for.
+export interface WriteMetricsSnapshot {
+  sinceMs: number;
+  totalRowsWritten: number;
+  // Extrapolation to 24h at the observed rate, against the 100,000/day
+  // ceiling -- the same caveat as projected24h above: trust it more the
+  // larger sinceMs is.
+  projected24h: number;
+  paths: WritePathReport[];
+}
+
+export function writeMetricsSnapshot(): WriteMetricsSnapshot {
+  const sinceMs = startedAtMs === null ? 0 : Math.max(0, Date.now() - startedAtMs);
+  let totalRowsWritten = 0;
+  for (const entry of counters.values()) totalRowsWritten += entry.rowsWritten;
+
+  const paths: WritePathReport[] = [];
+  for (const path of READ_PATHS) {
+    const entry = counters.get(path);
+    if (!entry || (entry.rowsWritten === 0 && entry.calls === 0)) continue;
+    paths.push({
+      path,
+      rowsWritten: entry.rowsWritten,
+      queries: entry.queries,
+      calls: entry.calls,
+      rowsWrittenPerCall: entry.calls > 0 ? entry.rowsWritten / entry.calls : null,
+      share: totalRowsWritten > 0 ? entry.rowsWritten / totalRowsWritten : 0,
+    });
+  }
+  paths.sort((a, b) => b.rowsWritten - a.rowsWritten);
+
+  return {
+    sinceMs,
+    totalRowsWritten,
+    projected24h: sinceMs > 0 ? Math.round((totalRowsWritten * 86_400_000) / sinceMs) : 0,
     paths,
   };
 }
