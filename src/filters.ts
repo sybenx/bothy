@@ -1,4 +1,5 @@
 import { GIFT_WRAP_KIND, type Filter, type NostrEvent, tagFilterEntries } from "./nostr";
+import { type GroupScope, PUBLIC_SCOPE } from "./groups";
 
 // How many tag rows one `#<letter>` condition is allowed to look at, per
 // event the client asked for.
@@ -54,6 +55,13 @@ export const TAG_SCAN_DEPTH = 5;
 
 export function tagScanLimit(limit: number): number {
   return limit * TAG_SCAN_DEPTH;
+}
+
+// The same budget, shared out across the partitions a single read covers
+// (FilterQueryOptions.tagScanDivisor). At least 1, so a divisor can never
+// silently turn a tag filter into one that looks at nothing.
+export function scopedTagScanLimit(limit: number, divisor = 1): number {
+  return Math.max(1, Math.ceil(tagScanLimit(limit) / Math.max(1, divisor)));
 }
 
 // Turns one REQ filter into a SQL query against the frozen schema
@@ -112,6 +120,41 @@ export interface FilterQueryOptions {
   // rows have to be gone before the LIMIT applies, or the LIMIT reports
   // them.
   excludeGiftWraps?: boolean;
+
+  // Which partition of `events` this query reads: the public rows, or one
+  // group's-worth of rows (src/groups.ts). Defaults to the public
+  // partition, which is what every unauthenticated read gets.
+  //
+  // Not optional in the SQL -- `is_group = ?` is emitted on EVERY query
+  // this function builds, and the same pin goes into every tag subquery.
+  // That is a hard requirement rather than an optimisation: schema.ts
+  // declares the three REQ-serving indexes as partial pairs keyed on this
+  // column, so a query naming no partition can use neither half of any
+  // pair and falls back to scanning `events`. Measured at 50,000 group
+  // events, an authenticated `{"kinds":[1],"limit":20}` with no pin read
+  // 92,033 rows; pinned, and run once per partition, it reads 82
+  // (docs/group-exclusion.md).
+  //
+  // A reader entitled to both partitions therefore runs the filter TWICE,
+  // once per scope -- storage.ts queryFilter merges and re-slices, exactly
+  // as it already does for the authors x kinds split expandFilter
+  // produces, and for the same reason: an index serves an ordered scan
+  // only when its key columns are pinned to one value each.
+  scope?: GroupScope;
+
+  // How many partitions the caller is reading in total, used only to split
+  // the tag subquery's scan depth between them.
+  //
+  // Without it a two-partition read would scan tagScanLimit(limit) rows in
+  // each half and cost twice what limits.ts filterReadCost prices a tag
+  // filter at. With it the two halves share the budget, so the priced
+  // figure stays true whoever is asking -- and the split is not merely
+  // cost-neutral, it is what stops one busy partition starving the other:
+  // measured at 50,000 group events, the owner's own
+  // `{"#p":[owner],"kinds":[1059]}` returned ZERO gift wraps unsplit,
+  // because group tag rows filled the whole scan depth, and 16 with the
+  // depth split.
+  tagScanDivisor?: number;
 }
 
 export function buildFilterQuery(
@@ -121,6 +164,12 @@ export function buildFilterQuery(
 ): { sql: string; params: unknown[] } | null {
   const conditions: string[] = ["(expiration IS NULL OR expiration > ?)"];
   const params: unknown[] = [nowSec];
+
+  // The partition pin, on every query without exception -- see
+  // FilterQueryOptions.scope. Emitted before the filter's own conditions
+  // so it is impossible to build a query here that omits it.
+  conditions.push("is_group = ?");
+  params.push(options.scope ?? PUBLIC_SCOPE);
 
   if (filter.ids !== undefined) {
     if (filter.ids.length === 0) return null;
@@ -155,8 +204,17 @@ export function buildFilterQuery(
   }
   for (const [letter, values] of tagFilterEntries(filter)) {
     if (values.length === 0) return null;
-    const subConditions = [`tag_name = ? AND tag_value IN (${placeholders(values.length)})`];
-    const subParams: unknown[] = [letter, ...values];
+    // The same partition pin as the outer query, and for a second reason
+    // on top of the index one: the subquery's LIMIT below runs BEFORE the
+    // outer query's conditions, so a candidate set that includes the other
+    // partition's rows is a candidate set that gets truncated by them.
+    // Measured, 50,000 group events, `{"#p":[owner],"limit":20}`: 20
+    // events returned with the pin, 1 without it.
+    const subConditions = [
+      "is_group = ?",
+      `tag_name = ? AND tag_value IN (${placeholders(values.length)})`,
+    ];
+    const subParams: unknown[] = [options.scope ?? PUBLIC_SCOPE, letter, ...values];
     // `since`/`until` are pushed down into the subquery, not left to the
     // outer query. `event_tags.created_at` IS the event's own created_at
     // (storage.ts insertEventRow copies it), so this is the same bound
@@ -175,7 +233,7 @@ export function buildFilterQuery(
     let subquery = `SELECT event_id FROM event_tags WHERE ${subConditions.join(" AND ")}`;
     if (filter.limit !== undefined) {
       subquery += " ORDER BY created_at DESC LIMIT ?";
-      subParams.push(tagScanLimit(filter.limit));
+      subParams.push(scopedTagScanLimit(filter.limit, options.tagScanDivisor));
     }
     conditions.push(`id IN (${subquery})`);
     params.push(...subParams);
@@ -216,6 +274,7 @@ function placeholders(count: number): string {
 // asserts this against the real params.length of a built query.
 export function filterParamCount(filter: Filter): number {
   let count = 1; // the "(expiration IS NULL OR expiration > ?)" guard on every query
+  count += 1; // the "is_group = ?" partition pin, also on every query
   if (filter.ids !== undefined && filter.ids.length > 0) count += filter.ids.length;
   if (filter.authors !== undefined && filter.authors.length > 0) count += 1;
   if (filter.kinds !== undefined && filter.kinds.length > 0) count += 1;
@@ -223,6 +282,7 @@ export function filterParamCount(filter: Filter): number {
   if (filter.until !== undefined) count += 1;
   for (const [, values] of tagFilterEntries(filter)) {
     if (values.length === 0) continue;
+    count += 1; // the subquery's own "is_group = ?" pin
     count += 1; // tag_name
     count += values.length;
     if (filter.since !== undefined) count += 1;

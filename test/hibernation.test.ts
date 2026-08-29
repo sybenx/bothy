@@ -8,13 +8,15 @@ import { env } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import {
-  EVENT_BASE_ROW_COST,
+  EVENT_BASE_ROW_COST_MEASURED,
   EVENT_COUNTER_ROW_COST,
   eventRemovalBudget,
   eventRemovalRowsWritten,
   eventRowCost,
+  eventRowCostMeasured,
+  partialIndexPairsOn,
   indexesOn,
-  TAG_ROW_COST,
+  TAG_ROW_COST_MEASURED,
   TOMBSTONE_ROW_COST,
 } from "../src/schema";
 import {
@@ -98,7 +100,34 @@ describe("hibernation", () => {
 // declarations. This project has already shipped a rows-written figure
 // that was wrong by 45x, and it was wrong because nobody measured it.
 describe("rows written per stored event", () => {
-  it("matches eventRowCost for a bare note", async () => {
+  // ------------------------------------------------------------------
+  // THE DERIVATION IS DELIBERATELY WRONG, AND THIS IS WHERE THAT IS
+  // RECORDED. Do not "fix" a failure here by editing the numbers.
+  //
+  // schema.ts declares the three REQ-serving indexes on `events`, and the
+  // tag lookup index, as partial PAIRS keyed on `is_group` (one half over
+  // the public partition, one over the group partition). A stored row
+  // satisfies exactly one half of each pair, so it pays one index entry
+  // per pair -- but EVENT_BASE_ROW_COST is `2 + indexesOn("events").length`
+  // and TAG_ROW_COST is `1 + indexesOn("event_tags").length`, and both
+  // count the halves separately:
+  //
+  //   eventRowCost(T)          12 + 4T   charged
+  //   eventRowCostMeasured(T)   9 + 3T   spent
+  //   over-charge               3 +  T   per stored event
+  //
+  // Left wrong on purpose: every consumer of eventRowCost is a guard, and
+  // an over-estimate makes each of them stricter -- smaller backfill
+  // pages, smaller vanish batches, an earlier headroom stop. Slower, never
+  // overrunning. schema.ts EVENT_BASE_ROW_COST carries the full argument.
+  //
+  // These tests exist so that (a) the wrongness cannot drift -- the gap is
+  // pinned, not merely tolerated -- and (b) a future fix cannot land
+  // quietly: making the derivation right turns every `eventRowCost`
+  // expectation below into a failure, and the fix is then to delete the
+  // over-charge assertions and schema.ts's eventRowCostMeasured with them.
+  // ------------------------------------------------------------------
+  it("costs eventRowCostMeasured for a bare note, and eventRowCost over-charges it", async () => {
     const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
     const note = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "no tags" });
 
@@ -107,17 +136,25 @@ describe("rows written per stored event", () => {
         storeEvent(sql, note, Math.floor(Date.now() / 1000)),
       );
       // 1 base row + 1 implicit PK index (id is TEXT, not a rowid alias)
-      // + 1 per declared index on `events`, + the two maintained counters
+      // + 1 per index a public row actually pays (three partial halves and
+      // idx_events_ingested), + the three maintained counters
       // storage.ts insertEventRow moves in the same breath as the row
       // (schema.ts EVENT_COUNTER_ROW_COST). The counters are part of what
       // storing an event costs, so they are part of what this asserts --
       // they are not free and the budget must not be told they are.
-      expect(measured).toBe(eventRowCost(0));
-      expect(measured).toBe(2 + indexesOn("events").length + EVENT_COUNTER_ROW_COST);
+      expect(measured).toBe(9);
+      expect(measured).toBe(eventRowCostMeasured(0));
+      expect(measured).toBe(
+        2 + indexesOn("events").length - partialIndexPairsOn("events") + EVENT_COUNTER_ROW_COST,
+      );
+
+      // And the figure the guards use, which is higher on purpose.
+      expect(eventRowCost(0)).toBe(12);
+      expect(eventRowCost(0) - measured).toBe(partialIndexPairsOn("events"));
     });
   });
 
-  it("matches eventRowCost for a reply carrying #e and #p", async () => {
+  it("costs eventRowCostMeasured for a reply carrying #e and #p, over-charged by one per tag", async () => {
     const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
     const reply = signEvent(OWNER_SECRET_KEY_HEX, {
       kind: 1,
@@ -132,8 +169,18 @@ describe("rows written per stored event", () => {
       const measured = measureRowsWritten(state.storage.sql, (sql) =>
         storeEvent(sql, reply, Math.floor(Date.now() / 1000)),
       );
-      expect(measured).toBe(eventRowCost(2));
-      expect(measured).toBe(EVENT_BASE_ROW_COST + EVENT_COUNTER_ROW_COST + 2 * TAG_ROW_COST);
+      expect(measured).toBe(15);
+      expect(measured).toBe(eventRowCostMeasured(2));
+      expect(measured).toBe(
+        EVENT_BASE_ROW_COST_MEASURED + EVENT_COUNTER_ROW_COST + 2 * TAG_ROW_COST_MEASURED,
+      );
+
+      // The tag half of the over-charge: `event_tags` carries a partial
+      // pair too, so each tag row is charged 4 and costs 3.
+      expect(eventRowCost(2)).toBe(20);
+      expect(eventRowCost(2) - measured).toBe(
+        partialIndexPairsOn("events") + 2 * partialIndexPairsOn("event_tags"),
+      );
     });
   });
 
@@ -152,11 +199,49 @@ describe("rows written per stored event", () => {
       const measured = measureRowsWritten(state.storage.sql, (sql) =>
         storeEvent(sql, event, Math.floor(Date.now() / 1000)),
       );
-      expect(measured).toBe(eventRowCost(1));
+      expect(measured).toBe(eventRowCostMeasured(1));
     });
   });
 
-  it("stamps the same figure into events.row_cost, which is what the 24h estimate sums", async () => {
+  it("costs a group event exactly what a public one costs", async () => {
+    // The whole reason the indexes are partial PAIRS rather than one
+    // widened index or one index plus a flag: a row pays for its own
+    // partition and not the other. If this ever diverges, the group
+    // partition has stopped being free and every figure in
+    // CLAUDE.md "The budget" needs redoing.
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    const now = Math.floor(Date.now() / 1000);
+    const publicNote = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 1,
+      content: "public",
+      created_at: now,
+      tags: [["e", "c".repeat(64)]],
+    });
+    const groupNote = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 1,
+      content: "in the group",
+      created_at: now,
+      // `h` is a single-letter tag, so it costs a tag row of its own --
+      // hence one indexed tag each, not one against two.
+      tags: [["h", "some-group"]],
+    });
+
+    await runInDurableObject(stub, async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const publicCost = measureRowsWritten(sql, (s) => storeEvent(s, publicNote, now));
+      const groupCost = measureRowsWritten(sql, (s) => storeEvent(s, groupNote, now));
+      expect(groupCost).toBe(publicCost);
+      expect(groupCost).toBe(eventRowCostMeasured(1));
+      // And it landed in the group partition, which is what made the
+      // comparison worth making.
+      expect(
+        sql.exec<{ is_group: number }>(`SELECT is_group FROM events WHERE id = ?`, groupNote.id).toArray()[0]
+          ?.is_group,
+      ).toBe(1);
+    });
+  });
+
+  it("stamps the OVER-CHARGED figure into events.row_cost, which is what the 24h estimate sums", async () => {
     const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
     const reply = signEvent(OWNER_SECRET_KEY_HEX, {
       kind: 1,
@@ -173,10 +258,16 @@ describe("rows written per stored event", () => {
       const stamped = sql
         .exec<{ row_cost: number }>(`SELECT row_cost FROM events WHERE id = ?`, reply.id)
         .toArray()[0]?.row_cost;
-      // The stamp is what backfill.ts hasBackfillHeadroom throttles
-      // against and what the admin page displays, so it has to equal what
-      // SQLite actually wrote -- not merely equal the formula.
-      expect(stamped).toBe(measured);
+      // It used to equal what SQLite actually wrote, and no longer does:
+      // the stamp is eventRowCost, which over-charges. backfill.ts
+      // hasBackfillHeadroom sums this column and so stops sooner than it
+      // needs to -- the safe direction, and the reason this reads as an
+      // inequality rather than an equality.
+      expect(stamped).toBe(eventRowCost(2));
+      expect(stamped).toBeGreaterThan(measured);
+      expect((stamped ?? 0) - measured).toBe(
+        partialIndexPairsOn("events") + 2 * partialIndexPairsOn("event_tags"),
+      );
     });
   });
 });

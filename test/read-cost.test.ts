@@ -472,13 +472,36 @@ describe("rows read by query shape", () => {
   it("counts gift wraps through an index instead of scanning the table", async () => {
     // storage.ts giftWrapCount, run on every accepted gift wrap. It cost
     // E because `kind` led no index; idx_events_kind_created fixed it as
-    // a side effect of fixing kinds-only REQ filters.
+    // a side effect of fixing kinds-only REQ filters, and that index is
+    // now the partial pair idx_events_kind_created_pub/_grp -- so the
+    // query has to name a partition, and giftWrapCount runs once per
+    // partition and sums.
     await runInDurableObject(stub(), async (_instance: Relay, state) => {
       const sql = state.storage.sql;
-      const cost = rowsRead(sql, `SELECT COUNT(*) AS n FROM events WHERE kind = ?`, 1059);
-      const unindexed = rowsRead(sql, `SELECT COUNT(*) AS n FROM events WHERE +kind = ?`, 1059);
+      const cost = rowsRead(sql, `SELECT COUNT(*) AS n FROM events WHERE kind = ? AND is_group = 0`, 1059);
+      const unindexed = rowsRead(sql, `SELECT COUNT(*) AS n FROM events WHERE +kind = ? AND is_group = 0`, 1059);
       expect(cost).toBeLessThan(10);
       expect(unindexed).toBeGreaterThanOrEqual(EVENTS);
+    });
+  });
+
+  it("scans the table for the same count with no partition named", async () => {
+    // THE COST OF THE PARTIAL PAIRS, stated as a measurement rather than
+    // left to be discovered. SQLite uses a partial index only for a query
+    // whose WHERE clause implies the index's predicate, so a lookup that
+    // names neither `is_group` value can use neither half and reads the
+    // table -- which is why storage.ts runs every partition-agnostic
+    // lookup once per partition (`acrossScopes`) rather than leaving the
+    // pin off.
+    //
+    // This is the assertion that fails if somebody "simplifies" one of
+    // those lookups by dropping the pin.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const pinned = rowsRead(sql, `SELECT COUNT(*) AS n FROM events WHERE kind = ? AND is_group = 0`, 1059);
+      const unpinned = rowsRead(sql, `SELECT COUNT(*) AS n FROM events WHERE kind = ?`, 1059);
+      expect(unpinned).toBeGreaterThanOrEqual(EVENTS);
+      expect(pinned * 100).toBeLessThan(unpinned);
     });
   });
 
@@ -518,9 +541,11 @@ describe("the read-cost guard", () => {
 
   it("admits the shapes an index now covers, and says which index", () => {
     const cases: [Filter, string][] = [
-      [{ kinds: [1], limit: 20 }, "idx_events_kind_created"],
-      [{ authors: [OWNER_PUBKEY_HEX], limit: 20 }, "idx_events_pubkey_created"],
-      [{ authors: [OWNER_PUBKEY_HEX], kinds: [1], limit: 20 }, "idx_events_pubkey_kind_created"],
+      // The public half of each partial pair: an unauthenticated read is
+      // priced against the partition it is allowed to see.
+      [{ kinds: [1], limit: 20 }, "idx_events_kind_created_pub"],
+      [{ authors: [OWNER_PUBKEY_HEX], limit: 20 }, "idx_events_pubkey_created_pub"],
+      [{ authors: [OWNER_PUBKEY_HEX], kinds: [1], limit: 20 }, "idx_events_pubkey_kind_created_pub"],
       [{ ids: ["0".repeat(64)] }, "events primary key"],
     ];
     for (const [filter, via] of cases) {
@@ -1058,5 +1083,72 @@ describe("gift wrap exclusion cost", () => {
     expect(maxGiftWraps({ MAX_EVENT_BYTES: "1024" } as unknown as Env) * 2).toBeLessThanOrEqual(
       MAX_FILTER_ROWS_READ,
     );
+  });
+});
+
+// The group partition (src/groups.ts, schema.ts's partial index pairs),
+// priced. The design claim is a pair of numbers: an unauthenticated read
+// costs what it always cost, and an authorised one costs twice that
+// because it runs once per partition. Both are asserted here rather than
+// argued, since the whole reason for choosing partial pairs over a widened
+// index was that a widened index moved a shape nobody had measured (an
+// authenticated `#p` read went 601 -> 204,701; docs/group-exclusion.md).
+describe("rows read by partition", () => {
+  it("costs an unauthenticated read exactly what the same filter cost before the partition existed", async () => {
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      const pub = buildFilterQuery({ kinds: [1], limit: 20 }, now)!;
+      // 2 rows per returned event + 1, the same figure this file's first
+      // assertion pins for the pre-partition index.
+      expect(rowsRead(sql, pub.sql, ...pub.params)).toBe(41);
+    });
+  });
+
+  it("costs an authorised read one query per partition, and prices it that way", async () => {
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      const filter: Filter = { kinds: [1], limit: 20 };
+      const publicHalf = buildFilterQuery(filter, now, { scope: 0 })!;
+      const groupHalf = buildFilterQuery(filter, now, { scope: 1 })!;
+      const measured =
+        rowsRead(sql, publicHalf.sql, ...publicHalf.params) +
+        rowsRead(sql, groupHalf.sql, ...groupHalf.params);
+
+      // The seeded fixture holds no group events, so the group half is a
+      // seek that finds nothing -- the floor of the two-partition cost
+      // rather than its ceiling.
+      expect(measured).toBeGreaterThan(rowsRead(sql, publicHalf.sql, ...publicHalf.params));
+
+      // And limits.ts knows: `scopes` multiplies the query count, so an
+      // authorised reader is admitted at a limit it can actually afford
+      // rather than at twice one.
+      expect(filterReadCost(filter, 2)!.rowsRead).toBe(filterReadCost(filter, 1)!.rowsRead * 2);
+    });
+  });
+
+  it("shares the tag scan budget between partitions instead of paying it twice", async () => {
+    // Without the divisor a two-partition read would look at
+    // tagScanLimit(limit) tag rows in EACH half and cost twice what
+    // limits.ts prices a tag filter at. The divisor is also what stops one
+    // busy partition starving the other: measured at 50,000 group events,
+    // the owner's own `{"#p":[owner],"kinds":[1059]}` returned zero gift
+    // wraps undivided (group tag rows filled the whole depth) and 16 with
+    // the budget split.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      const filter: Filter = { "#p": [OWNER_PUBKEY_HEX], limit: 20 };
+      const whole = buildFilterQuery(filter, now, { scope: 0 })!;
+      const half = buildFilterQuery(filter, now, { scope: 0, tagScanDivisor: 2 })!;
+      const wholeCost = rowsRead(sql, whole.sql, ...whole.params);
+      const halfCost = rowsRead(sql, half.sql, ...half.params);
+      expect(halfCost).toBeLessThan(wholeCost);
+      // Two halves add up to no more than one whole, which is the
+      // property that keeps filterReadCost's tag term true for an
+      // authorised reader without multiplying it.
+      expect(halfCost * 2).toBeLessThanOrEqual(wholeCost + 2);
+    });
   });
 });

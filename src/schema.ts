@@ -260,6 +260,31 @@ export const TABLES: readonly TableSpec[] = [
       // today, and inventing that number is how this project got
       // rows-written accounting wrong by 45x the first time.
       col("row_cost", "INTEGER"),
+      // 1 when this event carries an `h` tag naming a NIP-29 group
+      // (groups.ts isGroupEvent), 0 otherwise. Kind-agnostic: any kind may
+      // be scoped to a group, which is what NIP-29 says and what makes
+      // this a column rather than a kind range.
+      //
+      // It is a PARTITION, not a flag that gets tested. The three
+      // REQ-serving indexes below are partial pairs keyed on it, so every
+      // query pins it to one value and reads only that half; a query that
+      // pins nothing can use neither half and scans. That is the whole
+      // design, and it is why `is_group = ?` appears in every statement
+      // this codebase issues against `events` -- see INDEXES below for the
+      // measurements, and storage.ts for the two-partition form the
+      // internal lookups use.
+      //
+      // A column, not a second table. It costs nothing in rows written (a
+      // row write is a row, not a column -- the same accounting
+      // `ingested_at` and `row_cost` are argued on above), and the
+      // alternative measured no cheaper on any read while doubling every
+      // write path, every deletion path and the tombstone set.
+      //
+      // NOT NULL DEFAULT 0, so an existing relay's rows migrate to
+      // "public" -- which is exactly right: nothing carrying an `h` tag
+      // could have been stored before this shipped, because nothing
+      // distinguished it.
+      col("is_group", "INTEGER NOT NULL DEFAULT 0"),
     ],
   },
   {
@@ -269,6 +294,22 @@ export const TABLES: readonly TableSpec[] = [
       col("tag_value", "TEXT NOT NULL"),
       col("event_id", "TEXT NOT NULL"),
       col("created_at", "INTEGER NOT NULL"),
+      // The `is_group` of the event this tag row belongs to, copied at
+      // insert time the way `created_at` above already is, and for the
+      // same reason: the tag subquery has to be able to apply the
+      // exclusion ITSELF.
+      //
+      // Without it the subquery's own LIMIT (filters.ts tagScanLimit) runs
+      // before the exclusion does, so the candidate set is filled with
+      // group events and then emptied by the outer query -- measured at
+      // 50,000 group events, a client asking for 20 got 1
+      // (docs/group-exclusion.md). The rows have to be excluded where they
+      // are counted, not after.
+      //
+      // Zero additional rows written: the lookup index below is a partial
+      // PAIR on this column rather than a second index, so a tag row still
+      // pays one base row and one lookup entry, plus idx_event_tags_event.
+      col("is_group", "INTEGER NOT NULL DEFAULT 0"),
     ],
   },
   {
@@ -560,6 +601,19 @@ export const TABLES: readonly TableSpec[] = [
     name: "maintained_counts",
     columns: [
       col("events", "INTEGER NOT NULL"),
+      // How many of `events` are group events (groups.ts isGroupEvent).
+      // /api/stats reports `events - group_events`, because that endpoint
+      // is public and unauthenticated and a total that moved with group
+      // traffic would announce every arrival to anyone polling it -- the
+      // same detection the security review found for gift wraps, where
+      // holding a /live socket and polling `totalEvents` timed arrivals to
+      // the second. Relay.getStats carries the note about what this does
+      // NOT fix.
+      //
+      // A column on the row this write already updates, so splitting the
+      // counter costs zero additional rows written (measured: an UPDATE
+      // touching two columns reports the same 1 row as one touching one).
+      col("group_events", "INTEGER NOT NULL DEFAULT 0"),
       col("follows", "INTEGER NOT NULL"),
       // Wall-clock seconds of the last auditMaintainedCounts run, so the
       // daily recount is paced by the data rather than by how often the
@@ -634,6 +688,12 @@ export const TABLES: readonly TableSpec[] = [
       // isCreatedAtTooFarInFuture is deliberately one-sided).
       col("hour", "INTEGER PRIMARY KEY"),
       col("n", "INTEGER NOT NULL"),
+      // How many of `n` are group events, subtracted before /api/stats
+      // reports `events24h` -- see `group_events` on `maintained_counts`
+      // for why the public document must not move with group traffic.
+      // One more column on a bucket row that is written anyway: zero
+      // additional rows.
+      col("group_n", "INTEGER NOT NULL DEFAULT 0"),
     ],
   },
   {
@@ -699,6 +759,10 @@ export const TABLES: readonly TableSpec[] = [
       // by `ingested_at` would say -- which is what makes it auditable
       // (storage.ts auditMaintainedCounts).
       col("n", "INTEGER NOT NULL"),
+      // How many of `n` are group events, subtracted before /api/stats
+      // reports `ingested24h`. Same argument as `group_n` on
+      // `event_hour_counts`, through the other clock.
+      col("group_n", "INTEGER NOT NULL DEFAULT 0"),
       // Rows written during this hour, ALL of them: event rows, index
       // entries, tombstones, counter updates, the follow-list rebuild,
       // NIP-86 bans, backfill bookkeeping. Measured by the SqlStorage
@@ -780,44 +844,125 @@ export interface IndexSpec {
   // `row_cost` are argued on above. The cost of an index is incurred by
   // its existence, not its width.
   readonly covering?: readonly string[];
+  // A partial-index predicate (sqlite.org/partialindex.html). An index
+  // declared with one indexes only the rows satisfying it, and SQLite will
+  // use it only for a query whose own WHERE clause implies the predicate.
+  //
+  // Every entry carrying this is one half of a PAIR -- `is_group = 0` and
+  // `is_group = 1` over identical columns -- which is what makes the group
+  // partition free in rows written: a row satisfies exactly one predicate,
+  // so it pays exactly one index entry, the same as the single index the
+  // pair replaced (measured on a real cursor, test/hibernation.test.ts).
+  //
+  // The cost is paid in queries instead: a query that pins neither value
+  // can use neither half. That is not a subtlety to be careful about, it
+  // is the invariant -- storage.ts states it once and every lookup obeys
+  // it, because the alternative is a full scan (51,500 rows against 2,
+  // measured at 50,000 group events; docs/group-exclusion.md).
+  readonly where?: string;
 }
 
 export const INDEXES: readonly IndexSpec[] = [
+  // ------------------------------------------------------------------
+  // The three REQ-serving indexes, each declared TWICE: once over the
+  // public partition and once over the group partition (`is_group`, see
+  // TABLES above and src/groups.ts).
+  //
+  // Why pairs rather than one index carrying `is_group` as a key column:
+  // measured. A widened index makes `is_group` part of the key, so every
+  // query that does NOT pin it changes plan -- an authenticated owner
+  // reading their own gift wraps went from 601 rows read to 204,701,
+  // because SQLite abandoned the primary-key seek for a partition scan.
+  // A partial pair leaves the key columns exactly as they were, so a
+  // query pinning the partition gets the identical plan it got before
+  // this column existed, and a query pinning the other one gets the
+  // mirror image. Measured across every shape this relay serves, the
+  // public path is unchanged or cheaper and the authorised path costs at
+  // most 2x (two partitions instead of one) -- docs/group-exclusion.md.
+  //
+  // And why pairs rather than one partial index over the public rows
+  // alone: rows written. A lone `WHERE is_group = 0` index would leave
+  // group rows unindexed for every internal lookup (replacement, NIP-09,
+  // NIP-62 vanish), and adding a full index beside it would charge every
+  // public row twice. A pair charges each row once, whichever side it
+  // falls on.
+  //
   // Serves `authors` + `kinds` together -- the shape a well-behaved
   // client sends, and the only one that was ever cheap here.
   {
-    name: "idx_events_pubkey_kind_created",
+    name: "idx_events_pubkey_kind_created_pub",
     table: "events",
     keyColumns: ["pubkey", "kind"],
     orderedBy: "created_at",
+    where: "is_group = 0",
+  },
+  {
+    name: "idx_events_pubkey_kind_created_grp",
+    table: "events",
+    keyColumns: ["pubkey", "kind"],
+    orderedBy: "created_at",
+    where: "is_group = 1",
   },
   // Serves `kinds` with no `authors`. Added v0.7.2; see the measurement
   // at the top of this file. Also turns storage.ts giftWrapCount --
   // `SELECT COUNT(*) FROM events WHERE kind = ?`, run on every accepted
   // gift wrap -- from a full scan of `events` into an index count.
   {
-    name: "idx_events_kind_created",
+    name: "idx_events_kind_created_pub",
     table: "events",
     keyColumns: ["kind"],
     orderedBy: "created_at",
+    where: "is_group = 0",
+  },
+  {
+    name: "idx_events_kind_created_grp",
+    table: "events",
+    keyColumns: ["kind"],
+    orderedBy: "created_at",
+    where: "is_group = 1",
   },
   // Serves `authors` with no `kinds`. Added v0.7.2. On a single-owner
   // relay this is the shape that looks harmless and is not: every row in
   // the table carries the owner's pubkey, so `{"authors":[owner]}` is a
   // request for the whole table with a `limit` that bounds nothing.
   {
-    name: "idx_events_pubkey_created",
+    name: "idx_events_pubkey_created_pub",
     table: "events",
     keyColumns: ["pubkey"],
     orderedBy: "created_at",
+    where: "is_group = 0",
+  },
+  {
+    name: "idx_events_pubkey_created_grp",
+    table: "events",
+    keyColumns: ["pubkey"],
+    orderedBy: "created_at",
+    where: "is_group = 1",
   },
   // Serves `#<letter>` tag filters, through the subquery in
-  // buildFilterQuery.
+  // buildFilterQuery -- as a partial pair for the same reason the three
+  // above are one, and with the same measured consequence if it is not:
+  // carrying `is_group` as a leading KEY column here is what took the
+  // owner's own gift wrap read from 601 rows to 204,701, since that query
+  // pins no partition.
+  //
+  // The subquery has to be able to exclude group rows before its own
+  // LIMIT applies, or the candidate set fills with them and the outer
+  // query returns a short page -- 1 event where 20 were asked for, at
+  // 50,000 group events. See `event_tags.is_group` in TABLES.
   {
-    name: "idx_event_tags_lookup",
+    name: "idx_event_tags_lookup_pub",
     table: "event_tags",
     keyColumns: ["tag_name", "tag_value"],
     orderedBy: "created_at",
+    where: "is_group = 0",
+  },
+  {
+    name: "idx_event_tags_lookup_grp",
+    table: "event_tags",
+    keyColumns: ["tag_name", "tag_value"],
+    orderedBy: "created_at",
+    where: "is_group = 1",
   },
   // Serves `DELETE FROM event_tags WHERE event_id = ?` (storage.ts
   // deleteEventRow), which without it scans the whole table to remove a
@@ -895,7 +1040,8 @@ function createIndexSql(spec: IndexSpec): string {
     // is what keeps them out of the part of the index that does the work.
     ...(spec.covering ?? []),
   ];
-  return `CREATE INDEX IF NOT EXISTS ${spec.name} ON ${spec.table} (${columns.join(", ")})`;
+  const where = spec.where === undefined ? "" : ` WHERE ${spec.where}`;
+  return `CREATE INDEX IF NOT EXISTS ${spec.name} ON ${spec.table} (${columns.join(", ")})${where}`;
 }
 
 // Indexes declared on one table. Exported because limits.ts needs the
@@ -919,9 +1065,48 @@ export function indexesOn(table: string): readonly IndexSpec[] {
 // budget.
 // ---------------------------------------------------------------------
 
+// ---------------------------------------------------------------------
+// DELIBERATELY WRONG, AND WRONG IN THE SAFE DIRECTION. Read this before
+// "fixing" it, and read test/hibernation.test.ts, which asserts the
+// over-charge so that a fix cannot land silently.
+//
 // One base row, plus the implicit unique index SQLite maintains for
 // `id TEXT PRIMARY KEY` (a TEXT primary key is not a rowid alias, so it
-// costs its own index), plus one row per declared index on `events`.
+// costs its own index), plus one row per declared index on `events`. That
+// last term is the wrong one now: `indexesOn("events")` counts SEVEN
+// indexes, but three of them are the group halves of partial pairs and a
+// row satisfies exactly one half of each pair. A public event pays the
+// base row, the PK index, three partial entries and idx_events_ingested:
+//
+//   declared   2 + 7 = 9   + EVENT_COUNTER_ROW_COST 3   + 4 per tag row
+//   measured   2 + 4 = 6   + EVENT_COUNTER_ROW_COST 3   + 3 per tag row
+//
+//   => eventRowCost says 12 + 4T, an event costs 9 + 3T.
+//      A real five-tag note: 32 charged, 24 spent -- a third too much.
+//
+// Left wrong on purpose, because every consumer of this number is a
+// GUARD, and every one of them is made stricter rather than looser by an
+// over-estimate: limits.ts BACKFILL_PAGE_SIZE fetches smaller pages,
+// VANISH_BATCH_SIZE drains fewer events per tick, backfill.ts
+// hasBackfillHeadroom stops sooner, and `events.row_cost` stamps a figure
+// that makes estimateRowsWrittenSince read high. Backfill and the vanish
+// drain get slower; nothing overruns. That is the same direction
+// eventRemovalBudget was deliberately wrong in, for the same reason, and
+// this file already argues it there.
+//
+// Making it right means teaching IndexSpec that a pair costs one row --
+// which is a real change to the derivation, not a constant edit, and it
+// moves BACKFILL_PAGE_SIZE, VANISH_BATCH_SIZE and every stamped
+// `row_cost` with it. Do it deliberately or not at all.
+//
+// The one place the over-charge is NOT safe is
+// storage.ts auditMaintainedCounts, whose rows-written check is a FLOOR:
+// it asks whether the metered total ever fell below what the events in
+// the window cost to store, and an inflated cost turns that into a daily
+// false alarm on a check whose entire value is that it fires rarely. So
+// the measured figure is derived alongside, below, and used there and
+// nowhere else.
+// ---------------------------------------------------------------------
 export const EVENT_BASE_ROW_COST = 2 + indexesOn("events").length;
 
 // The three maintained counters storage.ts insertEventRow moves alongside
@@ -943,8 +1128,49 @@ export const EVENT_BASE_ROW_COST = 2 + indexesOn("events").length;
 // have to pay a write of their own.
 export const EVENT_COUNTER_ROW_COST = 3;
 
-// One base row per `event_tags` row, plus one per index on that table.
+// One base row per `event_tags` row, plus one per index on that table --
+// over-charged by exactly one, for the reason EVENT_BASE_ROW_COST above
+// carries in full: `idx_event_tags_lookup_pub`/`_grp` are a partial pair
+// and a tag row pays one of them, so this says 4 where a tag row costs 3.
 export const TAG_ROW_COST = 1 + indexesOn("event_tags").length;
+
+// How many partial index PAIRS are declared on a table. One pair is one
+// row written per stored row, not two, so this is exactly the amount by
+// which the two constants above over-charge.
+//
+// Derived from the declaration rather than written down, like everything
+// else in this section: adding or removing a pair moves it, and the pair
+// is recognised structurally (a partial index is one carrying `where`, and
+// they are declared in twos). If a future index carries `where` WITHOUT a
+// mirror -- a partial index over some rows and no index over the rest --
+// this halving stops being right, which is why the pairing is asserted in
+// test/schema-migration.ts rather than assumed here.
+export function partialIndexPairsOn(table: string): number {
+  return indexesOn(table).filter((i) => i.where !== undefined).length / 2;
+}
+
+// What a stored event ACTUALLY costs, as SqlStorageCursor reports it.
+//
+// This is not the fix for the over-charge above and must not be used as
+// one: it exists for storage.ts auditMaintainedCounts, whose rows-written
+// check compares a METERED total against the cost of the events that
+// produced it. A floor derived from an over-estimate is not a floor, it is
+// a daily false alarm, and a check that cries wolf once a day is a check
+// nobody reads on the day it is right.
+//
+// Everything else -- page sizing, drain pacing, the stamped `row_cost`
+// column -- deliberately keeps using the over-charged `eventRowCost`.
+// test/hibernation.test.ts pins both, and pins the difference between
+// them, so neither can drift and a fix to the derivation cannot land
+// without deleting this.
+export const EVENT_BASE_ROW_COST_MEASURED = EVENT_BASE_ROW_COST - partialIndexPairsOn("events");
+export const TAG_ROW_COST_MEASURED = TAG_ROW_COST - partialIndexPairsOn("event_tags");
+
+export function eventRowCostMeasured(indexedTagCount: number): number {
+  return (
+    EVENT_BASE_ROW_COST_MEASURED + EVENT_COUNTER_ROW_COST + TAG_ROW_COST_MEASURED * indexedTagCount
+  );
+}
 
 // Rows written by storing one event carrying `indexedTagCount`
 // single-letter tags. Stamped into `events.row_cost` at insert time
@@ -1124,7 +1350,8 @@ export function reconcileColumns(sql: SqlStorage, spec: TableSpec): string[] {
 // 1. The hash is DERIVED from TABLES and INDEXES structurally --
 //    `computeSchemaHash` walks every field `reconcileColumns` and
 //    `createIndexSql` actually act on (column name, definition,
-//    resetsOnAdd; index name, table, keyColumns, orderedBy, covering) --
+//    resetsOnAdd; index name, table, keyColumns, orderedBy, covering,
+//    where) --
 //    not a hand-maintained version number, and not a hash of a hand-picked
 //    subset. A hand-maintained number can be forgotten to bump; a
 //    structural hash cannot, because it has no "forgot" state -- it is
@@ -1183,6 +1410,7 @@ export function computeSchemaHash(tables: readonly TableSpec[], indexes: readonl
       keyColumns: i.keyColumns,
       orderedBy: i.orderedBy ?? null,
       covering: i.covering ?? [],
+      where: i.where ?? null,
     })),
   };
   return bytesToHex(sha256(new TextEncoder().encode(JSON.stringify(fingerprint))));
@@ -1242,12 +1470,14 @@ function seedMaintainedCounts(sql: SqlStorage): void {
   // a completed seed produced.
   sql.exec(`DELETE FROM event_hour_counts`);
   sql.exec(
-    `INSERT INTO event_hour_counts (hour, n)
-       SELECT created_at / 3600, COUNT(*) FROM events GROUP BY created_at / 3600`,
+    `INSERT INTO event_hour_counts (hour, n, group_n)
+       SELECT created_at / 3600, COUNT(*), COALESCE(SUM(is_group), 0)
+         FROM events GROUP BY created_at / 3600`,
   );
   sql.exec(
-    `INSERT INTO maintained_counts (events, follows, audited_at)
+    `INSERT INTO maintained_counts (events, group_events, follows, audited_at)
        SELECT (SELECT COALESCE(SUM(n), 0) FROM event_hour_counts),
+              (SELECT COALESCE(SUM(group_n), 0) FROM event_hour_counts),
               (SELECT COUNT(*) FROM follows),
               NULL`,
   );
@@ -1284,8 +1514,9 @@ function seedMaintainedCounts(sql: SqlStorage): void {
 function seedIngestCounts(sql: SqlStorage): void {
   if (sql.exec(`SELECT 1 FROM ingest_hour_counts LIMIT 1`).toArray().length > 0) return;
   sql.exec(
-    `INSERT INTO ingest_hour_counts (hour, n, rows_written)
-       SELECT ingested_at / 3600, COUNT(*), COALESCE(SUM(row_cost), 0)
+    `INSERT INTO ingest_hour_counts (hour, n, group_n, rows_written)
+       SELECT ingested_at / 3600, COUNT(*), COALESCE(SUM(is_group), 0),
+              COALESCE(SUM(row_cost), 0)
          FROM events WHERE ingested_at IS NOT NULL
         GROUP BY ingested_at / 3600`,
   );
@@ -1303,6 +1534,39 @@ function seedRelayIdentity(sql: SqlStorage): void {
   sql.exec(`INSERT INTO relay_identity (secret_key, public_key) VALUES (?, ?)`, secretKeyHex, publicKeyHex);
 }
 
+// Drops any index this file no longer declares.
+//
+// Needed because CREATE INDEX IF NOT EXISTS does exactly what it says: it
+// will not redefine an index that already exists under that name, and it
+// reports no error either. So an index whose DEFINITION changes has to
+// change its NAME -- which is how `idx_events_kind_created` became
+// `idx_events_kind_created_pub`/`_grp` -- and the old name then has to be
+// removed here, or a deployed relay keeps maintaining an index nothing
+// queries and pays a row per stored event for it forever.
+//
+// Scoped to our own `idx_` prefix so it can never touch
+// `sqlite_autoindex_*`, the implicit unique indexes behind TEXT PRIMARY
+// KEY columns, which are not ours to drop and are half of what
+// EVENT_BASE_ROW_COST counts.
+//
+// Runs only on the reconcile path (a schema-hash mismatch), so the handful
+// of rows it reads out of `sqlite_master` are paid on the wake after a
+// deploy that changed the schema, not on every wake. After the CREATE
+// INDEX loop rather than before it, so a throw part-way through leaves the
+// old indexes in place: an extra index is a cost, a missing one is an
+// outage.
+function dropUndeclaredIndexes(sql: SqlStorage): void {
+  const declared = new Set(INDEXES.map((i) => i.name));
+  const existing = sql
+    .exec<{ name: string }>(
+      `SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx\\_%' ESCAPE '\\'`,
+    )
+    .toArray();
+  for (const row of existing) {
+    if (!declared.has(row.name)) sql.exec(`DROP INDEX IF EXISTS ${row.name}`);
+  }
+}
+
 export function initSchema(sql: SqlStorage): void {
   ensureSchemaMetaTable(sql);
   const hash = currentSchemaHash();
@@ -1318,6 +1582,7 @@ export function initSchema(sql: SqlStorage): void {
   for (const index of INDEXES) {
     sql.exec(createIndexSql(index));
   }
+  dropUndeclaredIndexes(sql);
   // NIP-51 mute list support was removed (see CLAUDE.md "The budget"); this drops
   // the now-orphaned table on deployed relays that still carry it from
   // before the removal. Idempotent and a no-op on a fresh database.

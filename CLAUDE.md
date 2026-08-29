@@ -10,6 +10,7 @@ A single-user nostr relay that deploys in one click and runs on the Cloudflare W
 - TOFU ownership: unclaimed until `POST /api/claim` binds a pubkey, permanently, with no signature required (`OWNER_PUBKEY` env var skips this and disables the endpoint). Every event is still signature-verified regardless of owner.
 - Writes are owner-gated, with two exceptions: `ALLOW_FOLLOWS` (opt-out, on unless set to `"false"`) also accepts the owner's kind-3 follow list (cached from the owner's own stored contact list, refreshed immediately when the owner publishes a new one to this relay, with hourly cron as the fallback for when it arrived some other way — never fetched per event); kind-1059 gift wraps (NIP-59) are accepted from anyone, p-tag-addressed to the owner, gated by their own storage cap and per-IP throttle on top of the general write caps below. [docs/rungs.md](docs/rungs.md) describes this kind of escalation generically, in terms of who may write and what bounds the volume — bothy implements rung 3 (follows may write) with kind-1059 gift wraps layered in as an instance of rung 2 (addressed mail).
 - Gift wrap reads require NIP-42 AUTH as the p-tagged recipient, and the gate is **omission, not refusal**: a filter naming kind 1059 is refused from `f.kinds` alone with no storage access, and a filter that names no `kinds` is answered normally with the kind-1059 rows dropped from the query (`filters.ts excludeGiftWraps`). It used to decide by probing storage — re-run the filter restricted to 1059, refuse if anything came back — and that made the refusal itself the answer: an unauthenticated `{"#p":[owner],"since":S,"until":U,"limit":1}` said `auth-required` when a wrap fell inside the window and `EOSE` when none did, so bisecting since/until yielded exact arrival windows and an exact inbox count without ever naming 1059. Refusal leaks; omission does not. In SQL and never in memory afterwards, because a client asking for 20 and receiving 8 has counted the wraps in its own window.
+- NIP-29 group events — any event carrying an `h` tag, of any kind ([src/groups.ts](src/groups.ts)) — are held in a separate PARTITION of `events`/`event_tags` (`is_group`) and omitted from every unauthenticated read. Kind-agnostic, because NIP-29 scopes a group by that tag and not by a kind range: a kind-1 note, a kind-7 reaction and a kind-30023 post are all group events if they name a group. The exclusion covers four surfaces, not one — REQ results, `broadcast()` (a subscription registered before an event arrives is never re-examined by the REQ-time gate, which is why gift wraps gate there separately too), `liveBroadcast()` (the `/live` feed has no authentication at all), and the public counters on `/api/stats` (polling `totalEvents` while holding a `/live` socket dates every arrival to the second — the same shape the gift wrap review found). Same omit-don't-refuse rule as gift wraps: a filter that NAMES a group (`{"#h":[...]}`) is refused with `auth-required` from the filter alone, and a filter that does not is answered normally with the group's rows omitted. Reads are gated on the owner's NIP-42 identity, because membership is not modelled yet — see [docs/group-exclusion.md](docs/group-exclusion.md) for the measurements and for what is deliberately not implemented.
 - NIP-09 deletion and NIP-62 vanish requests both tombstone ids (`deleted_ids`) so a deleted event — gift wraps especially, since the sender keeps their own signed copy — can't be replayed back into storage.
 - Live feed (`/live`) is a separate, unauthenticated, push-only WebSocket channel for the admin page, capped at 5 concurrent connections and a 10-minute server-enforced lifetime (DO alarm). Never sends gift wraps or event content, only kind/time/truncated id.
 - NIP-86 relay management API: `banevent`/`allowevent`/`listbannedevents`, `banpubkey`/`unbanpubkey`/`listbannedpubkeys`, `allowpubkey`/`unallowpubkey`/`listallowedpubkeys`, `blockip`/`unblockip`/`listblockedips`, and `changerelayname`/`changerelaydescription`/`changerelayicon`, plus `supportedmethods`. Authenticated by a NIP-98 event ([src/nip98.ts](src/nip98.ts)) signed by the owner, with the `payload` tag required rather than optional; verification runs in the Worker so a forged request costs no DO time, and storage mutations go to the DO by RPC (`Relay.manage`). Phase one shipped only the methods that cost nothing on the per-event write path; phase two (`banpubkey`/`allowpubkey`) is the one addition that does, landed only once a metrics baseline existed to compare against — see CLAUDE.md "The budget". The kind allowlist methods answer with an explanation rather than a generic unknown-method error, since bothy stores every kind deliberately.
@@ -23,7 +24,7 @@ A single-user nostr relay that deploys in one click and runs on the Cloudflare W
 
 ## What it refuses to be
 
-No payments/zaps, no multi-region/D1/read-replica scaling, no NIP-05 hosting, no media/blossom uploads, no community moderation tooling (no moderator roles, no invite system, no report queue — the NIP-86 management API is the owner administering their own relay, which is a different thing), no public write mode, no continuous multi-relay sync (backfill is one-shot only). See [README.md](README.md) "What this is not".
+No group management (the `is_group` partition above gates who may READ a group's events; there is no group creation, no membership list, no moderation events, and nothing signs 39000-series metadata yet), no payments/zaps, no multi-region/D1/read-replica scaling, no NIP-05 hosting, no media/blossom uploads, no community moderation tooling (no moderator roles, no invite system, no report queue — the NIP-86 management API is the owner administering their own relay, which is a different thing), no public write mode, no continuous multi-relay sync (backfill is one-shot only). See [README.md](README.md) "What this is not".
 
 ## Configuration
 
@@ -59,7 +60,8 @@ which carry about five single-letter tags each).
 ### Rows written, per stored event
 
 ```
-9 + 3 × (single-letter tag count)
+measured   9 + 3 × (single-letter tag count)
+charged   12 + 4 × (single-letter tag count)   <- deliberately high, see below
 ```
 
 Six for the event row: one base row, one for the implicit unique index behind
@@ -70,6 +72,29 @@ rowid-aliased, so one row apiece). Three per indexed tag row: the row and its tw
 indexes. A bare note costs 9, a reply carrying `#e` and `#p` costs 15, a real note
 carrying about five tags costs 24. A delete is a write too, so a replacement or a
 NIP-09 deletion costs this shape again, plus 2 for a tombstone.
+
+`eventRowCost` charges more than an event costs, on purpose. The three
+REQ-serving indexes on `events` and the tag lookup index are declared as
+partial PAIRS keyed on `is_group` (one half over the public partition, one
+over the group partition), and a stored row satisfies exactly one half of
+each pair — so it pays one index entry per pair, exactly what the single
+index it replaced cost. `EVENT_BASE_ROW_COST` is
+`2 + indexesOn("events").length` and counts the halves separately, so a real
+five-tag note is charged 32 and spends 24.
+
+Left wrong, because every consumer of that number is a GUARD and an
+over-estimate makes each of them stricter rather than looser:
+`BACKFILL_PAGE_SIZE` fetches smaller pages, `VANISH_BATCH_SIZE` drains fewer
+events per tick, `hasBackfillHeadroom` stops sooner, and the `row_cost`
+stamped on each row reads high. Slower, never overrunning — the same
+direction `eventRemovalBudget` is deliberately wrong in.
+[test/hibernation.test.ts](test/hibernation.test.ts) pins the measured cost,
+the charged cost and the gap between them, so the wrongness cannot drift and
+a fix cannot land quietly. The one place it is NOT safe is
+`auditMaintainedCounts`' rows-written check, which is a floor: a floor above
+what the meter can report is a daily false alarm, so that one comparison
+converts the stamped sum back through `eventRowCostMeasured`. When the
+derivation is fixed, the two become equal and that arithmetic goes with it.
 
 The three counter rows are the price of `/api/stats` no longer scanning or
 sampling anything at all — 3 rows written per event against ~1,100 events/day
@@ -128,6 +153,9 @@ insert time so `estimateRowsWrittenSince` can sum a column.
 | Path | Rows read |
 |---|---|
 | REQ filter, `ids` | 1 per id, × combinations |
+| Group exclusion, any filter | 0 — it is a partition seek, not a post-filter |
+| REQ filter, reader authorised for the group | × 2, one query per partition |
+| Any `events` lookup that names no partition | the whole table — see below |
 | REQ filter, `#<letter>` tag | ~2 per matching tag row |
 | REQ filter served by an index | combinations × (2 × limit + 1) |
 | Gift wrap exclusion, tag-driven filter | 0 — bounded by the tag subquery's own LIMIT |
@@ -166,6 +194,19 @@ reconcile completes without throwing, so a migration that dies partway
 leaves the previous hash in place for the next wake to retry rather than
 being mistaken for one that finished. See the header comment on `initSchema`
 in [src/schema.ts](src/schema.ts).
+
+The partition is what makes the group exclusion affordable, and it imposes a
+rule: SQLite uses a partial index only for a query whose `WHERE` implies the
+index's predicate, so **every query against `events`/`event_tags` names a
+partition** or reads the table. Measured at 50,000 group events, `SELECT id
+FROM events WHERE pubkey = ? AND kind = ?`: 2 rows pinned, 2 rows run once per
+partition (`storage.ts acrossScopes`), **51,500** with no pin. A post-filter
+instead of a partition would have cost 1,090 rows on a
+`{"kinds":[1],"limit":20}` priced at 41, and 26,050 at limit 500 — one REQ
+frame over the whole per-REQ cap, invisible to `boundFilter`. Full sweep, and
+the measurements behind choosing partial pairs over a widened index (which took
+the owner's own gift wrap read from 601 rows to 204,701), in
+[docs/group-exclusion.md](docs/group-exclusion.md).
 
 `combinations` is the number of queries `filters.ts expandFilter` runs for a
 filter — its `authors` × `kinds` cross-product. The `2` is the index entry plus
@@ -492,6 +533,15 @@ usefully — what it structurally cannot do.
   permanent damage one event can do; a per-pubkey rate limit bounds how fast;
   `NON_OWNER_STORAGE_BYTES` reserves half the 5GB ceiling for the owner. Gift
   wraps carry their own count cap and per-IP throttle on top.
+- **Group disclosure.** Events carrying an `h` tag live in their own
+  partition of `events` and are omitted from every unauthenticated read, on
+  all four surfaces that reach one: REQ results, the push to already-open
+  subscriptions, the `/live` feed, and the public counters on `/api/stats`.
+  A filter naming a group is refused from the filter alone; one that does
+  not is answered with the rows omitted, so the answer does not depend on
+  what the group holds. The exclusion is a partition seek rather than a
+  post-filter, so it costs nothing and no filter can be shaped to read past
+  it.
 - **Gift wrap disclosure.** Reads of kind-1059 require NIP-42 AUTH as the
   p-tagged recipient. A filter naming 1059 is refused from `kinds` alone; a
   filter that names no kinds is served with the wraps omitted. The gate
@@ -529,6 +579,18 @@ usefully — what it structurally cannot do.
   a progress total and an age, never the pubkeys: the endpoint is public and
   unauthenticated, and itemising the rows published exactly which identities
   had asked this relay to erase them.
+- **Coarse channels around the group counters.** `/api/stats` publishes only
+  the public half of every count, but `storageBytes` grows with every stored
+  event whatever partition it is in, `rowsWrittenToday` is deliberately whole
+  (it is the owner's budget meter, and a budget figure that under-reports the
+  day's spend is worse than one that leaks traffic shape), and the `reads`
+  diagnostic moves with group REQs. All three are coarser than a per-event
+  counter and all three remain.
+- **Group membership.** There is none. Group reads are gated on the owner's
+  NIP-42 identity because that is the only identity this relay knows, so a
+  member is currently as unauthorised as a stranger. Two gates widen together
+  when it lands — `handleReqInner`'s and `broadcast()`'s — or a member
+  subscribed before an event arrives silently gets nothing.
 - **Anyone reading anything that is not a gift wrap.** There is no read
   authentication and none is planned; a personal relay's contents are as public
   as the notes in it.
@@ -551,12 +613,13 @@ usefully — what it structurally cannot do.
 - [src/index.ts](src/index.ts) — Worker entry: routing, `/api/*`, `scheduled()` cron dispatch.
 - [src/relay.ts](src/relay.ts) — the `Relay` Durable Object: connection lifecycle, NIP-01 message handling, live feed, alarm.
 - [src/relay-stub.ts](src/relay-stub.ts) — the one `idFromName("relay")` accessor, shared so nothing else can shard it.
-- [src/storage.ts](src/storage.ts) / [src/schema.ts](src/schema.ts) — SQLite schema and all read/write queries, including the row-cost accounting. `events.ingested_at` is wall-clock write time and must never be conflated with `created_at`: rows-written accounting and backfill's headroom guard both measure `ingested_at`, because a backfilled event's `created_at` is years old and measuring that made backfill's own writes invisible to the guard restraining them. A column, not a counter table — a counter costs a row write per event, a column costs nothing. The same argument added `events.row_cost` in v0.7.2: each event's rows-written cost is stamped at insert time so `estimateRowsWrittenSince` sums a column instead of rebuilding the figure from a `LEFT JOIN event_tags` with no index behind it, which read every tag row in the table to answer a question about the 24h window. The same argument runs the other way for `maintained_counts`/`event_hour_counts`, which DO pay a row write per event: there the alternative was a read that grew without bound, so 2 fixed rows against an event already costing 6 to 21 is the cheaper side. See CLAUDE.md "The budget".
-- [src/filters.ts](src/filters.ts) — REQ filter parsing, SQL query building, in-memory match testing for live broadcast, `FilterQueryOptions.excludeGiftWraps` (the NIP-42 read gate, expressed as omission — see "What it is"), and `expandFilter`, which splits one filter into the cross-product of its `authors` × `kinds` singletons. That split is what lets an index serve `ORDER BY created_at DESC LIMIT n`: a key column pinned to one value arrives sorted, `kind IN (1, 7)` does not, so a multi-kind filter defeats an index as thoroughly as no index at all. `storage.ts queryFilter` re-merges and re-slices to `limit`, so the split is invisible on the wire.
+- [src/storage.ts](src/storage.ts) / [src/schema.ts](src/schema.ts) — SQLite schema and all read/write queries, including the row-cost accounting. `storage.ts` states the partition rule once, above its first use, and every lookup below obeys it: pin `is_group` to one value, or run once per value; a lookup that names neither reads the whole table. `insertEventRow`/`deleteEventRow` stamp the partition onto the event row, its tag rows and both halves of every maintained counter, so "what an event is" and "what gets stored about it" stay the same lines of code. `events.ingested_at` is wall-clock write time and must never be conflated with `created_at`: rows-written accounting and backfill's headroom guard both measure `ingested_at`, because a backfilled event's `created_at` is years old and measuring that made backfill's own writes invisible to the guard restraining them. A column, not a counter table — a counter costs a row write per event, a column costs nothing. The same argument added `events.row_cost` in v0.7.2: each event's rows-written cost is stamped at insert time so `estimateRowsWrittenSince` sums a column instead of rebuilding the figure from a `LEFT JOIN event_tags` with no index behind it, which read every tag row in the table to answer a question about the 24h window. The same argument runs the other way for `maintained_counts`/`event_hour_counts`, which DO pay a row write per event: there the alternative was a read that grew without bound, so 2 fixed rows against an event already costing 6 to 21 is the cheaper side. See CLAUDE.md "The budget".
+- [src/filters.ts](src/filters.ts) — REQ filter parsing, SQL query building, in-memory match testing for live broadcast, `FilterQueryOptions.excludeGiftWraps` (the NIP-42 read gate, expressed as omission — see "What it is"), `FilterQueryOptions.scope`/`tagScanDivisor` (the group partition: every query this file builds pins `is_group`, tag subqueries included, and a reader entitled to both partitions runs the filter twice with the tag scan budget split between them rather than paid twice), and `expandFilter`, which splits one filter into the cross-product of its `authors` × `kinds` singletons. That split is what lets an index serve `ORDER BY created_at DESC LIMIT n`: a key column pinned to one value arrives sorted, `kind IN (1, 7)` does not, so a multi-kind filter defeats an index as thoroughly as no index at all. `storage.ts queryFilter` re-merges and re-slices to `limit`, so the split is invisible on the wire.
 - [src/nostr.ts](src/nostr.ts) — wire types and kind-range classifiers (replaceable/ephemeral/addressable).
 - [src/validate.ts](src/validate.ts) — event id computation and schnorr signature verification (`@noble/curves`).
 - [src/ownership.ts](src/ownership.ts) — owner pubkey resolution, TOFU claim, follow-list cache, profile/icon refresh. `getOwnerPubkey` runs `OWNER_PUBKEY` through `normalizePubkey` like every other pubkey boundary in the project, memoised on the raw string because it sits on the write path. It did not, and returned the variable verbatim while every comparison target is lowercase hex — so an operator setting an npub (the form every client shows them) got a relay where the owner could not write, could not read their own gift wraps, and could not be addressed by one, silently. A malformed value now resolves to null, which reads as unclaimed and is visible; `index.ts` still gates `/api/claim` on the variable being *set*, so this fails closed rather than reopening TOFU.
 - [src/relay-identity.ts](src/relay-identity.ts) — this relay's own signing keypair, distinct from the owner's pubkey and from `OWNER_PUBKEY`. NIP-29 requires 39000-series group metadata events to be "signed by the relay keypair directly," so this exists ahead of that work landing. Generated once, at schema-init time (`schema.ts` `seedRelayIdentity`) rather than at claim — `claim()` is skipped entirely under `OWNER_PUBKEY` (`relay.ts`), and this identity has to exist under that mode too, the same reason `follows.fetched_at` lives off the `owner` table rather than on it. Exposed as `relay_pubkey` on the NIP-11 document and `relayPubkey` on `/api/stats`, both always present since it doesn't depend on claim status; the secret key is read only by `signAsRelay`, which nothing calls yet.
+- [src/groups.ts](src/groups.ts) — what makes an event a group event (an `h` tag, any kind), the two scopes of the `is_group` partition, and `acrossScopes`, the once-per-partition form every lookup that is not about one partition in particular has to take. Also `filterNamesGroup`, which is what lets the read gate tell "this client asked for a group" from "this client asked for something the group happens to be in" without touching storage.
 - [src/host.ts](src/host.ts) — this deployment's own host, learned from request traffic; lets backfill skip self-seeding.
 - [src/pubkey.ts](src/pubkey.ts) / [src/bech32.ts](src/bech32.ts) — npub/hex normalization.
 - [src/profile-lookup.ts](src/profile-lookup.ts) — best-effort kind-0 lookup from well-known relays, runs in the Worker only, plus the isolate-local cache in front of it (`lookupProfileCached`). The cache is not `caches.default`: the Cache API needs a custom domain (developers.cloudflare.com/workers/runtime-apis/cache/, checked 2026-08-27) and bothy deploys to `workers.dev`, so it would silently no-op on the deployment shape this project exists for. Negative results are cached and concurrent lookups for one pubkey are coalesced — without both, the cache would miss on exactly the traffic it exists to absorb.
@@ -576,7 +639,7 @@ usefully — what it structurally cannot do.
 - Protocol errors go back as `["OK", id, false, "reason: message"]` or `["CLOSED", subid, "reason: message"]` with the NIP-01 machine-readable prefix (`invalid:`, `restricted:`, `blocked:`, `rate-limited:`, `auth-required:`, `duplicate:`). Never fail silently.
 - Comments explain *why*, especially anything hibernation- or budget-related — most modules carry inline notes on their row-write cost or CPU cost and point at CLAUDE.md "The budget" for the measured baseline.
 - Cheapest/most-certain rejections run before expensive ones on every write path: ownership check and tombstone check both precede schnorr verification.
-- Indexes are declared once, as data, in `schema.ts INDEXES`, and three things read that declaration: `limits.ts boundFilter` (which filters are affordable), `schema.ts eventRowCost` (what an event costs to write), and `limits.ts BACKFILL_PAGE_SIZE`/`VANISH_BATCH_SIZE` (how much work fits in a cron tick). Four on `events` — `(pubkey, kind, created_at)`, `(kind, created_at)`, `(pubkey, created_at)`, `(ingested_at)` covering `row_cost` — and two on `event_tags` — `(tag_name, tag_value, created_at)` and `(event_id)`. Adding another index therefore changes both the guard and the write accounting on its own; what it must NOT change silently is the measured baseline, so re-run `test/hibernation.test.ts`'s rows-written assertions and update the schema.ts comment and CLAUDE.md "The budget". Every accepted read filter must be answerable from one of these — that is enforced by cost, not by requiring a particular field.
+- Indexes are declared once, as data, in `schema.ts INDEXES`, and three things read that declaration: `limits.ts boundFilter` (which filters are affordable), `schema.ts eventRowCost` (what an event costs to write), and `limits.ts BACKFILL_PAGE_SIZE`/`VANISH_BATCH_SIZE` (how much work fits in a cron tick). Seven on `events` — `(pubkey, kind, created_at)`, `(kind, created_at)` and `(pubkey, created_at)`, each declared TWICE as a partial pair (`WHERE is_group = 0` / `= 1`), plus `(ingested_at)` covering `row_cost` — and three on `event_tags` — `(tag_name, tag_value, created_at)` as a partial pair, and `(event_id)`. A row satisfies one half of each pair, so a pair costs one row written per stored row, exactly what the single index it replaced cost; `eventRowCost` counts the halves separately and therefore over-charges, deliberately (see "The budget"). An index whose DEFINITION changes must change its NAME — `CREATE INDEX IF NOT EXISTS` will not redefine one and reports no error — and `initSchema` then drops whatever the declaration no longer carries. Adding another index therefore changes both the guard and the write accounting on its own; what it must NOT change silently is the measured baseline, so re-run `test/hibernation.test.ts`'s rows-written assertions and update the schema.ts comment and CLAUDE.md "The budget". Every accepted read filter must be answerable from one of these — that is enforced by cost, not by requiring a particular field.
 - Verify Cloudflare's own platform limits against live docs before relying on a number in a file — they change between compatibility dates. CLAUDE.md "The budget" cites the source and date at each point of use rather than assuming a cached number still holds.
 - Pin dependency versions; don't float to `latest` mid-project.
 - Commit directly to `main`. Never create a branch, and never open a pull

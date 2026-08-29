@@ -431,7 +431,18 @@ export interface FilterReadCost {
 //
 // `limit` is taken as given: callers pass an already-clamped filter, and
 // boundFilter below is what does the clamping.
-export function filterReadCost(filter: Filter): FilterReadCost | null {
+// `scopes` is how many partitions of `events` the reader is entitled to
+// (src/groups.ts): 1 for every unauthenticated client, 2 for an authorised
+// one. It multiplies the query count for the same reason `combinations`
+// does -- storage.ts queryFilter runs the filter once per partition,
+// because a partial index pair can only serve a query that pins one --
+// and it is a separate argument rather than something read off the filter
+// because it is a property of the READER, not of what was asked for.
+//
+// The tag term below is NOT multiplied: filters.ts splits the tag scan
+// budget across the partitions instead, so a two-partition read looks at
+// the same number of tag rows in total as a one-partition read.
+export function filterReadCost(filter: Filter, scopes = 1): FilterReadCost | null {
   const limit = filter.limit ?? MAX_FILTER_LIMIT;
   const candidates: FilterReadCost[] = [];
 
@@ -457,7 +468,7 @@ export function filterReadCost(filter: Filter): FilterReadCost | null {
   // cross-product to measure it would mean allocating ten thousand filter
   // objects to discover that a filter is too expensive to run, which is a
   // cheap denial of service against the guard that exists to prevent one.
-  const combinations = expandFilterCount(filter);
+  const combinations = expandFilterCount(filter) * scopes;
 
   // The primary key. `id TEXT PRIMARY KEY` is a unique index, so an
   // `ids` filter is one seek per id and needs no ordering at all -- the
@@ -569,7 +580,11 @@ export type FilterBound =
 // this file has always claimed for it. Divided equally rather than spent
 // first-come, so the answer does not depend on the order the client
 // happened to write its filters in.
-export function boundFilter(filter: Filter, budget: number = MAX_FILTER_ROWS_READ): FilterBound {
+export function boundFilter(
+  filter: Filter,
+  budget: number = MAX_FILTER_ROWS_READ,
+  scopes = 1,
+): FilterBound {
   // The query count, refused ahead of the cost model rather than through
   // it. filterReadCost prices the cheapest access path, and the cheapest
   // path can be cheap in rows while still being thousands of statements
@@ -577,7 +592,7 @@ export function boundFilter(filter: Filter, budget: number = MAX_FILTER_ROWS_REA
   // whether or not they read anything, and a lowered `limit` does not
   // remove one of them, so this belongs before the halving loop rather
   // than inside it.
-  const combinations = expandFilterCount(filter);
+  const combinations = expandFilterCount(filter) * scopes;
   if (combinations > MAX_FILTER_COMBINATIONS) {
     return {
       ok: false,
@@ -616,7 +631,7 @@ export function boundFilter(filter: Filter, budget: number = MAX_FILTER_ROWS_REA
   // occasionally gets 62 events where 100 would also have fit.
   for (let limit = requested; limit >= 1; limit = Math.floor(limit / 2)) {
     const candidate = { ...filter, limit };
-    const cost = filterReadCost(candidate);
+    const cost = filterReadCost(candidate, scopes);
     if (cost === null) {
       // Unbounded at any limit -- the limit is not what is wrong with it.
       return {

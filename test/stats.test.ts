@@ -307,7 +307,7 @@ describe("maintained event counters", () => {
       forgetSchemaHash(sql);
       initSchema(sql);
       expect(readMaintainedCounts(sql).events).toBe(4);
-      expect(countEvents24h(sql, now)).toBe(4);
+      expect(countEvents24h(sql, now).total).toBe(4);
 
       // A second reconcile pass -- what a later schema change causes --
       // must leave the counters exactly where they are, even after they

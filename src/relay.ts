@@ -12,6 +12,13 @@ import {
 import { matchesAnyFilter, parseFilter } from "./filters";
 import { recordHost } from "./host";
 import {
+  ALL_SCOPES,
+  filterNamesGroup,
+  type GroupScope,
+  isGroupEvent,
+  PUBLIC_SCOPE,
+} from "./groups";
+import {
   boundFilter,
   DAILY_ROWS_READ_LIMIT,
   DAILY_ROWS_WRITTEN_LIMIT,
@@ -617,6 +624,9 @@ export class Relay extends DurableObject<Env> {
     // and fall through to ~3E rows of recomputation; there is nothing
     // left here that can miss.
     const counts = readMaintainedCounts(sql);
+    // Both halves of the created_at buckets, one statement, ~26 rows --
+    // the public figure published below is the difference.
+    const windowed = countEvents24h(sql, nowSec);
     // The last two computed figures on this document, now maintained as
     // well -- both out of `ingest_hour_counts` in one statement, at most
     // 25 rows. They were a cache row on a five-minute clock, because each
@@ -637,14 +647,40 @@ export class Relay extends DurableObject<Env> {
       relayPubkey: getRelayPubkey(sql),
       // Both maintained: the row read above, plus at most 26 bucket rows.
       // Current as of this request.
-      totalEvents: counts.events,
-      events24h: countEvents24h(sql, nowSec),
+      // Group events are SUBTRACTED from every count on this document.
+      // /api/stats is public and unauthenticated, and the security review
+      // that produced the gift wrap read gate found the same shape here:
+      // hold a /live socket, poll a total that moves with every stored
+      // event, and each arrival the feed does not announce is dated to the
+      // second. Group events have exactly that shape, so the counters are
+      // maintained in two halves (schema.ts `group_events`/`group_n`) and
+      // only the public half is published.
+      //
+      // WHAT THIS DOES NOT FIX, stated here because the fields sit on the
+      // same document and a reader will assume otherwise:
+      //
+      //   storageBytes       `sql.databaseSize`, which grows with every
+      //                      stored event whatever partition it is in. Page
+      //                      granularity blurs it, a busy group still moves
+      //                      it, and nothing short of not reporting it
+      //                      would change that.
+      //   rowsWrittenToday   deliberately whole. It is the owner's budget
+      //                      meter, and a budget figure that under-reports
+      //                      the day's real spend is worse than one that
+      //                      leaks the shape of the traffic producing it.
+      //   reads              the read-metrics diagnostic, whose per-path
+      //                      counters move with group REQs like any other.
+      //
+      // All three are coarser channels than a per-event counter, and all
+      // three remain. See docs/group-exclusion.md.
+      totalEvents: counts.events - counts.groupEvents,
+      events24h: windowed.total - windowed.group,
       // Maintained, out of the ingest-hour buckets read above -- at most
       // 25 rows for the pair, current as of this request. They were the
       // two numbers most worth being current and the two that cost the
       // most to be, which is what a cache was papering over; bucketing
       // made the tension disappear rather than trading it.
-      ingested24h: ingest.ingested24h,
+      ingested24h: ingest.ingested24h - ingest.ingestedGroup24h,
       storageBytes: sql.databaseSize,
       rowsWrittenToday: ingest.rowsWrittenToday,
       storageBytesLimit: STORAGE_BYTES_LIMIT,
@@ -1340,6 +1376,28 @@ export class Relay extends DurableObject<Env> {
     // answer. At the common single-filter REQ the share IS the cap, so
     // nothing about the ordinary case moves.
     const perFilterBudget = Math.floor(MAX_FILTER_ROWS_READ / Math.max(1, rawFilters.length));
+
+    // Who this connection is, resolved once and used by both read gates
+    // below. One owner lookup rather than two, and none at all on the
+    // unauthenticated path -- `authedPubkey` is undefined there, so the
+    // `&&` short-circuits before the storage read, which is the property
+    // the gift wrap gate was rewritten to have and must not lose.
+    //
+    // Group reads are gated on the same identity as gift wrap reads for
+    // now, because that is the only identity this relay knows: NIP-29
+    // membership is not modelled yet. When it is, this is the line that
+    // widens -- and broadcast() below has to widen with it, or a member
+    // subscribed before an event arrives gets nothing.
+    const authedAsOwner =
+      state.authedPubkey !== undefined && state.authedPubkey === getOwnerPubkey(this.sql, this.env);
+    const mayReadGiftWraps = authedAsOwner;
+    const mayReadGroups = authedAsOwner;
+    // Which partitions this read covers. Passed into boundFilter because
+    // it multiplies the query count -- storage.ts runs the filter once per
+    // partition -- so an authorised reader is priced for what it actually
+    // costs rather than for half of it.
+    const scopes: readonly GroupScope[] = mayReadGroups ? ALL_SCOPES : [PUBLIC_SCOPE];
+
     const filters: Filter[] = [];
     for (const raw of rawFilters) {
       const filter = parseFilter(raw);
@@ -1347,7 +1405,7 @@ export class Relay extends DurableObject<Env> {
         send(ws, ["CLOSED", subId, "error: malformed filter"]);
         return;
       }
-      const bound = boundFilter(filter, perFilterBudget);
+      const bound = boundFilter(filter, perFilterBudget, scopes.length);
       if (!bound.ok) {
         send(ws, ["CLOSED", subId, bound.reason]);
         return;
@@ -1387,8 +1445,27 @@ export class Relay extends DurableObject<Env> {
     // The owner lookup is now inside the authenticated branch, so an
     // unauthenticated REQ -- every public read this relay serves -- pays
     // neither the probe nor the owner's two rows.
-    const mayReadGiftWraps =
-      state.authedPubkey !== undefined && state.authedPubkey === getOwnerPubkey(this.sql, this.env);
+    // Group events are gated the same way, and split the same way: a
+    // filter that NAMES a group (`{"#h":[...]}`, groups.ts
+    // filterNamesGroup) is refused from the filter alone, with no storage
+    // access, because the client has already said what it wants and being
+    // told to authenticate tells it nothing. A filter that does not name
+    // one is answered normally with the group's events omitted -- refusing
+    // that would make the refusal itself the answer, which is precisely
+    // the leak the gift wrap storage probe turned out to be.
+    if (!mayReadGroups && filters.some(filterNamesGroup)) {
+      if (state.authedPubkey === undefined) {
+        if (!state.challenge) {
+          state.challenge = crypto.randomUUID();
+          setState(ws, state);
+        }
+        send(ws, ["AUTH", state.challenge]);
+        send(ws, ["CLOSED", subId, "auth-required: authentication required to read group events"]);
+      } else {
+        send(ws, ["CLOSED", subId, "restricted: not allowed to read group events"]);
+      }
+      return;
+    }
     if (!mayReadGiftWraps && filters.some((f) => f.kinds?.includes(GIFT_WRAP_KIND))) {
       if (state.authedPubkey === undefined) {
         if (!state.challenge) {
@@ -1433,6 +1510,7 @@ export class Relay extends DurableObject<Env> {
     // stays open, so the two have to agree.
     const events = queryFilters(this.sql, filters, nowSeconds(), {
       excludeGiftWraps: !mayReadGiftWraps,
+      scopes,
     }).slice(0, MAX_EVENTS_PER_REQ);
     for (const event of events) {
       send(ws, ["EVENT", subId, event]);
@@ -1506,7 +1584,18 @@ export class Relay extends DurableObject<Env> {
     // liveBroadcast below already refuses kind 1059 for its permanently
     // unauthenticated channel. Owner looked up only on the gated kind so
     // the common path stays free of the extra read.
-    const gated = event.kind === GIFT_WRAP_KIND;
+    // Group events are gated here for exactly the reason gift wraps are,
+    // and it is worth restating because this is the surface an exclusion
+    // applied only to REQ results would miss entirely: a subscription
+    // registered BEFORE an event arrives is never re-examined by the
+    // REQ-time gate. `{"kinds":[1]}` from an unauthenticated client is a
+    // standing request that matches the group's kind-1 events as they are
+    // stored, and without this line every one of them would be pushed
+    // down that socket the moment it lands.
+    //
+    // Same identity as handleReqInner's gate, and it has to widen with it
+    // when NIP-29 membership lands.
+    const gated = event.kind === GIFT_WRAP_KIND || isGroupEvent(event);
     const owner = gated ? getOwnerPubkey(this.sql, this.env) : null;
     for (const ws of this.ctx.getWebSockets()) {
       // ctx.getWebSockets() with no tag argument returns every socket,
@@ -1538,7 +1627,13 @@ export class Relay extends DurableObject<Env> {
   // something sensitive) doesn't leak its body to whoever has the admin
   // page open.
   private liveBroadcast(event: NostrEvent): void {
-    if (event.kind === GIFT_WRAP_KIND) return;
+    // Group events never reach the live feed, on the same terms as gift
+    // wraps and for the same reason: this channel has no authentication
+    // at all (the admin page is static and unsigned), so every viewer is
+    // permanently the unauthenticated case. Even the redacted notice this
+    // sends -- kind, time, eight hex characters of id -- would time every
+    // message in the group to the second for anyone who opened the page.
+    if (event.kind === GIFT_WRAP_KIND || isGroupEvent(event)) return;
     const live = this.ctx.getWebSockets(LIVE_FEED_TAG);
     if (live.length === 0) return;
     const notice = JSON.stringify({ kind: event.kind, created_at: event.created_at, id: event.id.slice(0, 8) });

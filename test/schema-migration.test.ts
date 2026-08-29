@@ -472,6 +472,21 @@ describe("computeSchemaHash", () => {
       tables,
       indexes: [...indexes, { name: "idx_t_id", table: "t", keyColumns: [], orderedBy: "id" }],
     },
+    {
+      // A partial index and a full one over the same columns are
+      // different indexes, and only one of them can serve a query that
+      // names no partition -- so an unhashed `where` would be a migration
+      // that silently never runs, on the field the whole group partition
+      // depends on.
+      label: "an index gains a partial predicate",
+      tables,
+      indexes: [{ ...indexes[0]!, where: "a = 0" }],
+    },
+    {
+      label: "an index's partial predicate changes",
+      tables,
+      indexes: [{ ...indexes[0]!, where: "a = 1" }],
+    },
   ];
 
   for (const { label, tables: mutatedTables, indexes: mutatedIndexes } of MUTATIONS) {
@@ -517,6 +532,102 @@ function measureRowsRead(sql: SqlStorage, fn: (sql: SqlStorage) => void): number
 
 // The before/after this whole file exists to prove -- see CLAUDE.md "The
 // budget"'s `initSchema` row in the reads table.
+// The group partition (src/groups.ts) is expressed entirely in the index
+// declaration, so these assert the declaration itself and the migration
+// that installs it. Both properties are load-bearing and neither is
+// visible from the wire.
+describe("partial index pairs", () => {
+  it("declares every partial index as one half of a matched pair", () => {
+    // schema.ts partialIndexPairsOn divides the partial count by two to
+    // work out how much eventRowCost over-charges, and
+    // test/hibernation.test.ts pins that arithmetic. A partial index with
+    // no mirror would break the halving AND leave the other partition
+    // unindexed for whatever the index serves -- so the pairing is
+    // asserted rather than assumed.
+    const partial = INDEXES.filter((i) => i.where !== undefined);
+    expect(partial.length).toBeGreaterThan(0);
+    const key = (i: IndexSpec) =>
+      `${i.table}:${i.keyColumns.join(",")}:${i.orderedBy ?? ""}:${(i.covering ?? []).join(",")}`;
+    const byShape = new Map<string, IndexSpec[]>();
+    for (const index of partial) {
+      byShape.set(key(index), [...(byShape.get(key(index)) ?? []), index]);
+    }
+    for (const [shape, halves] of byShape) {
+      expect(halves.length, `${shape} is not a pair`).toBe(2);
+      expect(new Set(halves.map((h) => h.where)).size, `${shape} has two identical predicates`).toBe(2);
+      // Every row falls on exactly one side, which is what makes the pair
+      // cost the same one row per stored event a single index did.
+      expect(new Set(halves.map((h) => h.where))).toEqual(new Set(["is_group = 0", "is_group = 1"]));
+    }
+  });
+
+  it("creates them as partial indexes, not as full ones with a longer name", async () => {
+    await withSql((sql) => {
+      const sqlText = sql
+        .exec<{ name: string; sql: string | null }>(
+          `SELECT name, sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_kind_created_pub'`,
+        )
+        .toArray()[0]?.sql;
+      expect(sqlText).toContain("WHERE is_group = 0");
+    });
+  });
+});
+
+describe("dropping indexes the declaration no longer carries", () => {
+  it("removes an index left behind by an earlier schema", async () => {
+    // CREATE INDEX IF NOT EXISTS will not redefine an index that already
+    // exists under its name and reports no error either, so changing an
+    // index's definition means changing its NAME -- which is how
+    // idx_events_kind_created became idx_events_kind_created_pub/_grp. The
+    // old name then has to go, or a deployed relay pays a row per stored
+    // event forever to maintain an index nothing queries.
+    await withSql((sql) => {
+      sql.exec(`CREATE INDEX IF NOT EXISTS idx_events_kind_created ON events (kind, created_at DESC)`);
+      const before = sql
+        .exec<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_kind_created'`,
+        )
+        .toArray()[0]?.n;
+      expect(before).toBe(1);
+
+      forgetSchemaHash(sql);
+      initSchema(sql);
+
+      const after = sql
+        .exec<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_kind_created'`,
+        )
+        .toArray()[0]?.n;
+      expect(after).toBe(0);
+      // ...and every declared index is still there.
+      const present = new Set(
+        sql
+          .exec<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'index'`)
+          .toArray()
+          .map((r) => r.name),
+      );
+      for (const index of INDEXES) expect(present.has(index.name), index.name).toBe(true);
+    });
+  });
+
+  it("never touches SQLite's own implicit indexes", async () => {
+    // sqlite_autoindex_* are the unique indexes behind TEXT PRIMARY KEY
+    // columns. They are not ours to drop, they are half of what
+    // EVENT_BASE_ROW_COST counts, and dropping one would take the id seek
+    // -- the one lookup that needs no partition pin -- down with it.
+    await withSql((sql) => {
+      forgetSchemaHash(sql);
+      initSchema(sql);
+      const implicit = sql
+        .exec<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'index' AND name LIKE 'sqlite_autoindex_%'`,
+        )
+        .toArray()[0]?.n;
+      expect(implicit).toBeGreaterThan(0);
+    });
+  });
+});
+
 describe("initSchema's rows-read cost", () => {
   it("costs O(1) rows read on a wake where the schema hash already matches", async () => {
     await withSql((sql) => {

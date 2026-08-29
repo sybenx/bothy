@@ -80,6 +80,14 @@ Reading them back is restricted to you. A query that names kind 1059 gets a [NIP
 
 **Worth knowing:** Cloudflare terminates the TLS connection in front of this relay, so it necessarily sees the `p` tag (who a gift wrap is addressed to), the arrival time, and the sender's IP address, the same as any other Worker traffic. On a personal relay the `p` tag is always you, so that part leaks nothing new; the sender IPs, though, belong to other people sending you mail through infrastructure that you chose.
 
+## Group events stay out of public view
+
+If an event carries an `h` tag — the tag [NIP-29](https://github.com/nostr-protocol/nips/blob/master/29.md) uses to scope an event to a group — bothy stores it apart from everything else and leaves it out of every unauthenticated read. Any kind can carry that tag: a note, a reaction, a long-form post. Group support here is exactly this much and no more: there is no group creation, no membership list, and no moderation. What exists is the privacy half, ahead of the rest.
+
+Reading them back works the way gift wraps do. A query that names a group (`{"#h":["..."]}`) gets a [NIP-42](https://github.com/nostr-protocol/nips/blob/master/42.md) AUTH challenge; a query that doesn't name one is answered normally with the group's events simply absent — because a refusal that only happens when there was something to refuse is itself an answer. The same omission covers the live feed the admin page opens and the counts on the stats page, so a group's traffic doesn't show up as a number ticking upward for anyone watching the public page. Since there is no membership list yet, "authenticated" means you, the owner.
+
+**Worth knowing:** the stats page's storage figure and its rows-written figure both still move when anything is stored, group events included. The first is unavoidable, and the second is deliberate — it is your budget meter, and it would be worse for it to under-report what your relay actually spent today.
+
 ## Who can write here
 
 By default, bothy accepts events from two kinds of author: you (the owner), and the people you follow. Not strangers. It works by reading the follow list (kind 3) you've already published — bothy doesn't ask you to maintain a separate allowlist, it just uses the one your nostr client already keeps.
@@ -158,7 +166,7 @@ The NIPs leave some behavior unspecified. Two choices are worth knowing if you'r
 
 ## What this is not
 
-This project deliberately does not do: payments/zaps, multi-region scaling, NIP-05 hosting, media uploads, community moderation tooling, or a public write mode. The NIP-86 management API is the owner administering their own relay, not moderation tooling in the community sense — there are no moderator roles, no invite system, and no report queue. Public writes sit at the top of a documented ladder ([docs/rungs.md](docs/rungs.md)) rather than being an unexplained refusal — see "Who can write here" above for the rungs bothy does implement. See `CLAUDE.md` for the full list and reasoning — most feature requests are already ruled out there.
+This project deliberately does not do: payments/zaps, multi-region scaling, NIP-05 hosting, media uploads, community moderation tooling, group management (see "Group events stay out of public view" above — the read privacy is implemented, the group machinery is not), or a public write mode. The NIP-86 management API is the owner administering their own relay, not moderation tooling in the community sense — there are no moderator roles, no invite system, and no report queue. Public writes sit at the top of a documented ladder ([docs/rungs.md](docs/rungs.md)) rather than being an unexplained refusal — see "Who can write here" above for the rungs bothy does implement. See `CLAUDE.md` for the full list and reasoning — most feature requests are already ruled out there.
 
 ## Attribution
 

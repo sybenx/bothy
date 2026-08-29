@@ -1,5 +1,6 @@
 import type { OwnerProfile } from "./nip11";
 import type { Profile } from "./profile-lookup";
+import { acrossScopes } from "./groups";
 import { normalizePubkey } from "./pubkey";
 import { isPubkeyAllowed, isPubkeyBanned, setFollowCount } from "./storage";
 
@@ -194,13 +195,23 @@ export function refreshFollows(sql: SqlStorage, env: Env): void {
   const owner = getOwnerPubkey(sql, env);
   if (owner === null || !allowFollowsEnabled(env)) return;
 
-  const latest = sql
-    .exec<{ created_at: number; tags: string }>(
-      `SELECT created_at, tags FROM events WHERE pubkey = ? AND kind = ? ORDER BY created_at DESC LIMIT 1`,
-      owner,
-      CONTACT_LIST_KIND,
-    )
-    .toArray()[0];
+  // Once per partition, newest wins. `is_group` splits the REQ-serving
+  // indexes into partial pairs (schema.ts), so a lookup that names no
+  // partition uses neither half and scans -- 51,500 rows against 1,
+  // measured. Both halves are read rather than assuming the owner's
+  // contact list is public: an h-tagged kind-3 is still the owner's kind-3,
+  // and NIP-01 replaceability does not know about groups.
+  const latest = acrossScopes((scope) =>
+    sql
+      .exec<{ created_at: number; tags: string }>(
+        `SELECT created_at, tags FROM events WHERE pubkey = ? AND kind = ? AND is_group = ?
+         ORDER BY created_at DESC LIMIT 1`,
+        owner,
+        CONTACT_LIST_KIND,
+        scope,
+      )
+      .toArray(),
+  ).sort((a, b) => b.created_at - a.created_at)[0];
 
   const cachedFrom = sql
     .exec<{ fetched_at: number }>(`SELECT fetched_at FROM follows LIMIT 1`)
@@ -279,13 +290,18 @@ export function refreshProfile(sql: SqlStorage, env: Env, nowSec: number): void 
   if (!row) return;
   if (row.icon_refreshed_at !== null && nowSec - row.icon_refreshed_at < ICON_REFRESH_INTERVAL_SECONDS) return;
 
-  const latest = sql
-    .exec<{ content: string; created_at: number }>(
-      `SELECT content, created_at FROM events WHERE pubkey = ? AND kind = ? ORDER BY created_at DESC LIMIT 1`,
-      owner,
-      PROFILE_KIND,
-    )
-    .toArray()[0];
+  // Both partitions, newest wins -- see refreshFollows above for why.
+  const latest = acrossScopes((scope) =>
+    sql
+      .exec<{ content: string; created_at: number }>(
+        `SELECT content, created_at FROM events WHERE pubkey = ? AND kind = ? AND is_group = ?
+         ORDER BY created_at DESC LIMIT 1`,
+        owner,
+        PROFILE_KIND,
+        scope,
+      )
+      .toArray(),
+  ).sort((a, b) => b.created_at - a.created_at)[0];
 
   let name = row.name;
   let picture = row.picture;
