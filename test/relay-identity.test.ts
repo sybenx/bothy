@@ -94,8 +94,8 @@ describe("exposure on /api/stats and NIP-11", () => {
     };
     const info = (await (
       await exports.default.fetch("https://example.com/", { headers: { Accept: "application/nostr+json" } })
-    ).json()) as { relay_pubkey: string };
-    expect(info.relay_pubkey).toBe(stats.relayPubkey);
+    ).json()) as { self: string };
+    expect(info.self).toBe(stats.relayPubkey);
   });
 });
 

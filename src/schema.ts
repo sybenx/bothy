@@ -541,7 +541,69 @@ export const TABLES: readonly TableSpec[] = [
     // already about to reject a write, so it costs nothing on the common
     // accept path (owner, or an existing follow).
     name: "allowed_pubkeys",
-    columns: [col("pubkey", "TEXT PRIMARY KEY"), col("reason", "TEXT"), col("allowed_at", "INTEGER NOT NULL")],
+    columns: [
+      col("pubkey", "TEXT PRIMARY KEY"),
+      col("reason", "TEXT"),
+      col("allowed_at", "INTEGER NOT NULL"),
+      // WHO PUT THIS ROW HERE, and the only thing that decides whether a
+      // NIP-29 kind-9001 remove-user may take it away again.
+      //
+      // 'owner' is an explicit act: a NIP-86 allowpubkey call the operator
+      // made by hand. 'invite' is bookkeeping: the row kind-9000 put-user
+      // writes so a new group member can actually reach the relay at all,
+      // since membership is the INNER of two nested lists and the outer one
+      // is what ownership.ts isAllowedWriter consults (src/nip29.ts states
+      // the nesting in full).
+      //
+      // remove-user deletes only 'invite' rows. Without the distinction it
+      // would have exactly two options, and both are wrong: delete every
+      // row and removing somebody from the group silently revokes a write
+      // grant the owner made deliberately and separately, or delete none
+      // and every member ever removed keeps writing forever. The column is
+      // what lets the group take back only what the group gave.
+      //
+      // An allowpubkey on a row already here PROMOTES it to 'owner' rather
+      // than leaving it as the group's to reclaim -- an explicit act
+      // outranks the bookkeeping, and the operator who types the command
+      // means the grant to survive whatever the group does next. The
+      // promotion is one-way: put-user never demotes an 'owner' row back.
+      //
+      // NOT NULL DEFAULT 'owner', so every row on an existing relay
+      // migrates to owner-owned, which is exactly what they are: NIP-86
+      // allowpubkey was the only thing that could write this table before
+      // this column existed.
+      col("source", "TEXT NOT NULL DEFAULT 'owner'"),
+    ],
+  },
+  {
+    // NIP-29 group membership (src/nip29.ts) -- the INNER of the two
+    // nested lists described on `allowed_pubkeys.source` above. A row here
+    // means the pubkey may write `h`-tagged events; a row THERE means it
+    // may write to this relay at all, and a member needs both.
+    //
+    // No group id column, because there is exactly one group and its id is
+    // a constant (groups.ts TOP_LEVEL_GROUP_ID). A second group would need
+    // a composite primary key, which SQLite cannot add to an existing
+    // table (see whyNotAddable below) and which would therefore be a
+    // deliberate table rebuild rather than a column addition. That is the
+    // honest shape of the decision and it is recorded here rather than
+    // pre-paid for with a column nothing reads.
+    //
+    // Read on the write path, but only for events that carry an `h` tag
+    // and are not the owner's (nip29.ts authorizeGroupWrite), so it costs
+    // an indexed lookup on group traffic and nothing at all on the rest.
+    // Written at moderation pace: one row per put-user, one delete per
+    // remove-user.
+    //
+    // Members and their `allowed_pubkeys` rows can drift apart -- two
+    // tables, two writes -- and the failure that produces is silent: a
+    // member the relay believes is in the group, whose events the outer
+    // gate refuses with a message about follows that names nothing about
+    // groups. storage.ts auditMaintainedCounts checks the containment once
+    // a day and logs, like every other invariant there, without repairing
+    // it.
+    name: "group_members",
+    columns: [col("pubkey", "TEXT PRIMARY KEY"), col("added_at", "INTEGER NOT NULL")],
   },
   {
     // Every count /api/stats reports that is maintained rather than

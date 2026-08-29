@@ -41,6 +41,7 @@ import {
   STORAGE_BYTES_LIMIT,
   utcDayStartSeconds,
 } from "./limits";
+import { applyModeration, authorizeGroupWrite, isSupportedModerationKind } from "./nip29";
 import { handleManagementCall, type ManagementResponse } from "./nip86";
 import { resolveIcon, resolveName, type OwnerProfile } from "./nip11";
 import { version } from "../package.json";
@@ -983,6 +984,18 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
+    // NIP-29 group writes sit UNDER the gate above rather than beside it:
+    // `allowed_pubkeys` and the follow list say whether this pubkey may
+    // write to this relay at all, and only then does src/nip29.ts say
+    // whether it may write to the group. Three integer comparisons decide
+    // that an ordinary event is none of that file's business, so this
+    // costs nothing on the path every non-group write takes.
+    const groupAuth = authorizeGroupWrite(sql, event, auth.isOwner);
+    if (!groupAuth.ok) {
+      ok(ws, event.id, false, groupAuth.message);
+      return;
+    }
+
     this.acceptEvent(ws, sql, event, auth.isOwner);
   }
 
@@ -1288,6 +1301,21 @@ export class Relay extends DurableObject<Env> {
     if (event.kind === 5 && result.stored) {
       applyDeletion(sql, event);
     }
+    // NIP-29 moderation, applied exactly where a kind-5 reaches
+    // applyDeletion above and for the same reason: the moderation event is
+    // itself part of the group's canonical history, so it is stored first
+    // and acted on second. Scoped separately from "write" because the
+    // regeneration it triggers is a cost of its own -- reading the relay's
+    // three group state events and replacing whichever changed -- and
+    // folding it into the per-event write bucket would make every REQ-cost
+    // projection over that bucket describe a path most events never take.
+    //
+    // The events it returns are the relay's OWN, already stored by
+    // storeEvent; they are broadcast below beside the client's.
+    const generated =
+      isSupportedModerationKind(event.kind) && result.stored
+        ? withReadPath("groupState", () => applyModeration(sql, this.env, event, nowSeconds()))
+        : [];
     ok(ws, event.id, result.ok, result.message);
 
     if (result.stored) {
@@ -1306,6 +1334,15 @@ export class Relay extends DurableObject<Env> {
       }
       this.broadcast(result.stored);
       this.liveBroadcast(result.stored);
+    }
+    // Group state is group state: broadcast() drops these for any socket
+    // not authenticated as the owner, and liveBroadcast refuses them
+    // outright, both on the strength of groups.ts isGroupEvent -- which now
+    // recognises the relay-generated 39000-series by kind. Deliberately not
+    // routed through liveBroadcast at all, since it would refuse them
+    // anyway and calling it would only invite someone to "fix" that later.
+    for (const event of generated) {
+      this.broadcast(event);
     }
   }
 

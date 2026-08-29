@@ -234,11 +234,11 @@ describe("buildRelayInfo identity fields", () => {
   });
 
   it("publishes the relay's own pubkey even while unclaimed, unlike the owner's", () => {
-    // relay_pubkey is generated at schema-init time (schema.ts
+    // `self` is generated at schema-init time (schema.ts
     // seedRelayIdentity), independent of claim status -- there is no
     // "unknown" state for it the way there is for the owner's pubkey.
     const info = buildRelayInfo(NO_VARS, NO_SETTINGS, null, null, RELAY_HEX);
-    expect(info.relay_pubkey).toBe(RELAY_HEX);
+    expect(info.self).toBe(RELAY_HEX);
     expect(info).not.toHaveProperty("pubkey");
   });
 

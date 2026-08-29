@@ -1,4 +1,4 @@
-import type { Filter, NostrEvent } from "./nostr";
+import { dTagValue, type Filter, type NostrEvent } from "./nostr";
 
 // NIP-29 group membership, as this relay decides it: an event belongs to a
 // group when it carries an `h` tag naming one (nips/29.md, "Messages sent
@@ -20,6 +20,60 @@ import type { Filter, NostrEvent } from "./nostr";
 // relay.ts able to recognise a filter that NAMES a group without inspecting
 // storage.
 export const GROUP_TAG = "h";
+
+// The one group this relay hosts, and its id.
+//
+// NIP-29 has no notion of creating a group -- "what happens is just that
+// relays (most likely when asked by users) will create rules around some
+// specific ids" -- so a relay with exactly one group needs no id
+// negotiation and no kind-9007 create-group event: the id is a constant,
+// and the rules around it are this file plus src/nip29.ts. `_` is the
+// convention other NIP-29 relays use for a relay's own top-level group,
+// and it is chosen here for the same reason bothy has one owner: a
+// single-user relay hosting a single group needs no namespace.
+//
+// Enforced on MODERATION events only (nip29.ts authorizeGroupWrite), not
+// on ordinary group traffic. An `h` tag naming some other id still marks
+// its event as a group event and is still gated by the one member list --
+// partitioning is kind- and id-agnostic on purpose (see GROUP_TAG above),
+// and refusing an unrecognised id would mean deciding what a group IS at
+// the write gate rather than at the partition. Moderation is different
+// because the id there selects what gets mutated, and there is exactly
+// one thing it can select.
+export const TOP_LEVEL_GROUP_ID = "_";
+
+// The relay-generated group state events (nips/29.md "Group metadata
+// events"): 39000 metadata, 39001 admins, 39002 members, and the 39003
+// roles / 39004 livekit participants / 39005 pinned events beside them.
+//
+// These are the exception to "an event belongs to a group when it carries
+// an `h` tag", and the exception has teeth: NIP-29 says they "contain the
+// group id in a `d` tag instead of the `h` tag", so the `h` rule above
+// sees nothing at all in a kind-39001 admin list or a kind-39002 member
+// list -- the two events that ARE the group's membership, written out in
+// `p` tags. Before this range was recognised here they were stored in the
+// PUBLIC partition and served to any unauthenticated client that asked
+// for them: the group's exclusion covered every event in the group except
+// the list of who is in it.
+//
+// Recognised by KIND rather than by the `d` tag, and over the whole
+// 39000-39005 range rather than only the three bothy generates. `d` is
+// the generic addressable identifier every kind in the 30000-39999 range
+// carries, so it names a group only in this range and cannot be the test;
+// and a kind in this range that bothy does not generate is one no client
+// may write either (nip29.ts refuses them), so treating it as group state
+// hides an event that should not exist rather than exposing one.
+export function isGroupMetadataKind(kind: number): boolean {
+  return kind >= 39000 && kind <= 39005;
+}
+
+// The three this relay actually generates and signs (src/nip29.ts). NIP-29:
+// "Relays are supposed to generate the events that describe group metadata
+// and group admins. These are addressable events signed by the relay
+// keypair directly, with the group id as the `d` tag."
+export const GROUP_METADATA_KIND = 39000;
+export const GROUP_ADMINS_KIND = 39001;
+export const GROUP_MEMBERS_KIND = 39002;
 
 // Which partition of `events`/`event_tags` a row lives in. Stored as
 // `is_group`, and PINNED BY EVERY QUERY -- see schema.ts INDEXES, where the
@@ -58,8 +112,16 @@ export function scopeOf(event: NostrEvent): GroupScope {
   return isGroupEvent(event) ? GROUP_SCOPE : PUBLIC_SCOPE;
 }
 
+// The partition test, and the two rules underneath it: a relay-generated
+// group state event is one by KIND, everything else is one by `h` tag.
+//
+// The kind half deliberately does not require the `d` tag to name
+// anything. A kind-39002 carrying no `d` names no group and is malformed,
+// but it is still a member list, and the safe reading of a malformed
+// member list is "group state", not "public event" -- the direction that
+// hides rather than discloses.
 export function isGroupEvent(event: NostrEvent): boolean {
-  return groupIdOf(event) !== null;
+  return isGroupMetadataKind(event.kind) || groupIdOf(event) !== null;
 }
 
 // The group an event is addressed to, or null. Empty `h` values do not
@@ -67,6 +129,14 @@ export function isGroupEvent(event: NostrEvent): boolean {
 // one would let an author hide an event from public reads by tagging it
 // with nothing.
 export function groupIdOf(event: NostrEvent): string | null {
+  // The relay-generated range names its group in `d`, never in `h` --
+  // see isGroupMetadataKind above. An empty `d` names nothing here for
+  // the same reason an empty `h` does below; isGroupEvent still counts
+  // the event as group state on the strength of its kind alone.
+  if (isGroupMetadataKind(event.kind)) {
+    const d = dTagValue(event.tags);
+    return d === "" ? null : d;
+  }
   for (const tag of event.tags) {
     if (tag[0] === GROUP_TAG && tag[1] !== undefined && tag[1] !== "") return tag[1];
   }
@@ -82,7 +152,17 @@ export function groupIdOf(event: NostrEvent): string | null {
 // that does not name a group is answered normally with the group's events
 // omitted -- refusing THAT would make the refusal itself the answer, which
 // is the leak the gift wrap storage probe turned out to be.
+// `kinds` counts as naming a group too, on the same terms `kinds`
+// counts for the gift wrap gate: a filter asking for kind 39002 has
+// asked for this group's member list in as many words, so being told to
+// authenticate tells it nothing it did not already say. A filter naming
+// only `#d` does NOT count -- `d` identifies every addressable event
+// there is, so refusing on it would refuse reads of unrelated kinds that
+// happen to share an identifier. That filter is answered by omission
+// instead, which is the safe direction: omission returns the same answer
+// whether or not the group holds anything.
 export function filterNamesGroup(filter: Filter): boolean {
   const values = filter[`#${GROUP_TAG}`];
-  return Array.isArray(values) && values.length > 0;
+  if (Array.isArray(values) && values.length > 0) return true;
+  return filter.kinds?.some(isGroupMetadataKind) ?? false;
 }

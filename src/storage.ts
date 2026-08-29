@@ -673,13 +673,24 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   // tailing logs at the moment this runs, and `driftMessages` is what
   // survives past that moment for /api/stats to read back tomorrow.
   const driftMessages: string[] = [];
-  const drift = (what: string, said: number, is: number, where: string) => {
-    const message = `${what} says ${said}, the table says ${is} (off by ${said - is})`;
+  // `message` is what survives into `maintained_counts.last_drift`, which
+  // /api/stats reads back -- and that endpoint is PUBLIC and
+  // unauthenticated. `detail` is the part that goes only to the log line.
+  // The split exists for the group membership check below, whose useful
+  // detail is a list of pubkeys: naming them in `last_drift` would publish
+  // part of this group's membership on the one document anybody can fetch,
+  // which is the disclosure the whole partition exists to prevent. The
+  // stored half therefore counts; the logged half names.
+  const report = (message: string, where: string, detail = "") => {
     driftMessages.push(message);
     console.error(
-      `MAINTAINED COUNT DRIFT: ${message}. NOT corrected -- see storage.ts auditMaintainedCounts. ` +
+      `MAINTAINED COUNT DRIFT: ${message}.${detail === "" ? "" : ` ${detail}.`} ` +
+        `NOT corrected -- see storage.ts auditMaintainedCounts. ` +
         `Every write to the counted table must go through ${where}.`,
     );
+  };
+  const drift = (what: string, said: number, is: number, where: string) => {
+    report(`${what} says ${said}, the table says ${is} (off by ${said - is})`, where);
   };
 
   if (actual.total !== state.events) {
@@ -781,6 +792,40 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
       ingestBuckets.rowsWrittenToday,
       measuredCost,
       "the read-metrics.ts wrapper, landed by storage.ts settleRowsWritten at every entry point",
+    );
+  }
+
+  // NOT a counter, and the one check here that is about an invariant
+  // between two tables rather than between a table and a number kept
+  // alongside it. It lives in this function anyway because this is where
+  // the daily pace is (schema.ts `maintained_counts`: "a single
+  // `audited_at` is then what paces one daily audit over everything this
+  // relay maintains, rather than two gates that could drift apart").
+  //
+  // What it checks: every NIP-29 group member has an `allowed_pubkeys`
+  // row. Membership is the inner of two nested lists and the outer one is
+  // what the write gate actually consults (src/nip29.ts), so a member
+  // missing from it is a member who silently cannot write -- their events
+  // are refused by ownership.ts isAllowedWriter with a message about
+  // follows that says nothing about groups, and nothing anywhere connects
+  // the cause to the effect. The two tables are written together by
+  // nip29.ts applyModeration and can only come apart through a bug or a
+  // hand-edit, which is exactly the class of thing a daily check is for.
+  //
+  // Detect only, like everything above it. Repairing the containment would
+  // mean this function granting relay write access to a pubkey on the
+  // strength of a row it has just decided it cannot trust -- the loudest
+  // possible version of the objection schema.ts already makes to
+  // self-healing counters.
+  //
+  // Rows read: M plus an indexed seek each, where M is the member count.
+  const unallowedMembers = groupMembersWithoutAllowance(sql);
+  if (unallowedMembers.length > 0) {
+    report(
+      `${unallowedMembers.length} group member(s) have no allowed_pubkeys row, so the relay-wide write ` +
+        `gate refuses their events even though the group holds them as members`,
+      "nip29.ts applyModeration, which writes both tables together",
+      `Affected pubkeys: ${unallowedMembers.join(", ")}`,
     );
   }
 
@@ -1746,14 +1791,96 @@ export interface AllowedPubkey {
   reason: string | null;
 }
 
+// The NIP-86 allowpubkey path, and the only one that writes
+// `source = 'owner'`. An existing row is PROMOTED rather than left alone:
+// an operator typing this command means the grant to outlive whatever the
+// group does next, and a kind-9001 remove-user must not be able to revoke
+// it afterwards. See schema.ts `allowed_pubkeys.source`.
 export function allowPubkey(sql: SqlStorage, pubkey: string, reason: string | null, nowSec: number): void {
   sql.exec(
-    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at) VALUES (?, ?, ?)
-       ON CONFLICT(pubkey) DO UPDATE SET reason = excluded.reason, allowed_at = excluded.allowed_at`,
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source) VALUES (?, ?, ?, 'owner')
+       ON CONFLICT(pubkey) DO UPDATE SET reason = excluded.reason, allowed_at = excluded.allowed_at,
+                                         source = 'owner'`,
     pubkey,
     reason,
     nowSec,
   );
+}
+
+// ---------------------------------------------------------------------
+// NIP-29 group membership (src/nip29.ts), and the group's half of the
+// allowlist beside it. Two nested lists: a row in `group_members` says a
+// pubkey may write `h`-tagged events, a row in `allowed_pubkeys` says it
+// may write here at all, and a member needs both -- see schema.ts
+// `allowed_pubkeys.source` for why the second one has to remember who
+// created it.
+// ---------------------------------------------------------------------
+
+// The row kind-9000 put-user writes so a new member can reach the relay,
+// DO NOTHING on conflict rather than an upsert. A pubkey already carrying
+// an owner-granted allowance keeps it as owner-granted: put-user must
+// never demote a deliberate grant into one remove-user can reclaim, which
+// an upsert writing `source = 'invite'` would do silently. And a pubkey
+// already carrying an invite-granted one needs nothing changed.
+export function allowPubkeyForGroup(sql: SqlStorage, pubkey: string, nowSec: number): void {
+  sql.exec(
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source)
+       VALUES (?, 'added to the group by a NIP-29 put-user event', ?, 'invite')
+       ON CONFLICT(pubkey) DO NOTHING`,
+    pubkey,
+    nowSec,
+  );
+}
+
+// The inverse, and deliberately narrower than "delete the row": only what
+// the group itself granted comes back out. `AND source = 'invite'` is the
+// whole point of that column.
+export function revokeGroupAllowance(sql: SqlStorage, pubkey: string): void {
+  sql.exec(`DELETE FROM allowed_pubkeys WHERE pubkey = ? AND source = 'invite'`, pubkey);
+}
+
+export function addGroupMember(sql: SqlStorage, pubkey: string, nowSec: number): void {
+  sql.exec(`INSERT INTO group_members (pubkey, added_at) VALUES (?, ?) ON CONFLICT(pubkey) DO NOTHING`,
+    pubkey, nowSec);
+}
+
+export function removeGroupMember(sql: SqlStorage, pubkey: string): void {
+  sql.exec(`DELETE FROM group_members WHERE pubkey = ?`, pubkey);
+}
+
+// The write-path check (nip29.ts authorizeGroupWrite). Reached only for an
+// event carrying an `h` tag whose author is not the owner, so ordinary
+// traffic never pays it.
+export function isGroupMember(sql: SqlStorage, pubkey: string): boolean {
+  return sql.exec(`SELECT 1 FROM group_members WHERE pubkey = ?`, pubkey).toArray().length > 0;
+}
+
+// Ordered by pubkey, which makes the regenerated kind-39002 member list a
+// function of the member SET alone. That is what lets nip29.ts decide
+// whether to write a new one by comparing tags: ordered by `added_at`
+// instead, removing a member and adding them back would move them to the
+// end and rewrite an event whose membership had not changed.
+export function listGroupMembers(sql: SqlStorage): string[] {
+  return sql
+    .exec<{ pubkey: string }>(`SELECT pubkey FROM group_members ORDER BY pubkey ASC`)
+    .toArray()
+    .map((r) => r.pubkey);
+}
+
+// Group members with no `allowed_pubkeys` row: the containment the two
+// nested lists are supposed to have, checked once a day by
+// auditMaintainedCounts above. M rows plus an indexed seek each, where M
+// is the member count.
+export function groupMembersWithoutAllowance(sql: SqlStorage): string[] {
+  return sql
+    .exec<{ pubkey: string }>(
+      `SELECT m.pubkey FROM group_members m
+         LEFT JOIN allowed_pubkeys a ON a.pubkey = m.pubkey
+        WHERE a.pubkey IS NULL
+        ORDER BY m.added_at ASC`,
+    )
+    .toArray()
+    .map((r) => r.pubkey);
 }
 
 export function unallowPubkey(sql: SqlStorage, pubkey: string): void {
