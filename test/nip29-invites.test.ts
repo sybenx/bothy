@@ -43,7 +43,7 @@ import { createInvite, type GroupInvite, storeEvent } from "../src/storage";
 import { signEvent, type NostrEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
 import { callManagement } from "./helpers/management";
-import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
+import { type Keypair, OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
 import { collectStored, connectRelay, publish, type RelayConn } from "./helpers/socket";
 
 isolateStorage();
@@ -125,13 +125,19 @@ async function lists(): Promise<{
   });
 }
 
-async function authenticateAsOwner(conn: RelayConn): Promise<void> {
+// Completes a NIP-42 handshake as whoever holds `secretKeyHex`. Takes a
+// key rather than assuming the owner, because the member-read block below
+// turns on the difference between a connection that is AUTHENTICATED and
+// one that is authenticated AS THE OWNER -- the relay accepts a member's
+// auth event perfectly happily, and then declines to widen anything on the
+// strength of it, which is the property being asserted.
+async function authenticateAs(conn: RelayConn, secretKeyHex: string): Promise<void> {
   conn.send(["REQ", "challengeTrigger", { kinds: [1059] }]);
   const [, challenge] = await conn.nextMessage();
   await conn.nextMessage(); // CLOSED, auth-required
   conn.send([
     "AUTH",
-    signEvent(OWNER_SECRET_KEY_HEX, {
+    signEvent(secretKeyHex, {
       kind: 22242,
       tags: [
         ["relay", "wss://example.com"],
@@ -333,7 +339,7 @@ describe("kind-9021 join request", () => {
     // What DID get written is the relay's own member list, which is the
     // canonical record of the membership anyway.
     const owner = await connectRelay();
-    await authenticateAsOwner(owner);
+    await authenticateAs(owner, OWNER_SECRET_KEY_HEX);
     const state = await collectStored(owner, "members", [{ kinds: [GROUP_MEMBERS_KIND] }]);
     expect(state.length).toBe(1);
     expect(state[0]!.tags.filter((t) => t[0] === "p").map((t) => t[1])).toEqual([
@@ -690,5 +696,144 @@ describe("rows written", () => {
       );
       expect(cost).toBe(0);
     });
+  });
+});
+
+// THE TRIPWIRE UNDER THE READ GATE, and the reason it is a test rather
+// than the comment at relay.ts `mayReadGroups`.
+//
+// A kind-9009 is a stored, served group event carrying its code in a
+// `code` tag, so it lives in the partition that gate guards. Today that
+// gate admits the OWNER alone -- NIP-29 membership is not modelled on the
+// read side, so a member can write to the group and cannot read it back
+// (CLAUDE.md "What it structurally cannot defend against"). That
+// asymmetry is the only reason storing the code is safe.
+//
+// It is also load-bearing in a way nothing else states. The moment
+// member-side reads land -- already named in CLAUDE.md as a widening of
+// `mayReadGroups` and `broadcast()` together -- every member can read
+// every unused invite code. An invite code is a BEARER TOKEN: reading one
+// is as good as being handed it, so a member who can read the group can
+// mint memberships at will, and owner-only invites quietly stop being
+// owner-only without one line of the write path changing.
+//
+// These assertions fail if that gate widens without the 9009 being dealt
+// with first. That is the entire point: a comment only works on somebody
+// who happens to read it, and the person widening this gate will be
+// reading the gate, not the invite code that happens to sit behind it.
+describe("what a member can read", () => {
+  // A member in the fullest sense the relay has: in `group_members`, in
+  // `allowed_pubkeys`, writing to the group successfully, and holding a
+  // live NIP-42 session. Everything short of the read permission that
+  // does not exist yet -- so if any of it ever starts admitting them,
+  // this is the shape it will admit.
+  async function seedMemberAndInvite(): Promise<{ member: Keypair; conn: RelayConn }> {
+    const setup = await connectRelay();
+    const member = randomKeypair();
+    expect(
+      (
+        await publish(
+          setup,
+          signEvent(OWNER_SECRET_KEY_HEX, {
+            kind: PUT_USER_KIND,
+            tags: [
+              ["h", TOP_LEVEL_GROUP_ID],
+              ["p", member.pubkeyHex],
+            ],
+          }),
+        )
+      )[2],
+    ).toBe(true);
+    expect((await publish(setup, createInviteEvent()))[2]).toBe(true);
+    setup.close();
+
+    const conn = await connectRelay();
+    // Proof the membership is real rather than asserted: a non-member's
+    // `h`-tagged write is refused, so this succeeding is what makes the
+    // reads below a statement about members and not about strangers.
+    expect(
+      (
+        await publish(
+          conn,
+          signEvent(member.secretKeyHex, {
+            kind: 1,
+            tags: [["h", TOP_LEVEL_GROUP_ID]],
+            content: "written by a real member",
+          }),
+        )
+      )[2],
+    ).toBe(true);
+    await authenticateAs(conn, member.secretKeyHex);
+    return { member, conn };
+  }
+
+  it("gets no invite code back from any filter it is allowed to send", async () => {
+    const { member, conn } = await seedMemberAndInvite();
+
+    // Every shape that could reach a kind-9009: by its kind, by its
+    // author, by the member's own p tag, and by an `authors` sweep of the
+    // owner's events. None of these NAME a group (`filterNamesGroup` is
+    // `#h` and the 39000-series kinds), so each is answered by omission
+    // rather than refused -- which is what makes an empty result the
+    // assertion and not an artefact of the refusal.
+    for (const filter of [
+      { kinds: [CREATE_INVITE_KIND] },
+      { authors: [OWNER_PUBKEY_HEX], limit: 50 },
+      { "#p": [member.pubkeyHex], limit: 50 },
+      { kinds: [CREATE_INVITE_KIND], authors: [OWNER_PUBKEY_HEX] },
+    ]) {
+      const events = await collectStored(conn, `m${JSON.stringify(filter)}`, [filter]);
+      // Stated twice on purpose. The count is what fails if the gate
+      // widens; the tag scan is what fails if some future change serves a
+      // redacted or re-shaped invite event that still carries its code.
+      expect(events).toEqual([]);
+      expect(events.flatMap((e) => e.tags).filter((t) => t[0] === "code")).toEqual([]);
+    }
+
+    // Naming the group outright is refused rather than emptied, which is
+    // the omit-don't-refuse split working as designed: this filter has
+    // already said what it wants.
+    conn.send(["REQ", "named", { "#h": [TOP_LEVEL_GROUP_ID] }]);
+    const [frameType, , reason] = await conn.nextMessage();
+    expect(frameType).toBe("CLOSED");
+    expect(String(reason)).toContain("restricted:");
+    conn.close();
+  });
+
+  // The other surface, and the one a REQ-time gate cannot cover: a
+  // subscription registered BEFORE the event exists is never re-examined
+  // by handleReqInner, so broadcast() has its own copy of the same check.
+  // Widening one and not the other would push live codes at members while
+  // this file's stored-read assertions above still passed.
+  it("is not pushed one over a subscription it opened first", async () => {
+    const { conn } = await seedMemberAndInvite();
+    conn.send(["REQ", "live", { kinds: [CREATE_INVITE_KIND] }]);
+    expect((await conn.nextMessage())[0]).toBe("EOSE");
+
+    const owner = await connectRelay();
+    expect((await publish(owner, createInviteEvent("second-invite-code-aaaa")))[2]).toBe(true);
+    owner.close();
+
+    const pushed = await conn.nextMessage(600).catch(() => null);
+    expect(pushed).toBeNull();
+    conn.close();
+  });
+
+  // The control, and it is not optional: every assertion above is an
+  // absence, and an absence passes just as well when the feature is
+  // broken, when nothing was stored, or when the filters were wrong. This
+  // is the one that fails if the invite stopped existing rather than
+  // stopping being readable -- so the block as a whole can only pass when
+  // the code is genuinely there and genuinely withheld.
+  it("while the owner reads the same code in full", async () => {
+    const { conn } = await seedMemberAndInvite();
+    conn.close();
+
+    const owner = await connectRelay();
+    await authenticateAs(owner, OWNER_SECRET_KEY_HEX);
+    const events = await collectStored(owner, "ownersees", [{ kinds: [CREATE_INVITE_KIND] }]);
+    expect(events.length).toBe(1);
+    expect(events[0]!.tags).toContainEqual(["code", CODE]);
+    owner.close();
   });
 });

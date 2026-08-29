@@ -1555,6 +1555,20 @@ export class Relay extends DurableObject<Env> {
     // membership is not modelled yet. When it is, this is the line that
     // widens -- and broadcast() below has to widen with it, or a member
     // subscribed before an event arrives gets nothing.
+    //
+    // WIDENING THIS TO MEMBERS HANDS THEM EVERY UNUSED INVITE CODE, and
+    // that is a security decision rather than a scope one. A kind-9009
+    // create-invite is a stored, served group event carrying its code in
+    // a `code` tag (nip29.ts), so it sits in the partition this line
+    // guards. An invite code is a BEARER TOKEN: reading one is as good as
+    // being handed it, so a member who can read the group can mint
+    // memberships, and owner-only invites stop being owner-only without
+    // anything in the write path changing. Widen this and the 9009 needs
+    // an answer FIRST -- keep it owner-only, strip the code from what is
+    // served, or stop storing it as a served event. test/nip29-invites.ts
+    // ("what a member can read") fails if this line widens without one,
+    // deliberately, so the discovery is a red suite and not a comment
+    // somebody had to happen to read.
     const authedAsOwner =
       state.authedPubkey !== undefined && state.authedPubkey === getOwnerPubkey(this.sql, this.env);
     const mayReadGiftWraps = authedAsOwner;
@@ -1761,7 +1775,11 @@ export class Relay extends DurableObject<Env> {
     // down that socket the moment it lands.
     //
     // Same identity as handleReqInner's gate, and it has to widen with it
-    // when NIP-29 membership lands.
+    // when NIP-29 membership lands -- including the invite-code hazard
+    // stated in full there. A kind-9009 reaches this line the moment the
+    // owner publishes one, so widening HERE leaks a live code to any
+    // member holding a matching subscription, without a REQ ever being
+    // sent. Both gates, one decision.
     const gated = event.kind === GIFT_WRAP_KIND || isGroupEvent(event);
     const owner = gated ? getOwnerPubkey(this.sql, this.env) : null;
     for (const ws of this.ctx.getWebSockets()) {
