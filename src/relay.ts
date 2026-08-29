@@ -56,6 +56,7 @@ import { version } from "../package.json";
 import {
   type Filter,
   GIFT_WRAP_KIND,
+  isEphemeralKind,
   type NostrEvent,
   pTagValues,
   VANISH_KIND,
@@ -1374,9 +1375,23 @@ export class Relay extends DurableObject<Env> {
     // than the storage read below and far cheaper than schnorr. The owner
     // is exempt: they cannot meaningfully abuse their own relay, and a
     // client replaying a backlog after being offline is a normal thing for
-    // an owner to do and an abnormal thing for a follow to do.
+    // an owner to do and an abnormal thing for a follow to do. Ephemeral
+    // kinds are exempt too: this throttle exists to bound rows written
+    // (limits.ts MAX_EVENTS_PER_PUBKEY_PER_WINDOW), and storeEvent writes
+    // zero rows for an ephemeral event -- there is nothing here for the
+    // cap to bound. What an ephemeral event actually costs is a schnorr
+    // verify and a broadcast, and the per-IP message throttle
+    // (RATE_LIMIT_MAX_MESSAGES) already shapes both of those. Left gated
+    // on the cap being enabled at all, so `"off"` still disables every
+    // pubkey-keyed check in one place rather than this one silently
+    // surviving it.
     const eventCap = maxEventsPerPubkeyPerWindow(this.env);
-    if (!isOwner && eventCap !== null && this.isPubkeyRateLimited(event.pubkey, eventCap)) {
+    if (
+      !isOwner &&
+      eventCap !== null &&
+      !isEphemeralKind(event.kind) &&
+      this.isPubkeyRateLimited(event.pubkey, eventCap)
+    ) {
       ok(ws, event.id, false, "rate-limited: too many events from this pubkey, slow down");
       return;
     }

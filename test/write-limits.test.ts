@@ -177,6 +177,31 @@ describe("per-pubkey write throttle", () => {
     expect(replies.every(([ok]) => ok)).toBe(true);
     conn.close();
   });
+
+  it("exempts ephemeral kinds from a follow", async () => {
+    // storeEvent drops an ephemeral event before any row is touched --
+    // this throttle bounds rows written, so it has nothing to bound here.
+    // WebRTC signalling is the motivating case: dozens of candidates in
+    // the first second of a call, from a non-owner pubkey.
+    const conn = await connectRelay("203.0.113.45");
+    const friend = await addFollow(conn);
+
+    const replies: Array<[boolean, string]> = [];
+    for (let i = 0; i < MAX_EVENTS_PER_PUBKEY_PER_WINDOW + 5; i++) {
+      const candidate = signEvent(friend.secretKeyHex, { kind: 20000, content: `candidate ${i}` });
+      const [, , ok, message] = await publish(conn, candidate);
+      replies.push([ok, message]);
+    }
+
+    expect(replies.every(([ok]) => ok)).toBe(true);
+
+    // The per-pubkey cap is off for this kind, but the follow can still
+    // write an ordinary kind-1 -- exempting ephemeral kinds didn't
+    // accidentally exempt the pubkey.
+    const stillGated = await publishBurst(conn, friend, MAX_EVENTS_PER_PUBKEY_PER_WINDOW + 1, "still-gated");
+    expect(stillGated.some(([ok]) => !ok)).toBe(true);
+    conn.close();
+  });
 });
 
 // The reserved-share threshold is 2.5GB by default, which no test is

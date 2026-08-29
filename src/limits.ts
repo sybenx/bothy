@@ -234,6 +234,20 @@ export const MAX_JOIN_REQUESTS_PER_IP_PER_WINDOW = 5;
 // airtight and is not claimed to be. What it does cover is the case it
 // exists for -- sustained traffic keeps the object awake, so the window
 // that matters is exactly the one that survives.
+// Ephemeral kinds (nostr.ts isEphemeralKind, 20000-29999) are exempt from
+// this throttle -- see relay.ts acceptEvent. The arithmetic above prices
+// what a stored event costs in rows written, and an ephemeral event costs
+// zero: storage.ts storeEvent drops it before any row is touched. Counting
+// it here bounds a quantity it never consumes, and at 20/minute it made
+// WebRTC signalling (NIP-100-ish call setup, dozens of candidates in the
+// first second) impossible on a non-owner pubkey. What an ephemeral event
+// actually costs is a schnorr verify and a broadcast, and the existing
+// per-IP message throttle (relay.ts RATE_LIMIT_MAX_MESSAGES: 50 per 10s)
+// already shapes both -- so it is left to bound them alone. That throttle
+// is per IP and covers every frame type on the connection, not ephemeral
+// events alone, so a signalling burst has to fit inside 50 messages / 10s
+// = 5 events/second/connection, shared with whatever else that connection
+// sends in the same window.
 export const PUBKEY_RATE_LIMIT_WINDOW_MS = 60_000;
 export const MAX_EVENTS_PER_PUBKEY_PER_WINDOW = 20;
 
