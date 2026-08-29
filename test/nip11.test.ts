@@ -51,6 +51,7 @@ const PROFILE = {
 };
 
 const OWNER_HEX = "a".repeat(64);
+const RELAY_HEX = "c".repeat(64);
 
 describe("resolveName", () => {
   it("falls back to the hardcoded default with nothing set anywhere", () => {
@@ -137,37 +138,37 @@ describe("resolveIcon", () => {
 
 describe("buildRelayInfo", () => {
   it("falls back to the hardcoded defaults with no profile, no stored values and no env vars", () => {
-    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, null, null);
+    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, null, null, RELAY_HEX);
     expect(info.name).toBe(DEFAULT_NAME);
     expect(info.description).toBe(DEFAULT_DESCRIPTION);
     expect(info.icon).toBeUndefined();
   });
 
   it("carries the whole chain through, not just the name", () => {
-    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, PROFILE, null);
+    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, PROFILE, null, RELAY_HEX);
     expect(info.name).toBe("Aaron's relay");
     expect(info.description).toBe("kind-0 about text");
     expect(info.icon).toBe("https://example.com/aaron.png");
   });
 
   it("omits icon entirely rather than setting it to an empty string", () => {
-    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, { ...PROFILE, picture: null }, null);
+    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, { ...PROFILE, picture: null }, null, RELAY_HEX);
     expect(info).not.toHaveProperty("icon");
   });
 
   it("advertises software as a URL to the upstream project and version from package.json", () => {
-    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, null, null);
+    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, null, null, RELAY_HEX);
     expect(info.software).toBe("https://github.com/sybenx/bothy");
     expect(info.version).toBe(version);
   });
 
   it("advertises NIP-86 now that the management API exists", () => {
-    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, null, null) as { supported_nips: number[] };
+    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, null, null, RELAY_HEX) as { supported_nips: number[] };
     expect(info.supported_nips).toContain(86);
   });
 
   it("advertises a limitation object mirroring the enforced limits.ts constants", () => {
-    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, null, null) as { limitation: Record<string, unknown> };
+    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, null, null, RELAY_HEX) as { limitation: Record<string, unknown> };
     expect(info.limitation).toEqual({
       restricted_writes: true,
       max_subscriptions: MAX_SUBSCRIPTIONS_PER_CONNECTION,
@@ -185,13 +186,13 @@ describe("buildRelayInfo", () => {
   // enforces it would tell clients the opposite of the truth.
   it("omits max_message_length entirely when the size cap is disabled", () => {
     const disabled = { MAX_EVENT_BYTES: "off" } as unknown as Env;
-    const info = buildRelayInfo(disabled, NO_SETTINGS, null, null) as { limitation: Record<string, unknown> };
+    const info = buildRelayInfo(disabled, NO_SETTINGS, null, null, RELAY_HEX) as { limitation: Record<string, unknown> };
     expect("max_message_length" in info.limitation).toBe(false);
   });
 
   it("advertises a raised size cap rather than the default", () => {
     const raised = { MAX_EVENT_BYTES: "262144" } as unknown as Env;
-    const info = buildRelayInfo(raised, NO_SETTINGS, null, null) as { limitation: Record<string, unknown> };
+    const info = buildRelayInfo(raised, NO_SETTINGS, null, null, RELAY_HEX) as { limitation: Record<string, unknown> };
     expect(info.limitation.max_message_length).toBe(262144);
   });
 });
@@ -228,29 +229,38 @@ describe("NIP-11 routing", () => {
 // them as a nostr user or reach them at all.
 describe("buildRelayInfo identity fields", () => {
   it("publishes the owner pubkey when the relay is claimed", () => {
-    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, PROFILE, OWNER_HEX);
+    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, PROFILE, OWNER_HEX, RELAY_HEX);
     expect(info.pubkey).toBe(OWNER_HEX);
+  });
+
+  it("publishes the relay's own pubkey even while unclaimed, unlike the owner's", () => {
+    // relay_pubkey is generated at schema-init time (schema.ts
+    // seedRelayIdentity), independent of claim status -- there is no
+    // "unknown" state for it the way there is for the owner's pubkey.
+    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, null, null, RELAY_HEX);
+    expect(info.relay_pubkey).toBe(RELAY_HEX);
+    expect(info).not.toHaveProperty("pubkey");
   });
 
   it("omits pubkey entirely while unclaimed rather than emitting an empty one", () => {
     // Not a degenerate case: this is the normal state of a freshly
     // deployed relay, and an empty string would assert an owner exists.
-    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, null, null);
+    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, null, null, RELAY_HEX);
     expect(info).not.toHaveProperty("pubkey");
   });
 
   it("takes contact from the owner's kind-0 website", () => {
-    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, PROFILE, OWNER_HEX);
+    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, PROFILE, OWNER_HEX, RELAY_HEX);
     expect(info.contact).toBe("https://example.com/aaron");
   });
 
   it("omits contact when the kind-0 carries no website", () => {
-    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, { ...PROFILE, website: null }, OWNER_HEX);
+    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, { ...PROFILE, website: null }, OWNER_HEX, RELAY_HEX);
     expect(info).not.toHaveProperty("contact");
   });
 
   it("omits contact entirely when there is no profile at all", () => {
-    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, null, OWNER_HEX);
+    const info = buildRelayInfo(NO_VARS, NO_SETTINGS, null, OWNER_HEX, RELAY_HEX);
     expect(info).not.toHaveProperty("contact");
   });
 
@@ -258,7 +268,7 @@ describe("buildRelayInfo identity fields", () => {
     // contact has no environment-variable or NIP-86 rung, unlike
     // name/description/icon -- see resolveContact. A relay whose name is
     // overridden still reports the owner's own contact, or none.
-    const info = buildRelayInfo(WITH_VARS, STORED, { ...PROFILE, website: null }, OWNER_HEX);
+    const info = buildRelayInfo(WITH_VARS, STORED, { ...PROFILE, website: null }, OWNER_HEX, RELAY_HEX);
     expect(info).not.toHaveProperty("contact");
   });
 });

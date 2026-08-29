@@ -1,5 +1,6 @@
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
+import { generateRelayKeypair } from "./relay-identity";
 
 // Per-event write cost against the Workers Free plan's 100,000
 // rows-written/day ceiling — see CLAUDE.md "The budget". Rows written is
@@ -381,6 +382,17 @@ export const TABLES: readonly TableSpec[] = [
     // backfill_meta below.
     name: "relay_meta",
     columns: [col("host", "TEXT")],
+  },
+  {
+    // This relay's own signing identity (src/relay-identity.ts), distinct
+    // from the owner's pubkey. Generated once, at schema-init time
+    // (initSchema's seedRelayIdentity below) rather than tied to the TOFU
+    // claim step -- OWNER_PUBKEY skips claim() entirely and this identity
+    // must exist under that mode too, for the same reason `follows` and
+    // `relay_meta` live off the `owner` table rather than on it. Exactly
+    // one row, forever, like relay_meta and backfill_meta.
+    name: "relay_identity",
+    columns: [col("secret_key", "TEXT NOT NULL"), col("public_key", "TEXT NOT NULL")],
   },
   {
     // One-shot backfill: one row per relay pulled
@@ -1279,6 +1291,18 @@ function seedIngestCounts(sql: SqlStorage): void {
   );
 }
 
+// relay_identity must have exactly one row, like relay_meta and
+// backfill_meta -- guarded on the table being empty rather than
+// generated unconditionally on every reconcile, so a schema change years
+// from now cannot mint a second keypair underneath whatever this relay
+// has already published signed as itself. See src/relay-identity.ts for
+// why this exists and why it lives off the `owner` table.
+function seedRelayIdentity(sql: SqlStorage): void {
+  if (sql.exec(`SELECT 1 FROM relay_identity LIMIT 1`).toArray().length > 0) return;
+  const { secretKeyHex, publicKeyHex } = generateRelayKeypair();
+  sql.exec(`INSERT INTO relay_identity (secret_key, public_key) VALUES (?, ?)`, secretKeyHex, publicKeyHex);
+}
+
 export function initSchema(sql: SqlStorage): void {
   ensureSchemaMetaTable(sql);
   const hash = currentSchemaHash();
@@ -1322,6 +1346,7 @@ export function initSchema(sql: SqlStorage): void {
   sql.exec(`INSERT INTO relay_meta (host) SELECT NULL WHERE NOT EXISTS (SELECT 1 FROM relay_meta)`);
   seedMaintainedCounts(sql);
   seedIngestCounts(sql);
+  seedRelayIdentity(sql);
 
   // Stored only now that every statement above has run without throwing --
   // see the header comment on this function for why that ordering is the

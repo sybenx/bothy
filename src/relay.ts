@@ -57,6 +57,7 @@ import {
 import type { Profile } from "./profile-lookup";
 import { normalizePubkey } from "./pubkey";
 import { instrumentSql, readMetricsSnapshot, type ReadMetricsSnapshot, withReadPath } from "./read-metrics";
+import { getRelayPubkey } from "./relay-identity";
 import { initSchema } from "./schema";
 import {
   applyDeletion,
@@ -361,7 +362,12 @@ export class Relay extends DurableObject<Env> {
   //
   // RPC method, called directly by the Worker (src/index.ts) rather than
   // over fetch() -- this is the only code path that may write the `owner`
-  // row (ownership.ts).
+  // row (ownership.ts). Nothing to do here for the relay's own signing
+  // identity (src/relay-identity.ts): it is seeded at schema-init time,
+  // before this constructor's caller can reach any RPC method, precisely
+  // so it exists whether or not this claim ever runs -- OWNER_PUBKEY
+  // skips claim() entirely, and that deployment shape needs the identity
+  // too.
   async claim(
     rawPubkey: unknown,
     profile?: Profile,
@@ -389,18 +395,27 @@ export class Relay extends DurableObject<Env> {
   // caller (nip11.ts) falls back to hardcoded defaults in all those cases.
   async getIdentity(
     host?: string,
-  ): Promise<{ profile: OwnerProfile; settings: RelaySettings; ownerPubkey: string | null }> {
+  ): Promise<{
+    profile: OwnerProfile;
+    settings: RelaySettings;
+    ownerPubkey: string | null;
+    relayPubkey: string;
+  }> {
     return this.metered(() =>
       withReadPath("identity", () => {
         const sql = this.sql;
         if (host) recordHost(sql, host);
         // The owner pubkey rides along rather than costing a second RPC:
         // NIP-11 now publishes it (nip11.ts), and getOwnerPubkey is an
-        // env read plus at most one indexed row.
+        // env read plus at most one indexed row. The relay's own pubkey
+        // (src/relay-identity.ts) rides the same way -- one more row,
+        // already guaranteed to exist by initSchema (schema.ts
+        // seedRelayIdentity).
         return {
           profile: getOwnerProfile(sql, this.env),
           settings: getRelaySettings(sql),
           ownerPubkey: getOwnerPubkey(sql, this.env),
+          relayPubkey: getRelayPubkey(sql),
         };
       }),
     );
@@ -435,6 +450,13 @@ export class Relay extends DurableObject<Env> {
     version: string;
     claimed: boolean;
     ownerPubkey: string | null;
+    // This relay's own signing identity (src/relay-identity.ts), never
+    // the owner's -- generated once at schema-init time and guaranteed
+    // to exist regardless of claim status, unlike ownerPubkey above.
+    // NIP-29 requires 39000-series group metadata events to be "signed
+    // by the relay keypair directly"; this is that identity's public
+    // half, so a client can verify what it signs once that work lands.
+    relayPubkey: string;
     // Maintained, not counted: storage.ts readMaintainedCounts reads one
     // row of `maintained_counts`, which insertEventRow and deleteEventRow
     // move. Exact and current -- it was a COUNT(*) over `events` served
@@ -610,6 +632,9 @@ export class Relay extends DurableObject<Env> {
       version,
       claimed: owner !== null,
       ownerPubkey: owner,
+      // One more row, from the singleton relay_identity table -- see
+      // CLAUDE.md "The budget" for /api/stats' overall read cost.
+      relayPubkey: getRelayPubkey(sql),
       // Both maintained: the row read above, plus at most 26 bucket rows.
       // Current as of this request.
       totalEvents: counts.events,

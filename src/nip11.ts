@@ -121,6 +121,7 @@ export function buildRelayInfo(
   stored: RelaySettings,
   profile: OwnerProfile,
   ownerPubkey: string | null,
+  relayPubkey: string,
 ): Record<string, unknown> {
   const info: Record<string, unknown> = {
     name: resolveName(env, stored, profile),
@@ -196,6 +197,15 @@ export function buildRelayInfo(
   if (ownerPubkey) {
     info.pubkey = ownerPubkey;
   }
+  // This relay's own signing identity (src/relay-identity.ts) -- not a
+  // standard NIP-11 field, and deliberately not named `pubkey`: that
+  // field already means "who administers this relay" (above), and NIP-29
+  // requires 39000-series group metadata events to be "signed by the
+  // relay keypair directly," a different key with a different purpose.
+  // Unlike `pubkey`, never omitted: it is generated at schema-init time
+  // (schema.ts seedRelayIdentity) and exists independently of claim
+  // status, so there is no unclaimed-relay state where it is unknown.
+  info.relay_pubkey = relayPubkey;
   const contact = resolveContact(profile);
   if (contact) {
     info.contact = contact;
@@ -208,8 +218,9 @@ export function nip11Response(
   stored: RelaySettings,
   profile: OwnerProfile,
   ownerPubkey: string | null,
+  relayPubkey: string,
 ): Response {
-  return new Response(JSON.stringify(buildRelayInfo(env, stored, profile, ownerPubkey)), {
+  return new Response(JSON.stringify(buildRelayInfo(env, stored, profile, ownerPubkey, relayPubkey)), {
     headers: {
       "Content-Type": "application/nostr+json",
       // NIP-11 is fetched cross-origin by web clients before they ever

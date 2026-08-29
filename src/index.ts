@@ -280,8 +280,8 @@ async function route(request: Request, env: Env): Promise<Response> {
     // caller trustworthy.
     const limited = await rateLimited(env.RATE_LIMIT_API, request);
     if (limited !== null) return limited;
-    const { profile, settings, ownerPubkey } = await relayStub(env).getIdentity(url.host);
-    return nip11Response(env, settings, profile, ownerPubkey);
+    const { profile, settings, ownerPubkey, relayPubkey } = await relayStub(env).getIdentity(url.host);
+    return nip11Response(env, settings, profile, ownerPubkey, relayPubkey);
   }
 
   if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
