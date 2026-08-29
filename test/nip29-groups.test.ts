@@ -300,6 +300,116 @@ describe("the relay writing its own events", () => {
   });
 });
 
+// The two write paths dispatched ABOVE both gates, and what each of them
+// owes the group partition. relay.ts sends NIP-59 gift wraps and NIP-62
+// vanish requests straight past isAllowedWriter and authorizeGroupWrite,
+// each on its own source of authority -- so neither can be gated by
+// nip29.ts and each has to answer for the partition itself.
+describe("the paths that skip both write gates", () => {
+  // THE DEFECT THIS FIXES. storeEvent partitions by groups.ts
+  // isGroupEvent, which asks only whether the event carries an `h` tag --
+  // not who sent it and not which path it arrived on. A kind-1059 is
+  // accepted from ANY pubkey, so any stranger could put an `h` tag on one
+  // and land an event in the group partition without passing a single
+  // group check. It was documented as harmless on the grounds that it
+  // wrote into the partition rather than out of it, which described the
+  // wrong audience: everyone entitled to read that partition receives the
+  // injected event.
+  it("refuses an h-tagged gift wrap outright", async () => {
+    const conn = await connectRelay();
+    const stranger = randomKeypair();
+    const wrap = signEvent(stranger.secretKeyHex, {
+      kind: 1059,
+      tags: [
+        ["p", OWNER_PUBKEY_HEX],
+        ["h", TOP_LEVEL_GROUP_ID],
+      ],
+      content: "encrypted seal goes here",
+    });
+
+    const [, , accepted, message] = await publish(conn, wrap);
+    expect(accepted).toBe(false);
+    expect(message.startsWith("invalid:")).toBe(true);
+    expect(message).toContain("group tag");
+
+    // Refused, not merely repartitioned: nothing at all was stored.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const rows = state.storage.sql
+        .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events`)
+        .toArray()[0];
+      expect(rows?.n).toBe(0);
+    });
+    conn.close();
+  });
+
+  // Any `h` at all, not just this relay's group id -- the refusal is
+  // isGroupEvent, so it is exactly what the partition would have caught.
+  it("refuses one naming any other group id too, and still accepts an ordinary wrap", async () => {
+    const conn = await connectRelay();
+    const stranger = randomKeypair();
+    const elsewhere = signEvent(stranger.secretKeyHex, {
+      kind: 1059,
+      tags: [
+        ["p", OWNER_PUBKEY_HEX],
+        ["h", "some-other-relays-group"],
+      ],
+    });
+    expect((await publish(conn, elsewhere))[2]).toBe(false);
+
+    // And the path still works for the mail it exists for.
+    const ordinary = signEvent(stranger.secretKeyHex, {
+      kind: 1059,
+      tags: [["p", OWNER_PUBKEY_HEX]],
+    });
+    expect((await publish(conn, ordinary))[2]).toBe(true);
+    conn.close();
+  });
+
+  // The equivalent question asked of the other path, and the answer is
+  // that it has no equivalent hole: handleVanish stores no row for the
+  // request, so there is nothing for a partition to receive. Its side
+  // effect deletes only the signer's OWN rows, across both partitions --
+  // a member erasing their own group history, which is what NIP-62
+  // obliges this relay to honour.
+  it("stores no event for a vanish request, so it cannot reach a partition at all", async () => {
+    const conn = await connectRelay();
+    const member = randomKeypair();
+    await publish(conn, putUser(member.pubkeyHex));
+    const note = signEvent(member.secretKeyHex, {
+      kind: 1,
+      tags: [["h", TOP_LEVEL_GROUP_ID]],
+      content: "a member's group note",
+    });
+    expect((await publish(conn, note))[2]).toBe(true);
+
+    const vanish = signEvent(member.secretKeyHex, {
+      kind: 62,
+      // An `h` tag on the vanish itself, which is the shape the gift wrap
+      // hole took. It changes nothing here, because nothing is stored.
+      tags: [
+        ["relay", "wss://example.com"],
+        ["h", TOP_LEVEL_GROUP_ID],
+      ],
+    });
+    expect((await publish(conn, vanish))[2]).toBe(true);
+    conn.close();
+
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      expect(
+        sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events WHERE kind = 62`).toArray()[0]?.n,
+      ).toBe(0);
+      // And the member's group note went with them: the drain runs
+      // acrossScopes, so the group partition is not a place to hide from
+      // a vanish.
+      expect(
+        sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events WHERE id = ?`, note.id).toArray()[0]
+          ?.n,
+      ).toBe(0);
+    });
+  });
+});
+
 describe("membership", () => {
   it("writes both nested lists on put-user and takes back only its own on remove-user", async () => {
     const conn = await connectRelay();

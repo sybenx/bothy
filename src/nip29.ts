@@ -43,14 +43,27 @@ import {
   isGroupMetadataKind,
   TOP_LEVEL_GROUP_ID,
 } from "./groups";
+import {
+  INVITE_DEFAULT_TTL_SECONDS,
+  INVITE_MAX_TTL_SECONDS,
+  MAX_INVITE_CODE_LENGTH,
+  MAX_OUTSTANDING_INVITES,
+  MIN_INVITE_CODE_LENGTH,
+} from "./limits";
 import { type NostrEvent, pTagValues } from "./nostr";
 import { getOwnerPubkey } from "./ownership";
 import { signAsRelay, getRelayPubkey } from "./relay-identity";
 import {
   addGroupMember,
   allowPubkeyForGroup,
+  countOutstandingInvites,
+  createInvite,
+  expirationOf,
   isGroupMember,
+  isPubkeyBanned,
   listGroupMembers,
+  lookupInvite,
+  redeemInvite,
   removeGroupMember,
   revokeGroupAllowance,
   storeEvent,
@@ -63,6 +76,15 @@ import { computeEventId } from "./validate";
 export const PUT_USER_KIND = 9000;
 export const REMOVE_USER_KIND = 9001;
 export const EDIT_METADATA_KIND = 9002;
+export const CREATE_INVITE_KIND = 9009;
+
+// kind-9021, the one NIP-29 event a NON-member sends: "Any user can send
+// a kind 9021 event to the relay in order to request admission to the
+// group." It is not a moderation kind (the moderation range stops at
+// 9020) and it never reaches authorizeGroupWrite -- see handleJoinRequest
+// at the bottom of this file for where it is decided and why it has to be
+// dispatched above the relay-wide write gate.
+export const JOIN_REQUEST_KIND = 9021;
 
 // NIP-29 reserves 9000-9020 for moderation actions. bothy implements
 // three of them and REFUSES the rest by name rather than letting them
@@ -79,7 +101,32 @@ export function isModerationKind(kind: number): boolean {
 }
 
 export function isSupportedModerationKind(kind: number): boolean {
-  return kind === PUT_USER_KIND || kind === REMOVE_USER_KIND || kind === EDIT_METADATA_KIND;
+  return (
+    kind === PUT_USER_KIND ||
+    kind === REMOVE_USER_KIND ||
+    kind === EDIT_METADATA_KIND ||
+    kind === CREATE_INVITE_KIND
+  );
+}
+
+// The invite code carried by a kind-9009 create-invite or a kind-9021
+// join request. NIP-29 names the tag on both ("arbitrary `code`" on the
+// moderation event, `["code", "<optional-invite-code>"]` on the join
+// request), so one reader serves both sides.
+//
+// `code` is a multi-character tag name, so `event_tags` never indexes it
+// (schema.ts) -- a stored kind-9009 keeps its code in the event body
+// where only a reader entitled to the group partition can see it, and no
+// tag filter can be pointed at it.
+function codeTagValue(tags: string[][]): string | null {
+  const value = tags.find((t) => t[0] === "code")?.[1];
+  return value === undefined || value === "" ? null : value;
+}
+
+// When an invite created by this event stops working. See limits.ts
+// INVITE_DEFAULT_TTL_SECONDS for why there is no third possibility.
+function inviteExpiry(event: NostrEvent, nowSec: number): number {
+  return expirationOf(event) ?? nowSec + INVITE_DEFAULT_TTL_SECONDS;
 }
 
 // The role the owner carries in the generated kind-39001 admin list.
@@ -109,10 +156,16 @@ const METADATA_FIELDS = ["name", "picture", "banner", "about"] as const;
 //   hidden      relays should hide group metadata from non-members. True,
 //               and it is the whole reason groups.ts recognises this kind
 //               range at all.
-//   closed      join requests are ignored. True TODAY, because there is no
-//               kind-9021 join path and no invites; membership is created
-//               by the owner sending put-user. This is the one tag here
-//               that is expected to come off, when invites land.
+//   closed      NIP-29: "If a group is `closed`, join requests are not
+//               honored unless they include an invite code." True, and it
+//               is what this relay does exactly -- a kind-9021 with no
+//               code is refused, a kind-9021 with a live one is admitted.
+//               This tag was expected to come OFF when invites landed, on
+//               a reading of `closed` as "join requests are ignored". The
+//               spec's own sentence says otherwise: invite-only IS the
+//               closed group, and `open` is the tag that would be a lie
+//               here. So it stays, and the note that predicted its
+//               removal is what changed.
 const POLICY_TAGS = ["private", "restricted", "hidden", "closed"] as const;
 
 export type GroupWriteAuthorization = { ok: true } | { ok: false; message: string };
@@ -128,19 +181,40 @@ export type GroupWriteAuthorization = { ok: true } | { ok: false; message: strin
 // is none of this file's business, and only an `h`-tagged event from
 // somebody other than the owner reaches storage.
 //
-// WHAT IT DOES NOT COVER, and deliberately: relay.ts dispatches NIP-59
-// gift wraps and NIP-62 vanish requests before reaching either gate, since
-// each has an entirely different source of authority. So a gift wrap
-// carrying an `h` tag lands in the group partition without passing here.
-// That is a stranger writing into the partition, not out of it -- the
-// event is hidden from unauthenticated reads like everything else there,
-// and is still bounded by the gift wrap caps. Worth knowing rather than
-// worth closing: closing it would mean this file having an opinion about
-// a write path whose whole point is that ownership does not gate it.
+// THE THREE PATHS THAT DO NOT REACH HERE, and what each of them owes the
+// partition instead. relay.ts dispatches NIP-59 gift wraps, NIP-62 vanish
+// requests and NIP-29 join requests before either gate, since each has an
+// entirely different source of authority -- so none of them can be gated
+// by this function, and each has to answer for the group partition on its
+// own terms:
+//
+//   gift wrap    REFUSED OUTRIGHT if it is a group event (relay.ts
+//                handleGiftWrap). This was left open for one release on
+//                the reasoning that it wrote INTO the partition rather
+//                than out of it, and the reasoning was wrong: a member
+//                who authenticates and reads the group receives the
+//                injected event, so "hidden from unauthenticated reads"
+//                described the wrong audience. What made it safe to close
+//                is that an `h` tag on a wrap addressed by `p` tag to one
+//                recipient names nothing -- there was no legitimate case
+//                to preserve.
+//   vanish       NOT STORED AT ALL (relay.ts handleVanish stores no row
+//                for the request), so it cannot reach a partition. Its
+//                side effect deletes only rows whose `pubkey` is the
+//                signer's own, across both partitions (storage.ts
+//                vanishTargets runs acrossScopes), which is a member
+//                erasing their own group history -- exactly what NIP-62
+//                obliges this relay to honour.
+//   join request SAME SHAPE AS VANISH: handleJoinRequest below decides
+//                membership and stores no event, so the one write path
+//                open to a stranger who holds an invite code adds no row
+//                to the group partition either. The only group event a
+//                join produces is the relay's own regenerated kind-39002.
 export function authorizeGroupWrite(
   sql: SqlStorage,
   event: NostrEvent,
   isOwner: boolean,
+  nowSec: number,
 ): GroupWriteAuthorization {
   if (!isGroupEvent(event) && !isModerationKind(event.kind)) return { ok: true };
 
@@ -192,6 +266,7 @@ export function authorizeGroupWrite(
     if (event.kind === REMOVE_USER_KIND && pTagValues(event.tags).includes(event.pubkey)) {
       return { ok: false, message: "invalid: the relay owner cannot be removed from their own group" };
     }
+    if (event.kind === CREATE_INVITE_KIND) return authorizeCreateInvite(sql, event, nowSec);
     return { ok: true };
   }
 
@@ -203,6 +278,82 @@ export function authorizeGroupWrite(
   if (isOwner) return { ok: true };
   if (isGroupMember(sql, event.pubkey)) return { ok: true };
   return { ok: false, message: "restricted: only members of this relay's group can publish to it" };
+}
+
+// Everything a kind-9009 has to satisfy before the invite row exists.
+//
+// Reached only from the moderation branch above, so the caller is already
+// established as the owner -- these are not authorization checks, they are
+// the policy limits.ts states, applied where there is still a message
+// channel to say so on. Refusing here rather than clamping in
+// applyModeration is deliberate: an invite quietly given a different
+// lifetime than the client asked for is a link the client will describe
+// wrongly to the person it is sent to.
+//
+// Two storage reads, both at owner pace, neither on any path an ordinary
+// event takes.
+function authorizeCreateInvite(
+  sql: SqlStorage,
+  event: NostrEvent,
+  nowSec: number,
+): GroupWriteAuthorization {
+  const code = codeTagValue(event.tags);
+  if (code === null) {
+    return {
+      ok: false,
+      message: `invalid: a create-invite event must carry a ["code", "<code>"] tag naming the invite code`,
+    };
+  }
+  if (code.length < MIN_INVITE_CODE_LENGTH || code.length > MAX_INVITE_CODE_LENGTH) {
+    return {
+      ok: false,
+      message:
+        `invalid: an invite code must be between ${MIN_INVITE_CODE_LENGTH} and ` +
+        `${MAX_INVITE_CODE_LENGTH} characters -- it is a bearer token, so length is what makes it ` +
+        `worth holding`,
+    };
+  }
+
+  // Never re-open a code this relay has already seen. Without this, an
+  // owner reusing a code they had used before -- the same memorable
+  // string, months apart -- would hand the person who redeemed it the
+  // first time a second admission, and the row's `redeemed_by` would be
+  // overwritten with whoever got there next.
+  if (lookupInvite(sql, code) !== null) {
+    return {
+      ok: false,
+      message:
+        "invalid: this relay has already issued that invite code -- codes are single use and are never " +
+        "reissued, so pick a new one",
+    };
+  }
+
+  const expiration = expirationOf(event);
+  if (expiration !== null) {
+    if (expiration <= nowSec) {
+      return { ok: false, message: "invalid: this invite's expiration tag is already in the past" };
+    }
+    if (expiration - nowSec > INVITE_MAX_TTL_SECONDS) {
+      const maxDays = Math.floor(INVITE_MAX_TTL_SECONDS / 86_400);
+      return {
+        ok: false,
+        message:
+          `invalid: an invite may last at most ${maxDays} days -- set the expiration tag no further ` +
+          `than that ahead, or omit it for the ${Math.floor(INVITE_DEFAULT_TTL_SECONDS / 86_400)}-day default`,
+      };
+    }
+  }
+
+  if (countOutstandingInvites(sql, nowSec) >= MAX_OUTSTANDING_INVITES) {
+    return {
+      ok: false,
+      message:
+        `blocked: this relay already has ${MAX_OUTSTANDING_INVITES} unused invites outstanding -- revoke ` +
+        `some with the NIP-86 revokeinvite method, or let them expire`,
+    };
+  }
+
+  return { ok: true };
 }
 
 // Applies a moderation event's side effects and regenerates whatever group
@@ -234,8 +385,14 @@ export function applyModeration(sql: SqlStorage, env: Env, event: NostrEvent, no
       // OUTER list, so a member without this row is a member who cannot
       // write -- see storage.ts auditMaintainedCounts, which checks daily
       // that these two never came apart.
-      allowPubkeyForGroup(sql, pubkey, nowSec);
+      allowPubkeyForGroup(sql, pubkey, "added to the group by a NIP-29 put-user event", nowSec);
     }
+  } else if (event.kind === CREATE_INVITE_KIND) {
+    // authorizeCreateInvite above has already established that the code
+    // is present, well-sized, unseen and within the lifetime cap, so
+    // this cannot fail and does not re-check. The `?? ""` is for the
+    // type, not for a case that can happen.
+    createInvite(sql, codeTagValue(event.tags) ?? "", nowSec, inviteExpiry(event, nowSec));
   } else if (event.kind === REMOVE_USER_KIND) {
     for (const pubkey of pTagValues(event.tags)) {
       if (pubkey === owner) continue;
@@ -247,7 +404,161 @@ export function applyModeration(sql: SqlStorage, env: Env, event: NostrEvent, no
     }
   }
 
+  // A kind-9009 changes neither membership nor metadata, so the
+  // tag-by-tag comparison inside finds all three unchanged and writes
+  // nothing -- three rows read and no rows written. Called anyway rather
+  // than special-cased out, because on a relay whose owner has issued an
+  // invite before ever sending any other moderation event, this is the
+  // call that brings the group's state into being.
   return regenerateGroupState(sql, owner, event.kind === EDIT_METADATA_KIND ? event : null, nowSec);
+}
+
+// ---------------------------------------------------------------------
+// NIP-29 join requests (kind 9021).
+// ---------------------------------------------------------------------
+
+export interface JoinResult {
+  accepted: boolean;
+  message: string;
+  // The relay-signed group state this join changed -- in practice the
+  // regenerated kind-39002 member list, already stored, for the caller to
+  // broadcast. Empty on every refusal and on a request from somebody who
+  // was already a member.
+  generated: NostrEvent[];
+}
+
+// THE ONE MESSAGE EVERY REFUSAL SENDS, and the point of this file's join
+// half.
+//
+// A stranger presenting a code can be refused for four different reasons
+// -- the code is unknown, spent, expired or revoked -- and telling them
+// which is telling them things they must not learn. "Spent" and "expired"
+// both confirm that the code was REAL, which confirms this relay hosts a
+// group somebody was invited to; "unknown" against a code the attacker
+// generated confirms the opposite, which turns a join request into an
+// oracle for testing guesses one bit at a time. Distinguishing them would
+// be the same defect the gift wrap read gate had before it stopped
+// deciding by probing storage: the refusal itself becomes the answer.
+//
+// So the wire gets one string for all four, and the OWNER gets the
+// distinction, through a channel a stranger cannot read -- a log line
+// naming the reason. The admin who wants to know why their invitee is
+// stuck reads `wrangler tail`; the person who made the request learns
+// only that this link does not work.
+//
+// It is deliberately NOT the empty-handed "restricted:" of the ordinary
+// write gate. A real invitee whose link has lapsed needs to be told what
+// to do about it, and "ask for a new link" is true for all four reasons
+// at once, which is exactly what makes it safe to say.
+//
+// What this does not hide is timing: a known code costs one row read more
+// than an unknown one before the same refusal comes back. Measuring that
+// across a network is not a thing an attacker gets to do reliably, and
+// the alternative -- issuing a dummy read to level it -- would be
+// defending against an adversary who can already do better by other
+// means.
+export const JOIN_REFUSAL_MESSAGE =
+  "restricted: this invite code was not accepted -- ask whoever invited you for a new link";
+
+// The code as it appears in the owner's log. Truncated, and escaped
+// through JSON.stringify, because this string is chosen by whoever sent
+// the request: unbounded attacker text in a log is a way to bury the
+// lines around it, and a newline in it is a way to forge one. Twelve
+// characters is under the shortest code this relay will issue
+// (limits.ts MIN_INVITE_CODE_LENGTH), so a prefix still identifies a real
+// invite against the NIP-86 list without reproducing a live code in full.
+function codeLabel(code: string | null): string {
+  return code === null ? "(none)" : JSON.stringify(code.slice(0, 12));
+}
+
+// A kind-9021 join request: NIP-29's admission path, and the only write
+// path on this relay that a pubkey with no prior relationship to it can
+// use to gain one.
+//
+// DISPATCHED ABOVE THE RELAY-WIDE WRITE GATE (relay.ts handleEventInner),
+// necessarily: a person joining is by definition not yet in
+// `allowed_pubkeys`, so ownership.ts isAllowedWriter would refuse them
+// before this file ever saw the request. The authority here is the invite
+// code and nothing else -- a bearer token the owner minted, presented by
+// whoever holds it. That is what makes an invite link work for somebody
+// whose npub does not exist until they click it, and it is the whole
+// reason the caps in limits.ts around invites are shaped the way they
+// are.
+//
+// NOTHING IS STORED. The request is an action, not content -- the same
+// call relay.ts handleVanish makes about its own request event -- and
+// here it is also what keeps this path from being the hole the gift wrap
+// path was: a kind-9021 carries an `h` tag, so storing one would put a
+// stranger's event into the group partition through a path no group
+// authorization gates. The only event a successful join produces is this
+// relay's own regenerated kind-39002, which is the canonical record of
+// the membership anyway.
+//
+// Ordering is NOT cheapest-first, and that is the one place this file
+// departs from the project's convention. Signature verification happens
+// in relay.ts before this is called, ahead of any invite lookup, because
+// the reverse order is an oracle: a caller could offer a guessed code
+// under a junk signature and tell a real code from a fake one by whether
+// the refusal complained about the code or about the signature. Paying
+// schnorr on an unauthenticated request is the price, and the per-IP join
+// throttle is what bounds how often it is paid.
+export function handleJoinRequest(
+  sql: SqlStorage,
+  env: Env,
+  event: NostrEvent,
+  nowSec: number,
+): JoinResult {
+  const refuse = (reason: string, code: string | null): JoinResult => {
+    console.warn(
+      `[nip29] join request refused: ${reason} pubkey=${event.pubkey} code=${codeLabel(code)}`,
+    );
+    return { accepted: false, message: JOIN_REFUSAL_MESSAGE, generated: [] };
+  };
+
+  // Free checks first -- these read nothing, and a request naming another
+  // relay's group or carrying no code at all is refused before any of the
+  // storage below. Both get the same uniform message: answering "wrong
+  // group id" would confirm which id this relay does host.
+  if (groupIdOf(event) !== TOP_LEVEL_GROUP_ID) return refuse("not this relay's group", null);
+  const code = codeTagValue(event.tags);
+  // NIP-29: "If a group is `closed`, join requests are not honored unless
+  // they include an invite code." This group is closed and has no other
+  // admission path -- there is nobody to hold an uninvited request open
+  // for, since a moderator queue is not a thing this relay has.
+  if (code === null) return refuse("no invite code", null);
+
+  const owner = getOwnerPubkey(sql, env);
+  if (owner === null) return refuse("relay is unclaimed", code);
+
+  // Already in? Then the code stays unspent. A member re-sending a join
+  // request -- a client retrying, a second device -- must not consume an
+  // invite that could still admit somebody, and the owner is a member by
+  // exemption rather than by row (authorizeGroupWrite above), so they are
+  // checked as the same case. Saying so plainly is safe: the request is
+  // signed, so this tells the signer only about themselves.
+  if (event.pubkey === owner || isGroupMember(sql, event.pubkey)) {
+    return { accepted: true, message: "already a member of this group", generated: [] };
+  }
+
+  // Before redeeming, so a banned pubkey does not burn a live invite on
+  // its way to being refused. It gets the uniform message like every
+  // other refusal: the ban is the owner's business, and confirming one to
+  // the banned party tells them how to come back under another key.
+  if (isPubkeyBanned(sql, event.pubkey)) return refuse("pubkey is banned", code);
+
+  const outcome = redeemInvite(sql, code, event.pubkey, nowSec);
+  if (outcome !== "redeemed") return refuse(`invite code ${outcome}`, code);
+
+  // The same two nested lists put-user writes, in the same order and for
+  // the same reason -- a member without the outer row is a member whose
+  // events are refused with a message about follows. storage.ts
+  // auditMaintainedCounts checks the containment daily whichever path
+  // created it.
+  addGroupMember(sql, event.pubkey, nowSec);
+  allowPubkeyForGroup(sql, event.pubkey, "joined the group with a NIP-29 invite code", nowSec);
+
+  console.warn(`[nip29] join request accepted: pubkey=${event.pubkey} code=${codeLabel(code)}`);
+  return { accepted: true, message: "", generated: regenerateGroupState(sql, owner, null, nowSec) };
 }
 
 interface StoredGroupState {

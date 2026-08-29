@@ -23,6 +23,8 @@ import {
   DAILY_ROWS_READ_LIMIT,
   DAILY_ROWS_WRITTEN_LIMIT,
   GIFT_WRAP_RATE_LIMIT_WINDOW_MS,
+  JOIN_REQUEST_RATE_LIMIT_WINDOW_MS,
+  MAX_JOIN_REQUESTS_PER_IP_PER_WINDOW,
   LIVE_FEED_MAX_LIFETIME_MS,
   MAX_EVENTS_PER_REQ,
   MAX_CONN_STATE_BYTES,
@@ -41,7 +43,13 @@ import {
   STORAGE_BYTES_LIMIT,
   utcDayStartSeconds,
 } from "./limits";
-import { applyModeration, authorizeGroupWrite, isSupportedModerationKind } from "./nip29";
+import {
+  applyModeration,
+  authorizeGroupWrite,
+  handleJoinRequest,
+  isSupportedModerationKind,
+  JOIN_REQUEST_KIND,
+} from "./nip29";
 import { handleManagementCall, type ManagementResponse } from "./nip86";
 import { resolveIcon, resolveName, type OwnerProfile } from "./nip11";
 import { version } from "../package.json";
@@ -239,6 +247,15 @@ export class Relay extends DurableObject<Env> {
   // across every frame type; this one specifically bounds rows-written
   // risk on the one write path anyone can use without being the owner.
   private giftWrapRateLimits = new Map<string, { windowStart: number; count: number }>();
+
+  // The same shape again, for kind-9021 join requests -- the other write
+  // path a stranger can reach. Keyed by IP and held in memory for the
+  // same reasons and with the same eviction caveat (limits.ts
+  // JOIN_REQUEST_RATE_LIMIT_WINDOW_MS/MAX_JOIN_REQUESTS_PER_IP_PER_WINDOW).
+  // A separate counter from the gift wrap one because they bound
+  // different things: that one bounds rows written, this one bounds
+  // guesses at a bearer token.
+  private joinRateLimits = new Map<string, { windowStart: number; count: number }>();
 
   // Per-PUBKEY write counter (limits.ts PUBKEY_RATE_LIMIT_WINDOW_MS/
   // MAX_EVENTS_PER_PUBKEY_PER_WINDOW). The two maps above are keyed by IP
@@ -968,6 +985,15 @@ export class Relay extends DurableObject<Env> {
       this.handleGiftWrap(ws, event);
       return;
     }
+    // NIP-29 join request. Necessarily above isAllowedWriter and not
+    // beside it: somebody joining is by definition not in
+    // `allowed_pubkeys` yet, so the relay-wide gate would refuse the one
+    // event whose entire purpose is to get them past it. The authority is
+    // the invite code -- see nip29.ts handleJoinRequest.
+    if (event.kind === JOIN_REQUEST_KIND) {
+      this.handleJoin(ws, event);
+      return;
+    }
 
     // Ownership is checked before id/signature validity, not after.
     // Schnorr verification is the most expensive per-event operation
@@ -990,7 +1016,7 @@ export class Relay extends DurableObject<Env> {
     // whether it may write to the group. Three integer comparisons decide
     // that an ordinary event is none of that file's business, so this
     // costs nothing on the path every non-group write takes.
-    const groupAuth = authorizeGroupWrite(sql, event, auth.isOwner);
+    const groupAuth = authorizeGroupWrite(sql, event, auth.isOwner, nowSeconds());
     if (!groupAuth.ok) {
       ok(ws, event.id, false, groupAuth.message);
       return;
@@ -1007,6 +1033,38 @@ export class Relay extends DurableObject<Env> {
   // abuse controls below, on top of the general per-connection rate
   // limit already applied to every message in webSocketMessage.
   private handleGiftWrap(ws: WebSocket, event: NostrEvent): void {
+    // THE ONE CHECK THAT HAS TO COME FIRST, and not for cost reasons.
+    //
+    // This path is dispatched ABOVE both write gates, so nothing below it
+    // ever consults nip29.ts authorizeGroupWrite -- and storeEvent
+    // partitions by groups.ts isGroupEvent, which asks only whether the
+    // event carries an `h` tag and not who sent it. A kind-1059 carrying
+    // one therefore landed in the group partition without any group
+    // authorization at all: unauthenticated injection into a private
+    // group's feed, delivered to every reader entitled to that partition,
+    // bounded by nothing but the gift wrap caps below.
+    //
+    // Refused rather than partitioned differently, because a gift wrap
+    // carrying a group tag is not a thing that means anything. NIP-59
+    // addresses a wrap to a recipient by `p` tag and the sender is a
+    // throwaway key; a group tag on top of that names a feed the wrap's
+    // own recipient rule already contradicts. There is nothing to
+    // preserve, so the safe answer and the correct answer are the same.
+    //
+    // Tested with isGroupEvent and not with a hand-rolled `h` lookup, so
+    // that what is refused here is exactly what would have been
+    // partitioned there -- the two cannot drift apart into a rule that
+    // refuses one shape while the partition catches another.
+    if (isGroupEvent(event)) {
+      ok(
+        ws,
+        event.id,
+        false,
+        "invalid: a gift wrap is mail addressed to this relay's owner and cannot carry a group tag",
+      );
+      return;
+    }
+
     const sql = this.sql;
     const owner = getOwnerPubkey(sql, this.env);
     if (owner === null) {
@@ -1039,6 +1097,78 @@ export class Relay extends DurableObject<Env> {
     // acceptEvent's exemptions should follow who signed it, not who this
     // path usually is.
     this.acceptEvent(ws, sql, event, event.pubkey === owner);
+  }
+
+  // NIP-29 (nips/29.md) join request: "Any user can send a kind 9021
+  // event to the relay in order to request admission to the group."
+  //
+  // The decision itself is nip29.ts handleJoinRequest -- what belongs
+  // here is the wire-level work that has to happen before any invite code
+  // is looked at, and the ORDER of it is the part that matters.
+  private handleJoin(ws: WebSocket, event: NostrEvent): void {
+    // Size first, for the reason acceptEvent states about its own copy of
+    // this check: it is the only check whose result bounds the cost of
+    // the rest, and idMatchesContent below re-serializes and hashes the
+    // whole event. A join request never reaches acceptEvent, so it would
+    // otherwise be the one unauthenticated write path with no size bound
+    // in front of the hash.
+    const byteCap = maxEventBytes(this.env);
+    if (byteCap !== null && JSON.stringify(event).length > byteCap) {
+      ok(ws, event.id, false, `invalid: event exceeds the maximum size of ${byteCap} bytes`);
+      return;
+    }
+
+    // Ahead of schnorr, because it is what bounds how often schnorr gets
+    // paid on behalf of somebody this relay has not authorized -- the
+    // same ordering and the same in-memory counter shape handleGiftWrap
+    // uses above.
+    if (this.isJoinRateLimited(getState(ws).ip)) {
+      ok(ws, event.id, false, "rate-limited: too many join requests from this connection, slow down");
+      return;
+    }
+
+    // AHEAD OF THE INVITE LOOKUP, which inverts this project's
+    // cheapest-first convention on purpose. If a bad code were refused
+    // before a bad signature, a caller could offer guessed codes under
+    // junk signatures and learn which ones are real from which complaint
+    // came back -- the signature check would become a free oracle over
+    // the relay's live invites. Verifying first costs ~1.1ms of CPU on an
+    // unauthenticated request; the throttle above is what bounds how
+    // often that bill arrives.
+    if (!idMatchesContent(event)) {
+      ok(ws, event.id, false, "invalid: id does not match the hash of its contents");
+      return;
+    }
+    if (!verifySignature(event)) {
+      ok(ws, event.id, false, "invalid: signature verification failed");
+      return;
+    }
+
+    const result = withReadPath("join", () =>
+      handleJoinRequest(this.sql, this.env, event, nowSeconds()),
+    );
+    ok(ws, event.id, result.accepted, result.message);
+    // The regenerated member list, if this join changed one. Group state
+    // is group state: broadcast() drops it for any socket not
+    // authenticated as the owner, and it is deliberately not routed
+    // through liveBroadcast -- the same handling acceptEvent gives the
+    // events applyModeration returns.
+    for (const generated of result.generated) {
+      this.broadcast(generated);
+    }
+  }
+
+  // See limits.ts JOIN_REQUEST_RATE_LIMIT_WINDOW_MS/
+  // MAX_JOIN_REQUESTS_PER_IP_PER_WINDOW.
+  private isJoinRateLimited(ip: string): boolean {
+    const now = Date.now();
+    const entry = this.joinRateLimits.get(ip);
+    if (!entry || now - entry.windowStart >= JOIN_REQUEST_RATE_LIMIT_WINDOW_MS) {
+      this.joinRateLimits.set(ip, { windowStart: now, count: 1 });
+      return false;
+    }
+    entry.count++;
+    return entry.count > MAX_JOIN_REQUESTS_PER_IP_PER_WINDOW;
   }
 
   // See limits.ts GIFT_WRAP_RATE_LIMIT_WINDOW_MS/MAX_GIFT_WRAPS_PER_IP_PER_WINDOW

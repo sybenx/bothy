@@ -1816,18 +1816,26 @@ export function allowPubkey(sql: SqlStorage, pubkey: string, reason: string | nu
 // created it.
 // ---------------------------------------------------------------------
 
-// The row kind-9000 put-user writes so a new member can reach the relay,
+// The row a new member needs in order to reach the relay at all -- written
+// by kind-9000 put-user and by a redeemed kind-9021 join request, which is
+// why the reason is the caller's to supply rather than a constant here.
 // DO NOTHING on conflict rather than an upsert. A pubkey already carrying
 // an owner-granted allowance keeps it as owner-granted: put-user must
 // never demote a deliberate grant into one remove-user can reclaim, which
 // an upsert writing `source = 'invite'` would do silently. And a pubkey
 // already carrying an invite-granted one needs nothing changed.
-export function allowPubkeyForGroup(sql: SqlStorage, pubkey: string, nowSec: number): void {
+export function allowPubkeyForGroup(
+  sql: SqlStorage,
+  pubkey: string,
+  reason: string,
+  nowSec: number,
+): void {
   sql.exec(
     `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source)
-       VALUES (?, 'added to the group by a NIP-29 put-user event', ?, 'invite')
+       VALUES (?, ?, ?, 'invite')
        ON CONFLICT(pubkey) DO NOTHING`,
     pubkey,
+    reason,
     nowSec,
   );
 }
@@ -1881,6 +1889,156 @@ export function groupMembersWithoutAllowance(sql: SqlStorage): string[] {
     )
     .toArray()
     .map((r) => r.pubkey);
+}
+
+// ---------------------------------------------------------------------
+// NIP-29 invite codes (src/nip29.ts). One row per kind-9009 the owner
+// publishes; the row, not the event, is what a kind-9021 join request is
+// checked against -- see schema.ts `group_invites`.
+// ---------------------------------------------------------------------
+
+export interface GroupInvite {
+  code: string;
+  created_at: number;
+  expires_at: number;
+  redeemed_at: number | null;
+  redeemed_by: string | null;
+  revoked_at: number | null;
+}
+
+// What a presented code turned out to be. Four of the five are refusals,
+// and nip29.ts collapses all of them into ONE message on the wire -- this
+// distinction exists for the owner's log line and for the NIP-86 methods,
+// never for the person who presented the code. See handleJoinRequest.
+export type InviteOutcome = "redeemed" | "unknown" | "revoked" | "spent" | "expired";
+
+export function lookupInvite(sql: SqlStorage, code: string): GroupInvite | null {
+  return (
+    sql
+      .exec<{
+        code: string;
+        created_at: number;
+        expires_at: number;
+        redeemed_at: number | null;
+        redeemed_by: string | null;
+        revoked_at: number | null;
+      }>(
+        `SELECT code, created_at, expires_at, redeemed_at, redeemed_by, revoked_at
+           FROM group_invites WHERE code = ?`,
+        code,
+      )
+      .toArray()[0] ?? null
+  );
+}
+
+export function createInvite(sql: SqlStorage, code: string, createdAt: number, expiresAt: number): void {
+  sql.exec(
+    `INSERT INTO group_invites (code, created_at, expires_at) VALUES (?, ?, ?)`,
+    code,
+    createdAt,
+    expiresAt,
+  );
+}
+
+// Outstanding means redeemable right now: unspent, unrevoked, unexpired.
+// The same three conditions as listUnusedInvites below and as the
+// redeemable branch of redeemInvite -- stated three times because they
+// are three different statements, and kept identical because a row this
+// count admits and a redemption refuses would be a cap the owner cannot
+// clear by using the invites it is counting.
+export function countOutstandingInvites(sql: SqlStorage, nowSec: number): number {
+  return (
+    sql
+      .exec<{
+        n: number
+      }>(
+        `SELECT COUNT(*) AS n FROM group_invites
+          WHERE redeemed_at IS NULL AND revoked_at IS NULL AND expires_at > ?`,
+        nowSec,
+      )
+      .toArray()[0]?.n ?? 0
+  );
+}
+
+export interface UnusedInvite {
+  code: string;
+  created_at: number;
+  expires_at: number;
+}
+
+export function listUnusedInvites(sql: SqlStorage, nowSec: number): UnusedInvite[] {
+  return sql
+    .exec<{ code: string; created_at: number; expires_at: number }>(
+      `SELECT code, created_at, expires_at FROM group_invites
+        WHERE redeemed_at IS NULL AND revoked_at IS NULL AND expires_at > ?
+        ORDER BY created_at DESC`,
+      nowSec,
+    )
+    .toArray();
+}
+
+// Classify, then spend -- both here, so SINGLE USE is a property of one
+// statement rather than of a caller's ordering.
+//
+// The UPDATE repeats every condition the SELECT above just checked, which
+// looks redundant and is not the same claim: the SELECT decides what to
+// TELL the owner, the UPDATE decides what to WRITE, and only the second
+// one has to be safe against two redemptions of the same code. A Durable
+// Object is single-threaded and nothing awaits between these two
+// statements, so today they cannot disagree; the guard is what keeps that
+// true if a future caller ever puts something between them.
+//
+// The classification order is revoked, then spent, then expired, because
+// a row can be more than one at once and the owner wants the most
+// decisive reason: an invite that was revoked and has since also lapsed
+// was revoked, and saying "expired" would describe the clock instead of
+// the act.
+export function redeemInvite(
+  sql: SqlStorage,
+  code: string,
+  pubkey: string,
+  nowSec: number,
+): InviteOutcome {
+  const invite = lookupInvite(sql, code);
+  if (invite === null) return "unknown";
+  if (invite.revoked_at !== null) return "revoked";
+  if (invite.redeemed_at !== null) return "spent";
+  if (invite.expires_at <= nowSec) return "expired";
+  sql.exec(
+    `UPDATE group_invites SET redeemed_at = ?, redeemed_by = ?
+      WHERE code = ? AND redeemed_at IS NULL AND revoked_at IS NULL AND expires_at > ?`,
+    nowSec,
+    pubkey,
+    code,
+    nowSec,
+  );
+  return "redeemed";
+}
+
+// What a revoke did. A separate type from InviteOutcome above, which
+// describes a REDEMPTION -- reusing it would have made "revoked" mean
+// "this revoke succeeded" in one function and "this code was already dead
+// when you presented it" in the other.
+export type RevokeOutcome = "revoked" | "unknown" | "spent" | "already-revoked";
+
+// NIP-86 revokeinvite (src/nip86.ts). Says exactly why a revoke did
+// nothing -- here the caller IS the owner, so there is nobody to keep the
+// distinction from, which is the opposite of the join path's rule.
+//
+// A spent invite is left alone rather than marked revoked: it is already
+// unusable, and overwriting its history would lose `redeemed_by`, which
+// is the only record of who the code let in.
+//
+// An EXPIRED but unspent invite is revoked normally rather than reported
+// as already-dead. The owner saying they meant it dead outlives the clock
+// having made it so, and the row is what an admin reads back later.
+export function revokeInvite(sql: SqlStorage, code: string, nowSec: number): RevokeOutcome {
+  const invite = lookupInvite(sql, code);
+  if (invite === null) return "unknown";
+  if (invite.revoked_at !== null) return "already-revoked";
+  if (invite.redeemed_at !== null) return "spent";
+  sql.exec(`UPDATE group_invites SET revoked_at = ? WHERE code = ? AND redeemed_at IS NULL`, nowSec, code);
+  return "revoked";
 }
 
 export function unallowPubkey(sql: SqlStorage, pubkey: string): void {

@@ -109,6 +109,95 @@ export function maxEventBytes(env: Env): number | null {
 export const GIFT_WRAP_RATE_LIMIT_WINDOW_MS = 60_000;
 export const MAX_GIFT_WRAPS_PER_IP_PER_WINDOW = 5;
 
+// ---------------------------------------------------------------------
+// NIP-29 invites (src/nip29.ts). An invite code is a BEARER TOKEN, and
+// every cap below exists because of that one word.
+//
+// The relay cannot authenticate the person who will present it -- that is
+// the point, not a shortcoming: the whole reason an invite link works for
+// onboarding is that the person clicking it may not have an npub until
+// they click. So the code is the credential, whoever holds it, and the
+// only controls available are how long it lives, how many exist, how hard
+// it is to guess, and how fast it can be guessed at. One each, below.
+// ---------------------------------------------------------------------
+
+// How long an invite lives when the kind-9009 that created it names no
+// expiry of its own, and the longest one it may name.
+//
+// EXPIRY IS MANDATORY -- an invite with no `expiration` tag gets the
+// default rather than living forever, and one asking for longer than the
+// maximum is refused rather than clamped. NIP-29 says nothing about
+// either (it describes kind-9009 as carrying an "arbitrary `code`" and
+// stops there), so this is bothy's policy and is documented as such in
+// the README.
+//
+// The reasoning is the bearer-token one again: a credential with no
+// expiry outlives every reason it was issued, and it does so silently.
+// An invite link pasted into a chat, a screenshot, a synced note, a
+// browser history -- each is a copy the owner cannot count and will not
+// remember, and without an expiry each stays live until somebody thinks
+// to revoke a code they have long since forgotten issuing. A revocation
+// the owner has to remember to perform is a revocation that does not
+// happen; an expiry happens on its own.
+//
+// Refused rather than clamped, because clamping is a silent
+// disagreement: the client that asked for a year would be told `["OK",
+// id, true]` and would go on believing the link it just generated lasts a
+// year. The refusal names the maximum, so the client can ask again for
+// something this relay will actually honour.
+export const INVITE_DEFAULT_TTL_SECONDS = 7 * 24 * 60 * 60;
+export const INVITE_MAX_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+// The code itself, bounded at both ends.
+//
+// The minimum is the only guessing defence this relay can enforce, and it
+// is a weak one: length is not entropy, and an owner who picks a
+// sixteen-character English sentence has satisfied it while producing a
+// code worth nothing. Nothing here can check entropy -- the code arrives
+// already chosen, inside a signed event -- so the honest statement is
+// that this floor stops the accidents (a code typed by hand, a client
+// with a lazy generator) and the per-IP throttle below is what bounds the
+// deliberate case. A client generating 16 random hex characters is at 64
+// bits, which the throttle puts far out of reach.
+//
+// The maximum is a storage bound and nothing more: the code is stored
+// verbatim in `group_invites` and echoed back by the NIP-86 list method,
+// so it needs an end.
+export const MIN_INVITE_CODE_LENGTH = 16;
+export const MAX_INVITE_CODE_LENGTH = 128;
+
+// How many invites may be outstanding -- unspent, unexpired, unrevoked --
+// at one time.
+//
+// Not a defence against the owner, who is the only pubkey that can create
+// one and whom this relay does not defend against (CLAUDE.md "Threat
+// model"). It is a bound on the LIST: the NIP-86 listunusedinvites method
+// returns every outstanding code in one response, and an admin who cannot
+// read the list cannot use it to revoke anything. Sixty-four live invites
+// is far past what a single-owner relay hands out and still a response a
+// person can look at.
+export const MAX_OUTSTANDING_INVITES = 64;
+
+// Per-IP join request throttle, the same shape and the same reasoning as
+// the gift wrap one above: kind-9021 is the second write path a stranger
+// can reach without being authorized by anything this relay stored in
+// advance, so it gets its own counter rather than sharing the general
+// per-message limit, which is tuned for connection spam.
+//
+// This is the cap that actually bounds guessing. The general per-message
+// throttle (relay.ts RATE_LIMIT_MAX_MESSAGES: 50 per 10s) would permit
+// ~432,000 attempts a day from one address, which is a real threat to a
+// weak code and no threat at all to a strong one. Five a minute is
+// generous for a person following a link and turns even a deliberately
+// short code into days of work per address.
+//
+// Counted in memory (relay.ts joinRateLimits), so it costs no rows and is
+// lost on eviction -- the same honest caveat as every other throttle in
+// this file. An attacker pacing themselves around hibernation gets fresh
+// windows; what they do not get is a fast one.
+export const JOIN_REQUEST_RATE_LIMIT_WINDOW_MS = 60_000;
+export const MAX_JOIN_REQUESTS_PER_IP_PER_WINDOW = 5;
+
 // Per-PUBKEY write throttle. Per pubkey, not per IP, because the two
 // existing throttles (RATE_LIMIT_MAX_MESSAGES in relay.ts, and the gift
 // wrap one above) are both keyed by IP, and an author with several

@@ -606,6 +606,56 @@ export const TABLES: readonly TableSpec[] = [
     columns: [col("pubkey", "TEXT PRIMARY KEY"), col("added_at", "INTEGER NOT NULL")],
   },
   {
+    // NIP-29 invite codes (src/nip29.ts): one row per kind-9009
+    // create-invite the owner publishes, and the thing a kind-9021 join
+    // request from a stranger is checked against.
+    //
+    // THE ROW IS THE TRUTH, not the kind-9009 event that created it. The
+    // event is the owner's own history of having issued the invite; this
+    // row is the invite's current state, and only this row is consulted
+    // when a code is presented. Storing the state on the event instead
+    // would mean mutating a signed event to spend a code, which is not a
+    // thing that can be done.
+    //
+    // The code is stored VERBATIM rather than hashed, which is a
+    // deliberate departure from how a bearer token is usually held at
+    // rest. Hashing protects a secret from whoever can read the table;
+    // here that is the relay owner, who is the person that issued the
+    // code and the only person the NIP-86 list method will ever show it
+    // to. They need to read a live invite back -- that is the entire
+    // point of listunusedinvites, since a link the admin cannot see again
+    // is a link they cannot re-send or match against the one they are
+    // being asked about. Hashing would buy nothing against the threat
+    // this relay actually has (a stranger guessing, which the throttle
+    // and the code length bound) and would cost the feature that was
+    // asked for.
+    //
+    // Spent, revoked and expired are three different NULL-able columns
+    // rather than one status string, because a row can be more than one
+    // of them and the admin's log line says which. A code is redeemable
+    // only while all three are clear.
+    //
+    // Rows are never swept. They accumulate at owner pace -- one per
+    // invite ever issued, on a relay with one owner -- so a sweep would
+    // cost more complexity than the rows are worth, and keeping the dead
+    // ones is what lets nip29.ts tell the admin "this code expired" or
+    // "this code was already used" instead of "no such code" forever
+    // after. Deleting them would erase exactly the distinction the log
+    // line exists to draw.
+    name: "group_invites",
+    columns: [
+      col("code", "TEXT PRIMARY KEY"),
+      col("created_at", "INTEGER NOT NULL"),
+      // Always set. See limits.ts INVITE_DEFAULT_TTL_SECONDS: there is no
+      // never-expiring invite, so this column has no "unset" state to
+      // represent and is NOT NULL rather than nullable-means-forever.
+      col("expires_at", "INTEGER NOT NULL"),
+      col("redeemed_at", "INTEGER"),
+      col("redeemed_by", "TEXT"),
+      col("revoked_at", "INTEGER"),
+    ],
+  },
+  {
     // Every count /api/stats reports that is maintained rather than
     // computed. Exactly one row.
     //

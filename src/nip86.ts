@@ -25,6 +25,8 @@ import {
   listBannedEvents,
   listBannedPubkeys,
   listBlockedIps,
+  listUnusedInvites,
+  revokeInvite,
   setRelaySetting,
   unallowPubkey,
   unbanPubkey,
@@ -72,6 +74,17 @@ export const SUPPORTED_METHODS = [
   "changerelayname",
   "changerelaydescription",
   "changerelayicon",
+  // bothy's own, not NIP-86's. The spec defines no invite methods at all,
+  // so these two are an extension in the same spirit as the empty-string
+  // unset convention on the change* methods, and are documented in the
+  // README beside it.
+  // Named plainly rather than under a vendor prefix, because
+  // supportedmethods is the discovery mechanism and a client that reads
+  // this list learns what is here without needing to know whose idea it
+  // was. If NIP-86 ever standardises these names with different
+  // semantics, this is the line that has to change.
+  "listunusedinvites",
+  "revokeinvite",
 ] as const;
 
 // The exact string blockip demands back as its `reason` before it will
@@ -241,6 +254,51 @@ export function handleManagementCall(
 
     case "listallowedpubkeys":
       return { result: listAllowedPubkeys(sql) };
+
+    // The admin's window onto NIP-29 invites (src/nip29.ts). Two methods
+    // and no create: an invite is CREATED by publishing a kind-9009,
+    // which is a signed part of the group's history, and offering a
+    // second way in through an HTTP call would put the same act on two
+    // paths with only one of them recorded in the group.
+    //
+    // What the owner cannot do without these is see a link they issued
+    // and kill it. Both are answered in full here, spelling out spent
+    // from expired from unknown -- the exact distinction the join path
+    // refuses to make on the wire (nip29.ts JOIN_REFUSAL_MESSAGE). The
+    // difference is who is asking: this endpoint is authenticated by a
+    // NIP-98 signature from the owner, and there is nothing to keep from
+    // the person who issued the code.
+    case "listunusedinvites":
+      // Unused means redeemable right now -- unspent, unrevoked and not
+      // yet expired. A code that is none of those is not a link the admin
+      // can still do anything about, and listing the dead ones would bury
+      // the live ones. `expires_at` is on every row because it is the
+      // thing that decides whether to re-send a link or reissue it.
+      return { result: listUnusedInvites(sql, nowSec) };
+
+    case "revokeinvite": {
+      const code = stringParam(params, 0);
+      if (code === null || code === "") return err("revokeinvite takes the invite code as a string");
+      const outcome = revokeInvite(sql, code, nowSec);
+      switch (outcome) {
+        case "revoked":
+          return { result: true };
+        // Reported as failures rather than as an idempotent success,
+        // because each one means the admin was looking at something other
+        // than what they thought. "Already used" in particular is the
+        // answer to a question they urgently have -- revoking a code to
+        // stop somebody getting in, and being told somebody already did.
+        case "spent":
+          return err(
+            "revokeinvite: that invite has already been redeemed, so there is nothing left to revoke -- " +
+              "remove the member with a NIP-29 kind-9001 remove-user event instead",
+          );
+        case "already-revoked":
+          return err("revokeinvite: that invite was already revoked");
+        case "unknown":
+          return err("revokeinvite: this relay has never issued that invite code");
+      }
+    }
 
     case "blockip": {
       const ip = stringParam(params, 0);
