@@ -31,7 +31,7 @@ import { buildFilterQuery } from "../src/filters";
 import { GROUP_SCOPE, isGroupEvent, PUBLIC_SCOPE, TOP_LEVEL_GROUP_ID } from "../src/groups";
 import { PUT_USER_KIND } from "../src/nip29";
 import type { Relay } from "../src/relay";
-import { auditMaintainedCounts, readMaintainedCounts } from "../src/storage";
+import { auditMaintainedCounts, fixMisclassifiedGroupEvents, readMaintainedCounts } from "../src/storage";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
 import { type Keypair, OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
@@ -176,6 +176,192 @@ describe("what makes an event a group event", () => {
         .map((r) => r.is_group);
       expect(tagScopes.length).toBeGreaterThan(0);
       expect(tagScopes.every((s) => s === GROUP_SCOPE)).toBe(true);
+    });
+  });
+});
+
+describe("fixMisclassifiedGroupEvents: the one-time partition correction", () => {
+  // storeEvent can no longer produce a row shaped like this -- scopeOf
+  // already uses the corrected isGroupEvent -- which is exactly why a
+  // relay that stored one under the OLD, id-agnostic test needs a
+  // migration rather than a guard on the write path. This inserts
+  // straight into storage the way the pre-fix code would have, bypassing
+  // storeEvent entirely, to stand in for that relay's existing data.
+  it("clears is_group on a pre-existing row naming a foreign group, leaves a real one alone, and keeps the counters consistent", async () => {
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      const hour = Math.trunc(now / 3600);
+
+      const foreign = signEvent(OWNER_SECRET_KEY_HEX, {
+        kind: 1,
+        content: "wrongly filed under the old id-agnostic test",
+        tags: [["h", "someone-elses-group"]],
+        created_at: now,
+      });
+      sql.exec(
+        `INSERT INTO events
+           (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost, is_group)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 1)`,
+        foreign.id,
+        foreign.pubkey,
+        foreign.created_at,
+        foreign.kind,
+        JSON.stringify(foreign.tags),
+        foreign.content,
+        foreign.sig,
+        now,
+        12,
+      );
+      sql.exec(
+        `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at, is_group)
+         VALUES ('h', ?, ?, ?, 1)`,
+        "someone-elses-group",
+        foreign.id,
+        now,
+      );
+      sql.exec(`UPDATE maintained_counts SET events = events + 1, group_events = group_events + 1`);
+      sql.exec(
+        `INSERT INTO event_hour_counts (hour, n, group_n) VALUES (?, 1, 1)
+           ON CONFLICT(hour) DO UPDATE SET n = n + 1, group_n = group_n + 1`,
+        hour,
+      );
+      sql.exec(
+        `INSERT INTO ingest_hour_counts (hour, n, group_n, rows_written) VALUES (?, 1, 1, 21)
+           ON CONFLICT(hour) DO UPDATE SET n = n + 1, group_n = group_n + 1, rows_written = rows_written + 21`,
+        hour,
+      );
+
+      // A real member of this relay's own group, stored the same way --
+      // the migration must not touch this one.
+      const ours = groupNote("really ours");
+      await (async () => {
+        const conn = await connectRelay();
+        await publish(conn, ours);
+        conn.close();
+      })();
+
+      const before = readMaintainedCounts(sql);
+
+      expect(fixMisclassifiedGroupEvents(sql, 100)).toBe(1);
+
+      const foreignRow = sql
+        .exec<{ is_group: number }>(`SELECT is_group FROM events WHERE id = ?`, foreign.id)
+        .toArray()[0];
+      expect(foreignRow?.is_group).toBe(PUBLIC_SCOPE);
+      const foreignTag = sql
+        .exec<{ is_group: number }>(`SELECT is_group FROM event_tags WHERE event_id = ?`, foreign.id)
+        .toArray()[0];
+      expect(foreignTag?.is_group).toBe(PUBLIC_SCOPE);
+
+      const oursRow = sql
+        .exec<{ is_group: number }>(`SELECT is_group FROM events WHERE id = ?`, ours.id)
+        .toArray()[0];
+      expect(oursRow?.is_group).toBe(GROUP_SCOPE);
+
+      const after = readMaintainedCounts(sql);
+      expect(after.events).toBe(before.events);
+      expect(after.groupEvents).toBe(before.groupEvents - 1);
+
+      // Idempotent: the guard flag is now set, so a second call finds
+      // nothing (the row already dropped out of `is_group = 1`) and costs
+      // one bounded, empty query rather than repeating the fix.
+      expect(fixMisclassifiedGroupEvents(sql, 100)).toBe(0);
+
+      // And the counters this migration touched stay internally
+      // consistent with the table -- auditMaintainedCounts finds no drift.
+      sql.exec(`UPDATE maintained_counts SET audited_at = NULL`);
+      auditMaintainedCounts(sql, now);
+      expect(readMaintainedCounts(sql).drift).toBeNull();
+    });
+  });
+
+  // THE SPECIFIC MECHANISM, exercised rather than assumed: candidacy is
+  // keyed to events.is_group, the same column the fix flips FIRST (a
+  // single UPDATE, atomic on its own). This simulates a cron tick that
+  // died immediately after that one statement -- the earliest point a
+  // crash could leave anything behind -- by applying it by hand and
+  // nothing else, then calling the migration again exactly as the next
+  // cron tick would. If candidacy were keyed to the tag row's own
+  // `is_group` copy instead (as an earlier version of this migration was),
+  // this row would still match the tag-index seek and the second call
+  // would decrement group_events a second time for an event it had
+  // already (partially) fixed.
+  it("does not double-decrement when a prior run flipped events.is_group but got no further", async () => {
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      const hour = Math.trunc(now / 3600);
+
+      const foreign = signEvent(OWNER_SECRET_KEY_HEX, {
+        kind: 1,
+        content: "wrongly filed, then half-fixed",
+        tags: [["h", "someone-elses-group"]],
+        created_at: now,
+      });
+      sql.exec(
+        `INSERT INTO events
+           (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost, is_group)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 1)`,
+        foreign.id,
+        foreign.pubkey,
+        foreign.created_at,
+        foreign.kind,
+        JSON.stringify(foreign.tags),
+        foreign.content,
+        foreign.sig,
+        now,
+        12,
+      );
+      sql.exec(
+        `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at, is_group)
+         VALUES ('h', ?, ?, ?, 1)`,
+        "someone-elses-group",
+        foreign.id,
+        now,
+      );
+      sql.exec(`UPDATE maintained_counts SET events = events + 1, group_events = group_events + 1`);
+      sql.exec(
+        `INSERT INTO event_hour_counts (hour, n, group_n) VALUES (?, 1, 1)
+           ON CONFLICT(hour) DO UPDATE SET n = n + 1, group_n = group_n + 1`,
+        hour,
+      );
+      sql.exec(
+        `INSERT INTO ingest_hour_counts (hour, n, group_n, rows_written) VALUES (?, 1, 1, 21)
+           ON CONFLICT(hour) DO UPDATE SET n = n + 1, group_n = group_n + 1, rows_written = rows_written + 21`,
+        hour,
+      );
+
+      // The crash: only the very first statement the fix issues has run.
+      // event_tags.is_group, and all three counters, are exactly as wrong
+      // as they were before any fix was attempted.
+      sql.exec(`UPDATE events SET is_group = 0 WHERE id = ?`, foreign.id);
+
+      const stillPending = readMaintainedCounts(sql);
+      expect(stillPending.groupEvents).toBe(1); // untouched by the "crash"
+
+      // The next cron tick's call. It must find nothing for this row --
+      // events.is_group is already 0 -- and so must not touch
+      // group_events, its hour bucket, or its ingest bucket again.
+      expect(fixMisclassifiedGroupEvents(sql, 100)).toBe(0);
+
+      const after = readMaintainedCounts(sql);
+      expect(after.groupEvents).toBe(stillPending.groupEvents);
+
+      const bucket = sql
+        .exec<{ group_n: number }>(`SELECT group_n FROM event_hour_counts WHERE hour = ?`, hour)
+        .toArray()[0];
+      expect(bucket?.group_n).toBe(1);
+
+      // The one row this leaves behind: event_tags never caught up with
+      // events for this specific id. Documented as the accepted, safe-
+      // direction residue in fixMisclassifiedGroupEvents' own comment --
+      // asserted here so a future change that claims to "fix" this
+      // doesn't silently start double-decrementing instead.
+      const tagRow = sql
+        .exec<{ is_group: number }>(`SELECT is_group FROM event_tags WHERE event_id = ?`, foreign.id)
+        .toArray()[0];
+      expect(tagRow?.is_group).toBe(GROUP_SCOPE);
     });
   });
 });

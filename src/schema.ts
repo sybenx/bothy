@@ -421,7 +421,17 @@ export const TABLES: readonly TableSpec[] = [
     // inbound request traffic, not known at deploy time. Single row, like
     // backfill_meta below.
     name: "relay_meta",
-    columns: [col("host", "TEXT")],
+    columns: [
+      col("host", "TEXT"),
+      // Guards the one-time correction for events wrongly flagged
+      // is_group = 1 before groups.ts isGroupEvent was scoped to
+      // TOP_LEVEL_GROUP_ID (storage.ts fixMisclassifiedGroupEvents,
+      // called from relay.ts runCron) -- 0 until a cron tick finds
+      // nothing left to fix, then permanently 1, the same shape
+      // backfill_meta.exhaust_reset_applied guards its own one-time
+      // reset below.
+      col("group_scope_fixed", "INTEGER NOT NULL DEFAULT 0"),
+    ],
   },
   {
     // This relay's own signing identity (src/relay-identity.ts), distinct

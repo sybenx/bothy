@@ -3,9 +3,11 @@ import {
   acrossScopes,
   GROUP_SCOPE,
   type GroupScope,
+  isGroupEvent,
   isGroupMetadataKind,
   PUBLIC_SCOPE,
   scopeOf,
+  TOP_LEVEL_GROUP_ID,
 } from "./groups";
 import {
   EVENT_BASE_ROW_COST,
@@ -847,6 +849,171 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
     nowSec,
     driftMessages.length > 0 ? JSON.stringify(driftMessages) : null,
   );
+}
+
+// One-time correction for events that were flagged is_group = 1 for two
+// reasons that turned out to be the same shape: groups.ts isGroupEvent
+// used to accept ANY `h` tag as this relay's group, and separately used to
+// accept ANY 39000-series event as this relay's group metadata regardless
+// of who signed it. Two populations, one partition, one migration:
+//
+//   1. An ordinary `h`-tagged event backfilled from the owner's own
+//      history that names some OTHER relay's NIP-29 group -- reached here
+//      because backfill fetches wherever the owner's events were
+//      published, not only what was written to this relay.
+//   2. A 39000-series event NOT signed by this relay's own identity
+//      (relay-identity.ts) -- reached the same way, and refused at the
+//      source now (storeEvent below); this migration is what cleans up
+//      any that got in before that refusal existed. Checked by SIGNER,
+//      not by `d`, for the reason storeEvent's own comment gives: a
+//      forged `d` reading TOP_LEVEL_GROUP_ID would defeat a `d`-tag check.
+//
+// Both make an event unreadable to anyone who is not a member of the one
+// group this relay actually hosts -- population 1 hides a stranger's
+// unrelated content behind a membership list that has nothing to do with
+// it, population 2 sits in the partition as a second, indistinguishable
+// candidate for "this group's member list" alongside the relay's genuine
+// one, which is worse than hidden: it is ambiguous.
+//
+// BATCHED, and deliberately without a separate cursor. Every call asks the
+// group partition's own indexes for up to `limit` candidates -- the same
+// bounded-request shape hasVanishTargets/drainVanish already use to make a
+// cost this relay cannot avoid a fixed one instead of a table scan. `limit`
+// is VANISH_BATCH_SIZE at the one call site (relay.ts runCronInner) --
+// reused rather than a constant invented for this, because the write shape
+// is the same one VANISH_BATCH_SIZE is already paced against: an UPDATE
+// that moves a row's `is_group` between partitions retires its old
+// partial-index entries and writes new ones, the same index-maintenance
+// cost schema.ts eventRemovalBudget prices for a removal.
+//
+// CANDIDACY IS KEYED TO events.is_group, THE SAME COLUMN THE FIX FLIPS
+// FIRST -- and that is what makes a re-run after ANY crash point safe
+// rather than merely "looks fine." Population 1's candidate query joins
+// event_tags to events and requires e.is_group = 1 (not just the tag
+// row's own copy of it) alongside the tag-index seek; population 2's
+// query is against `events` directly. So once `UPDATE events SET
+// is_group = 0` commits for a row -- the FIRST statement the fix below
+// issues, and a single statement is atomic on its own -- that row can
+// never be selected as a candidate again, by either branch, regardless of
+// which of the later statements (event_tags, then the three counters) a
+// crash left unexecuted. A re-run therefore cannot re-decrement
+// maintained_counts/event_hour_counts/ingest_hour_counts for a row it has
+// already flipped -- there is nothing left to find it by. This was NOT
+// true of the first version of this migration, which kept the tag-index
+// seek keyed to the tag row's OWN is_group copy: a crash between the
+// events flip and the event_tags flip left the row rediscoverable via its
+// still-`is_group = 1` tag row while the refetch below (which already
+// required events.is_group = 1) found nothing and skipped it forever --
+// safe against double-decrementing, but never terminating for that row
+// either, since group_scope_fixed can only ever be set once a call finds
+// zero candidates.
+//
+// What a crash between the events flip and the remaining statements DOES
+// still leave behind: that one row's event_tags copy, and whichever of
+// the three counters had not yet been decremented, permanently wrong by
+// one. That is the safe direction to be wrong in -- a permanently
+// UNDER-decremented `group_events` makes the public `totalEvents` figure
+// (events - group_events) read slightly LOW, never high, so it never
+// attributes a group event's existence to the public count. The daily
+// audit (auditMaintainedCounts) reports it if the affected hour bucket is
+// still inside its 24h window; outside that window it is a silent,
+// bounded, one-row drift rather than a growing one. Fixing it would mean
+// re-deriving "was this row's counters actually applied" from data this
+// migration does not keep, which is the kind of state a bearer-token-sized
+// bug does not justify adding.
+//
+// Guarded by relay_meta.group_scope_fixed exactly the way
+// backfill_meta.exhaust_reset_applied guards backfill.ts
+// resetWronglyExhaustedRelays: 0 until a call finds nothing left to fix,
+// then permanently 1, so a relay with nothing wrong -- and every relay
+// going forward, once this has run -- pays one bounded, index-seeked
+// query and never asks again.
+//
+// Population 1's candidate id is still re-checked against the real,
+// corrected isGroupEvent before anything is written -- an event can carry
+// more than one `h` tag, and groupIdOf reads only the FIRST one, so a
+// second, mismatched tag on an event that is genuinely ours must not be
+// reclassified. Population 2 needs no such recheck: `pubkey` is a single
+// column, not a repeatable tag, so the SQL condition IS the authoritative
+// answer.
+//
+// A NOTE ON WHAT "BOUNDED" DOES NOT PROMISE, for population 1: an event
+// with a genuinely matching FIRST `h` tag and an extra, different one
+// after it is a false positive every single call re-selects and
+// re-skips, so a relay holding one never sees group_scope_fixed flip to
+// 1 -- every future cron tick pays this one bounded, index-seeked query
+// forever rather than zero. That is still bounded (the same cost every
+// time, never a scan that grows with E), just not self-terminating. No
+// real NIP-29 client emits two `h` tags with different values, so this is
+// a cost this relay accepts rather than a case worth a second piece of
+// state to track.
+export function fixMisclassifiedGroupEvents(sql: SqlStorage, limit: number): number {
+  const alreadyFixed =
+    sql.exec<{ group_scope_fixed: number }>(`SELECT group_scope_fixed FROM relay_meta LIMIT 1`).toArray()[0]
+      ?.group_scope_fixed ?? 1;
+  if (alreadyFixed) return 0;
+
+  const relayPubkey = getRelayPubkey(sql);
+
+  const candidates = sql
+    .exec<{ event_id: string }>(
+      `SELECT DISTINCT event_id FROM (
+         SELECT et.event_id FROM event_tags et JOIN events e ON e.id = et.event_id
+          WHERE et.is_group = 1 AND e.is_group = 1 AND et.tag_name = 'h' AND et.tag_value <> ?
+         UNION ALL
+         SELECT id AS event_id FROM events
+          WHERE is_group = 1 AND kind BETWEEN 39000 AND 39005 AND pubkey <> ?
+       ) LIMIT ?`,
+      TOP_LEVEL_GROUP_ID,
+      relayPubkey,
+      limit,
+    )
+    .toArray();
+
+  if (candidates.length === 0) {
+    sql.exec(`UPDATE relay_meta SET group_scope_fixed = 1`);
+    return 0;
+  }
+
+  let fixed = 0;
+  for (const { event_id } of candidates) {
+    const row = sql
+      .exec<EventRow & { ingested_at: number | null }>(
+        `SELECT id, pubkey, created_at, kind, tags, content, sig, ingested_at
+           FROM events WHERE id = ? AND is_group = 1`,
+        event_id,
+      )
+      .toArray()[0];
+    if (row === undefined) continue;
+    const event = rowToEvent(row);
+    // The false-positive guard the comment above describes, for
+    // population 1 only -- population 2's SQL condition (pubkey <>
+    // relayPubkey) is already the authoritative answer, since a single
+    // event has exactly one pubkey.
+    if (!isGroupMetadataKind(event.kind) && isGroupEvent(event)) continue;
+
+    // FIRST, and the reason a crash after this line cannot cause a
+    // double-decrement on any later call -- see the comment above.
+    sql.exec(`UPDATE events SET is_group = 0 WHERE id = ?`, event_id);
+    sql.exec(`UPDATE event_tags SET is_group = 0 WHERE event_id = ?`, event_id);
+    // Mirrors bumpEventCounters'/deleteEventRow's decrement exactly, minus
+    // the `events`/`n` halves -- this is a reclassification, not a
+    // removal, so the total event count does not move, only which half of
+    // it is "group".
+    sql.exec(`UPDATE maintained_counts SET group_events = group_events - 1`);
+    sql.exec(
+      `UPDATE event_hour_counts SET group_n = group_n - 1 WHERE hour = ?`,
+      hourBucket(row.created_at),
+    );
+    if (row.ingested_at !== null) {
+      sql.exec(
+        `UPDATE ingest_hour_counts SET group_n = group_n - 1 WHERE hour = ?`,
+        hourBucket(row.ingested_at),
+      );
+    }
+    fixed += 1;
+  }
+  return fixed;
 }
 
 // ---------------------------------------------------------------------
