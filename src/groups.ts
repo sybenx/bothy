@@ -32,14 +32,26 @@ export const GROUP_TAG = "h";
 // and it is chosen here for the same reason bothy has one owner: a
 // single-user relay hosting a single group needs no namespace.
 //
-// Enforced on MODERATION events only (nip29.ts authorizeGroupWrite), not
-// on ordinary group traffic. An `h` tag naming some other id still marks
-// its event as a group event and is still gated by the one member list --
-// partitioning is kind- and id-agnostic on purpose (see GROUP_TAG above),
-// and refusing an unrecognised id would mean deciding what a group IS at
-// the write gate rather than at the partition. Moderation is different
-// because the id there selects what gets mutated, and there is exactly
-// one thing it can select.
+// Enforced at two different points, on purpose, in two different ways:
+//
+//   - The WRITE GATE (nip29.ts authorizeGroupWrite) is id-agnostic on
+//     ordinary group traffic: an `h` tag naming some OTHER id still marks
+//     its event as needing the one member list's say-so (isAnyGroupEvent
+//     below), because refusing an unrecognised id at the gate would mean
+//     deciding what a group IS at write time rather than at the partition
+//     -- and because the alternative is a bypass, a client dodging the
+//     member check by tagging `h` with anything other than `_`. Moderation
+//     events ARE checked against this id specifically, because the id
+//     there selects what gets mutated and there is exactly one thing it
+//     can select.
+//   - The PARTITION (isGroupEvent below) is not id-agnostic. An event
+//     carrying an `h` tag that names some OTHER relay's group -- reached
+//     here because backfill fetched it as part of the OWNER's own
+//     authored history, published elsewhere, not written to this relay at
+//     all -- is not this relay's group and must not be filed in it: doing
+//     so made it unreadable to anyone who is not a member of the one group
+//     this relay actually hosts, which is a stranger's private content
+//     gated behind a membership list that has nothing to do with it.
 export const TOP_LEVEL_GROUP_ID = "_";
 
 // The relay-generated group state events (nips/29.md "Group metadata
@@ -143,15 +155,59 @@ export function scopeOf(event: NostrEvent): GroupScope {
   return isGroupEvent(event) ? GROUP_SCOPE : PUBLIC_SCOPE;
 }
 
-// The partition test, and the two rules underneath it: a relay-generated
-// group state event is one by KIND, everything else is one by `h` tag.
+// The partition test: whether an event is IN THIS RELAY'S OWN group, not
+// whether it merely looks like group traffic of some kind. One rule,
+// keyed to TOP_LEVEL_GROUP_ID, for every kind including the relay-
+// generated metadata range: an event counts only when groupIdOf reports
+// exactly this relay's own id.
 //
-// The kind half deliberately does not require the `d` tag to name
-// anything. A kind-39002 carrying no `d` names no group and is malformed,
-// but it is still a member list, and the safe reading of a malformed
-// member list is "group state", not "public event" -- the direction that
-// hides rather than discloses.
+// This used to special-case the metadata range, treating a MISSING or
+// empty `d` as group state too -- the reasoning being that the safe
+// reading of a malformed member/admin list is "hide it", not "here is a
+// public event." That reasoning was right for a reader deciding what to
+// disclose and wrong for the PARTITION: a malformed-or-foreign 39000-series
+// event and this relay's own genuine one are otherwise identical in shape
+// (same kind, same read gate), so leaving either of them classified as
+// "ours" put two candidate kind-39002 member lists in the one partition a
+// bare `{"kinds":[39002]}` reads, with no way for a client to tell which
+// one is real. storage.ts storeEvent is what actually closes that: a
+// metadata-kind event only reaches insertEventRow (and therefore this
+// function) if it was signed by THIS RELAY'S OWN identity, which always
+// stamps `d` as TOP_LEVEL_GROUP_ID correctly -- so a stored metadata event
+// is guaranteed well-formed, and there is no remaining malformed case for
+// this function to special-case. See storeEvent's own comment for why the
+// check belongs there (by SIGNER) and not here (by `d` tag): a forged `d`
+// that merely reads TOP_LEVEL_GROUP_ID would defeat a check made here.
+//
+// NARROWER than "carries a group tag of some kind" -- see isAnyGroupEvent
+// below for that test, which two callers still need. This one backs the
+// PARTITION (storage.ts scopeOf, and the broadcast()/liveBroadcast()
+// mirrors of the REQ-time read gate), and an unauthenticated read is
+// measured against the partition: an event this relay did not host the
+// group for must land in the public partition, or a member of this
+// relay's one group ends up the only reader who can ever see somebody
+// else's.
 export function isGroupEvent(event: NostrEvent): boolean {
+  return groupIdOf(event) === TOP_LEVEL_GROUP_ID;
+}
+
+// The loose test isGroupEvent used to BE, before it was scoped to this
+// relay's own group: does this event carry a group tag at all, whatever
+// id it names? Two callers still need exactly that shape, and neither of
+// them is asking "is this ours to gate" -- unlike scopeOf and the
+// broadcast mirrors, which are:
+//
+//   - nip29.ts authorizeGroupWrite's early exit, so an event tagged into
+//     some OTHER id still reaches the one member list rather than sailing
+//     through as an ordinary write. The write gate's bypass concern (see
+//     TOP_LEVEL_GROUP_ID above) is about ANY foreign id, not only this
+//     relay's own.
+//   - relay.ts handleGiftWrap's refusal: a gift wrap addressed by `p` tag
+//     to one recipient and ALSO carrying a group tag is not a thing that
+//     means anything, whichever id that tag names -- the wrap's own
+//     addressing rule already contradicts it, so there is no reason to
+//     let a foreign id through where a local one would be refused.
+export function isAnyGroupEvent(event: NostrEvent): boolean {
   return isGroupMetadataKind(event.kind) || groupIdOf(event) !== null;
 }
 

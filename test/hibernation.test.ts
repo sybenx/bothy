@@ -26,6 +26,7 @@ import {
   VANISH_BATCH_SIZE,
   VANISH_ROWS_SHARE_LIMIT,
 } from "../src/limits";
+import { TOP_LEVEL_GROUP_ID } from "../src/groups";
 import { applyDeletion, storeEvent as store } from "../src/storage";
 import { storeEvent } from "../src/storage";
 import type { Relay } from "../src/relay";
@@ -222,8 +223,12 @@ describe("rows written per stored event", () => {
       content: "in the group",
       created_at: now,
       // `h` is a single-letter tag, so it costs a tag row of its own --
-      // hence one indexed tag each, not one against two.
-      tags: [["h", "some-group"]],
+      // hence one indexed tag each, not one against two. Tagged with
+      // TOP_LEVEL_GROUP_ID specifically -- isGroupEvent (groups.ts) now
+      // scopes the partition to this relay's own group id, so an
+      // arbitrary id would land in the PUBLIC partition instead and the
+      // comparison below would not be testing what it says it is.
+      tags: [["h", TOP_LEVEL_GROUP_ID]],
     });
 
     await runInDurableObject(stub, async (_instance: Relay, state) => {

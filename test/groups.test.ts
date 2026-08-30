@@ -1,10 +1,13 @@
 // NIP-29 group events, and the four surfaces they have to be excluded
 // from for an unauthenticated reader.
 //
-// An event belongs to a group when it carries an `h` tag (src/groups.ts) --
-// KIND-AGNOSTIC, so a kind-1 note, a kind-7 reaction and a kind-30023
-// long-form post are all group events if they name a group, and none of
-// the tests below lean on a kind range.
+// An event belongs to THIS RELAY'S group when it carries an `h` tag naming
+// TOP_LEVEL_GROUP_ID (src/groups.ts isGroupEvent) -- KIND-AGNOSTIC, so a
+// kind-1 note, a kind-7 reaction and a kind-30023 long-form post are all
+// group events if they name this relay's group, and none of the tests
+// below lean on a kind range. An `h` tag naming some OTHER group is a
+// different thing entirely -- see test/backfill.test.ts for that case,
+// which this file does not cover.
 //
 // The four surfaces, each with its own describe block, because each one
 // is reached by a different code path and an exclusion applied to one of
@@ -36,7 +39,11 @@ import { connectLiveFeed, connectRelay, publish, type RelayConn } from "./helper
 
 isolateStorage();
 
-const GROUP_ID = "bothy-test-group";
+// This relay hosts exactly one group, TOP_LEVEL_GROUP_ID -- isGroupEvent
+// now scopes the partition to that id specifically (groups.ts), so these
+// fixtures tag their notes with it directly rather than with an arbitrary
+// id of the test's own choosing.
+const GROUP_ID = TOP_LEVEL_GROUP_ID;
 
 function stub() {
   return env.RELAY.get(env.RELAY.idFromName("relay"));
@@ -74,26 +81,28 @@ async function authenticateAsOwner(conn: RelayConn, secretKeyHex = OWNER_SECRET_
 
 // Puts a pubkey into the group through the path the owner actually uses:
 // a kind-9000 put-user, which writes BOTH nested lists (src/nip29.ts).
-// Tagged with TOP_LEVEL_GROUP_ID rather than the GROUP_ID these tests
-// write their notes under, because membership is one relay-wide list and
-// the partition is id-agnostic -- which is exactly why a member admitted
-// to `_` reads this file's group traffic as well.
-async function makeMember(): Promise<Keypair> {
+// Tagged with TOP_LEVEL_GROUP_ID, same as GROUP_ID above -- this relay
+// hosts exactly one group and moderation events are always checked
+// against that id (nip29.ts authorizeGroupWrite), whatever id ordinary
+// group traffic happens to carry.
+// The put-user event itself is `h`-tagged into TOP_LEVEL_GROUP_ID, same as
+// GROUP_ID now, so it is returned alongside the keypair: a test collecting
+// `{"#h": [GROUP_ID]}` sees this moderation event in the results too, and
+// needs its id to say so.
+async function makeMember(): Promise<Keypair & { putUserId: string }> {
   const member = randomKeypair();
   const conn = await connectRelay();
-  const [, , ok] = await publish(
-    conn,
-    signEvent(OWNER_SECRET_KEY_HEX, {
-      kind: PUT_USER_KIND,
-      tags: [
-        ["h", TOP_LEVEL_GROUP_ID],
-        ["p", member.pubkeyHex],
-      ],
-    }),
-  );
+  const putUser = signEvent(OWNER_SECRET_KEY_HEX, {
+    kind: PUT_USER_KIND,
+    tags: [
+      ["h", TOP_LEVEL_GROUP_ID],
+      ["p", member.pubkeyHex],
+    ],
+  });
+  const [, , ok] = await publish(conn, putUser);
   expect(ok).toBe(true);
   conn.close();
-  return member;
+  return { ...member, putUserId: putUser.id };
 }
 
 async function collect(conn: RelayConn, subId: string, filter: unknown): Promise<string[]> {
@@ -121,6 +130,24 @@ describe("what makes an event a group event", () => {
     // it with an empty group.
     expect(isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, tags: [["h"]] }))).toBe(false);
     expect(isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, tags: [["h", ""]] }))).toBe(false);
+  });
+
+  // THE DEFECT THIS FIXES: isGroupEvent used to count ANY `h` tag as this
+  // relay's group, which meant an event backfilled from the owner's own
+  // history -- authored by them, but published to a DIFFERENT relay
+  // hosting a DIFFERENT NIP-29 group -- got filed into this relay's group
+  // partition anyway. That made a stranger's group content unreadable to
+  // anyone who is not a member of the one group this relay actually
+  // hosts. See test/backfill.test.ts for the same case exercised through
+  // applyBackfillPage and the stored `is_group` column.
+  it("does not count an `h` tag naming some OTHER relay's group", () => {
+    for (const kind of [1, 7, 11, 1063, 10002, 30023]) {
+      expect(
+        isGroupEvent(
+          signEvent(OWNER_SECRET_KEY_HEX, { kind, tags: [["h", "some-other-relays-group"]] }),
+        ),
+      ).toBe(false);
+    }
   });
 
   it("stores the partition on the event row and on every one of its tag rows", async () => {
@@ -273,8 +300,12 @@ describe("surface 1: REQ results", () => {
 
     // Naming the group is answered rather than refused now -- the same
     // filter the "restricts, rather than challenges" test above sends
-    // from a pubkey that authenticated and is not a member.
-    expect(await collect(conn, "memberGroup", { "#h": [GROUP_ID] })).toEqual([group.id]);
+    // from a pubkey that authenticated and is not a member. The put-user
+    // that admitted this member is itself `h`-tagged into GROUP_ID (now
+    // the same id as TOP_LEVEL_GROUP_ID), so it is in this result too.
+    expect((await collect(conn, "memberGroup", { "#h": [GROUP_ID] })).sort()).toEqual(
+      [group.id, member.putUserId].sort(),
+    );
     const both = await collect(conn, "memberKinds", { kinds: [1] });
     expect(both.sort()).toEqual([group.id, plain.id].sort());
     conn.close();

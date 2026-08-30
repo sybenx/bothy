@@ -40,7 +40,7 @@ import {
   GROUP_METADATA_KIND,
   GROUP_SCOPE,
   groupIdOf,
-  isGroupEvent,
+  isAnyGroupEvent,
   isGroupMetadataKind,
   TOP_LEVEL_GROUP_ID,
 } from "./groups";
@@ -201,8 +201,11 @@ export type GroupWriteAuthorization = { ok: true } | { ok: false; message: strin
 // by this function, and each has to answer for the group partition on its
 // own terms:
 //
-//   gift wrap    REFUSED OUTRIGHT if it is a group event (relay.ts
-//                handleGiftWrap). This was left open for one release on
+//   gift wrap    REFUSED OUTRIGHT if it carries a group tag naming ANY id
+//                (relay.ts handleGiftWrap, groups.ts isAnyGroupEvent --
+//                broader than the partition test on purpose, since a
+//                group tag on a wrap means nothing whichever id it names).
+//                This was left open for one release on
 //                the reasoning that it wrote INTO the partition rather
 //                than out of it, and the reasoning was wrong: a member
 //                who authenticates and reads the group receives the
@@ -229,7 +232,11 @@ export function authorizeGroupWrite(
   isOwner: boolean,
   nowSec: number,
 ): GroupWriteAuthorization {
-  if (!isGroupEvent(event) && !isModerationKind(event.kind)) return { ok: true };
+  // isAnyGroupEvent, not the partition test: an event tagged into some
+  // OTHER group still has to reach the member list below, or tagging `h`
+  // with anything other than `_` would be a way to dodge it entirely (see
+  // groups.ts TOP_LEVEL_GROUP_ID).
+  if (!isAnyGroupEvent(event) && !isModerationKind(event.kind)) return { ok: true };
 
   // NIP-29: these "MUST be created by the relay master key only (as stated
   // by the NIP-11 `self` pubkey)... Relays shouldn't accept these events if

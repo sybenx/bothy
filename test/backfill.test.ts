@@ -13,7 +13,9 @@ import {
   purgeSelfRelay,
   seedBackfillRelays,
 } from "../src/backfill";
+import { GROUP_MEMBERS_KIND, isGroupEvent, TOP_LEVEL_GROUP_ID } from "../src/groups";
 import { recordHost } from "../src/host";
+import { getRelayPubkey } from "../src/relay-identity";
 import {
   BACKFILL_ROWS_SHARE_LIMIT,
   MAX_CREATED_AT_FUTURE_SECONDS,
@@ -481,6 +483,108 @@ describe("backfill ingest", () => {
       const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [spoofed], true, 1000);
       expect(result.stored).toBe(0);
       expect(eventRows(sql, `WHERE id = '${spoofed.id}'`)).toHaveLength(0);
+    });
+  });
+
+  // THE DEFECT groups.ts isGroupEvent used to have: it counted ANY `h`
+  // tag as this relay's group, so an event backfilled here because the
+  // OWNER authored it -- but which the owner posted into a DIFFERENT
+  // NIP-29 group on a DIFFERENT relay -- got filed into this relay's own
+  // group partition anyway. That partition is a read gate (relay.ts
+  // handleReqInner and its broadcast()/liveBroadcast() mirrors), so the
+  // foreign group's content became unreadable to anyone who is not a
+  // member of the one group THIS relay hosts: a stranger's private
+  // conversation, elsewhere, hidden behind a membership list that has
+  // nothing to do with it.
+  it("stores a backfilled event carrying another relay's group tag as a PUBLIC event, not this relay's group event", async () => {
+    const foreign = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 1,
+      content: "posted into a group hosted by an entirely different relay",
+      tags: [["h", "someone-elses-group"]],
+      created_at: 1000,
+    });
+    expect(isGroupEvent(foreign)).toBe(false);
+
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [foreign], true, 1000);
+      expect(result.stored).toBe(1);
+
+      const row = sql
+        .exec<{ is_group: number }>(`SELECT is_group FROM events WHERE id = ?`, foreign.id)
+        .toArray()[0];
+      expect(row?.is_group).toBe(0);
+
+      // The tag rows carry the same partition -- the exclusion has to be
+      // seekable from the tag index too (storage.ts isIndexedTag).
+      const tagScopes = sql
+        .exec<{ is_group: number }>(`SELECT is_group FROM event_tags WHERE event_id = ?`, foreign.id)
+        .toArray();
+      expect(tagScopes.length).toBeGreaterThan(0);
+      expect(tagScopes.every((r) => r.is_group === 0)).toBe(true);
+    });
+  });
+
+  // The contrasting case: a backfilled event that really does name THIS
+  // relay's group still lands in the group partition, so the fix above is
+  // scoped to the id and not a blanket "backfill never partitions".
+  it("still stores a backfilled event naming this relay's own group as a group event", async () => {
+    const ours = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 1,
+      content: "posted into this relay's own group, backfilled from elsewhere",
+      tags: [["h", TOP_LEVEL_GROUP_ID]],
+      created_at: 1000,
+    });
+    expect(isGroupEvent(ours)).toBe(true);
+
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [ours], true, 1000);
+      expect(result.stored).toBe(1);
+      const row = sql
+        .exec<{ is_group: number }>(`SELECT is_group FROM events WHERE id = ?`, ours.id)
+        .toArray()[0];
+      expect(row?.is_group).toBe(1);
+    });
+  });
+
+  // THE SECOND SHAPE OF THE SAME BUG: NIP-29 requires 39000-series group
+  // metadata to be "signed by the relay keypair directly," and this
+  // relay's own generation (nip29.ts applyModeration) always does, always
+  // stamping `d` as TOP_LEVEL_GROUP_ID correctly. A 39000-series event
+  // backfilled under the OWNER's own key -- reached the same way as the
+  // foreign-`h` case above, because the owner personally signed and
+  // published it somewhere, which is already non-compliant on whatever
+  // relay accepted it -- is never this relay's own metadata, whatever its
+  // `d` tag happens to say. Checked by SIGNER rather than by `d`, because
+  // a `d`-tag check alone would accept a forged kind-39002 whose `d`
+  // merely reads TOP_LEVEL_GROUP_ID, indistinguishable from this relay's
+  // real member list to any `#d`-scoped filter too -- worse than the
+  // malformed-`d` case, not better.
+  it("refuses to store a 39000-series event backfilled under the owner's own key, not the relay's", async () => {
+    const forged = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: GROUP_MEMBERS_KIND,
+      content: "",
+      tags: [
+        ["d", TOP_LEVEL_GROUP_ID],
+        ["p", randomKeypair().pubkeyHex],
+      ],
+      created_at: 1000,
+    });
+
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      expect(forged.pubkey).not.toBe(getRelayPubkey(sql));
+
+      const result = applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [forged], true, 1000);
+      expect(result.stored).toBe(0);
+      expect(sql.exec(`SELECT 1 FROM events WHERE id = ?`, forged.id).toArray()).toHaveLength(0);
     });
   });
 

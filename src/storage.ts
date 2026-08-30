@@ -3,6 +3,7 @@ import {
   acrossScopes,
   GROUP_SCOPE,
   type GroupScope,
+  isGroupMetadataKind,
   PUBLIC_SCOPE,
   scopeOf,
 } from "./groups";
@@ -17,6 +18,7 @@ import {
 } from "./schema";
 import { addRowsWritten, takeRowsWritten, unlandedRowsWritten, withReadPath } from "./read-metrics";
 import { normalizeIp } from "./ip";
+import { getRelayPubkey } from "./relay-identity";
 import {
   dTagValue,
   type Filter,
@@ -971,6 +973,43 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent, ingestedAt: numbe
   }
 
   if (isAddressableKind(event.kind)) {
+    // NIP-29: 39000-series group metadata events "MUST be created by the
+    // relay master key only... Relays shouldn't accept these events if
+    // they're signed by anyone else." nip29.ts authorizeGroupWrite already
+    // refuses every client-submitted one of these outright, unconditionally
+    // -- but that gate sits ABOVE storeEvent, on the live write path only.
+    // backfill.ts applyBackfillPage is the other caller of storeEvent, and
+    // it bypasses that gate entirely: it can pull in anything the owner
+    // ever personally signed, including a kind in this range signed under
+    // their OWN key rather than the relay's, if they (or some client bug)
+    // ever published one elsewhere.
+    //
+    // Checked by SIGNER, not by the `d` tag it carries. groups.ts
+    // isGroupEvent used to accept a metadata-kind event with a missing or
+    // empty `d` as "ours" on the reasoning that hiding is safer than
+    // disclosing -- which protected against disclosure but not against
+    // AMBIGUITY: a bare `{"kinds":[39002]}` still can't tell that
+    // malformed row apart from this relay's own genuine member list, both
+    // landing in the same partition. Checking the `d` value instead of the
+    // signer would not have fixed that either -- a forged kind-39002
+    // signed by the owner's own key with `d` set to read TOP_LEVEL_GROUP_ID
+    // would pass a `d`-tag check and be genuinely indistinguishable from
+    // this relay's real member list to any `#d`-scoped filter too. The
+    // signer is the one thing a forgery cannot fake: only
+    // relay-identity.ts signAsRelay ever produces a signature this check
+    // accepts, and every event it signs (nip29.ts applyModeration) always
+    // stamps `d` as TOP_LEVEL_GROUP_ID correctly -- so a metadata-kind
+    // event that reaches insertEventRow below is guaranteed well-formed,
+    // and groups.ts isGroupEvent no longer needs a malformed case at all.
+    //
+    // Refused the same way a superseded replacement is (ok: true, nothing
+    // stored) rather than as a protocol-level error: the only caller that
+    // reaches this branch with such an event is backfill, which reads
+    // `stored` and nothing else (CLAUDE.md storage-semantics: "dropped
+    // rather than stored" is the same rule ephemeral kinds follow above).
+    if (isGroupMetadataKind(event.kind) && event.pubkey !== getRelayPubkey(sql)) {
+      return { ok: true, message: "", stored: null };
+    }
     const d = dTagValue(event.tags);
     // Both partitions, for the reason the replaceable branch above gives.
     const candidates = acrossScopes((scope) =>

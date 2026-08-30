@@ -16,6 +16,7 @@ import {
   CREATE_INVITE_KIND,
   filterNamesGroup,
   type GroupScope,
+  isAnyGroupEvent,
   isGroupEvent,
   PUBLIC_SCOPE,
 } from "./groups";
@@ -1087,24 +1088,24 @@ export class Relay extends DurableObject<Env> {
     // This path is dispatched ABOVE both write gates, so nothing below it
     // ever consults nip29.ts authorizeGroupWrite -- and storeEvent
     // partitions by groups.ts isGroupEvent, which asks only whether the
-    // event carries an `h` tag and not who sent it. A kind-1059 carrying
-    // one therefore landed in the group partition without any group
-    // authorization at all: unauthenticated injection into a private
-    // group's feed, delivered to every reader entitled to that partition,
-    // bounded by nothing but the gift wrap caps below.
+    // event is IN THIS RELAY'S OWN group. A kind-1059 carrying an `h` tag
+    // naming that group would land in the group partition without any
+    // group authorization at all: unauthenticated injection into a
+    // private group's feed, delivered to every reader entitled to that
+    // partition, bounded by nothing but the gift wrap caps below.
     //
     // Refused rather than partitioned differently, because a gift wrap
     // carrying a group tag is not a thing that means anything. NIP-59
     // addresses a wrap to a recipient by `p` tag and the sender is a
     // throwaway key; a group tag on top of that names a feed the wrap's
     // own recipient rule already contradicts. There is nothing to
-    // preserve, so the safe answer and the correct answer are the same.
-    //
-    // Tested with isGroupEvent and not with a hand-rolled `h` lookup, so
-    // that what is refused here is exactly what would have been
-    // partitioned there -- the two cannot drift apart into a rule that
-    // refuses one shape while the partition catches another.
-    if (isGroupEvent(event)) {
+    // preserve, so the safe answer and the correct answer are the same --
+    // whichever id that group tag names, not only this relay's own, so
+    // this is tested with isAnyGroupEvent (groups.ts) rather than
+    // isGroupEvent: a foreign id makes just as little sense on a wrap as
+    // this relay's own does, and there is no reason to let one through
+    // where the other is refused.
+    if (isAnyGroupEvent(event)) {
       ok(
         ws,
         event.id,

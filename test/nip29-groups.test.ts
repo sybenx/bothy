@@ -120,9 +120,19 @@ describe("the 39000-series and the group partition", () => {
       // The `h` rule would have said no -- there is no `h` tag here.
       expect(event.tags.some((t) => t[0] === "h")).toBe(false);
     }
-    // And a malformed one, naming no group at all, is still group state:
-    // the safe reading of a member list with no `d` is "hide it".
-    expect(isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind: 39002 }))).toBe(true);
+    // A malformed one -- naming no group at all -- is NOT group state by
+    // this test any more. It used to be, on the reasoning that the safe
+    // reading of a member list with no `d` is "hide it" -- which protected
+    // against disclosure but not against AMBIGUITY: a bare
+    // `{"kinds":[39002]}` still could not tell a malformed row apart from
+    // this relay's own genuine member list, both landing in the same
+    // partition. The disclosure risk is now closed a different way --
+    // storage.ts storeEvent refuses to store ANY 39000-series event not
+    // signed by this relay's own identity, regardless of its `d` tag, so a
+    // malformed one (like this one, signed by the owner rather than the
+    // relay) never reaches storage to need hiding. See test/backfill.test.ts
+    // for that refusal exercised through storeEvent directly.
+    expect(isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind: 39002 }))).toBe(false);
     // Neighbouring addressable kinds are untouched -- `d` identifies every
     // addressable event there is, so this cannot be a `d`-tag rule.
     expect(isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind: 30023, tags: [["d", "post"]] }))).toBe(
