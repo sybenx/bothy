@@ -1,3 +1,5 @@
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import type { OwnerProfile } from "./nip11";
 import type { Profile } from "./profile-lookup";
 import { acrossScopes } from "./groups";
@@ -148,6 +150,19 @@ export function isAllowedWriter(sql: SqlStorage, env: Env, pubkey: string): Writ
     : { allowed: false, reason: "not-follow" };
 }
 
+// Fingerprint of a follow set, in the style of schema.ts
+// computeSchemaHash and for the same reason: derived from the content it
+// describes, so it cannot be forgotten, only recomputed. Sorted before
+// hashing, because a set has no order and two kind-3s listing the same
+// people in a different tag order are the same follow set. Built over the
+// deduplicated set rather than the raw tags, so a list that repeats a
+// pubkey hashes the same as one that does not -- which matches what the
+// rebuild below actually stores, since `follows.pubkey` is a PRIMARY KEY
+// that would collapse the duplicates anyway.
+export function computeFollowsHash(follows: ReadonlySet<string>): string {
+  return bytesToHex(sha256(new TextEncoder().encode(JSON.stringify([...follows].sort()))));
+}
+
 // Re-derives the follow cache from the owner's own most recent kind-3
 // event already stored on this relay -- not a fresh fetch from other
 // relays. This relay is in the owner's relay list by construction (it's
@@ -169,28 +184,68 @@ export function isAllowedWriter(sql: SqlStorage, env: Env, pubkey: string): Writ
 // published it elsewhere first) -- so a tick that finds nothing new is
 // the normal case, not the exception, and it should cost nothing.
 //
-// `follows.fetched_at` is what makes the comparison possible, and it now
-// holds the `created_at` of the kind-3 the rows were derived FROM rather
-// than the wall clock at which they were written. That is the same
-// watermark `owner.profile_synced_at` is for kind-0, kept in this table
-// rather than on the `owner` row because there may not BE an owner row:
-// OWNER_PUBKEY skips the claim flow that creates it (see refreshProfile),
-// and a cache keyed to a row that does not exist is a cache that never
-// compares. Every row carries the same value, so reading one answers for
-// all of them -- one row read per call.
+// "Nothing new" is decided by CONTENT, not by timestamp:
+// `relay_meta.follows_hash` holds a fingerprint of the follow set the
+// cache was last rebuilt from (computeFollowsHash above), and a kind-3
+// whose parsed set hashes to the same value writes nothing, whatever its
+// created_at says. The previous guard compared created_at watermarks,
+// which is a proxy for "the follows changed" rather than a measurement
+// of it, and the gap between the two was not hypothetical: many clients
+// re-sign and republish an UNCHANGED contact list as a matter of course
+// (a "broadcast", a login, a settings save), each one a legitimately
+// newer replaceable event that storeEvent stores and acceptEvent then
+// hands to this function -- which rebuilt the whole table to reproduce
+// its own contents, 3F + 1 rows per touch, at whatever frequency the
+// owner's clients happened to choose. Measured live: ~7,700 of an
+// 18-hour window's 8,158 rows written, from 34 events ingested.
+// The timestamp guard also missed in the OTHER direction: NIP-01 breaks
+// an equal-created_at tie by lowest id, so a replacement at the identical
+// second could change the content while the watermark stood still. The
+// hash catches both, because it looks at the thing itself.
 //
-// Compared by equality rather than by "is the stored list newer". A
-// replaceable event's created_at only moves forward (NIP-01, and
-// MAX_CREATED_AT_FUTURE_SECONDS bounds the other end), so the two orderings
-// agree on every real change; equality additionally forces exactly one
-// rebuild on the first call after an upgrade, when the stored watermark
-// is a wall-clock second left by the old code and cannot match any
-// event's created_at. What neither form catches is a replacement
-// published at the identical created_at as the event it replaces -- NIP-01
-// resolves that tie by id, so the content can change while the timestamp
-// does not. refreshProfile has carried exactly that exposure since it was
-// written; noted here rather than defended against, since the cost of
-// defending is the 900 rows this change exists to stop paying.
+// What the check costs: one row read for the stored hash, plus a parse
+// and a sha256 over the ONE event body the function has already fetched
+// -- CPU linear in the list, storage flat in it, which is the constraint
+// that matters here (reading the F cached rows back to compare would
+// also have scaled with F, on a path that runs on every owner kind-3
+// publish and every cron tick). At 334 follows the hash is ~21KB through
+// sha256, well under the ~1.1ms schnorr verify every stored event
+// already pays (validate.ts).
+//
+// The hash lives on `relay_meta` (single row, seeded by initSchema)
+// rather than on the `owner` row, for the reason `follows.fetched_at`
+// already does: OWNER_PUBKEY skips the claim flow that creates the owner
+// row (see refreshProfile), and a watermark keyed to a row that may not
+// exist is a watermark that never compares. It is written only AFTER a
+// rebuild completes -- the schema_meta pattern (schema.ts initSchema):
+// a rebuild that throws partway leaves the previous hash standing, the
+// next call finds the mismatch again and retries from the DELETE, and
+// the half-written table never gets mistaken for a finished one.
+// `follows.fetched_at` still records the created_at of the kind-3 whose
+// SET last differed -- deliberately not advanced when an identical list
+// arrives under a newer timestamp, since touching it would cost the F
+// row writes this guard exists to not spend, to restate a list that did
+// not change.
+//
+// When the set genuinely DID change, the rebuild below is still
+// delete-everything-reinsert-everything -- 3F + 2 rows to add one
+// follow, the same shape of problem this guard fixes, one layer down.
+// Left that way deliberately, for now: the identical-republish case
+// fires at client-automation frequency (unbounded by human intent,
+// which is what made it dominate the live budget), while a genuine
+// follow/unfollow fires at human-action frequency -- a handful a day,
+// ~1,000 rows each at the live relay's 334 follows, real but bounded by
+// the owner actually doing something. A delta rebuild would cost F rows
+// READ per change (the current membership has to come from somewhere)
+// to write ~3 rows per actual delta -- a good trade of the plentiful
+// ceiling for the scarce one -- but it also requires moving
+// `fetched_at` off the per-row schema (delta-updated rows would
+// disagree on it, and rewriting it on all F rows re-spends what the
+// delta saved), which drags storage.ts followsListAt and the audit
+// along. Worth doing if follow counts grow toward the thousands, where
+// one change is ~3F rows and a day of ordinary follow activity starts
+// to crowd the budget; not worth the refactor to shave a cost that
+// human-rate actions bound today.
 export function refreshFollows(sql: SqlStorage, env: Env): void {
   const owner = getOwnerPubkey(sql, env);
   if (owner === null || !allowFollowsEnabled(env)) return;
@@ -213,14 +268,17 @@ export function refreshFollows(sql: SqlStorage, env: Env): void {
       .toArray(),
   ).sort((a, b) => b.created_at - a.created_at)[0];
 
-  const cachedFrom = sql
-    .exec<{ fetched_at: number }>(`SELECT fetched_at FROM follows LIMIT 1`)
-    .toArray()[0]?.fetched_at;
+  const storedHash =
+    sql.exec<{ follows_hash: string | null }>(`SELECT follows_hash FROM relay_meta LIMIT 1`).toArray()[0]
+      ?.follows_hash ?? null;
 
   if (!latest) {
     // The contact list is gone -- deleted, vanished, or never stored.
     // Only pay for the DELETE if there is something to delete; an empty
-    // cache on a relay with no kind-3 is already the right answer.
+    // cache on a relay with no kind-3 is already the right answer. The
+    // hash alone cannot decide that: a relay upgrading to this column
+    // has follows rows and a NULL hash, so the table is checked directly
+    // -- one row read, only on the no-kind-3 path.
     //
     // The counter moves with the DELETE and inside the same branch, not
     // after the `if`: this is one of exactly two places that write the
@@ -228,19 +286,28 @@ export function refreshFollows(sql: SqlStorage, env: Env): void {
     // update parked at the function's exit would be a separate step that
     // an early return could skip -- which is precisely what the two
     // returns above it do on the common path.
-    if (cachedFrom !== undefined) {
+    const hasCache = sql.exec(`SELECT 1 FROM follows LIMIT 1`).toArray().length > 0;
+    if (hasCache || storedHash !== null) {
       sql.exec(`DELETE FROM follows`);
       setFollowCount(sql, 0);
+      sql.exec(`UPDATE relay_meta SET follows_hash = NULL`);
     }
     return;
   }
-  if (cachedFrom === latest.created_at) return;
 
-  sql.exec(`DELETE FROM follows`);
   const tags = JSON.parse(latest.tags) as string[][];
   const follows = new Set(
     tags.filter((t) => t[0] === "p" && t[1]).map((t) => t[1] as string),
   );
+  // The content check -- see the header comment for why this is a hash
+  // of the set rather than a created_at watermark. A NULL stored hash
+  // (fresh relay, or first call after the upgrade that added the column)
+  // never equals a real one, so both rebuild exactly once and then
+  // settle.
+  const hash = computeFollowsHash(follows);
+  if (hash === storedHash) return;
+
+  sql.exec(`DELETE FROM follows`);
   for (const pubkey of follows) {
     sql.exec(`INSERT INTO follows (pubkey, fetched_at) VALUES (?, ?)`, pubkey, latest.created_at);
   }
@@ -251,11 +318,16 @@ export function refreshFollows(sql: SqlStorage, env: Env): void {
   // what was actually inserted, since a contact list may repeat a pubkey
   // and the table's PRIMARY KEY would collapse the duplicates.
   //
-  // Rows written: 1, on top of the hundreds this rebuild already costs,
-  // and only when the list has genuinely changed -- the equality check
-  // above returns before reaching here on every other call. That is the
-  // whole price of `/api/stats` no longer counting `follows` per request.
+  // Rows written: 2, on top of the hundreds this rebuild already costs,
+  // and only when the list has genuinely changed -- the hash check above
+  // returns before reaching here on every other call. That is the whole
+  // price of `/api/stats` no longer counting `follows` per request.
   setFollowCount(sql, follows.size);
+  // The hash lands LAST, after every row it vouches for -- the
+  // schema_meta ordering (see the header comment). Written even for an
+  // empty set: hash-of-empty is a real fingerprint, and NULL is reserved
+  // for "no cache", which the clear branch above owns.
+  sql.exec(`UPDATE relay_meta SET follows_hash = ?`, hash);
 }
 
 // Re-derives the cached name/picture (backing NIP-11's icon and

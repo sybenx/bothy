@@ -187,19 +187,20 @@ describe("follow cache rebuild: does an unchanged or backfill-superseded kind-3 
       // storeEvent's replaceable-kind branch refuses every one of these
       // (isSupersededBy: existing.created_at > candidate.created_at) --
       // "stored: null", no DELETE, no INSERT. The cached kind-3 never
-      // changes, so cachedFrom === latest.created_at holds on every one
-      // of the 24 subsequent refreshFollows calls too.
+      // changes, so refreshFollows finds nothing to do on every one of
+      // the 24 subsequent calls too.
       //
       // If this is nonzero, the hypothesis as stated -- backfill ingesting
-      // OLDER history retriggers the rebuild -- is confirmed. If it is
-      // zero, that specific mechanism is killed and the ~39,000 unaccounted
-      // rows on the live relay come from elsewhere (a genuinely NEWER
-      // kind-3 surfacing from a not-yet-exhausted relay, which would
-      // rebuild once and then stabilize, not 24 times; or a different
-      // "cron" sub-task entirely, most plausibly an active NIP-62 vanish
-      // drain -- see stats.vanishing on /api/stats, and
-      // limits.ts VANISH_ROWS_SHARE_LIMIT for how large that alone can get
-      // in a day).
+      // OLDER history retriggers the rebuild -- is confirmed. It was zero,
+      // and the unaccounted rows were subsequently traced to the MIRROR
+      // case this test's fixture could not produce: a genuinely NEWER
+      // kind-3 carrying an UNCHANGED follow set, which clients republish
+      // as a matter of course and which the then-current created_at
+      // watermark could not tell from a real change. That case is fixed
+      // by comparing the set itself (ownership.ts computeFollowsHash) and
+      // pinned in test/follows.test.ts's identical-republish test; this
+      // one stays as the record of the hypothesis that was tested first
+      // and the direction it ruled out.
       expect(cost).toBe(0);
 
       const stillCached = sql.exec(`SELECT COUNT(*) AS n FROM follows`).toArray()[0] as { n: number };

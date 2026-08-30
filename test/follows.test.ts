@@ -153,11 +153,14 @@ describe("NIP-86 banpubkey/allowpubkey write gate (phase two)", () => {
 
       const build = measureRowsWritten(sql, (s) => refreshFollows(s, FOLLOWS_ENV));
       // 2 per follow to insert (the row and its primary key index),
-      // nothing to delete on a cache that was empty, and 1 for the
-      // maintained follow count (schema.ts `maintained_counts`) -- one row
-      // against the hundred this rebuild already costs, and the reason
-      // /api/stats no longer counts `follows` per request.
-      expect(build).toBe(2 * follows.length + 1);
+      // nothing to delete on a cache that was empty, 1 for the maintained
+      // follow count (schema.ts `maintained_counts`), and 1 for the
+      // set fingerprint on relay_meta (ownership.ts computeFollowsHash)
+      // -- two rows against the hundred this rebuild already costs, and
+      // what they buy respectively is /api/stats no longer counting
+      // `follows` per request, and the unchanged-republish case below
+      // costing nothing at all.
+      expect(build).toBe(2 * follows.length + 2);
 
       const unchanged = measureRowsWritten(sql, (s) => refreshFollows(s, FOLLOWS_ENV));
       // Zero, counter included. This is the assertion that says the
@@ -167,6 +170,67 @@ describe("NIP-86 banpubkey/allowpubkey write gate (phase two)", () => {
       // that had not changed.
       expect(unchanged).toBe(0);
       // And the cache it declined to rebuild is still the right one.
+      expect(isAllowedWriter(sql, FOLLOWS_ENV, follows[0]!).allowed).toBe(true);
+      expect(readMaintainedCounts(sql).follows).toBe(follows.length);
+    });
+  });
+
+  it("writes nothing beyond the event itself when an identical contact list is republished with a fresh created_at", async () => {
+    // THE DEFECT THIS PINS: many clients re-sign and republish an
+    // UNCHANGED contact list as a matter of course -- a "broadcast", a
+    // login, a settings save. Each republish is a legitimately newer
+    // replaceable event (fresh created_at, fresh id, fresh sig), so
+    // storeEvent stores it and relay.ts acceptEvent hands it to
+    // refreshFollows -- which, deciding by created_at watermark, rebuilt
+    // the whole follows table to reproduce its own contents: 3F + 1 rows
+    // per touch, at whatever frequency the owner's clients chose.
+    // Measured live before the fix: ~7,700 of an 18-hour window's 8,158
+    // rows written, from 34 events ingested. refreshFollows now decides
+    // by a fingerprint of the follow SET (relay_meta.follows_hash), so a
+    // timestamp that moved over an unchanged set writes nothing.
+    const follows = Array.from({ length: 50 }, () => randomKeypair().pubkeyHex);
+    const now = Math.floor(Date.now() / 1000);
+    const original = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 3,
+      tags: follows.map((pubkey) => ["p", pubkey]),
+      created_at: now,
+    });
+
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      storeEvent(sql, original, now);
+      refreshFollows(sql, FOLLOWS_ENV);
+
+      // The republish, exactly as a client "broadcast" produces it: the
+      // same follow set -- here in REVERSED tag order, with one pubkey
+      // repeated, both of which real clients emit and neither of which
+      // changes the SET -- under a new created_at, so it is a different
+      // event with a different id that storeEvent genuinely replaces the
+      // old one with.
+      const republished = signEvent(OWNER_SECRET_KEY_HEX, {
+        kind: 3,
+        tags: [...follows]
+          .reverse()
+          .map((pubkey) => ["p", pubkey])
+          .concat([["p", follows[0]!]]),
+        created_at: now + 3600,
+      });
+      // The event itself costs real rows -- a replaceable replacement,
+      // stored like any other -- which is what "beyond the event itself"
+      // measures against.
+      const eventItself = measureRowsWritten(sql, (s) => {
+        expect(storeEvent(s, republished, now + 3600).stored).not.toBeNull();
+      });
+      expect(eventItself).toBeGreaterThan(0);
+
+      // The refresh that acceptEvent fires on that store: ZERO. Before
+      // the hash guard this was the full 3F + 1 rebuild, every time.
+      expect(measureRowsWritten(sql, (s) => refreshFollows(s, FOLLOWS_ENV))).toBe(0);
+
+      // And it declined because nothing changed, not because it never
+      // looked: the cache still admits the same set.
       expect(isAllowedWriter(sql, FOLLOWS_ENV, follows[0]!).allowed).toBe(true);
       expect(readMaintainedCounts(sql).follows).toBe(follows.length);
     });

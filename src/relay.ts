@@ -1438,10 +1438,27 @@ export class Relay extends DurableObject<Env> {
 
     // Per-pubkey write throttle (limits.ts). Still ahead of every
     // id/tombstone/signature check -- it's a Map lookup, so it is cheaper
-    // than the storage read below and far cheaper than schnorr. The owner
-    // is exempt: they cannot meaningfully abuse their own relay, and a
-    // client replaying a backlog after being offline is a normal thing for
-    // an owner to do and an abnormal thing for a follow to do. Ephemeral
+    // than the storage read below and far cheaper than schnorr.
+    //
+    // The owner is exempt -- NOT because ordinary owner traffic cannot
+    // cost anything (it can: an unchanged kind-3 republished by a client
+    // as a matter of course used to trigger a full follow-cache rebuild,
+    // ~3F + 1 rows a touch with no abuse anywhere in it, until
+    // ownership.ts refreshFollows started comparing content instead of
+    // timestamps), but because the budget this cap protects is the
+    // owner's own. CLAUDE.md "Threat model" already draws the line:
+    // "Nothing here defends the relay against its own owner, and the
+    // storage and rate caps deliberately exempt them." Refusing the
+    // owner's events would spend the thing the relay exists for --
+    // storing what they publish, a replayed post-offline backlog
+    // included, which arrives at exactly the burst rate a cap would
+    // refuse -- to conserve a resource that is theirs to spend and whose
+    // spend their own admin page already shows (rowsWrittenToday). And
+    // the kind-3 lesson says a cap here was never the right tool for
+    // that shape anyway: it bounds event FREQUENCY, while the damage was
+    // cost PER EVENT -- a few touches a day, far under any plausible
+    // rate, at ~1,000 rows each. Costs like that get fixed by making
+    // them not scale, not by throttling the principal. Ephemeral
     // kinds are exempt too: this throttle exists to bound rows written
     // (limits.ts MAX_EVENTS_PER_PUBKEY_PER_WINDOW), and storeEvent writes
     // zero rows for an ephemeral event -- there is nothing here for the
