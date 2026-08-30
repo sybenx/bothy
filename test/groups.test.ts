@@ -28,7 +28,7 @@ import { env, exports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { buildFilterQuery } from "../src/filters";
-import { GROUP_SCOPE, isGroupEvent, PUBLIC_SCOPE, TOP_LEVEL_GROUP_ID } from "../src/groups";
+import { GROUP_MEMBERS_KIND, GROUP_SCOPE, isGroupEvent, PUBLIC_SCOPE, TOP_LEVEL_GROUP_ID } from "../src/groups";
 import { PUT_USER_KIND } from "../src/nip29";
 import type { Relay } from "../src/relay";
 import { auditMaintainedCounts, fixMisclassifiedGroupEvents, readMaintainedCounts } from "../src/storage";
@@ -243,7 +243,7 @@ describe("fixMisclassifiedGroupEvents: the one-time partition correction", () =>
 
       const before = readMaintainedCounts(sql);
 
-      expect(fixMisclassifiedGroupEvents(sql, 100)).toBe(1);
+      expect(fixMisclassifiedGroupEvents(sql, state.storage, 100)).toBe(1);
 
       const foreignRow = sql
         .exec<{ is_group: number }>(`SELECT is_group FROM events WHERE id = ?`, foreign.id)
@@ -266,7 +266,7 @@ describe("fixMisclassifiedGroupEvents: the one-time partition correction", () =>
       // Idempotent: the guard flag is now set, so a second call finds
       // nothing (the row already dropped out of `is_group = 1`) and costs
       // one bounded, empty query rather than repeating the fix.
-      expect(fixMisclassifiedGroupEvents(sql, 100)).toBe(0);
+      expect(fixMisclassifiedGroupEvents(sql, state.storage, 100)).toBe(0);
 
       // And the counters this migration touched stay internally
       // consistent with the table -- auditMaintainedCounts finds no drift.
@@ -276,18 +276,20 @@ describe("fixMisclassifiedGroupEvents: the one-time partition correction", () =>
     });
   });
 
-  // THE SPECIFIC MECHANISM, exercised rather than assumed: candidacy is
-  // keyed to events.is_group, the same column the fix flips FIRST (a
-  // single UPDATE, atomic on its own). This simulates a cron tick that
-  // died immediately after that one statement -- the earliest point a
-  // crash could leave anything behind -- by applying it by hand and
-  // nothing else, then calling the migration again exactly as the next
-  // cron tick would. If candidacy were keyed to the tag row's own
-  // `is_group` copy instead (as an earlier version of this migration was),
-  // this row would still match the tag-index seek and the second call
-  // would decrement group_events a second time for an event it had
-  // already (partially) fixed.
-  it("does not double-decrement when a prior run flipped events.is_group but got no further", async () => {
+  // The migration itself cannot produce this state any more -- each
+  // candidate's read-check-fix sequence runs inside storage.transactionSync,
+  // so a crash mid-fix rolls back to exactly where it started (see the
+  // header comment above). This constructs the half-flipped state by hand
+  // instead -- events.is_group already 0, event_tags and every counter
+  // still describing it as a group event -- as a hostile-input-style
+  // check: whatever produced a row shaped like this (a hand edit, a bug
+  // somewhere else entirely), a re-run must not find it, must not touch
+  // its counters again, and must not double-decrement group_events. It
+  // is also the reason candidacy is keyed to events.is_group rather than
+  // the tag row's own copy: with the tag-row-keyed version this migration
+  // used before, this exact row would still match the tag-index seek and
+  // the call below would decrement group_events a second time.
+  it("does not double-decrement a row it finds already half-flipped by something else", async () => {
     await runInDurableObject(stub(), async (_instance: Relay, state) => {
       const sql = state.storage.sql;
       const now = Math.floor(Date.now() / 1000);
@@ -332,9 +334,9 @@ describe("fixMisclassifiedGroupEvents: the one-time partition correction", () =>
         hour,
       );
 
-      // The crash: only the very first statement the fix issues has run.
-      // event_tags.is_group, and all three counters, are exactly as wrong
-      // as they were before any fix was attempted.
+      // The hand-constructed inconsistency: only events.is_group has
+      // moved. event_tags.is_group, and all three counters, are exactly
+      // as wrong as they were before any fix was attempted.
       sql.exec(`UPDATE events SET is_group = 0 WHERE id = ?`, foreign.id);
 
       const stillPending = readMaintainedCounts(sql);
@@ -343,7 +345,7 @@ describe("fixMisclassifiedGroupEvents: the one-time partition correction", () =>
       // The next cron tick's call. It must find nothing for this row --
       // events.is_group is already 0 -- and so must not touch
       // group_events, its hour bucket, or its ingest bucket again.
-      expect(fixMisclassifiedGroupEvents(sql, 100)).toBe(0);
+      expect(fixMisclassifiedGroupEvents(sql, state.storage, 100)).toBe(0);
 
       const after = readMaintainedCounts(sql);
       expect(after.groupEvents).toBe(stillPending.groupEvents);
@@ -353,15 +355,99 @@ describe("fixMisclassifiedGroupEvents: the one-time partition correction", () =>
         .toArray()[0];
       expect(bucket?.group_n).toBe(1);
 
-      // The one row this leaves behind: event_tags never caught up with
-      // events for this specific id. Documented as the accepted, safe-
-      // direction residue in fixMisclassifiedGroupEvents' own comment --
-      // asserted here so a future change that claims to "fix" this
-      // doesn't silently start double-decrementing instead.
+      // What this hand-constructed state leaves behind: event_tags never
+      // caught up with events for this specific id, because nothing in
+      // this test asked it to (the migration itself no longer produces
+      // this gap -- see the comment above). Asserted so a future change
+      // that removes the events.is_group-keyed candidacy check doesn't
+      // silently start double-decrementing a row like this instead.
       const tagRow = sql
         .exec<{ is_group: number }>(`SELECT is_group FROM event_tags WHERE event_id = ?`, foreign.id)
         .toArray()[0];
       expect(tagRow?.is_group).toBe(GROUP_SCOPE);
+    });
+  });
+
+  // Population 2: a 39000-series event admitted by the pre-fix code
+  // because nothing checked who signed it. De-flagging it into the
+  // public partition would not have ended the ambiguity it causes -- an
+  // owner-or-member reader merges both partitions, so a de-flagged copy
+  // would still sit next to this relay's genuine member list -- so this
+  // one is deleted outright rather than reclassified.
+  it("purges a pre-existing 39000-series row not signed by this relay, rather than de-flagging it", async () => {
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      const hour = Math.trunc(now / 3600);
+
+      // Signed by the OWNER, not the relay's own identity -- exactly the
+      // shape backfill could admit before storeEvent refused it.
+      const forged = signEvent(OWNER_SECRET_KEY_HEX, {
+        kind: GROUP_MEMBERS_KIND,
+        content: "",
+        tags: [
+          ["d", TOP_LEVEL_GROUP_ID],
+          ["p", randomKeypair().pubkeyHex],
+        ],
+        created_at: now,
+      });
+      sql.exec(
+        `INSERT INTO events
+           (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost, is_group)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 1)`,
+        forged.id,
+        forged.pubkey,
+        forged.created_at,
+        forged.kind,
+        JSON.stringify(forged.tags),
+        forged.content,
+        forged.sig,
+        now,
+        12,
+      );
+      sql.exec(
+        `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at, is_group)
+         VALUES ('d', ?, ?, ?, 1), ('p', ?, ?, ?, 1)`,
+        TOP_LEVEL_GROUP_ID,
+        forged.id,
+        now,
+        forged.tags[1]![1],
+        forged.id,
+        now,
+      );
+      sql.exec(`UPDATE maintained_counts SET events = events + 1, group_events = group_events + 1`);
+      sql.exec(
+        `INSERT INTO event_hour_counts (hour, n, group_n) VALUES (?, 1, 1)
+           ON CONFLICT(hour) DO UPDATE SET n = n + 1, group_n = group_n + 1`,
+        hour,
+      );
+      sql.exec(
+        `INSERT INTO ingest_hour_counts (hour, n, group_n, rows_written) VALUES (?, 1, 1, 24)
+           ON CONFLICT(hour) DO UPDATE SET n = n + 1, group_n = group_n + 1, rows_written = rows_written + 24`,
+        hour,
+      );
+
+      const before = readMaintainedCounts(sql);
+
+      expect(fixMisclassifiedGroupEvents(sql, state.storage, 100)).toBe(1);
+
+      // Gone entirely -- not de-flagged into the public partition.
+      expect(sql.exec(`SELECT 1 FROM events WHERE id = ?`, forged.id).toArray()).toHaveLength(0);
+      expect(sql.exec(`SELECT 1 FROM event_tags WHERE event_id = ?`, forged.id).toArray()).toHaveLength(0);
+
+      // A real removal, unlike population 1's reclassification: BOTH
+      // halves of maintained_counts move, not just the group half.
+      const after = readMaintainedCounts(sql);
+      expect(after.events).toBe(before.events - 1);
+      expect(after.groupEvents).toBe(before.groupEvents - 1);
+
+      // Idempotent, and for the reason deleteEventRow already guards:
+      // nothing left to find.
+      expect(fixMisclassifiedGroupEvents(sql, state.storage, 100)).toBe(0);
+
+      sql.exec(`UPDATE maintained_counts SET audited_at = NULL`);
+      auditMaintainedCounts(sql, now);
+      expect(readMaintainedCounts(sql).drift).toBeNull();
     });
   });
 });

@@ -875,52 +875,75 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
 // candidate for "this group's member list" alongside the relay's genuine
 // one, which is worse than hidden: it is ambiguous.
 //
+// THE TWO POPULATIONS ARE FIXED DIFFERENTLY, and that is deliberate.
+// Population 1 is de-flagged into the PUBLIC partition -- it is somebody
+// else's ordinary content, wrongly gated, and belongs there once ungated.
+// Population 2 is DELETED outright, not de-flagged, because de-flagging
+// alone does not close the ambiguity it exists to fix: an owner-or-member
+// reader is the one actually entitled to ask `{"kinds":[39002]}`, and that
+// reader's REQ merges BOTH partitions (relay.ts handleReqInner: `scopes =
+// mayReadGroups ? ALL_SCOPES : [PUBLIC_SCOPE]`), so a de-flagged copy
+// would still turn up alongside this relay's genuine member list -- the
+// exact ambiguity this migration exists to end, surviving for the one
+// audience it matters to. De-flagging population 2 would also be a NEW
+// disclosure: an entirely ordinary, group-unrelated `{"authors":[owner]}`
+// from an unauthenticated client would start returning it once it sat in
+// the public partition, since filterNamesGroup only refuses a filter that
+// NAMES a group or a metadata kind, and an authors-only filter does
+// neither. Deletion is safe unconditionally because storeEvent's own
+// signer check (below) means no event shaped like this can ever be
+// re-admitted -- there is nothing left to preserve and nothing this purge
+// could need to run twice for.
+//
 // BATCHED, and deliberately without a separate cursor. Every call asks the
 // group partition's own indexes for up to `limit` candidates -- the same
 // bounded-request shape hasVanishTargets/drainVanish already use to make a
 // cost this relay cannot avoid a fixed one instead of a table scan. `limit`
 // is VANISH_BATCH_SIZE at the one call site (relay.ts runCronInner) --
-// reused rather than a constant invented for this, because the write shape
-// is the same one VANISH_BATCH_SIZE is already paced against: an UPDATE
-// that moves a row's `is_group` between partitions retires its old
-// partial-index entries and writes new ones, the same index-maintenance
-// cost schema.ts eventRemovalBudget prices for a removal.
+// reused rather than a constant invented for this, because both fixes
+// share its cost shape: population 1's UPDATE moves a row's `is_group`
+// between partitions, retiring its old partial-index entries and writing
+// new ones, and population 2's DELETE removes them outright -- the same
+// index-maintenance cost schema.ts eventRemovalBudget prices for a
+// removal, which is exactly what VANISH_BATCH_SIZE is paced against.
 //
-// CANDIDACY IS KEYED TO events.is_group, THE SAME COLUMN THE FIX FLIPS
-// FIRST -- and that is what makes a re-run after ANY crash point safe
-// rather than merely "looks fine." Population 1's candidate query joins
-// event_tags to events and requires e.is_group = 1 (not just the tag
-// row's own copy of it) alongside the tag-index seek; population 2's
-// query is against `events` directly. So once `UPDATE events SET
-// is_group = 0` commits for a row -- the FIRST statement the fix below
-// issues, and a single statement is atomic on its own -- that row can
-// never be selected as a candidate again, by either branch, regardless of
-// which of the later statements (event_tags, then the three counters) a
-// crash left unexecuted. A re-run therefore cannot re-decrement
-// maintained_counts/event_hour_counts/ingest_hour_counts for a row it has
-// already flipped -- there is nothing left to find it by. This was NOT
-// true of the first version of this migration, which kept the tag-index
-// seek keyed to the tag row's OWN is_group copy: a crash between the
-// events flip and the event_tags flip left the row rediscoverable via its
-// still-`is_group = 1` tag row while the refetch below (which already
-// required events.is_group = 1) found nothing and skipped it forever --
-// safe against double-decrementing, but never terminating for that row
-// either, since group_scope_fixed can only ever be set once a call finds
-// zero candidates.
+// EACH CANDIDATE'S FIX RUNS INSIDE storage.transactionSync, which is what
+// makes a crash mid-fix leave NO residue at all, rather than merely a
+// SAFE one.
 //
-// What a crash between the events flip and the remaining statements DOES
-// still leave behind: that one row's event_tags copy, and whichever of
-// the three counters had not yet been decremented, permanently wrong by
-// one. That is the safe direction to be wrong in -- a permanently
-// UNDER-decremented `group_events` makes the public `totalEvents` figure
-// (events - group_events) read slightly LOW, never high, so it never
-// attributes a group event's existence to the public count. The daily
-// audit (auditMaintainedCounts) reports it if the affected hour bucket is
-// still inside its 24h window; outside that window it is a silent,
-// bounded, one-row drift rather than a growing one. Fixing it would mean
-// re-deriving "was this row's counters actually applied" from data this
-// migration does not keep, which is the kind of state a bearer-token-sized
-// bug does not justify adding.
+// Cloudflare's SQLite-backed Durable Object storage commits each
+// `SqlStorage.exec()` call independently; there is no cross-statement
+// atomicity without asking for it, and asking for it with raw SQL is
+// refused outright ("please use the state.storage.transaction() or
+// state.storage.transactionSync() APIs instead of the SQL BEGIN
+// TRANSACTION or SAVEPOINT statements", confirmed against the real
+// runtime). transactionSync's actual contract, also confirmed directly:
+// an exception thrown inside its closure rolls back every write the
+// closure made, including writes issued through instrumentSql's Proxy
+// wrapper around the same underlying connection (relay.ts's `this.sql`
+// is never the raw object). That is exactly what an interrupted cron
+// tick needs: either the whole read-check-fix sequence for one candidate
+// happened, or none of it did. A crash between population 1's `events`
+// flip and its `event_tags` flip therefore cannot leave the two columns
+// disagreeing -- the transaction that would have produced that
+// disagreement never committed anything, and the SAME candidate query
+// rediscovers the row on the next call exactly as it was before this
+// call started. Same for population 2's deleteEventRow: either the row
+// and its counters are gone, or nothing happened.
+//
+// This replaces an earlier version of this migration that relied on
+// STATEMENT ORDERING instead -- candidacy keyed to whichever field the
+// fix touched first, so a re-run could not double-decrement a counter.
+// That version could still leave a stale `event_tags.is_group` behind on
+// a crash between the two flips, reasoned about at the time as a safe,
+// bounded, one-row residue. It was not: filters.ts buildFilterQuery's
+// tag-filter subquery (`SELECT event_id FROM event_tags WHERE is_group =
+// ? AND tag_name = ? AND tag_value IN (...)`) reads event_tags.is_group
+// DIRECTLY to decide which ids a `#<letter>`-tag-filtered REQ returns, in
+// whichever partition the reader is scoped to -- an access decision, not
+// a cosmetic one, and "safe direction" was the wrong standard to hold it
+// to. transactionSync removes the crash window the residue depended on,
+// rather than reasoning about what it would have left behind.
 //
 // Guarded by relay_meta.group_scope_fixed exactly the way
 // backfill_meta.exhaust_reset_applied guards backfill.ts
@@ -947,7 +970,11 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
 // real NIP-29 client emits two `h` tags with different values, so this is
 // a cost this relay accepts rather than a case worth a second piece of
 // state to track.
-export function fixMisclassifiedGroupEvents(sql: SqlStorage, limit: number): number {
+export function fixMisclassifiedGroupEvents(
+  sql: SqlStorage,
+  storage: DurableObjectStorage,
+  limit: number,
+): number {
   const alreadyFixed =
     sql.exec<{ group_scope_fixed: number }>(`SELECT group_scope_fixed FROM relay_meta LIMIT 1`).toArray()[0]
       ?.group_scope_fixed ?? 1;
@@ -977,41 +1004,80 @@ export function fixMisclassifiedGroupEvents(sql: SqlStorage, limit: number): num
 
   let fixed = 0;
   for (const { event_id } of candidates) {
-    const row = sql
-      .exec<EventRow & { ingested_at: number | null }>(
-        `SELECT id, pubkey, created_at, kind, tags, content, sig, ingested_at
-           FROM events WHERE id = ? AND is_group = 1`,
-        event_id,
-      )
-      .toArray()[0];
-    if (row === undefined) continue;
-    const event = rowToEvent(row);
-    // The false-positive guard the comment above describes, for
-    // population 1 only -- population 2's SQL condition (pubkey <>
-    // relayPubkey) is already the authoritative answer, since a single
-    // event has exactly one pubkey.
-    if (!isGroupMetadataKind(event.kind) && isGroupEvent(event)) continue;
+    // The whole read-check-fix sequence for ONE candidate, atomically --
+    // see the header comment above for why this is a transaction rather
+    // than an ordering argument. Returns whether this candidate was
+    // actually corrected, so a false positive (population 1's recheck) or
+    // a row already gone (a previous call's completed fix) costs nothing
+    // and changes nothing.
+    const wasFixed = storage.transactionSync((): boolean => {
+      const row = sql
+        .exec<EventRow & { ingested_at: number | null }>(
+          `SELECT id, pubkey, created_at, kind, tags, content, sig, ingested_at
+             FROM events WHERE id = ? AND is_group = 1`,
+          event_id,
+        )
+        .toArray()[0];
+      if (row === undefined) return false;
+      const event = rowToEvent(row);
 
-    // FIRST, and the reason a crash after this line cannot cause a
-    // double-decrement on any later call -- see the comment above.
-    sql.exec(`UPDATE events SET is_group = 0 WHERE id = ?`, event_id);
-    sql.exec(`UPDATE event_tags SET is_group = 0 WHERE event_id = ?`, event_id);
-    // Mirrors bumpEventCounters'/deleteEventRow's decrement exactly, minus
-    // the `events`/`n` halves -- this is a reclassification, not a
-    // removal, so the total event count does not move, only which half of
-    // it is "group".
-    sql.exec(`UPDATE maintained_counts SET group_events = group_events - 1`);
-    sql.exec(
-      `UPDATE event_hour_counts SET group_n = group_n - 1 WHERE hour = ?`,
-      hourBucket(row.created_at),
-    );
-    if (row.ingested_at !== null) {
+      if (isGroupMetadataKind(event.kind)) {
+        // Population 2 is PURGED, not reclassified -- de-flagging it
+        // into the public partition would leave it exactly as ambiguous
+        // as it was in the group partition, just for a different
+        // audience. The owner-or-member reader who is actually entitled
+        // to ask `{"kinds":[39002]}` reads BOTH partitions merged
+        // (relay.ts handleReqInner: `scopes = mayReadGroups ?
+        // ALL_SCOPES : [PUBLIC_SCOPE]`), so a de-flagged copy would still
+        // turn up alongside this relay's genuine member list -- the
+        // exact ambiguity the partition-only fix was supposed to end,
+        // just surviving for the one audience it matters to. Worse, an
+        // unauthenticated `{"authors":[owner]}` (an entirely ordinary
+        // query, unrelated to groups) would start returning it once it
+        // sat in the public partition, since filterNamesGroup only
+        // refuses a filter that NAMES a group or a metadata kind -- an
+        // authors-only filter does neither. Deletion is what
+        // storeEvent's refusal made safe to do unconditionally: no
+        // signer-mismatched event in this kind range can ever be
+        // re-admitted, so there is nothing to preserve and nothing this
+        // purge could need to run again for.
+        //
+        // deleteEventRow is the existing single removal choke point
+        // (defined above in this file) -- reusing it means this pays
+        // exactly the event_tags cleanup and counter decrements a live
+        // NIP-09 deletion would, through the one place that keeps "what
+        // an event is" and "what gets stored about it" in the same
+        // lines of code.
+        deleteEventRow(sql, event_id);
+        return true;
+      }
+
+      // Population 1: the false-positive guard the header comment
+      // describes. An event can carry more than one `h` tag, and
+      // groupIdOf reads only the FIRST one, so a second, mismatched tag
+      // on an event that is genuinely ours must not be reclassified.
+      if (isGroupEvent(event)) return false;
+
+      sql.exec(`UPDATE events SET is_group = 0 WHERE id = ?`, event_id);
+      sql.exec(`UPDATE event_tags SET is_group = 0 WHERE event_id = ?`, event_id);
+      // Mirrors bumpEventCounters'/deleteEventRow's decrement exactly,
+      // minus the `events`/`n` halves -- this is a reclassification, not
+      // a removal, so the total event count does not move, only which
+      // half of it is "group".
+      sql.exec(`UPDATE maintained_counts SET group_events = group_events - 1`);
       sql.exec(
-        `UPDATE ingest_hour_counts SET group_n = group_n - 1 WHERE hour = ?`,
-        hourBucket(row.ingested_at),
+        `UPDATE event_hour_counts SET group_n = group_n - 1 WHERE hour = ?`,
+        hourBucket(row.created_at),
       );
-    }
-    fixed += 1;
+      if (row.ingested_at !== null) {
+        sql.exec(
+          `UPDATE ingest_hour_counts SET group_n = group_n - 1 WHERE hour = ?`,
+          hourBucket(row.ingested_at),
+        );
+      }
+      return true;
+    });
+    if (wasFixed) fixed += 1;
   }
   return fixed;
 }

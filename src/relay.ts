@@ -822,16 +822,19 @@ export class Relay extends DurableObject<Env> {
       // fetching its own history from itself. See purgeSelfRelay.
         purgeSelfRelay(sql);
         // One-time correction for events wrongly filed into this relay's
-        // group partition before groups.ts isGroupEvent was scoped to
-        // TOP_LEVEL_GROUP_ID -- see storage.ts fixMisclassifiedGroupEvents.
-        // VANISH_BATCH_SIZE reused rather than a new constant: the write
-        // this performs (moving a row between partial-index partitions)
-        // costs the same shape VANISH_BATCH_SIZE is already paced against.
-        // Alongside the relay's own upkeep, ahead of the vanish drain
-        // below, for the reason every step above it is: this is the relay
-        // fixing its own past mistake, not a cost a stranger's request
-        // sizes.
-        fixMisclassifiedGroupEvents(sql, VANISH_BATCH_SIZE);
+        // group partition (de-flagged into the public one) or wrongly
+        // admitted as this relay's own group metadata (purged outright)
+        // before groups.ts isGroupEvent and storage.ts storeEvent were
+        // scoped to TOP_LEVEL_GROUP_ID and this relay's own signer -- see
+        // storage.ts fixMisclassifiedGroupEvents. VANISH_BATCH_SIZE reused
+        // rather than a new constant: both of that function's writes cost
+        // the same shape VANISH_BATCH_SIZE is already paced against, an
+        // UPDATE moving a row between partial-index partitions or a
+        // DELETE removing one outright. Alongside the relay's own
+        // upkeep, ahead of the vanish drain below, for the reason every
+        // step above it is: this is the relay fixing its own past
+        // mistake, not a cost a stranger's request sizes.
+        fixMisclassifiedGroupEvents(sql, this.ctx.storage, VANISH_BATCH_SIZE);
         // Once a day (paced by maintained_counts.audited_at, not by this
         // tick's frequency), recount `events` and `follows` and log if the
         // maintained counters disagree. E + F rows read, once -- against
