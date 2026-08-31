@@ -19,9 +19,12 @@ A single-user nostr relay that deploys in one click and runs on the Cloudflare W
 - **Two nested lists.** `allowed_pubkeys` is the outer one (relay-wide write access, what `ownership.ts isAllowedWriter` consults); `group_members` is the inner one (permission to write an `h`-tagged event, on top of that). `relay.ts handleEventInner` calls `nip29.ts authorizeGroupWrite` UNDER the relay-wide gate, never beside it, and three integer comparisons return early for any event that is neither group-scoped nor moderation, so ordinary writes pay nothing. `allowed_pubkeys.source` is `owner` or `invite`: put-user and a redeemed kind-9021 both write the row a new member needs as `invite`, remove-user deletes only `invite` rows, and a NIP-86 `allowpubkey` on an existing row PROMOTES it to `owner` — an explicit act outranks the group's bookkeeping, and the promotion is one-way. Without that column remove-user would have two options and both are wrong: revoke a grant the owner made deliberately, or let every ex-member keep writing forever.
 - **The relay signing its own events** is new to this codebase, and the rule is: bypass the GATE, never the BOOKKEEPING. A relay-generated 39000/39001/39002 never enters `handleEventInner` — there is nobody to authorize — but it goes through `storage.ts storeEvent`, the same function every client write reaches, so it pays the maintained counters, both hour buckets, the stamped `row_cost`, the `is_group` partition and the addressable-replacement rule exactly as any other event does. There is no second insert path and there must never be one: half of `storeEvent` reimplemented is half of the budget accounting missing, and the accounting is the part nothing would notice was wrong. `test/nip29-groups.test.ts` asserts it by running the daily counter audit — which recounts the table rather than trusting the counters — over a relay whose only events are relay-generated. The secret key stays behind `relay-identity.ts signAsRelay`, which is handed a 32-byte hash and returns a signature; `nip29.ts` builds the event and computes its id through the same `validate.ts computeEventId` every client event goes through, so these verify like any other event.
 - The three are regenerated only when their own content changes, compared tag-by-tag before writing — the same measure-before-writing rule `ownership.ts refreshFollows` applies to the follow cache and for the same reason: a membership change touches neither the admin list nor the metadata, and rewriting all three anyway would delete and re-insert two unchanged addressable events every time. Each regeneration is stamped `max(now, previous + 1)` rather than `now`, because NIP-01 breaks a `created_at` tie on an addressable event by LOWEST id — two membership changes in the same wall-clock second would otherwise produce a member list that loses to the one it replaces about half the time, and lose SILENTLY, since `storeEvent` reports success with `stored: null`. The generated 39000 carries the operator's `name`/`picture`/`banner`/`about` from the triggering 9002 (or forward from the previous document, so an unrelated regeneration cannot blank the group's name) and then the policy tags `private`/`restricted`/`hidden`/`closed`, which are facts about what this relay enforces rather than preferences a 9002 expresses. `closed` is the one expected to come off, when invites land.
+- **Web push** ([src/push.ts](src/push.ts)), off unless `VAPID_PRIVATE_KEY` is set as a Cloudflare SECRET. The public half of that keypair is derived from the secret rather than configured beside it (two configured halves can disagree; a derived one cannot) and published as `push_key` on the NIP-11 document; unset means no `push_key`, which means no client subscribes, which means no subscription rows, no outbox rows and no alarm — the degradation path hearth's `reference/push.md` describes, and a supported state rather than an error. RFC 8291 encryption and RFC 8292 VAPID are written against `crypto.subtle` directly: every npm package for this is Node-shaped (`require("crypto")`, `crypto.createECDH()`, `require("https")`) and none of it runs on workerd, while ECDH P-256, HKDF-SHA256, AES-128-GCM and ES256 all do — natively, which also matters on a 10ms CPU budget. The single exception is deriving a public key from a bare private scalar, which WebCrypto cannot do at all (`importKey` wants the x and y being derived), so `p256.getPublicKey` does that one line and everything else is the platform. A payload carries the room name and `"message"`/`"voice"` and NOTHING else — not the message, not the sender: it travels through Apple's or Google's push service, and the room name is the only part already public (it is the NIP-11 `name`). `subscribepush`/`unsubscribepush` bind a device to the pubkey the NIP-98 signature PROVED and never to one the body offers, and they are the only two NIP-86 methods a group member may call rather than only the owner (`nip86.ts MEMBER_CALLABLE_METHODS`) — a member who could not call them could not be notified, which would make push owner-only in a room built for a group.
+- **The fan-out runs in the Durable Object's alarm**, which is the one place in this object that reaches the network, and it is not the exception to "the DO opens no outbound connection" it looks like. That rule exists because an outbound WEBSOCKET pins the object in memory for as long as it stays open — up to fifteen minutes, which is why `profile-lookup.ts` and `backfill-worker.ts` both live in the Worker. An HTTPS request that completes does not, and an alarm is a brief billed wake the platform schedules against a hibernated object and lets hibernate again, exactly as the live feed's lifetime alarm already does. There is also no Worker-side alternative: nothing in the Worker runs when a WebSocket message arrives, and the hourly cron is three orders of magnitude too slow for a notification.
+- **The NIP-86 management route sends CORS headers and answers an OPTIONS preflight.** Safe, and the comment in `index.ts` says why so nobody removes it as an oversight: every call is authenticated by a NIP-98 signature over that exact method, URL and body, there is no cookie or session for a cross-origin request to borrow — which is the ambient authority the same-origin policy exists to protect — and an unauthenticated preflight reveals only that the endpoint exists, which the NIP-11 document already advertises unauthenticated on the same URL. Without it the API was reachable only from a page the relay itself served, and hearth is served from GitHub Pages, so every management call from it failed at the browser: the invite listing that had already shipped, and push subscription after it. The preflight is deliberately NOT rate limited — it reaches no Durable Object, and counting it would spend two of an address's sixty per minute for every management call.
 - NIP-09 deletion and NIP-62 vanish requests both tombstone ids (`deleted_ids`) so a deleted event — gift wraps especially, since the sender keeps their own signed copy — can't be replayed back into storage.
 - Live feed (`/live`) is a separate, unauthenticated, push-only WebSocket channel for the admin page, capped at 5 concurrent connections and a 10-minute server-enforced lifetime (DO alarm). Never sends gift wraps or event content, only kind/time/truncated id.
-- NIP-86 relay management API: `banevent`/`allowevent`/`listbannedevents`, `banpubkey`/`unbanpubkey`/`listbannedpubkeys`, `allowpubkey`/`unallowpubkey`/`listallowedpubkeys`, `blockip`/`unblockip`/`listblockedips`, `changerelayname`/`changerelaydescription`/`changerelayicon`, and `listunusedinvites`/`revokeinvite`, plus `supportedmethods`. Authenticated by a NIP-98 event ([src/nip98.ts](src/nip98.ts)) signed by the owner, with the `payload` tag required rather than optional; verification runs in the Worker so a forged request costs no DO time, and storage mutations go to the DO by RPC (`Relay.manage`). Phase one shipped only the methods that cost nothing on the per-event write path; phase two (`banpubkey`/`allowpubkey`) is the one addition that does, landed only once a metrics baseline existed to compare against — see CLAUDE.md "The budget". The kind allowlist methods answer with an explanation rather than a generic unknown-method error, since bothy stores every kind deliberately. `listunusedinvites`/`revokeinvite` are bothy's own — NIP-86 defines no invite methods — and they are the deliberate MIRROR of the join path's uniform refusal: here the caller is the owner, authenticated by a NIP-98 signature over this exact request, so spent, already-revoked and never-issued are each named in full. There is no creation method to match them: an invite is created by publishing a kind-9009, which is a signed part of the group's history, and a second way in over HTTP would put one act on two paths with only one of them recorded in the group.
+- NIP-86 relay management API: `banevent`/`allowevent`/`listbannedevents`, `banpubkey`/`unbanpubkey`/`listbannedpubkeys`, `allowpubkey`/`unallowpubkey`/`listallowedpubkeys`, `blockip`/`unblockip`/`listblockedips`, `changerelayname`/`changerelaydescription`/`changerelayicon`, `listunusedinvites`/`revokeinvite`, and `subscribepush`/`unsubscribepush`, plus `supportedmethods`. Authenticated by a NIP-98 event ([src/nip98.ts](src/nip98.ts)) signed by the owner, with the `payload` tag required rather than optional; verification runs in the Worker so a forged request costs no DO time, and storage mutations go to the DO by RPC (`Relay.manage`). Phase one shipped only the methods that cost nothing on the per-event write path; phase two (`banpubkey`/`allowpubkey`) is the one addition that does, landed only once a metrics baseline existed to compare against — see CLAUDE.md "The budget". The kind allowlist methods answer with an explanation rather than a generic unknown-method error, since bothy stores every kind deliberately. `listunusedinvites`/`revokeinvite` are bothy's own — NIP-86 defines no invite methods — and they are the deliberate MIRROR of the join path's uniform refusal: here the caller is the owner, authenticated by a NIP-98 signature over this exact request, so spent, already-revoked and never-issued are each named in full. There is no creation method to match them: an invite is created by publishing a kind-9009, which is a signed part of the group's history, and a second way in over HTTP would put one act on two paths with only one of them recorded in the group.
 - `banevent` writes both a `banned_events` row and a `deleted_ids` tombstone: the ban is what the operator reads back, the tombstone is what actually refuses a re-send or a backfill replay. `listbannedevents` reads `banned_events`, never `deleted_ids` — the latter holds NIP-09 and NIP-62 deletions too. `allowevent` is the one place in the codebase that deletes a tombstone.
 - `banpubkey`/`allowpubkey` are two independent lists (`banned_pubkeys`/`allowed_pubkeys`), not opposite ends of one — unlike `allowevent`, `unbanpubkey` and `unallowpubkey` each just delete their own row. `ownership.ts isAllowedWriter` checks `banned_pubkeys` before the follows lookup, unconditionally for every non-owner write, so a banned pubkey is refused even if it's also a follow; it checks `allowed_pubkeys` only on the path already about to reject (owner-only mode, or "not a follow"), so that lookup costs nothing on the common accept path. The owner's own pubkey can never be banned — `banpubkey` refuses the call outright rather than accepting it and having no effect.
 - IP blocks are checked exactly once per WebSocket connection in `Relay.fetch`, never per message, and never on the management endpoint — blocking your own address must not lock you out of the API that unblocks it. Blocking the caller's own address refuses once and names an exact confirmation string to pass back as the reason.
@@ -37,6 +40,8 @@ No more than one group. Membership is created by the owner publishing a put-user
 ## Configuration
 
 Everything optional is read defensively (`env.X ?? fallback`) and declared nowhere in `wrangler.jsonc`'s `vars` block — a clean deploy must ask for nothing but a project name. The `ratelimits` block is the one binding added to `wrangler.jsonc` since, and it fits that rule: its namespace ids are ours to pick, nothing is provisioned, and nothing is prompted for. Both bindings are still read as `env.X?.limit(...)` — the Cloudflare docs do not state which plans the binding is available on (checked 2026-08-27), so an absent binding means "allowed" rather than an exception on every request. Env vars, all added by hand in the Cloudflare dashboard if wanted: `OWNER_PUBKEY`, `RELAY_NAME`, `RELAY_DESCRIPTION`, `RELAY_ICON`, `ALLOW_FOLLOWS`, `MAX_EVENT_BYTES`, `MAX_EVENTS_PER_PUBKEY_PER_MINUTE`, `NON_OWNER_STORAGE_BYTES`. See [src/env.d.ts](src/env.d.ts).
+
+`VAPID_PRIVATE_KEY` is the one piece of configuration that is a SECRET and not a var, and the distinction is the point rather than a convention. `wrangler.jsonc` declares no `vars` block precisely because a git-connected Worker may sync vars from that config on deploy and overwrite what was set in the dashboard — for a private key that would mean the repository silently deciding what it is. `wrangler secret put VAPID_PRIVATE_KEY` is the only way in, secrets are never synced from config, and the key is therefore incapable of reaching the repository or `wrangler.jsonc`. It is read the same defensive way as every var (`env.X ?? fallback`), and a value that does not decode to a valid 32-byte P-256 scalar is logged once and treated as unset — the same behaviour as no key at all, which is a supported state.
 
 The three identity variables sit at the top of the resolution chain described above — they outrank a value stored through NIP-86, which outranks the owner's kind-0.
 
@@ -225,6 +230,109 @@ membership change holds unchanged. What is new is who chooses the rate, and
 `MAX_OUTSTANDING_INVITES` is what bounds it: 64 live invites redeemed all at
 once is ~7,000 rows, ~7% of the daily ceiling. A refused join writes **0**.
 
+### Rows written, per push and per hour of a call
+
+Measured (`test/push.test.ts`, and derived in `limits.ts`):
+
+```
+one message notification, however many devices it reaches
+  the kind-9 itself           9 + 3 x 1 indexed tag (`h`)             12
+  queueing it                 1 outbox row + 1 PK index                2
+  scheduling the alarm        setAlarm                                 1
+  clearing the outbox row     base + index                             2
+                                                                     ---
+                                                                      17
+
+each further message inside the coalescing window
+  the kind-9 itself                                                    12
+  folding it into the queued row (1 row updated in place)                1
+                                                                     ---
+                                                                      13
+
+registering a device (subscribepush)   1 base + 1 PK index              2
+disposing of a 404/410 endpoint        base + index                     2
+a successful push                      0, or 1 once a day per endpoint
+a refused push                                                          0
+```
+
+The fan-out writes NOTHING per endpoint on the ordinary path, so a
+notification reaching sixty devices costs the same 17 rows as one reaching
+one. That is the second place the presence lesson had to be applied:
+`push_subscriptions.last_ok_at` is the field reference/push.md asks for
+("when it was last seen working"), and refreshing it on every successful
+send would have been one row per device per notification — thousands a day
+to maintain a column whose only conceivable reader is a sweep of
+long-dead endpoints. It is refreshed at most once a day per endpoint
+(`limits.ts PUSH_LAST_OK_INTERVAL_SECONDS`), which is far finer than that
+reader would need, and the disposal that actually matters does not wait
+for it at all: a 404 or 410 deletes the row on the spot.
+
+What sixty devices costs is SUBREQUESTS, which is a different ceiling and
+is bounded separately — see below.
+
+Presence is the one that could have been ruinous and is not. hearth beats
+every five seconds while somebody is in a call, so a stored beat would be
+a row write every five seconds per participant:
+
+```
+ten people in a call, one hour, one write per beat        72,000 rows
+ten people in a call, one hour, as written                   900 rows
+```
+
+That is 0.9% of the day's ceiling against 72% of it. The interval is
+derived rather than chosen (`limits.ts PRESENCE_WRITE_INTERVAL_SECONDS`):
+one percent of `DAILY_ROWS_WRITTEN_LIMIT` per hour, divided by a ten-person
+reference call, is one write per 36 seconds, rounded UP to a whole
+heartbeat because a write that would land between beats does not happen
+until the next one — 8 beats, 40 seconds. `PRESENCE_STALE_SECONDS` then
+falls out of that: a live row is refreshed on the first beat at or after
+the interval, so it is never older than the interval plus one beat, and
+45 seconds is therefore exactly the boundary between "has been beating all
+along" and "arrived". Seven beats in eight cost nothing at all, answered
+from the in-memory tier (`relay.ts presenceWrites`); the eighth costs one
+read and one write.
+
+The cost of that coarseness is stated where it is paid: the stored tier
+resolves presence at 45 seconds rather than hearth's 13, so somebody whose
+connection drops and comes back inside 45 seconds of an EVICTION is
+treated as having been there all along and is not announced twice. That is
+the right direction to be wrong in — a reconnect is not an arrival, and
+announcing one would be a quieter version of the twelve-a-minute noise the
+whole design exists to avoid. A deliberate `{"status":"leave"}` beat
+clears the row, so leaving and coming straight back IS announced.
+
+### Subrequests, which is the ceiling the fan-out actually hits
+
+Rows are not what bounds a push. Workers Free allows **50 subrequests per
+invocation** (developers.cloudflare.com/workers/platform/limits/, checked
+2026-08-30) and every push is one outbound HTTPS request. Twenty members
+with a phone, a laptop and a home-screen install each is sixty endpoints,
+so a fan-out written inline inside the request that stored the message
+starts failing at exactly the group size this was built for — and fails at
+the fifty-first request rather than the first, which is a partial delivery
+nobody notices rather than an error.
+
+The bound, derived in `limits.ts`:
+
+```
+WORKER_SUBREQUEST_LIMIT                 50   platform, Workers Free
+PUSH_SUBREQUEST_RESERVE                 10   left unspent
+MAX_PUSHES_PER_TICK                     40   one alarm invocation
+PUSH_MAX_TICKS                           4   invocations one notification may span
+MAX_PUSH_ENDPOINTS_PER_NOTIFICATION    160   = 40 members at the 4-device cap
+```
+
+Endpoints past `MAX_PUSHES_PER_TICK` are DEFERRED, not dropped: the outbox
+row carries a cursor (ordered by endpoint, which survives a subscription
+being added or removed mid-fan-out where a rowid offset would not) and the
+alarm reschedules itself immediately. Endpoints past
+`MAX_PUSH_ENDPOINTS_PER_NOTIFICATION` ARE dropped, and dropped loudly — a
+`console.warn` naming the reason and the count, because a notification is
+news, news goes stale, and a queue that stopped quietly would be
+indistinguishable from one that finished. Raising the ceiling means
+raising `PUSH_MAX_TICKS` and accepting the extra staleness, which is a
+decision with a cost rather than a number to nudge.
+
 ### Rows read, by path
 
 | Path | Rows read |
@@ -246,6 +354,10 @@ once is ~7,000 rows, ~7% of the daily ceiling. A refused join writes **0**.
 | `auditMaintainedCounts`, once a day | E + F + M + ≤ 51 bucket rows (one scan of `events`, one of `follows`, one of `group_members`) |
 | Backfill tick | bounded by today's ingest count (headroom check) + ~2 per event in the page |
 | Live write, regular kind | 0–2, plus 3 for the counter updates |
+| Presence beat, inside the write interval | 0 — answered from memory, seven beats in eight |
+| Presence beat, outside it | 1 for the stored watermark |
+| Push fan-out, per alarm tick | 1–2 outbox rows + ≤ `MAX_PUSHES_PER_TICK` subscription rows + 1 per distinct recipient pubkey |
+| Push fan-out, no VAPID key | 0 — `vapidKeys` returns before any storage access |
 | Replaceable/addressable replacement | ~2 per tag on the replaced event |
 | NIP-62 vanish, per event removed | ~2 per tag on that event |
 | `giftWrapCount`, per gift wrap accepted | ~0 |
@@ -538,6 +650,7 @@ The per-request cost of each HTTP path, after the pass that added it:
 | `GET /api/profile`, unclaimed, cache hit | yes | no | 1–2 | 10/min |
 | `GET /api/profile`, unclaimed, cache miss | yes | 2 sockets | 1–2 | 10/min |
 | NIP-11 document | yes | no | 2 | 60/min |
+| `OPTIONS` any path (CORS preflight) | **no** | no | 0 | none — reaches no DO |
 | `POST /` (NIP-86), auth fails | **no** | no | 0 | 60/min |
 | `POST /` (NIP-86), signature valid, not the owner | yes | no | 2 | 60/min |
 | `POST /` (NIP-86), authorized | yes | no | 2 + the method's own | 60/min |
@@ -679,6 +792,27 @@ usefully — what it structurally cannot do.
   storage probe it replaced could not — that probe's refusal was a one-bit
   read of the owner's inbox per REQ, bisectable into exact arrival times and
   an exact count.
+- **A push telling somebody something the room did not.** A payload
+  carries the room's name and the word `message` or `voice`, and nothing
+  else — not the message, not the sender's name. It passes through
+  Apple's or Google's infrastructure to reach a phone, so the rule is that
+  nothing in it may be anything that infrastructure should not hold; the
+  room name is admissible only because it is already the NIP-11 `name`
+  any client fetches unauthenticated. The payload is also RFC 8291
+  encrypted to the subscription's own keys, which the push service does
+  not have, so this is belt as well as braces — but the rule is about
+  what is put in, not about what the encryption hides.
+- **A device registered against somebody else's name.** `subscribepush`
+  binds the endpoint to the pubkey the NIP-98 signature PROVED, and the
+  request body has no field for a pubkey at all. `unsubscribepush` is
+  scoped to the signer for the mirror-image reason: an endpoint is not a
+  secret to anybody who has seen a fan-out, and quietly turning somebody's
+  notifications off is a subtler kind of damage than turning them on.
+  Widening the management gate to members is scoped to exactly these two
+  methods (`nip86.ts MEMBER_CALLABLE_METHODS`), checked in that order —
+  the method name first, because it is free, and membership second,
+  because it costs a round trip — so a stranger's signature over
+  `banpubkey` still costs what it did before push existed.
 - **Replay of deleted events.** `deleted_ids` tombstones every id removed by
   NIP-09, NIP-62 or `banevent`, so a sender holding a signed copy cannot put it
   back.
@@ -732,6 +866,27 @@ usefully — what it structurally cannot do.
   that function granting relay write access on the strength of a row it has
   just decided it cannot trust. What it STORES in `last_drift` is a count,
   never the pubkeys — `/api/stats` reads that column back and is public.
+- **What a push service learns.** Registering an endpoint tells this
+  relay which devices a member has, and pushing to one tells Apple or
+  Google that this deployment sent that device something, when. The
+  payload is encrypted and says nothing, but the timing and the pairing
+  are theirs by construction and no relay can prevent it. That is why
+  push is something a person turns on rather than something a client does
+  on their behalf, and why a relay that never advertises a `push_key`
+  never learns any of it (reference/push.md "What it costs").
+- **A duplicate presence notification after an eviction.** The stored
+  watermark resolves presence at 45 seconds where hearth resolves it at
+  13, so somebody who drops and returns across an eviction inside that
+  window is not announced — correct — while somebody who genuinely leaves
+  and returns just outside it is announced again. Both are the coarseness
+  the write interval buys, and the alternative is a row write every five
+  seconds per participant.
+- **A push that never arrives.** A 429 or a 5xx from a push service
+  leaves the row alone and the notification simply misses that device;
+  there is no retry queue, because a retried notification is stale by the
+  time it lands and a queue with no age bound is the thing
+  `MAX_PUSH_ENDPOINTS_PER_NOTIFICATION` exists to prevent. The failure is
+  logged, not swallowed.
 - **Anyone reading anything that is not a gift wrap.** There is no read
   authentication and none is planned; a personal relay's contents are as public
   as the notes in it.
@@ -773,11 +928,12 @@ usefully — what it structurally cannot do.
 - [src/pubkey.ts](src/pubkey.ts) / [src/bech32.ts](src/bech32.ts) — npub/hex normalization.
 - [src/profile-lookup.ts](src/profile-lookup.ts) — best-effort kind-0 lookup from well-known relays, runs in the Worker only, plus the isolate-local cache in front of it (`lookupProfileCached`). The cache is not `caches.default`: the Cache API needs a custom domain (developers.cloudflare.com/workers/runtime-apis/cache/, checked 2026-08-27) and bothy deploys to `workers.dev`, so it would silently no-op on the deployment shape this project exists for. Negative results are cached and concurrent lookups for one pubkey are coalesced — without both, the cache would miss on exactly the traffic it exists to absorb.
 - [src/backfill.ts](src/backfill.ts) / [src/backfill-worker.ts](src/backfill-worker.ts) — backfill state machine (DO-side, pure) and outbound fetch orchestration (Worker-side).
-- [src/limits.ts](src/limits.ts) — every numeric abuse/budget cap in the project, each commented with what it bounds. The invite block (`INVITE_DEFAULT_TTL_SECONDS`, `INVITE_MAX_TTL_SECONDS`, `MIN_INVITE_CODE_LENGTH`, `MAX_OUTSTANDING_INVITES`, `MAX_JOIN_REQUESTS_PER_IP_PER_WINDOW`) is five caps around one word: a bearer token the relay cannot authenticate leaves only lifetime, count, guessability and guess rate to bound, and each constant is one of those. The three write-path caps (event size, per-pubkey rate, non-owner storage share) are enforced in `relay.ts acceptEvent` before id/signature verification, exempt the owner from two of the three, and are each raisable or disablable by env var — disabled only by the exact string `"off"`, never by any truthy value. Also `boundFilter`, the read-abuse guard: it prices a REQ filter (`combinations × (2 × limit + 1)` on an index path, `combinations × ids.length` on the primary key, where `combinations` comes from `expandFilter` itself) against the index set declared in `schema.ts`, clamps the limit until the query is affordable, and refuses what no limit can fix — plus `MAX_FILTER_COMBINATIONS`, which refuses on query count alone, ahead of the price, because a lowered limit removes rows and never statements, and `MAX_QUERY_BOUND_PARAMS`, which refuses on the number of `?` placeholders the query would bind, ahead of the price, because a lowered limit removes neither `ids.length` nor a tag's value count — the shape a live filter naming enough ids exploited to pass `MAX_FILTER_ROWS_READ` while still exceeding SQLite's own 100-bound-parameter ceiling and crashing with an uncaught `SQLITE_ERROR`. It replaced `isUnconstrainedFilter`, which asked whether a field was *present* rather than what the query *cost* and so admitted the two shapes that read the whole table. The one cap NOT declared here is the HTTP rate limit: Cloudflare's runtime enforces it from `wrangler.jsonc` before any of this code runs, so a number here would be decorative and could silently disagree with the one in force — `limits.ts` carries the pointer and the reasoning instead.
+- [src/limits.ts](src/limits.ts) — every numeric abuse/budget cap in the project, each commented with what it bounds. The presence block derives its write interval from hearth's own heartbeat period and this relay's rows-written ceiling rather than declaring one, and derives the staleness threshold from the interval, so the two cannot drift into a combination that reads a live participant as an arrival; the push block derives its per-tick bound from Workers Free's 50-subrequest ceiling and its per-notification bound from that. The invite block (`INVITE_DEFAULT_TTL_SECONDS`, `INVITE_MAX_TTL_SECONDS`, `MIN_INVITE_CODE_LENGTH`, `MAX_OUTSTANDING_INVITES`, `MAX_JOIN_REQUESTS_PER_IP_PER_WINDOW`) is five caps around one word: a bearer token the relay cannot authenticate leaves only lifetime, count, guessability and guess rate to bound, and each constant is one of those. The three write-path caps (event size, per-pubkey rate, non-owner storage share) are enforced in `relay.ts acceptEvent` before id/signature verification, exempt the owner from two of the three, and are each raisable or disablable by env var — disabled only by the exact string `"off"`, never by any truthy value. Also `boundFilter`, the read-abuse guard: it prices a REQ filter (`combinations × (2 × limit + 1)` on an index path, `combinations × ids.length` on the primary key, where `combinations` comes from `expandFilter` itself) against the index set declared in `schema.ts`, clamps the limit until the query is affordable, and refuses what no limit can fix — plus `MAX_FILTER_COMBINATIONS`, which refuses on query count alone, ahead of the price, because a lowered limit removes rows and never statements, and `MAX_QUERY_BOUND_PARAMS`, which refuses on the number of `?` placeholders the query would bind, ahead of the price, because a lowered limit removes neither `ids.length` nor a tag's value count — the shape a live filter naming enough ids exploited to pass `MAX_FILTER_ROWS_READ` while still exceeding SQLite's own 100-bound-parameter ceiling and crashing with an uncaught `SQLITE_ERROR`. It replaced `isUnconstrainedFilter`, which asked whether a field was *present* rather than what the query *cost* and so admitted the two shapes that read the whole table. The one cap NOT declared here is the HTTP rate limit: Cloudflare's runtime enforces it from `wrangler.jsonc` before any of this code runs, so a number here would be decorative and could silently disagree with the one in force — `limits.ts` carries the pointer and the reasoning instead.
 - [src/exhaustion.ts](src/exhaustion.ts) — classifies a Cloudflare free-tier allowance being consumed and names which one; `index.ts` wraps both `fetch` and `scheduled` with it. Exists because the last outage's only symptom was an admin page that loaded the word "bothy" and no numbers — `public/` is served from `env.ASSETS` and never touches the DO, so the one part still working was the part that proved nothing. Matching is substring signatures against error text Cloudflare does not document as stable, so it fails useful rather than silent: the raw message is always logged, the resource name only added when a signature matches. Non-exhaustion errors are logged and rethrown, never converted into a quiet 503.
 - [src/read-metrics.ts](src/read-metrics.ts) — **diagnostic, and expected to be removed**: in-memory attribution of rows *read* to the code path that caused them, surfaced as `reads` on `/api/stats`. Added after the live relay exhausted the 5,000,000 rows-read/day allowance under ordinary operation and nothing here could say which path spent it. Counters live in memory, never in storage — a counter costing a row write to measure a row read repeats the mistake CLAUDE.md "The budget" already rejected — so they reset on eviction and describe proportions, not daily totals. Every `SqlStorage` access in the DO goes through `instrumentSql`, so a query can be mislabelled into `unattributed` but never missed. See CLAUDE.md "The budget" for the per-call costs and the arithmetic against the ceiling.
 - [src/nip11.ts](src/nip11.ts) — relay info document, and the name/description/icon resolution chain shared with `/api/stats`.
 - [src/nip29.ts](src/nip29.ts) — group writes: the moderation events a client may send (`authorizeGroupWrite`, called by `relay.ts handleEventInner` under the relay-wide gate), and the 39000-series state this relay generates and signs in response (`applyModeration`, called by `acceptEvent` exactly where a kind-5 reaches `applyDeletion`, because the moderation event is itself part of the group's canonical history and is stored before it is acted on). Holds the two-nested-lists rule in full. Everything it writes goes through `storage.ts storeEvent` — the gate is what a relay-signed event skips, not the bookkeeping. Also `handleJoinRequest`, the kind-9021 admission path, which is the one function here reached by a pubkey the relay has never authorized: it stores nothing, refuses everything with one identical message (`JOIN_REFUSAL_MESSAGE` — four distinguishable refusals would be an oracle for testing guesses), and logs the real reason where only the owner can read it. `authorizeCreateInvite` beside it holds the kind-9009 policy, refusing rather than clamping, so a client is never told `true` about a lifetime the relay did not grant.
+- [src/push.ts](src/push.ts) — web push: the VAPID keypair (one secret, public half derived), RFC 8291 aes128gcm encryption, RFC 8292 VAPID authorization, and one send. Written against `crypto.subtle` rather than a library, because every npm package for this is Node-shaped and none of it runs on workerd, while all four primitives are native here — see the header comment for what was checked and the one line `@noble` still does. Also names the two kinds worth a notification: NIP-29's kind-9 chat, and hearth's own kind-25051 call presence, which has no NIP. `sendPush` is the only outbound request this Durable Object ever makes, and it is made from the alarm; see CLAUDE.md "What it is" for why that does not break hibernation and why the Worker cannot do it instead.
 - [src/nip86.ts](src/nip86.ts) — management API method dispatch (runs in the DO; touches storage, opens nothing).
 - [src/nip98.ts](src/nip98.ts) — HTTP auth verification for the management API (runs in the Worker only). Deliberately does not know who the owner is: establishing that costs a Durable Object round trip, which is the most expensive thing an unauthenticated caller can provoke on this path, so `verifyNip98` answers only what the request itself can answer and `index.ts` asks the DO afterwards (`ownerReason`).
 - [public/index.html](public/index.html) — the static admin page (claim form, stats, live feed).
@@ -814,7 +970,7 @@ npm run cf-typegen   # regenerate worker-configuration.d.ts
 Two kinds of assertion live in the same suite ([test/](test)):
 
 1. **Protocol conformance** — NIP-01 REQ/EVENT/CLOSE/EOSE, filters, replaceable/addressable/ephemeral storage rules, NIP-09/40/42/59/62, and NIP-86/98 management. Reject paths are asserted as carefully as accept paths.
-2. **Budget/hibernation regression** — [test/hibernation.test.ts](test/hibernation.test.ts) asserts the object becomes eligible to hibernate after the last message, and pins the per-event rows-written cost against a real `SqlStorageCursor.rowsWritten`; [test/nip29-groups.test.ts](test/nip29-groups.test.ts) pins the per-membership-change cost the same way; [test/read-cost.test.ts](test/read-cost.test.ts) pins rows read per query shape. These assertions are the budget baseline — there is no separate file of recorded numbers to fall out of step with them.
+2. **Budget/hibernation regression** — [test/hibernation.test.ts](test/hibernation.test.ts) asserts the object becomes eligible to hibernate after the last message, and pins the per-event rows-written cost against a real `SqlStorageCursor.rowsWritten`; [test/nip29-groups.test.ts](test/nip29-groups.test.ts) pins the per-membership-change cost the same way; [test/read-cost.test.ts](test/read-cost.test.ts) pins rows read per query shape; [test/push.test.ts](test/push.test.ts) pins that twelve presence heartbeats write zero rows on the presence path and that one fan-out spends no more than one invocation's subrequest allowance. That last file also decrypts a real push body back to its payload rather than asserting the encryption's shape — RFC 8291 has several places where a wrong constant produces a body that is well-formed and undecryptable, and every one of them looks like success from inside the relay. These assertions are the budget baseline — there is no separate file of recorded numbers to fall out of step with them.
 
 See [docs/test-notes.md](docs/test-notes.md) for suite layout, fixture rationale, and the couple of places tests drop below the wire protocol to real storage (documented exceptions, not the norm).
 

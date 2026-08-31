@@ -1,6 +1,6 @@
 {
   "name": "bothy",
-  "version": "0.11.3",
+  "version": "0.12.0",
   "private": true,
   "type": "module",
   "description": "A single-user nostr relay that runs on the Cloudflare free tier and deploys in one click.",

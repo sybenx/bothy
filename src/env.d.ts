@@ -42,6 +42,15 @@ interface Env {
   RELAY_DESCRIPTION?: string;
   RELAY_ICON?: string;
   ALLOW_FOLLOWS?: string;
+  // Web push (src/push.ts). A SECRET, not a var -- set with
+  // `wrangler secret put VAPID_PRIVATE_KEY`, never in wrangler.jsonc,
+  // which declares no vars at all and which a git-connected Worker may
+  // sync over the dashboard on every deploy. Base64url, the 32-byte P-256
+  // scalar every web push tool calls the private key; the public half is
+  // derived from it rather than configured beside it, so the two cannot
+  // disagree. Unset means no push_key on the NIP-11 document and no push,
+  // which is a supported state and not an error (reference/push.md).
+  VAPID_PRIVATE_KEY?: string;
   MAX_EVENT_BYTES?: string;
   MAX_EVENTS_PER_PUBKEY_PER_MINUTE?: string;
   NON_OWNER_STORAGE_BYTES?: string;

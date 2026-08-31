@@ -941,6 +941,210 @@ export function maxGiftWraps(env: Env): number {
 // about, not just a copy used for a progress bar.
 export const DAILY_ROWS_WRITTEN_LIMIT = 100_000;
 
+// ---------------------------------------------------------------------
+// Call presence (src/push.ts CALL_PRESENCE_KIND, reference/push.md).
+//
+// hearth heartbeats every five seconds while somebody is in a call, and
+// treats a pubkey as gone thirteen seconds after its last beat. The relay
+// has to keep the same picture for one reason only: a notification is
+// owed on the transition from absent to present, and on nothing else. A
+// relay that pushed on the event rather than on the transition would send
+// twelve notifications a minute per person in the call.
+//
+// The naive way to know the transition is to store the last beat, and
+// that costs a row write every five seconds per participant -- ten people
+// for an evening is tens of thousands of writes against a ceiling of
+// 100,000 a day, on a relay that has already been taken offline by
+// resource exhaustion once. So the watermark is written COARSELY and read
+// at the coarseness it was written: a beat that finds the stored value
+// younger than the interval below writes nothing at all.
+//
+// Two tiers, and the second one is what makes the first affordable:
+//
+//   memory   relay.ts presenceWrites, keyed by pubkey. A beat whose
+//            pubkey was written within the interval costs no read and no
+//            write -- the ordinary case for every beat but one in eight.
+//            Lost on eviction, like every other in-memory throttle in
+//            this file, which is exactly what the stored tier is for.
+//   storage  `presence.last_seen`, one row per pubkey, refreshed at most
+//            once per interval. This is what an evicted object reads to
+//            tell an ongoing call from a new arrival.
+// ---------------------------------------------------------------------
+
+// hearth's own two numbers, from reference/push.md and its app.js
+// (HEARTBEAT_MS, PRESENCE_TIMEOUT_MS). Named here rather than inlined
+// because everything below is derived from them, and because a client
+// that changes its beat rate changes what this relay has to tolerate.
+export const PRESENCE_HEARTBEAT_SECONDS = 5;
+export const PRESENCE_TIMEOUT_SECONDS = 13;
+
+// What one hour of a ten-person call may spend, and the reference call it
+// is measured against. One percent of the day's rows-written ceiling per
+// hour of call is the budget: an evening of four hours is then 4% of the
+// day, which leaves the owner's own traffic, backfill's reserved half and
+// the vanish drain's reserved quarter untouched by a room being used for
+// what it is for.
+const PRESENCE_HOURLY_ROWS_SHARE = DAILY_ROWS_WRITTEN_LIMIT / 100;
+const PRESENCE_REFERENCE_CALL_SIZE = 10;
+
+// The interval falls straight out of those two, rounded UP to a whole
+// heartbeat -- a write that would land between beats is a write that does
+// not happen until the next one, so expressing the interval in anything
+// finer than a beat is expressing a precision the beat rate cannot
+// deliver.
+//
+//   1,000 rows/hour / 10 people        = 100 writes per person per hour
+//   3,600s / 100                       = one write per 36 seconds
+//   rounded up to a whole heartbeat    = 8 beats, 40 seconds
+//
+// Measured against the ceiling that produced it: ten people in a call for
+// an hour is 10 x 90 = 900 rows written, 0.9% of the day. The same ten
+// people at a per-beat write would have cost 72,000.
+export const PRESENCE_WRITE_INTERVAL_SECONDS =
+  PRESENCE_HEARTBEAT_SECONDS *
+  Math.ceil(
+    3600 / (PRESENCE_HOURLY_ROWS_SHARE / PRESENCE_REFERENCE_CALL_SIZE) / PRESENCE_HEARTBEAT_SECONDS,
+  );
+
+// How stale a STORED watermark may be and still mean "in the call".
+//
+// Derived, not chosen, and it is the whole correctness argument for
+// writing coarsely. Somebody who is beating refreshes their row on the
+// first beat at or after PRESENCE_WRITE_INTERVAL_SECONDS, so a live row
+// is never older than that interval plus one beat. Anything older cannot
+// belong to somebody who has been beating continuously, and is therefore
+// an arrival.
+//
+// The cost of the coarseness, stated plainly: the stored tier resolves
+// presence at 45 seconds rather than hearth's 13, so somebody whose
+// connection drops and comes back inside 45 seconds of an eviction is
+// treated as having been there all along and is not announced a second
+// time. That is the right direction to be wrong in -- a reconnect is not
+// an arrival, and announcing one would be the same twelve-a-minute noise
+// this section exists to avoid, just rarer.
+export const PRESENCE_STALE_SECONDS =
+  PRESENCE_WRITE_INTERVAL_SECONDS + PRESENCE_HEARTBEAT_SECONDS;
+
+// Ceiling on the in-memory presence map, the same guard and the same
+// reason as PUBKEY_RATE_LIMIT_MAX_TRACKED above: the map is keyed by
+// pubkey, and although only a member of the group can beat at all, the
+// membership list is not bounded by anything in this file. Stale entries
+// are dropped once the map reaches this size (relay.ts prunePresence).
+export const PRESENCE_MAX_TRACKED = 1_000;
+
+// ---------------------------------------------------------------------
+// Push fan-out (src/push.ts, relay.ts drainPushOutbox).
+//
+// THE BOUND THAT MATTERS IS SUBREQUESTS, NOT ROWS. Every push is an
+// outbound HTTPS request, and Workers Free allows fifty subrequests per
+// invocation (developers.cloudflare.com/workers/platform/limits/, checked
+// 2026-08-30). Twenty members with a phone, a laptop and a home-screen
+// install each is sixty endpoints -- so a fan-out written inline inside
+// the request that stored the message starts failing at exactly the group
+// size this is being built for, and fails at the fifty-first request
+// rather than at the first, which makes it a partial delivery nobody
+// notices rather than an error.
+//
+// So the fan-out is queued and drained by the Durable Object's alarm, one
+// batch per invocation, with a fresh subrequest allowance each time.
+// ---------------------------------------------------------------------
+
+// Cloudflare Workers Free, per invocation. Named rather than inlined
+// because the two constants below are derived from it and a change to the
+// plan changes both.
+export const WORKER_SUBREQUEST_LIMIT = 50;
+
+// Left unspent, so the batch is never the thing that reaches the ceiling.
+// The alarm makes no other outbound request today; the reserve is for the
+// one that gets added later, which would otherwise turn a working fan-out
+// into a fan-out that silently loses its last endpoint.
+const PUSH_SUBREQUEST_RESERVE = 10;
+
+// Endpoints pushed in one alarm invocation.
+export const MAX_PUSHES_PER_TICK = WORKER_SUBREQUEST_LIMIT - PUSH_SUBREQUEST_RESERVE;
+
+// How many alarm invocations one notification may span before the rest of
+// its endpoints are dropped.
+//
+// A notification is news, and news goes stale: a queue that retried
+// forever would eventually wake somebody's phone about a message from
+// half an hour ago, which is worse than not waking it. Four ticks is the
+// bound, and the alarm reschedules itself immediately, so it is four
+// consecutive wakes rather than four of anything slower.
+const PUSH_MAX_TICKS = 4;
+
+// The real ceiling on one notification's fan-out, and what it means in
+// people: 160 endpoints is 40 members at the four-device cap below. A
+// group larger than that has its tail DROPPED, and dropped loudly --
+// relay.ts names the count in a console.warn rather than letting the
+// queue quietly stop. Raising it means raising PUSH_MAX_TICKS and
+// accepting the extra staleness, which is a decision with a cost rather
+// than a number to nudge.
+export const MAX_PUSH_ENDPOINTS_PER_NOTIFICATION = MAX_PUSHES_PER_TICK * PUSH_MAX_TICKS;
+
+// Endpoints one pubkey may register. reference/push.md names the shape:
+// "a phone, a laptop, a home screen install and a browser tab are four
+// different endpoints". Four is that list, and it is a bound on the
+// fan-out as much as on the table -- every device a member adds is a
+// subrequest every message spends.
+//
+// The oldest is evicted rather than the new one refused: a browser that
+// rotates its endpoint (which they do, on their own schedule) would
+// otherwise fill the allowance with dead rows and lock the member out of
+// their own notifications.
+export const MAX_PUSH_SUBSCRIPTIONS_PER_PUBKEY = 4;
+
+// How long a push service may hold an undeliverable notification (RFC
+// 8030's TTL header). Two answers, because the two notifications go stale
+// at completely different rates: it stays true that somebody said
+// something in the room, so a message is worth delivering to a phone that
+// comes back online within the hour; it stops being true that somebody is
+// at the fire the moment they leave, so a voice notification held past
+// five minutes is a phone buzzing about an empty room.
+export const PUSH_TTL_SECONDS = { message: 3600, voice: 300 } as const;
+
+// RFC 8188's record size, written into the body header. One record, and
+// the payload is a room name and one word, so this is chosen to sit well
+// clear of the 4096-byte body every push service accepts rather than to
+// be tight.
+export const PUSH_RECORD_SIZE = 4096;
+
+// The most plaintext one record can carry: the record, less RFC 8188's
+// one-byte padding delimiter and AES-GCM's sixteen-byte tag. Derived so
+// that changing the record size above cannot leave this behind.
+export const PUSH_PAYLOAD_MAX_BYTES = PUSH_RECORD_SIZE - 1 - 16;
+
+// How stale `push_subscriptions.last_ok_at` may get before a successful
+// send refreshes it.
+//
+// Coarsened for exactly the reason presence is, and it is the same
+// mistake avoided twice: writing it on every successful push would be one
+// row per device per notification -- sixty devices and a busy day is
+// thousands of rows to maintain a column whose only conceivable reader is
+// a sweep of endpoints that have been dead for a long time. A day is far
+// finer than that reader would need. The disposal that actually matters
+// does not wait for it at all: a 404 or 410 deletes the row on the spot.
+export const PUSH_LAST_OK_INTERVAL_SECONDS = 24 * 60 * 60;
+
+// How long the alarm waits before draining the outbox, and how long it
+// waits between the batches of one fan-out.
+//
+// Two seconds, doing two jobs. Going out: it is the coalescing window --
+// a handful of messages typed in the same breath queue one notification
+// and one fan-out rather than one each, which is what hearth's service
+// worker would collapse them into anyway (`tag: "hearth:message"`).
+// Coming back: it is the gap between one batch of MAX_PUSHES_PER_TICK and
+// the next, and it is short because the only reason there is a next one
+// is a subrequest ceiling, not anything worth waiting for.
+export const PUSH_ALARM_DELAY_MS = 2000;
+
+// How long a VAPID JWT stays valid (RFC 8292 "the `exp` claim... MUST NOT
+// be more than 24 hours from the time of the request"). Twelve hours is
+// comfortably inside that and comfortably outside any clock skew; the
+// token is minted per fan-out and never stored, so nothing is gained by
+// making it longer.
+export const VAPID_JWT_LIFETIME_SECONDS = 12 * 60 * 60;
+
 // Maximum seconds an event's created_at may lead wall-clock now. Every
 // kind sorts by created_at descending, and a replaceable kind (kind-0,
 // kind-3, ...) keeps whichever stored version has the higher created_at

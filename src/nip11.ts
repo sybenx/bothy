@@ -8,6 +8,7 @@ import {
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
   maxEventBytes,
 } from "./limits";
+import { pushPublicKey } from "./push";
 import type { RelaySettings } from "./storage";
 import { version } from "../package.json";
 
@@ -225,6 +226,26 @@ export function buildRelayInfo(
   // (schema.ts seedRelayIdentity) and exists independently of claim
   // status, so there is no unclaimed-relay state where it is unknown.
   info.self = relayPubkey;
+  // The public half of this deployment's VAPID keypair (src/push.ts), and
+  // the field hearth reads to decide whether push is available at all
+  // (reference/push.md: "loadRelayInfo takes push_key out of the relay's
+  // NIP-11 document"). base64url, unpadded, the exact string a browser
+  // wants as `applicationServerKey`.
+  //
+  // Not a NIP-11 field -- the spec defines none for this, and neither
+  // does any NIP -- so it is bothy's own, named after what a client does
+  // with it rather than under a vendor prefix, on the same reasoning
+  // nip86.ts names listunusedinvites plainly.
+  //
+  // OMITTED, never emitted empty, when no VAPID key is configured. That
+  // absence is the entire degradation path: hearth reads no key, never
+  // calls subscribepush, keeps raising notifications while it is open,
+  // and says so in its account overlay. A relay with push switched off is
+  // not a relay with push broken.
+  const pushKey = pushPublicKey(env);
+  if (pushKey) {
+    info.push_key = pushKey;
+  }
   const contact = resolveContact(profile);
   if (contact) {
     info.contact = contact;

@@ -2337,3 +2337,245 @@ export function listAllowedPubkeys(sql: SqlStorage): AllowedPubkey[] {
 export function isPubkeyAllowed(sql: SqlStorage, pubkey: string): boolean {
   return sql.exec(`SELECT 1 FROM allowed_pubkeys WHERE pubkey = ?`, pubkey).toArray().length > 0;
 }
+
+// ---------------------------------------------------------------------
+// Web push subscriptions (src/push.ts, src/nip86.ts subscribepush).
+//
+// The pubkey on every row here is the one the NIP-98 signature proved,
+// never one a request body offered -- see schema.ts `push_subscriptions`.
+// These functions take it as a parameter and never derive it, so there is
+// no path through this file where a body could reach that column.
+// ---------------------------------------------------------------------
+
+export interface PushSubscriptionRow {
+  endpoint: string;
+  pubkey: string;
+  p256dh: string;
+  auth: string;
+}
+
+// The same row plus the only column the fan-out reads and does not send:
+// when this endpoint last worked, which decides whether a success is
+// worth a row write at all (limits.ts PUSH_LAST_OK_INTERVAL_SECONDS).
+export interface PushFanoutRow extends PushSubscriptionRow {
+  last_ok_at: number | null;
+}
+
+// Registers or refreshes one endpoint, evicting this pubkey's oldest if
+// they are already at the cap.
+//
+// An upsert rather than an insert, because a browser hands the same
+// endpoint back on every load once it has one (hearth's subscribeToPush
+// reuses `getSubscription()`), and because the keys behind an endpoint
+// can legitimately change. Rebinding an endpoint to a DIFFERENT pubkey is
+// allowed for the same reason: an endpoint belongs to a browser profile,
+// and a household laptop signed into one npub and then another is one
+// endpoint that genuinely changed hands. The row moving means the old
+// pubkey stops receiving on it, which is the correct outcome.
+export function upsertPushSubscription(
+  sql: SqlStorage,
+  row: PushSubscriptionRow,
+  perPubkeyCap: number,
+  nowSec: number,
+): void {
+  sql.exec(
+    `INSERT INTO push_subscriptions (endpoint, pubkey, p256dh, auth, created_at, last_ok_at)
+       VALUES (?, ?, ?, ?, ?, NULL)
+       ON CONFLICT(endpoint) DO UPDATE SET
+         pubkey = excluded.pubkey,
+         p256dh = excluded.p256dh,
+         auth = excluded.auth,
+         created_at = excluded.created_at`,
+    row.endpoint,
+    row.pubkey,
+    row.p256dh,
+    row.auth,
+    nowSec,
+  );
+  // Oldest out, not newest refused. A browser that rotates its endpoint
+  // -- which they do, on their own schedule and without telling anyone --
+  // would otherwise fill a member's four slots with dead rows and lock
+  // them out of their own notifications, with the newest registration,
+  // the only live one, being the one turned away.
+  //
+  // `rowid DESC` breaks the tie, and it is load-bearing rather than
+  // tidy: `created_at` is a whole second, and four devices registered by
+  // one person setting up their phone and laptop land inside one. Ordered
+  // by endpoint instead, the survivor would be whichever string sorted
+  // first -- which is to say arbitrary, and specifically NOT the
+  // registration that just arrived. `endpoint` is a TEXT primary key and
+  // so not a rowid alias, which is what leaves the implicit rowid free to
+  // carry insertion order.
+  sql.exec(
+    `DELETE FROM push_subscriptions
+       WHERE pubkey = ?
+         AND endpoint NOT IN (
+           SELECT endpoint FROM push_subscriptions WHERE pubkey = ?
+             ORDER BY created_at DESC, rowid DESC LIMIT ?
+         )`,
+    row.pubkey,
+    row.pubkey,
+    perPubkeyCap,
+  );
+}
+
+// Scoped to the pubkey that signed the call, not to the endpoint alone.
+// Without the `AND pubkey = ?` any member holding a valid NIP-98 key
+// could unsubscribe anybody else's device by naming its endpoint --
+// endpoints are not secrets to the people who have seen a fan-out fail,
+// and silently turning somebody's notifications off is a quieter kind of
+// damage than turning them on.
+export function deletePushSubscription(sql: SqlStorage, pubkey: string, endpoint: string): boolean {
+  const before = sql
+    .exec(`SELECT 1 FROM push_subscriptions WHERE endpoint = ? AND pubkey = ?`, endpoint, pubkey)
+    .toArray().length;
+  if (before === 0) return false;
+  sql.exec(`DELETE FROM push_subscriptions WHERE endpoint = ? AND pubkey = ?`, endpoint, pubkey);
+  return true;
+}
+
+// Deletes by endpoint alone -- the disposal path, for an endpoint the
+// push service itself reported gone (404/410). No pubkey to scope it to:
+// the authority here is the push service, not a caller.
+export function forgetPushEndpoint(sql: SqlStorage, endpoint: string): void {
+  sql.exec(`DELETE FROM push_subscriptions WHERE endpoint = ?`, endpoint);
+}
+
+// One page of the fan-out. Ordered by endpoint and resumed by endpoint
+// (schema.ts `push_outbox.cursor`) so a subscription added or removed
+// mid-fan-out cannot shift the page boundary underneath the cursor, which
+// a rowid offset would.
+export function pushSubscriptionsAfter(
+  sql: SqlStorage,
+  after: string | null,
+  limit: number,
+): PushFanoutRow[] {
+  return sql
+    .exec<{
+      endpoint: string;
+      pubkey: string;
+      p256dh: string;
+      auth: string;
+      last_ok_at: number | null;
+    }>(
+      `SELECT endpoint, pubkey, p256dh, auth, last_ok_at FROM push_subscriptions
+         WHERE endpoint > ? ORDER BY endpoint ASC LIMIT ?`,
+      after ?? "",
+      limit,
+    )
+    .toArray();
+}
+
+export function markPushEndpointOk(sql: SqlStorage, endpoint: string, nowSec: number): void {
+  sql.exec(`UPDATE push_subscriptions SET last_ok_at = ? WHERE endpoint = ?`, nowSec, endpoint);
+}
+
+export function countPushSubscriptions(sql: SqlStorage): number {
+  const row = sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM push_subscriptions`).toArray()[0];
+  return row?.n ?? 0;
+}
+
+// ---------------------------------------------------------------------
+// The push outbox (schema.ts `push_outbox`, relay.ts drainPushOutbox).
+// At most two rows -- one per notification reason -- because messages
+// arriving in the same few seconds are one notification.
+// ---------------------------------------------------------------------
+
+export interface PushOutboxRow {
+  reason: string;
+  actors: string[];
+  queued_at: number;
+  cursor: string | null;
+  sent: number;
+}
+
+// Queues a notification, or folds this occurrence into the one already
+// queued for the same reason.
+//
+// Folding does NOT reset `cursor` or `sent`: a fan-out already halfway
+// through its endpoints keeps going rather than starting again, so a busy
+// room cannot make the drain restart forever and never reach the last
+// member. It does add the new actor, so somebody who has just posted is
+// not pushed about their own message even when it arrived after the row
+// did.
+export function queuePush(sql: SqlStorage, reason: string, actor: string, nowSec: number): void {
+  const existing = sql
+    .exec<{ actors: string }>(`SELECT actors FROM push_outbox WHERE reason = ?`, reason)
+    .toArray()[0];
+  if (existing === undefined) {
+    sql.exec(
+      `INSERT INTO push_outbox (reason, actors, queued_at, cursor, sent) VALUES (?, ?, ?, NULL, 0)`,
+      reason,
+      JSON.stringify([actor]),
+      nowSec,
+    );
+    return;
+  }
+  const actors = parseActors(existing.actors);
+  if (actors.includes(actor)) return;
+  actors.push(actor);
+  sql.exec(`UPDATE push_outbox SET actors = ? WHERE reason = ?`, JSON.stringify(actors), reason);
+}
+
+// A stored column parsed back, so a row written by some future version --
+// or corrupted -- degrades into "exclude nobody" rather than throwing
+// inside the alarm and stalling every pending notification.
+function parseActors(raw: string): string[] {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+export function pendingPushes(sql: SqlStorage): PushOutboxRow[] {
+  return sql
+    .exec<{ reason: string; actors: string; queued_at: number; cursor: string | null; sent: number }>(
+      `SELECT reason, actors, queued_at, cursor, sent FROM push_outbox ORDER BY queued_at ASC`,
+    )
+    .toArray()
+    .map((row) => ({ ...row, actors: parseActors(row.actors) }));
+}
+
+export function advancePush(sql: SqlStorage, reason: string, cursor: string, sent: number): void {
+  sql.exec(`UPDATE push_outbox SET cursor = ?, sent = ? WHERE reason = ?`, cursor, sent, reason);
+}
+
+export function clearPush(sql: SqlStorage, reason: string): void {
+  sql.exec(`DELETE FROM push_outbox WHERE reason = ?`, reason);
+}
+
+// ---------------------------------------------------------------------
+// Call presence (schema.ts `presence`, limits.ts's presence block).
+//
+// Read and written at most once per PRESENCE_WRITE_INTERVAL_SECONDS per
+// pubkey -- relay.ts's in-memory tier is what keeps the seven beats in
+// between from reaching this file at all.
+// ---------------------------------------------------------------------
+
+export function lastPresenceAt(sql: SqlStorage, pubkey: string): number | null {
+  const row = sql
+    .exec<{ last_seen: number }>(`SELECT last_seen FROM presence WHERE pubkey = ?`, pubkey)
+    .toArray()[0];
+  return row?.last_seen ?? null;
+}
+
+export function recordPresence(sql: SqlStorage, pubkey: string, nowSec: number): void {
+  sql.exec(
+    `INSERT INTO presence (pubkey, last_seen) VALUES (?, ?)
+       ON CONFLICT(pubkey) DO UPDATE SET last_seen = excluded.last_seen`,
+    pubkey,
+    nowSec,
+  );
+}
+
+// A deliberate departure: hearth publishes a kind-25051 with
+// `{"status":"leave"}` when somebody closes the call, and honouring it
+// means their next arrival is announced however soon it comes. Without
+// this, leaving and coming back inside PRESENCE_STALE_SECONDS would be
+// silent -- which is the right default for a dropped connection and the
+// wrong one for somebody who said they were going.
+export function clearPresence(sql: SqlStorage, pubkey: string): void {
+  sql.exec(`DELETE FROM presence WHERE pubkey = ?`, pubkey);
+}

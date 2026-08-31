@@ -21,6 +21,7 @@ import {
   banEvent,
   banPubkey,
   blockIp,
+  deletePushSubscription,
   listAllowedPubkeys,
   listBannedEvents,
   listBannedPubkeys,
@@ -31,7 +32,10 @@ import {
   unallowPubkey,
   unbanPubkey,
   unblockIp,
+  upsertPushSubscription,
 } from "./storage";
+import { MAX_PUSH_SUBSCRIPTIONS_PER_PUBKEY } from "./limits";
+import { pushConfigured } from "./push";
 import { getOwnerPubkey } from "./ownership";
 import { normalizeIp } from "./ip";
 import { normalizePubkey } from "./pubkey";
@@ -85,7 +89,30 @@ export const SUPPORTED_METHODS = [
   // semantics, this is the line that has to change.
   "listunusedinvites",
   "revokeinvite",
+  // bothy's own as well, and the one pair on this list a member may call
+  // rather than only the owner -- see MEMBER_CALLABLE_METHODS below. The
+  // subscription belongs to whoever signed the NIP-98 event, so the call
+  // has to be reachable by them and by nobody speaking for them.
+  "subscribepush",
+  "unsubscribepush",
 ] as const;
+
+// The methods a GROUP MEMBER may call, not just the owner.
+//
+// Every other method here administers the relay, and index.ts refuses a
+// signature that is not the owner's before dispatch ever happens. These
+// two do not administer anything: they register and remove one device's
+// push endpoint, and reference/push.md is explicit that "the signer of
+// that event is the member the subscription belongs to". A member who
+// could not call them could not be notified, which would leave push as
+// an owner-only feature in a room built for a group.
+//
+// Widening the gate this far and no further is the whole point of the
+// list being a list. index.ts checks membership only for a method named
+// here, so the owner-only refusal is still what every other method gets,
+// and a member's signature buys them nothing except their own
+// subscription row.
+export const MEMBER_CALLABLE_METHODS: readonly string[] = ["subscribepush", "unsubscribepush"];
 
 // The exact string blockip demands back as its `reason` before it will
 // block the address the management request itself came from. Chosen to
@@ -172,10 +199,86 @@ function changeIdentity(
   return { result: true, error: identityNote(field, method, envVarName, envValue, value === "") };
 }
 
+// The subscription object hearth sends as subscribepush's one parameter
+// -- `JSON.parse(JSON.stringify(pushSubscription))`, which is the browser's
+// own serialization of a PushSubscription.
+//
+// Validated to the byte here rather than at send time, because a row that
+// cannot be encrypted to is a row that fails once per message forever:
+// RFC 8291 wants `p256dh` to be an uncompressed P-256 point (65 bytes,
+// leading 0x04) and `auth` to be exactly the 16-byte auth secret, and
+// neither is something a later check can repair. `expirationTime` is
+// accepted and ignored -- it is null in every browser that ships push
+// today, and a relay acting on an expiry it was told rather than on the
+// 410 the push service will send is trusting the wrong party.
+function parsePushSubscription(
+  value: unknown,
+): { endpoint: string; p256dh: string; auth: string } | string {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return "subscribepush takes one PushSubscription object";
+  }
+  const sub = value as { endpoint?: unknown; keys?: unknown };
+  if (typeof sub.endpoint !== "string" || sub.endpoint === "") {
+    return "subscribepush: the subscription has no endpoint";
+  }
+  // https only, and length-bounded. The endpoint is a URL this relay will
+  // POST to on its own initiative, so it is the one field a caller
+  // controls that turns into outbound traffic -- an http:// or file://
+  // endpoint is not a push service, and an unbounded one is a stored
+  // string with no reason to be long.
+  try {
+    if (new URL(sub.endpoint).protocol !== "https:") {
+      return "subscribepush: the endpoint must be an https URL";
+    }
+  } catch {
+    return "subscribepush: the endpoint is not a URL";
+  }
+  if (sub.endpoint.length > MAX_PUSH_ENDPOINT_LENGTH) {
+    return `subscribepush: the endpoint is longer than ${MAX_PUSH_ENDPOINT_LENGTH} characters`;
+  }
+  const keys = (sub.keys ?? {}) as { p256dh?: unknown; auth?: unknown };
+  if (typeof keys.p256dh !== "string" || typeof keys.auth !== "string") {
+    return "subscribepush: the subscription is missing its p256dh/auth keys";
+  }
+  const p256dh = decodeBase64Url(keys.p256dh);
+  const auth = decodeBase64Url(keys.auth);
+  if (p256dh === null || p256dh.length !== 65 || p256dh[0] !== 0x04) {
+    return "subscribepush: p256dh must be a base64url uncompressed P-256 public key";
+  }
+  if (auth === null || auth.length !== 16) {
+    return "subscribepush: auth must be a base64url 16-byte secret";
+  }
+  return { endpoint: sub.endpoint, p256dh: keys.p256dh, auth: keys.auth };
+}
+
+// Long enough for every push service in use (FCM's are ~200 characters,
+// Mozilla's ~100), short enough that the column cannot be used as
+// storage.
+const MAX_PUSH_ENDPOINT_LENGTH = 1024;
+
+function decodeBase64Url(value: string): Uint8Array | null {
+  if (!/^[A-Za-z0-9_-]*$/.test(value)) return null;
+  const padded = value.replace(/-/g, "+").replace(/_/g, "/");
+  try {
+    return Uint8Array.from(atob(padded + "=".repeat((4 - (padded.length % 4)) % 4)), (c) =>
+      c.charCodeAt(0),
+    );
+  } catch {
+    return null;
+  }
+}
+
 // `callerIp` is the address the management request itself arrived from
 // (CF-Connecting-IP), threaded through from the Worker purely so blockip
 // can recognize a self-block. It is never used to authorize anything --
 // authorization is the NIP-98 signature and nothing else.
+//
+// `signer` is the pubkey that signature proved, and it is used by exactly
+// one pair of methods: subscribepush/unsubscribepush bind a device to
+// their caller. It is not an authorization input either -- index.ts has
+// already decided this caller may make this call -- it is the ANSWER to
+// "whose device is this", which the request body is deliberately not
+// allowed to give (reference/push.md, schema.ts `push_subscriptions`).
 export function handleManagementCall(
   sql: SqlStorage,
   env: Env,
@@ -183,6 +286,7 @@ export function handleManagementCall(
   params: unknown[],
   callerIp: string,
   nowSec: number,
+  signer: string,
 ): ManagementResponse {
   if (typeof method !== "string") return err("request is missing a string 'method'");
 
@@ -298,6 +402,50 @@ export function handleManagementCall(
         case "unknown":
           return err("revokeinvite: this relay has never issued that invite code");
       }
+    }
+
+    // bothy's own, and the client half is hearth's subscribeToPush
+    // (reference/push.md). The pubkey stored is `signer` and nothing else
+    // -- the parameters carry a device, not an identity.
+    case "subscribepush": {
+      // Refused rather than stored when this deployment has no VAPID key,
+      // because a stored subscription that can never be pushed to is a
+      // device endpoint held for nothing -- and holding one is the whole
+      // cost reference/push.md asks the person to weigh. A client only
+      // reaches this method after reading `push_key` off the NIP-11
+      // document, so the ordinary way to see this error is a key removed
+      // between the two.
+      if (!pushConfigured(env)) {
+        return err(
+          "subscribepush: this relay advertises no push_key, so it cannot send push notifications and " +
+            "will not keep a subscription it can never use",
+        );
+      }
+      const parsed = parsePushSubscription(params[0]);
+      if (typeof parsed === "string") return err(parsed);
+      upsertPushSubscription(
+        sql,
+        { ...parsed, pubkey: signer },
+        MAX_PUSH_SUBSCRIPTIONS_PER_PUBKEY,
+        nowSec,
+      );
+      return { result: true };
+    }
+
+    case "unsubscribepush": {
+      const endpoint = stringParam(params, 0);
+      if (endpoint === null || endpoint === "") {
+        return err("unsubscribepush takes the subscription endpoint as a string");
+      }
+      // `true` whether or not a row went, because the caller's goal is a
+      // state ("this device is not registered") and that state holds
+      // either way. hearth calls this on its way to `sub.unsubscribe()`
+      // and swallows the answer; a failure here would only be noise on a
+      // path where nothing is wrong. Scoped to the signer inside
+      // deletePushSubscription -- one member must not be able to unhook
+      // another's phone.
+      deletePushSubscription(sql, signer, endpoint);
+      return { result: true };
     }
 
     case "blockip": {

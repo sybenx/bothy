@@ -48,6 +48,16 @@ interface Allowance {
 // Durable Object round trip.
 const REFUSALS_TO_CONFIRM = 5;
 
+// Wall-clock budget per test, not a latency assertion -- the same
+// distinction helpers/socket.ts draws for its own timeout. Every probe
+// here is a real Worker plus Durable Object round trip and a test may run
+// two of them, so up to three hundred sequential round trips share one
+// deadline while the rest of the suite runs in parallel around it. Vitest
+// defaults to five seconds, which the suite outgrew: these started timing
+// out on a loaded machine while passing in isolation, which is a
+// statement about the machine rather than about the limiter.
+const PROBE_TIMEOUT_MS = 30_000;
+
 // Counts how many requests an address gets through before the first 429.
 // Every admission is asserted to precede every refusal. That makes
 // `admitted` the allowance in the ordinary case, but not a number to
@@ -100,7 +110,7 @@ describe("per-IP HTTP rate limiting", () => {
     const body = (await firstRefusal!.json()) as { error: string; retryAfterSeconds: number };
     expect(body.error).toContain("rate limited");
     expect(body.retryAfterSeconds).toBe(HTTP_RATE_LIMIT_PERIOD_SECONDS);
-  });
+  }, PROBE_TIMEOUT_MS);
 
   it("keys the allowance by address, so one caller cannot spend another's", async () => {
     const exhausted = await measureAllowance("/api/stats", "203.0.113.2");
@@ -112,7 +122,7 @@ describe("per-IP HTTP rate limiting", () => {
       }),
     );
     expect(other.status).toBe(200);
-  });
+  }, PROBE_TIMEOUT_MS);
 
   it("shares one allowance across every path that wakes the Durable Object", async () => {
     // The guarantee worth having is "this address cannot wake the object
@@ -136,7 +146,7 @@ describe("per-IP HTTP rate limiting", () => {
       }),
     );
     expect(upgrade.status).toBe(429);
-  });
+  }, PROBE_TIMEOUT_MS);
 
   it("bounds WebSocket upgrades, which relay.ts's per-message throttle never sees", async () => {
     // An upgrade wakes the Durable Object and spends one of the day's
@@ -150,7 +160,7 @@ describe("per-IP HTTP rate limiting", () => {
     });
     expect(admitted).toBeGreaterThan(0);
     expect(refused).toBeGreaterThan(0);
-  });
+  }, PROBE_TIMEOUT_MS);
 
   it("gives /api/profile a strictly tighter allowance than the rest", async () => {
     // Not a tidier number for its own sake: /api/profile is the only
@@ -164,7 +174,7 @@ describe("per-IP HTTP rate limiting", () => {
 
     expect(profile.refused).toBeGreaterThan(0);
     expect(profile.admitted).toBeLessThan(api.admitted);
-  });
+  }, PROBE_TIMEOUT_MS);
 
   it("never rate limits the static admin page", async () => {
     // public/ is served from env.ASSETS and never touches the Durable
@@ -180,5 +190,5 @@ describe("per-IP HTTP rate limiting", () => {
     );
     expect(page.status).toBe(200);
     expect(await page.text()).toContain("bothy");
-  });
+  }, PROBE_TIMEOUT_MS);
 });

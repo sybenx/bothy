@@ -266,7 +266,7 @@ describe("maintained event counters", () => {
     expect((await fetchCounts()).totalEvents).toBe(1);
 
     await runInDurableObject(stub, (instance: Relay) =>
-      instance.manage("banevent", [target.id, "spam"], "1.2.3.4"),
+      instance.manage("banevent", [target.id, "spam"], "1.2.3.4", OWNER_PUBKEY_HEX),
     );
     expect((await fetchCounts()).totalEvents).toBe(0);
 
@@ -276,7 +276,7 @@ describe("maintained event counters", () => {
     // created_at lookup lives inside deleteEventRow rather than being
     // passed in by callers that happen to know it.
     await runInDurableObject(stub, (instance: Relay) =>
-      instance.manage("banevent", ["a".repeat(64), "never stored"], "1.2.3.4"),
+      instance.manage("banevent", ["a".repeat(64), "never stored"], "1.2.3.4", OWNER_PUBKEY_HEX),
     );
     expect((await fetchCounts()).totalEvents).toBe(0);
   });
@@ -436,7 +436,7 @@ describe("rows written today", () => {
     // 900 rows at 300 follows, was invisible the same way.
     const before = await rowsWrittenToday();
     await runInDurableObject(stub(), (instance: Relay) =>
-      instance.manage("banpubkey", ["b".repeat(64), "spam"], "1.2.3.4"),
+      instance.manage("banpubkey", ["b".repeat(64), "spam"], "1.2.3.4", OWNER_PUBKEY_HEX),
     );
     const after = await rowsWrittenToday();
     expect(after).toBeGreaterThan(before);
@@ -449,7 +449,7 @@ describe("rows written today", () => {
     // does not survive the next hibernation.
     const before = await rowsWrittenToday();
     await runInDurableObject(stub(), (instance: Relay) =>
-      instance.manage("blockip", ["10.0.0.9", "noisy"], "1.2.3.4"),
+      instance.manage("blockip", ["10.0.0.9", "noisy"], "1.2.3.4", OWNER_PUBKEY_HEX),
     );
     const landed = await rowsWrittenToday();
     expect(landed).toBeGreaterThan(before);
@@ -502,7 +502,7 @@ describe("rows written today", () => {
 
     const before = await rowsWrittenToday();
     await runInDurableObject(stub(), (instance: Relay) =>
-      instance.manage("banevent", [target.id, "gone"], "1.2.3.4"),
+      instance.manage("banevent", [target.id, "gone"], "1.2.3.4", OWNER_PUBKEY_HEX),
     );
     expect(await rowsWrittenToday()).toBeGreaterThanOrEqual(before + eventRemovalBudget(2));
   });
@@ -522,7 +522,7 @@ describe("rows written today", () => {
     );
 
     await runInDurableObject(stub(), (instance: Relay) =>
-      instance.manage("banevent", [target.id, "gone"], "1.2.3.4"),
+      instance.manage("banevent", [target.id, "gone"], "1.2.3.4", OWNER_PUBKEY_HEX),
     );
 
     const removed = await runInDurableObject(stub(), async (_instance: Relay, state) =>

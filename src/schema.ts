@@ -677,6 +677,117 @@ export const TABLES: readonly TableSpec[] = [
     ],
   },
   {
+    // Web push subscriptions (src/push.ts, reference/push.md). One row
+    // per ENDPOINT, not per person: a phone, a laptop, a home screen
+    // install and a browser tab are four endpoints for one pubkey, which
+    // is why the primary key is the endpoint and the pubkey is an
+    // ordinary column.
+    //
+    // THE PUBKEY COMES FROM THE NIP-98 SIGNATURE, NEVER FROM THE BODY.
+    // reference/push.md is explicit about it and so is nip86.ts: the
+    // subscribepush call's parameters carry an endpoint and two keys and
+    // say nothing about whose they are, so the only trustworthy answer is
+    // the one the signature already proved. A body that tried to name a
+    // pubkey would be registering somebody else's device against their
+    // name -- and since the fan-out skips the author of a message, that
+    // is a way to suppress somebody's notifications as much as to steal
+    // them.
+    //
+    // NO SECONDARY INDEX, deliberately, and this is one of the few tables
+    // in this schema where that is a considered decision rather than an
+    // omission. The fan-out reads the whole table anyway (every
+    // subscription is a candidate recipient), the per-pubkey cap
+    // (limits.ts MAX_PUSH_SUBSCRIPTIONS_PER_PUBKEY) bounds it at four
+    // rows per member, and an index on `pubkey` would cost a row written
+    // per subscribe to serve a query that is already reading everything.
+    // Deletion is by endpoint, which is the primary key.
+    //
+    // `p256dh` and `auth` are the subscription's own keys, base64url, as
+    // the browser produced them -- RFC 8291's `ua_public` and auth
+    // secret. Stored verbatim for the same reason `group_invites.code` is:
+    // they are not credentials to this relay, they are credentials this
+    // relay presents elsewhere, and hashing them would make them useless.
+    //
+    // `last_ok_at` is when a send to this endpoint last succeeded, which
+    // is the only evidence the relay ever gets that a device is still
+    // real. Nothing reads it yet; it is the field reference/push.md asks
+    // for ("when it was last seen working") and the one a later sweep of
+    // long-dead endpoints would be built on. A push service answering 404
+    // or 410 does not wait for a sweep -- that row is deleted on the spot
+    // (relay.ts drainPushOutbox).
+    name: "push_subscriptions",
+    columns: [
+      col("endpoint", "TEXT PRIMARY KEY"),
+      col("pubkey", "TEXT NOT NULL"),
+      col("p256dh", "TEXT NOT NULL"),
+      col("auth", "TEXT NOT NULL"),
+      col("created_at", "INTEGER NOT NULL"),
+      col("last_ok_at", "INTEGER"),
+    ],
+  },
+  {
+    // The push fan-out queue. At most two rows, ever.
+    //
+    // Keyed by REASON rather than by occurrence, which is what keeps the
+    // queue's cost off the message path. Ten messages arriving in the
+    // seconds before the alarm fires are one notification, not ten --
+    // hearth's service worker collapses them into one line in the shade
+    // anyway (`tag: "hearth:message"`), so a row per message would be
+    // paying rows written to produce a notification the phone would then
+    // throw away. An upsert costs one row; the first insert costs two.
+    //
+    // `actors` is the JSON array of pubkeys NOT to push to: whoever
+    // caused each of the coalesced occurrences. reference/push.md, "push
+    // to every member of that group with a subscription, except the
+    // pubkey that signed it" -- and with several messages coalesced there
+    // are several such pubkeys, so it is a list rather than a column.
+    //
+    // `cursor` is how far through the endpoints, ordered by endpoint, the
+    // drain got. It exists because one notification can outlast one
+    // invocation: Workers Free allows fifty subrequests per invocation
+    // and a push is a subrequest, so a fan-out wider than limits.ts
+    // MAX_PUSHES_PER_TICK resumes on the next alarm rather than being
+    // truncated. Ordered by endpoint and not by rowid because the
+    // ordering has to survive a subscription being added or deleted
+    // mid-fan-out, and an endpoint is stable where a position is not.
+    //
+    // `sent` is what has actually gone out for this notification, checked
+    // against limits.ts MAX_PUSH_ENDPOINTS_PER_NOTIFICATION. A queue that
+    // resumed forever would eventually wake a phone about half-hour-old
+    // news; past the cap the remaining endpoints are dropped and the
+    // count is logged (relay.ts), because a push dropped silently is
+    // indistinguishable from one nobody ever tried to send.
+    name: "push_outbox",
+    columns: [
+      col("reason", "TEXT PRIMARY KEY"),
+      col("actors", "TEXT NOT NULL"),
+      col("queued_at", "INTEGER NOT NULL"),
+      col("cursor", "TEXT"),
+      col("sent", "INTEGER NOT NULL DEFAULT 0"),
+    ],
+  },
+  {
+    // Call presence watermarks (src/push.ts CALL_PRESENCE_KIND). One row
+    // per pubkey that has ever been in a call, holding the wall-clock
+    // second its beat was last WRITTEN -- which is not the second it was
+    // last seen, and the difference is the entire design.
+    //
+    // hearth beats every five seconds. Storing every beat would be a row
+    // write every five seconds per participant; limits.ts
+    // PRESENCE_WRITE_INTERVAL_SECONDS derives how much coarser than that
+    // this row is allowed to be (40 seconds, eight beats) and
+    // PRESENCE_STALE_SECONDS derives what "absent" therefore has to mean
+    // when read back (45 seconds, the interval plus one beat). Ten people
+    // in a call for an hour cost 900 rows written rather than 72,000.
+    //
+    // Rows are never swept. They accumulate at one row per pubkey that
+    // has ever joined a call on a relay with one group, which is the same
+    // argument `group_invites` makes: the sweep would cost more than the
+    // rows.
+    name: "presence",
+    columns: [col("pubkey", "TEXT PRIMARY KEY"), col("last_seen", "INTEGER NOT NULL")],
+  },
+  {
     // Every count /api/stats reports that is maintained rather than
     // computed. Exactly one row.
     //

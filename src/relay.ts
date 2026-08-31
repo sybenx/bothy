@@ -10,7 +10,6 @@ import {
   seedBackfillRelays,
 } from "./backfill";
 import { matchesAnyFilter, parseFilter } from "./filters";
-import { recordHost } from "./host";
 import {
   ALL_SCOPES,
   CREATE_INVITE_KIND,
@@ -22,6 +21,13 @@ import {
 } from "./groups";
 import {
   boundFilter,
+  MAX_PUSHES_PER_TICK,
+  MAX_PUSH_ENDPOINTS_PER_NOTIFICATION,
+  PRESENCE_MAX_TRACKED,
+  PRESENCE_STALE_SECONDS,
+  PRESENCE_WRITE_INTERVAL_SECONDS,
+  PUSH_ALARM_DELAY_MS,
+  PUSH_LAST_OK_INTERVAL_SECONDS,
   DAILY_ROWS_READ_LIMIT,
   DAILY_ROWS_WRITTEN_LIMIT,
   GIFT_WRAP_RATE_LIMIT_WINDOW_MS,
@@ -54,6 +60,17 @@ import {
 } from "./nip29";
 import { handleManagementCall, type ManagementResponse } from "./nip86";
 import { resolveIcon, resolveName, type OwnerProfile } from "./nip11";
+import {
+  CALL_PRESENCE_KIND,
+  GROUP_CHAT_KIND,
+  type PushPayload,
+  type PushReason,
+  pushConfigured,
+  pushSubject,
+  sendPush,
+  vapidKeys,
+} from "./push";
+import { getOwnHost, recordHost } from "./host";
 import { version } from "../package.json";
 import {
   type Filter,
@@ -86,8 +103,19 @@ import {
 import { getRelayPubkey } from "./relay-identity";
 import { initSchema } from "./schema";
 import {
+  advancePush,
   applyDeletion,
   beginVanish,
+  clearPresence,
+  clearPush,
+  forgetPushEndpoint,
+  lastPresenceAt,
+  markPushEndpointOk,
+  pendingPushes,
+  type PushFanoutRow,
+  pushSubscriptionsAfter,
+  queuePush,
+  recordPresence,
   auditMaintainedCounts,
   countEvents24h,
   type CountAuditStatus,
@@ -221,6 +249,21 @@ function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
 }
 
+// hearth's call presence content: `{"status":"here","muted":false}` while
+// somebody is in the call, `{"status":"leave"}` on the way out (its
+// app.js publishPresence/publishLeavePresence). Anything that does not
+// parse is read as "here", which is the safe direction: the beat arrived,
+// so somebody is beating, and treating an unparseable one as a departure
+// would announce their next beat as an arrival.
+function presenceStatus(event: NostrEvent): "here" | "leave" {
+  try {
+    const parsed = JSON.parse(event.content) as { status?: unknown };
+    return parsed?.status === "leave" ? "leave" : "here";
+  } catch {
+    return "here";
+  }
+}
+
 function send(ws: WebSocket, message: unknown[]): void {
   ws.send(JSON.stringify(message));
 }
@@ -276,6 +319,29 @@ export class Relay extends DurableObject<Env> {
   // Same in-memory, resets-on-eviction tradeoff as the other two -- see
   // the constant's comment for exactly how much that is and isn't worth.
   private pubkeyRateLimits = new Map<string, { windowStart: number; count: number }>();
+
+  // Per-PUBKEY presence watermark cache -- when this object last WROTE a
+  // `presence` row for a pubkey, not when it last saw a beat. hearth
+  // beats every five seconds and this relay writes at most once every
+  // PRESENCE_WRITE_INTERVAL_SECONDS (limits.ts), so seven beats in eight
+  // are answered from here and never reach storage at all.
+  //
+  // Memory, like the three throttles above, and losing it on eviction is
+  // not a correctness problem here for once: the stored row is the
+  // authority and PRESENCE_STALE_SECONDS is derived to be exactly the
+  // staleness a live row can have, so a woken object reads the right
+  // answer out of storage on the first beat after the wake and repopulates
+  // this map from it.
+  private presenceWrites = new Map<string, number>();
+
+  // Set when this invocation queued something into `push_outbox`, and
+  // cleared by settlePushAlarm() at the end of the invocation. A flag
+  // rather than an await at the queue site, because the queue site is
+  // acceptEvent -- deep inside a synchronous write path (handleEventInner
+  // through storeEvent), where scheduling an alarm would mean making that
+  // whole path async to await a storage call that has nothing to do with
+  // storing the event.
+  private pushAlarmWanted = false;
 
   // DIAGNOSTIC (src/read-metrics.ts, and expected to be removed with it):
   // every storage access in this object goes through this handle rather
@@ -474,12 +540,27 @@ export class Relay extends DurableObject<Env> {
   // live here rather than in the Worker for the same reason claim() and
   // ingestBackfillPage() do: the Durable Object owns every write, and it
   // opens no outbound connection to serve one.
-  async manage(method: unknown, params: unknown[], callerIp: string): Promise<ManagementResponse> {
+  async manage(
+    method: unknown,
+    params: unknown[],
+    callerIp: string,
+    signer: string,
+  ): Promise<ManagementResponse> {
     return this.metered(() =>
       withReadPath("management", () =>
-        handleManagementCall(this.sql, this.env, method, params, callerIp, nowSeconds()),
+        handleManagementCall(this.sql, this.env, method, params, callerIp, nowSeconds(), signer),
       ),
     );
+  }
+
+  // Whether a pubkey is in this relay's one group -- for the Worker's
+  // management gate (src/index.ts), which needs it for exactly the two
+  // methods a member may call rather than only the owner (nip86.ts
+  // MEMBER_CALLABLE_METHODS). One indexed row read, and reached only by a
+  // caller who has already produced a valid signature that turned out not
+  // to be the owner's, so no unauthenticated path pays for it.
+  async isGroupMember(pubkey: string): Promise<boolean> {
+    return this.metered(() => withReadPath("management", () => isGroupMember(this.sql, pubkey)));
   }
 
   // Backs GET /api/stats (src/index.ts) -- see CLAUDE.md "What it is".
@@ -925,7 +1006,12 @@ export class Relay extends DurableObject<Env> {
   }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    return this.metered(() => this.webSocketMessageInner(ws, message));
+    return this.metered(async () => {
+      this.webSocketMessageInner(ws, message);
+      // Inside metered(), so the setAlarm this may perform is counted by
+      // the write meter like every other row this invocation writes.
+      await this.settlePushAlarm();
+    });
   }
 
   private webSocketMessageInner(ws: WebSocket, message: string | ArrayBuffer): void {
@@ -1560,6 +1646,12 @@ export class Relay extends DurableObject<Env> {
       if (event.pubkey === owner && event.kind === CONTACT_LIST_KIND) {
         refreshFollows(sql, this.env);
       }
+      // Push, if this deployment has a key for it -- see notePush below.
+      // Placed here, under `result.stored`, so it is reached only by an
+      // event that passed every gate, verified its own signature and was
+      // actually accepted: a notification about a refused event would be
+      // a notification about nothing.
+      this.notePush(sql, event);
       this.broadcast(result.stored);
       this.liveBroadcast(result.stored);
     }
@@ -1573,6 +1665,286 @@ export class Relay extends DurableObject<Env> {
     for (const event of generated) {
       this.broadcast(event);
     }
+  }
+
+  // ------------------------------------------------------------------
+  // Push (src/push.ts, reference/push.md). Everything below is a no-op on
+  // a deployment with no VAPID key: no rows written, no alarm scheduled,
+  // no fetch attempted, and no error anywhere a client can see.
+  // ------------------------------------------------------------------
+
+  // What an accepted event owes the notification queue. Two kinds reach
+  // anything here, and the integer comparisons that decide an ordinary
+  // event is neither cost nothing on the path every other write takes --
+  // the same shape as authorizeGroupWrite's early exit.
+  private notePush(sql: SqlStorage, event: NostrEvent): void {
+    if (!pushConfigured(this.env)) return;
+    if (event.kind === CALL_PRESENCE_KIND) {
+      withReadPath("presence", () => this.notePresence(sql, event));
+      return;
+    }
+    // The group's chat kind only. isGroupEvent, not isAnyGroupEvent: a
+    // kind-9 tagged into somebody else's group id is not a message in
+    // this room, and waking this room's members about it would be
+    // notifying them of something they cannot read.
+    if (event.kind === GROUP_CHAT_KIND && isGroupEvent(event)) {
+      withReadPath("push", () => {
+        queuePush(sql, "message", event.pubkey, nowSeconds());
+        this.pushAlarmWanted = true;
+      });
+    }
+  }
+
+  // The presence transition, and the one thing reference/push.md warns
+  // will go wrong if it is written quickly: hearth beats every five
+  // seconds, so a relay that pushed on the EVENT rather than on the
+  // absent-to-present TRANSITION would send twelve notifications a minute
+  // per person in the call.
+  //
+  // Three outcomes, cheapest first:
+  //
+  //   memory says written recently   nothing at all -- no read, no write.
+  //                                  Seven beats in eight.
+  //   stored watermark is fresh      one read, one write, no notification.
+  //                                  Somebody who has been here all along.
+  //   stored watermark is stale      the same, plus a queued notification.
+  //                                  An arrival.
+  //
+  // See limits.ts for how the interval and the staleness threshold are
+  // derived from hearth's own heartbeat period and presence timeout, and
+  // for what an hour of a ten-person call costs (900 rows written,
+  // against 72,000 for a write per beat).
+  private notePresence(sql: SqlStorage, event: NostrEvent): void {
+    const now = nowSeconds();
+
+    // hearth publishes `{"status":"leave"}` when somebody closes the
+    // call, and honouring it is what makes a deliberate return
+    // announceable however soon it comes. Without it, leaving and coming
+    // back inside PRESENCE_STALE_SECONDS would be silent -- the right
+    // answer for a dropped connection, the wrong one for somebody who
+    // said they were going.
+    if (presenceStatus(event) === "leave") {
+      this.presenceWrites.delete(event.pubkey);
+      clearPresence(sql, event.pubkey);
+      return;
+    }
+
+    const written = this.presenceWrites.get(event.pubkey);
+    if (written !== undefined && now - written < PRESENCE_WRITE_INTERVAL_SECONDS) return;
+
+    // Read BEFORE the write, because the write is what destroys the
+    // evidence: the stored watermark's age is the only thing that
+    // distinguishes an arrival from a beat once memory is gone.
+    const stored = lastPresenceAt(sql, event.pubkey);
+    recordPresence(sql, event.pubkey, now);
+    this.rememberPresenceWrite(event.pubkey, now);
+
+    // Anything inside the derived staleness window belongs to somebody
+    // who has been beating continuously, since a live row is refreshed
+    // every PRESENCE_WRITE_INTERVAL_SECONDS at the latest.
+    if (stored !== null && now - stored <= PRESENCE_STALE_SECONDS) return;
+    queuePush(sql, "voice", event.pubkey, now);
+    this.pushAlarmWanted = true;
+  }
+
+  // Bounded like the throttle maps above, and for the same reason: the
+  // key is a pubkey, and although only a group member can beat at all,
+  // the member list is not bounded by anything in limits.ts. Oldest
+  // written first, so what survives a prune is what is most likely still
+  // in the call.
+  private rememberPresenceWrite(pubkey: string, nowSec: number): void {
+    if (this.presenceWrites.size >= PRESENCE_MAX_TRACKED) {
+      const cutoff = nowSec - PRESENCE_WRITE_INTERVAL_SECONDS;
+      for (const [key, written] of this.presenceWrites) {
+        if (written <= cutoff) this.presenceWrites.delete(key);
+      }
+      // Still full after dropping every stale entry -- more live
+      // participants than the map is sized for, which cannot happen on a
+      // relay hosting one group. Cleared outright rather than left to
+      // grow: the cost of being wrong is one duplicate notification each,
+      // and the cost of not bounding it is the object's memory.
+      if (this.presenceWrites.size >= PRESENCE_MAX_TRACKED) this.presenceWrites.clear();
+    }
+    this.presenceWrites.set(pubkey, nowSec);
+  }
+
+  // Schedules the drain, once per invocation that queued anything.
+  //
+  // The same only-if-sooner shape as scheduleLiveFeedAlarm below, and it
+  // has to be: there is one alarm, shared with the live feed's lifetime
+  // sweep, and setAlarm is a row write. PUSH_ALARM_DELAY_MS is also the
+  // coalescing window -- a second message arriving inside it finds an
+  // alarm already scheduled sooner than it wants and writes nothing.
+  private async settlePushAlarm(): Promise<void> {
+    if (!this.pushAlarmWanted) return;
+    this.pushAlarmWanted = false;
+    const desired = Date.now() + PUSH_ALARM_DELAY_MS;
+    const existing = await this.ctx.storage.getAlarm();
+    if (existing === null || existing > desired) {
+      await this.ctx.storage.setAlarm(desired);
+    }
+  }
+
+  // One batch of the fan-out. Returns true when there is more to do and
+  // the alarm should come back for it.
+  //
+  // BOUNDED BY SUBREQUESTS, which is the constraint that shapes this
+  // whole function. Workers Free allows fifty subrequests per invocation
+  // and every push is one, so twenty members with a phone, a laptop and a
+  // home-screen install each -- sixty endpoints -- cannot be served by one
+  // invocation at all. limits.ts MAX_PUSHES_PER_TICK is what one
+  // invocation spends; the outbox row's cursor is what the next one
+  // resumes from; MAX_PUSH_ENDPOINTS_PER_NOTIFICATION is where a fan-out
+  // stops being retried and the remainder is DROPPED -- loudly, in the
+  // log, because a push dropped silently is indistinguishable from one
+  // nobody ever tried to send.
+  //
+  // Reads and writes are each gathered into their own synchronous
+  // withReadPath scope with the awaits between them, because a scope is
+  // synchronous and must not straddle an await -- the same rule fetch()
+  // observes for its connect scope.
+  private async drainPushOutbox(): Promise<boolean> {
+    const keys = vapidKeys(this.env);
+    if (keys === null) return false;
+    const sql = this.sql;
+    const nowSec = nowSeconds();
+
+    // Who is already looking at the room. reference/push.md: "Do not push
+    // to somebody whose socket is open" -- they are getting hearth's own
+    // banner, and two notifications for one message is worse than one.
+    // Only an AUTHENTICATED socket counts: an anonymous one could be
+    // anybody, and this relay's group reads require NIP-42 anyway, so a
+    // hearth client reading the room has always authenticated. Costs no
+    // storage at all -- the pubkey is in the connection attachment.
+    const online = new Set<string>();
+    for (const ws of this.ctx.getWebSockets()) {
+      if (this.ctx.getTags(ws).includes(LIVE_FEED_TAG)) continue;
+      const authed = getState(ws).authedPubkey;
+      if (authed !== undefined) online.add(authed);
+    }
+
+    const plan = withReadPath("push", () => {
+      const pending = pendingPushes(sql);
+      if (pending.length === 0) return null;
+      const owner = getOwnerPubkey(sql, this.env);
+      const membership = new Map<string, boolean>();
+      const isMember = (pubkey: string): boolean => {
+        if (owner !== null && pubkey === owner) return true;
+        let member = membership.get(pubkey);
+        if (member === undefined) {
+          member = isGroupMember(sql, pubkey);
+          membership.set(pubkey, member);
+        }
+        return member;
+      };
+      // The room's name, and the only thing besides the notification kind
+      // that goes over the wire. Already public -- it is the NIP-11
+      // `name` any client can fetch without authenticating -- which is
+      // exactly why it is the one field a payload may carry.
+      const payloadRoom = resolveName(this.env, getRelaySettings(sql), getOwnerProfile(sql, this.env));
+      const subject = pushSubject(getOwnHost(sql));
+
+      let budget = MAX_PUSHES_PER_TICK;
+      const batches: {
+        reason: string;
+        payload: PushPayload;
+        page: PushFanoutRow[];
+        targets: PushFanoutRow[];
+        exhausted: boolean;
+        sent: number;
+      }[] = [];
+      for (const row of pending) {
+        // Out of subrequests. The rows left untouched are why `deferred`
+        // exists below: without it a notification that never got a page
+        // at all would leave nothing to reschedule the alarm for, and
+        // would sit in the outbox until some unrelated event queued
+        // another one.
+        if (budget <= 0) break;
+        // A page no larger than the subrequests left, so a page can never
+        // describe more work than this invocation is allowed to do.
+        const page = pushSubscriptionsAfter(sql, row.cursor, budget);
+        const targets = page
+          .filter((sub) => !row.actors.includes(sub.pubkey))
+          .filter((sub) => !online.has(sub.pubkey))
+          .filter((sub) => isMember(sub.pubkey));
+        batches.push({
+          reason: row.reason,
+          payload: { room: payloadRoom, kind: row.reason as PushReason },
+          page,
+          targets,
+          // A short page is the end of the table. The cap is the other
+          // way out, and the only one that loses a notification.
+          exhausted: page.length < budget,
+          sent: row.sent,
+        });
+        budget -= targets.length;
+      }
+      return { subject, batches, deferred: batches.length < pending.length };
+    });
+    if (plan === null) return false;
+
+    // The one place this Durable Object reaches the network -- see
+    // push.ts sendPush for why an alarm may and a WebSocket handler may
+    // not. Concurrently: the runtime queues these against its own
+    // simultaneous-connection limit, and forty sequential round trips to
+    // a push service would be forty times the wall clock for no gain.
+    const results = await Promise.all(
+      plan.batches.map(async (batch) => ({
+        batch,
+        outcomes: await Promise.all(
+          batch.targets.map((target) => sendPush(keys, plan.subject, target, batch.payload, nowSec)),
+        ),
+      })),
+    );
+
+    let more = plan.deferred;
+    withReadPath("push", () => {
+      for (const { batch, outcomes } of results) {
+        outcomes.forEach((outcome, index) => {
+          const endpoint = batch.targets[index]!.endpoint;
+          // reference/push.md "Cleanup": 404 or 410 means that endpoint
+          // is gone for good, so the row goes. Anything else -- a 429, a
+          // 5xx, a network failure -- is worth a retry and is not worth a
+          // deletion, so the row stays and this notification simply
+          // misses that device.
+          if (outcome === "gone") {
+            forgetPushEndpoint(sql, endpoint);
+            return;
+          }
+          if (outcome !== "sent") return;
+          // Refreshed at most once a day per endpoint, never once per
+          // push -- see limits.ts PUSH_LAST_OK_INTERVAL_SECONDS. Sixty
+          // devices and a busy day would otherwise be thousands of rows
+          // written to maintain a column nothing reads yet.
+          const lastOk = batch.targets[index]!.last_ok_at;
+          if (lastOk === null || nowSec - lastOk >= PUSH_LAST_OK_INTERVAL_SECONDS) {
+            markPushEndpointOk(sql, endpoint, nowSec);
+          }
+        });
+        const sent = batch.sent + outcomes.filter((outcome) => outcome === "sent").length;
+        const last = batch.page[batch.page.length - 1];
+        if (batch.exhausted || last === undefined) {
+          clearPush(sql, batch.reason);
+          continue;
+        }
+        if (sent >= MAX_PUSH_ENDPOINTS_PER_NOTIFICATION) {
+          // The drop, named rather than counted. A notification is news
+          // and news goes stale, so a fan-out wider than the cap stops
+          // rather than waking somebody about half-hour-old traffic --
+          // but stopping quietly would look exactly like finishing.
+          console.warn(
+            `push: dropped the rest of a "${batch.reason}" notification after ` +
+              `${sent} endpoints (limits.ts MAX_PUSH_ENDPOINTS_PER_NOTIFICATION); ` +
+              `this group has more subscribed devices than one notification may fan out to`,
+          );
+          clearPush(sql, batch.reason);
+          continue;
+        }
+        advancePush(sql, batch.reason, last.endpoint, sent);
+        more = true;
+      }
+    });
+    return more;
   }
 
   // Scoped as one "req" entry per REQ frame (read-metrics.ts). The
@@ -2013,18 +2385,29 @@ export class Relay extends DurableObject<Env> {
   }
 
   private async alarmInner(): Promise<void> {
+    // One alarm, two jobs, and the push drain goes first because it is
+    // the one with a deadline: a notification waiting on the next live
+    // feed sweep would arrive up to ten minutes late. The two are
+    // otherwise unrelated -- either can be the reason this alarm was
+    // scheduled, and neither may assume it was.
+    const morePushes = await this.drainPushOutbox();
+
     const now = Date.now();
-    let nextExpiry: number | null = null;
+    let next: number | null = morePushes ? now + PUSH_ALARM_DELAY_MS : null;
     for (const ws of this.ctx.getWebSockets(LIVE_FEED_TAG)) {
       const expiresAt = getLiveFeedState(ws).connectedAt + LIVE_FEED_MAX_LIFETIME_MS;
       if (expiresAt <= now) {
         ws.close(1000, "live feed connection lifetime exceeded, reconnect");
-      } else if (nextExpiry === null || expiresAt < nextExpiry) {
-        nextExpiry = expiresAt;
+      } else if (next === null || expiresAt < next) {
+        next = expiresAt;
       }
     }
-    if (nextExpiry !== null) {
-      await this.ctx.storage.setAlarm(nextExpiry);
+    // Whichever comes first. A single setAlarm either way, because there
+    // is a single alarm: rescheduling for the live feed alone would drop
+    // a half-finished fan-out, and rescheduling for the fan-out alone
+    // would leave a live feed connection open past its lifetime.
+    if (next !== null) {
+      await this.ctx.storage.setAlarm(next);
     }
   }
 

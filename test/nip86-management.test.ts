@@ -445,7 +445,7 @@ describe("changerelayname / changerelaydescription / changerelayicon", () => {
       const sql = state.storage.sql;
       const withEnvVar = { OWNER_PUBKEY: OWNER_PUBKEY_HEX, RELAY_NAME: "from-the-dashboard" } as unknown as Env;
 
-      const reply = handleManagementCall(sql, withEnvVar, "changerelayname", ["Signal Hill"], CALLER_IP, 1000);
+      const reply = handleManagementCall(sql, withEnvVar, "changerelayname", ["Signal Hill"], CALLER_IP, 1000, OWNER_PUBKEY_HEX);
 
       expect(reply.result).toBe(true);
       expect(reply.error).toContain("RELAY_NAME");

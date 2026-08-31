@@ -1,7 +1,7 @@
 import { runBackfillTick } from "./backfill-worker";
 import { logExhaustion } from "./exhaustion";
 import { HTTP_RATE_LIMIT_PERIOD_SECONDS, secondsUntilUtcMidnight } from "./limits";
-import { MANAGEMENT_CONTENT_TYPE } from "./nip86";
+import { MANAGEMENT_CONTENT_TYPE, MEMBER_CALLABLE_METHODS } from "./nip86";
 import { nip11Response } from "./nip11";
 import { ownerReason, verifyNip98 } from "./nip98";
 import { lookupProfileCached } from "./profile-lookup";
@@ -166,11 +166,13 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
     return managementResponse({ error: auth.reason }, 401);
   }
 
-  // The first DO round trip of the request, and the last thing standing
-  // between a valid signature and a management call.
-  const denial = ownerReason(auth.pubkey, await relayStub(env).getOwner());
-  if (denial !== null) return managementResponse({ error: denial }, 401);
-
+  // Parsed before the ownership round trip, which it was not before. The
+  // parse is free -- no storage, no network -- and the method name is now
+  // needed to know WHICH gate applies: almost everything here is
+  // owner-only, and subscribepush/unsubscribepush are callable by a group
+  // member too (nip86.ts MEMBER_CALLABLE_METHODS). Doing it in the other
+  // order would mean refusing a member's subscription before having read
+  // the word that says it was one.
   let parsed: unknown;
   try {
     parsed = JSON.parse(new TextDecoder().decode(body));
@@ -180,18 +182,102 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
   const call = parsed as { method?: unknown; params?: unknown } | null;
   const params = Array.isArray(call?.params) ? (call.params as unknown[]) : [];
 
+  // The first DO round trip of the request, and the last thing standing
+  // between a valid signature and a management call.
+  const denial = ownerReason(auth.pubkey, await relayStub(env).getOwner());
+  if (denial !== null) {
+    // A member's subscribepush is the one thing a non-owner signature can
+    // buy here, and it buys nothing else: the method has to be on the
+    // short list AND the signer has to be in the group. Two conditions,
+    // checked in that order, because the first is free and the second is
+    // a second round trip -- so a stranger signing `banpubkey` still
+    // costs exactly what it cost before this existed.
+    //
+    // UNCLAIMED still refuses whatever the method is. `ownerReason`
+    // returns its unclaimed reason before any signer comparison, and a
+    // relay with no owner has no group and no members, so there is
+    // nobody the membership check could admit anyway.
+    const memberCallable =
+      typeof call?.method === "string" && MEMBER_CALLABLE_METHODS.includes(call.method);
+    if (!memberCallable || !(await relayStub(env).isGroupMember(auth.pubkey))) {
+      return managementResponse({ error: denial }, 401);
+    }
+  }
+
   const result = await relayStub(env).manage(
     call?.method,
     params,
     request.headers.get("CF-Connecting-IP") ?? "unknown",
+    // The pubkey the signature proved, not one the body offered -- see
+    // nip86.ts handleManagementCall and schema.ts `push_subscriptions`.
+    auth.pubkey,
   );
   return managementResponse(result);
+}
+
+// ---------------------------------------------------------------------
+// CORS on the management endpoint.
+//
+// WHY THIS IS SAFE, AND WHY IT MUST NOT BE REMOVED AS AN OVERSIGHT.
+//
+// Every management call is authenticated by a NIP-98 event (src/nip98.ts)
+// signed over this exact method, URL and body, and index.ts refuses
+// anything else before the Durable Object is touched. Allowing a browser
+// to make the request from another origin therefore weakens no
+// authorization whatsoever: the signature is the credential, it travels
+// in a header the page has to construct deliberately, and no browser
+// attaches it on a page's behalf. There is no cookie, no session and no
+// ambient authority here for a cross-origin request to borrow -- which is
+// exactly the thing the same-origin policy exists to protect, and exactly
+// the thing this endpoint does not have. `*` rather than a reflected
+// origin for the same reason: with no credentials in play there is no
+// origin to keep secret, and a wildcard cannot be combined with
+// credentials even if some later change tried to.
+//
+// What an unauthenticated preflight reveals is that a management endpoint
+// exists, which the NIP-11 document already advertises to anyone --
+// `supported_nips` lists 86 unauthenticated, on the same URL.
+//
+// WITHOUT THIS, the management API is reachable only from a page the
+// relay itself served. hearth is served from GitHub Pages, so every
+// management call from it failed at the browser: listunusedinvites, which
+// already shipped, and now subscribepush -- which means push could not be
+// turned on from the copy of hearth most people use.
+const CORS_HEADERS: Record<string, string> = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  // Exactly the two headers a NIP-86 call sets. `Authorization` is what
+  // makes the request non-simple and forces the preflight in the first
+  // place; `Content-Type` is non-simple too, since
+  // application/nostr+json+rpc is not one of the three CORS-safelisted
+  // media types.
+  "Access-Control-Allow-Headers": "Authorization, Content-Type",
+  // A day, so a client making repeated management calls preflights once
+  // rather than doubling every call into two requests against the same
+  // per-IP allowance.
+  "Access-Control-Max-Age": "86400",
+};
+
+// The preflight. Answered for any path, because the management endpoint
+// is the relay ROOT (nips/86.md: "on the same URI as the relay's
+// websocket") and a browser preflighting it sends OPTIONS with no
+// Content-Type header at all -- so the management branch in route()
+// cannot recognize it, and without an explicit branch it would fall
+// through to the static asset handler and answer 405.
+//
+// Deliberately NOT rate limited, unlike every other HTTP path here. It
+// never reaches the Durable Object, reads no storage and opens nothing,
+// so there is no cost for the limiter to protect; and counting it would
+// spend two of an IP's sixty per minute for every single management call,
+// halving the real allowance for the one client that has to preflight.
+function preflightResponse(): Response {
+  return new Response(null, { status: 204, headers: CORS_HEADERS });
 }
 
 function managementResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": MANAGEMENT_CONTENT_TYPE },
+    headers: { "Content-Type": MANAGEMENT_CONTENT_TYPE, ...CORS_HEADERS },
   });
 }
 
@@ -256,6 +342,13 @@ async function handleProfile(request: Request, env: Env): Promise<Response> {
 // wrapper there has something to wrap.
 async function route(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
+
+  // The CORS preflight for the management endpoint, answered before
+  // anything else because an OPTIONS request carries neither the
+  // Content-Type that identifies a management call nor the Accept header
+  // that identifies a NIP-11 fetch -- see preflightResponse above for why
+  // cross-origin management calls are safe and why this must stay.
+  if (request.method === "OPTIONS") return preflightResponse();
 
   // NIP-86 is checked BEFORE NIP-11, and the order is load-bearing:
   // "application/nostr+json+rpc" contains "application/nostr+json" as a

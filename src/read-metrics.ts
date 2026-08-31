@@ -84,6 +84,19 @@ export const READ_PATHS = [
   // join stores no event at all -- folding it in would put reads into a
   // per-event bucket for a path that never writes an event row.
   "join",
+  // relay.ts notePresence: the call-presence watermark (schema.ts
+  // `presence`). Separate from "write" because it is paid by one
+  // ephemeral kind that stores no event, and because the whole point of
+  // limits.ts PRESENCE_WRITE_INTERVAL_SECONDS is that this bucket stays
+  // small -- a bucket growing with the beat rate rather than with the
+  // write interval is the failure this instrument would catch.
+  "presence",
+  // relay.ts drainPushOutbox: the outbox rows, the subscription page and
+  // the membership lookups one push fan-out pays. Separate from "write"
+  // for the same reason "groupState" is -- it runs in the alarm, not on
+  // the write path, and averaging it into the per-event bucket would
+  // describe a cost no event pays.
+  "push",
   // relay.ts fetch(): recordHost plus the once-per-connection
   // isIpBlocked lookup.
   "connect",
