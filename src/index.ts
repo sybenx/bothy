@@ -8,6 +8,7 @@ import { lookupProfileCached } from "./profile-lookup";
 import { normalizeIp } from "./ip";
 import { normalizePubkey } from "./pubkey";
 import { relayStub } from "./relay-stub";
+import { cachedUpstreamVersion, describeUpdate, updateCheckEnabled } from "./upstream-version";
 
 export { Relay } from "./relay";
 
@@ -285,8 +286,28 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
   const limited = await rateLimited(env.RATE_LIMIT_API, request);
   if (limited !== null) return limited;
 
+  // The "a newer bothy exists" notice (src/upstream-version.ts), merged
+  // in HERE rather than inside getStats, and the placement is the point:
+  // it is an outbound request, and the Durable Object is the one place in
+  // this project that must not make one on a read path (CLAUDE.md "The
+  // budget" -- a socket held there costs duration and blocks
+  // hibernation). The Worker is stateless and pays neither.
+  //
+  // Started before the DO round trip and awaited after it, so the two
+  // overlap: on the rare cache miss this adds latency only if
+  // githubusercontent is slower than the relay's own storage, and never
+  // more than UPSTREAM_VERSION_TIMEOUT_MS. It cannot reject
+  // (cachedUpstreamVersion catches everything and answers null), so no
+  // failure here can turn a working stats page into an error.
+  //
+  // The version it is compared against is the one getStats already
+  // reports, not a second import of package.json -- CLAUDE.md "Release
+  // step" keeps exactly one source of truth for that string.
+  const upstream = updateCheckEnabled(env) ? cachedUpstreamVersion() : Promise.resolve(null);
+
   const stats = await relayStub(env).getStats(new URL(request.url).host);
-  return json(stats);
+
+  return json({ ...stats, ...describeUpdate(await upstream, stats.version) });
 }
 
 // The claim form's courtesy profile preview, and nothing else: you paste

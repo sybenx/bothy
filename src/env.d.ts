@@ -51,6 +51,13 @@ interface Env {
   // disagree. Unset means no push_key on the NIP-11 document and no push,
   // which is a supported state and not an error (reference/push.md).
   VAPID_PRIVATE_KEY?: string;
+  // The upstream update check (upstream-version.ts), which /api/stats
+  // answers with and the admin page renders as a one-line notice. An
+  // opt-OUT, and the same only-one-exact-value-disables-it shape as
+  // ALLOW_FOLLOWS above: setting it to the exact string "off" is the only
+  // way to stop the Worker asking githubusercontent what the current
+  // release is. Unset means the check runs.
+  UPDATE_CHECK?: string;
   MAX_EVENT_BYTES?: string;
   MAX_EVENTS_PER_PUBKEY_PER_MINUTE?: string;
   NON_OWNER_STORAGE_BYTES?: string;

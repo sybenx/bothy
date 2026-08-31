@@ -831,6 +831,43 @@ export const PROFILE_CACHE_TTL_MS = 5 * 60 * 1000;
 // isolate memory under a flood of distinct pubkeys, not to serve one.
 export const PROFILE_CACHE_MAX_ENTRIES = 256;
 
+// ---------------------------------------------------------------------
+// The upstream version check (upstream-version.ts), which /api/stats
+// answers with so the admin page can say a newer release exists.
+//
+// Same cache shape and the same reasoning as the block above: isolate-
+// local, because caches.default needs a custom domain and bothy deploys
+// to workers.dev. What differs is the traffic it absorbs. /api/stats is
+// unauthenticated and is loaded on every visit to a public page, and the
+// answer is a version string that changes a few times a month, so an
+// uncached check would point this deployment's IP at githubusercontent
+// once per page view to learn something that was already true an hour
+// ago. Six hours is well under "a release you have not noticed yet" and
+// well over any burst.
+export const UPSTREAM_VERSION_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+// The failure this one bounds is different, so it is cached for minutes
+// rather than hours: a check that failed says nothing about upstream, and
+// retrying an unreachable host every six hours would leave a relay
+// wrongly quiet about an update for a quarter of a day after one blip.
+// Long enough that a githubusercontent outage cannot turn each page view
+// into another outbound attempt, short enough to recover on its own.
+export const UPSTREAM_VERSION_ERROR_CACHE_TTL_MS = 10 * 60 * 1000;
+
+// How long the check waits before giving up, matching profile-lookup.ts's
+// LOOKUP_TIMEOUT_MS shape. It runs concurrently with the getStats round
+// trip (index.ts handleStats), so this is the ceiling on how much a slow
+// GitHub can add to a page load -- and it is a courtesy notice, so the
+// right behaviour when it is slow is to answer without it.
+export const UPSTREAM_VERSION_TIMEOUT_MS = 2500;
+
+// A ceiling on what the check will read before deciding upstream is not
+// serving a package.json. The real file is around 800 bytes; this is
+// generous room above that and still refuses to pull an unbounded body
+// into a Worker's memory because a URL that used to be a small JSON file
+// stopped being one.
+export const UPSTREAM_VERSION_MAX_BYTES = 16 * 1024;
+
 
 
 // How long the Worker's cron tick keeps one outbound backfill socket open

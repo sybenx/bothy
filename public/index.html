@@ -73,6 +73,17 @@
   }
   footer { margin-top: 1rem; font-size: 0.8rem; opacity: 0.6; }
   footer a { color: inherit; }
+  /* The update notice sits inside footer's 0.6 opacity, so it cannot be
+     made louder than the version string beside it -- which is right. It
+     is news, not an alarm: nothing here is broken, and a relay that is
+     one release behind keeps working exactly as it did. The separator is
+     a pseudo-element so the notice can be hidden without leaving a
+     stranded dot behind it. */
+  /* inline-block so the separator sits outside the link's underline --
+     a dot that reads as part of the link text looks like a typo in the
+     version number. The margins are the spacing; a plain space either
+     side would collapse against the pseudo-element boundary. */
+  #update-link::before { content: "\00b7"; display: inline-block; margin: 0 0.4em; text-decoration: none; }
   /* Everything down to and including the version attribution, held to
      exactly one viewport tall. That is what puts #diagnostics -- the one
      element deliberately outside this wrapper -- at the fold precisely,
@@ -154,6 +165,13 @@
 
 <footer>
   <a id="version-link" href="https://github.com/sybenx/bothy" target="_blank" rel="noopener"></a>
+  <!-- Shown only when /api/stats reports a strictly newer release
+       upstream (src/upstream-version.ts). Points at the README section
+       that explains how to pull one in, because the relay cannot link to
+       the thing that would actually do it: the updater lives in the
+       owner's own GitHub repo, whose name this deployment has never been
+       told. -->
+  <a id="update-link" href="https://github.com/sybenx/bothy#keeping-it-updated" target="_blank" rel="noopener" hidden></a>
 </footer>
 </div>
 
@@ -239,6 +257,18 @@ async function main() {
   document.getElementById("reset-note").hidden = false;
   setFavicon(stats.icon);
   document.getElementById("version-link").textContent = "bothy" + (stats.version ? " v" + stats.version : "");
+
+  // The update notice. Both halves are checked rather than just the
+  // boolean: `updateAvailable` is false whenever `latestVersion` is null
+  // (src/upstream-version.ts describeUpdate), so this cannot render
+  // "vnull available", and a relay whose check is disabled or failing
+  // shows nothing at all rather than something reassuring it cannot
+  // actually vouch for.
+  if (stats.updateAvailable && stats.latestVersion) {
+    const updateLink = document.getElementById("update-link");
+    updateLink.textContent = "v" + stats.latestVersion + " available";
+    updateLink.hidden = false;
+  }
 
   // Read side for NIP-86's changerelayname, which the spec gives no
   // getrelayname to pair with. Resolved server-side through the same

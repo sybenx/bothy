@@ -11,7 +11,19 @@ export default defineConfig({
       // than in wrangler.jsonc so a real deploy stays unclaimed (TOFU) by
       // default -- see CLAUDE.md "Ownership".
       miniflare: {
-        bindings: { OWNER_PUBKEY: OWNER_PUBKEY_HEX },
+        bindings: {
+          OWNER_PUBKEY: OWNER_PUBKEY_HEX,
+          // The upstream update check (src/upstream-version.ts) is on by
+          // default in a real deployment, and every test that calls
+          // /api/stats would therefore make a real request to
+          // githubusercontent -- a suite whose results depend on the
+          // network, and on someone else's availability, for a field
+          // none of those tests are about. Off here; the one file that IS
+          // about it (test/upstream-version.test.ts) passes its own env
+          // and stubs fetch, so it exercises both states without either
+          // one leaving the machine.
+          UPDATE_CHECK: "off",
+        },
       },
     }),
   ],
