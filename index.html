@@ -21,7 +21,7 @@
 <header class="topbar">
   <div class="wrap">
     <a class="brand" href="./">
-      <svg viewBox="0 0 16 16" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M2.5 8.5 8 3l5.5 5.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><rect x="4.5" y="8" width="7" height="5.5" fill="currentColor"/></svg>
+      <svg viewBox="0 0 16 16" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M2.4 8.4 8 3l5.6 5.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M4.6 8h6.8v5.6H4.6z" fill="currentColor"/><rect x="6.7" y="9.5" width="2.6" height="2.6" rx=".35" fill="var(--ember)"/></svg>
       bothy
     </a>
     <nav>
@@ -35,12 +35,26 @@
 
   <section class="hero">
     <div class="wrap">
+      <!-- Larger and simpler than it was. The old mark carried a roof, two
+           walls, a door outline and a small off-centre window, and at 5rem
+           the door read as a second window while the ember — the one part
+           that means anything — was a dark speck near the corner. The door
+           is gone, the window is centred and roughly three times the area,
+           and the light it throws is drawn rather than implied, so the mark
+           says "someone is in" at the size the page actually renders it. -->
       <svg class="hut" viewBox="0 0 64 64" fill="none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
-        <path d="M4 30 32 7l28 23" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round" opacity=".75"/>
-        <path d="M12 26v31h40V26" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round" opacity=".75"/>
-        <path d="M27 57V41h10v16" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round" opacity=".45"/>
-        <path d="M3 57h58" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" opacity=".2"/>
-        <rect x="17" y="33" width="7.5" height="7.5" rx="1" fill="var(--ember)"/>
+        <defs>
+          <radialGradient id="hut-glow">
+            <stop class="glow-in" offset="0%"/>
+            <stop class="glow-mid" offset="55%"/>
+            <stop class="glow-out" offset="100%"/>
+          </radialGradient>
+        </defs>
+        <circle cx="32" cy="40.5" r="17" fill="url(#hut-glow)"/>
+        <path d="M9 28 32 9l23 19" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity=".8"/>
+        <path d="M13 25.5V56M51 25.5V56" stroke="currentColor" stroke-width="3" stroke-linecap="round" opacity=".8"/>
+        <path d="M5 56h54" stroke="currentColor" stroke-width="3" stroke-linecap="round" opacity=".22"/>
+        <rect x="25.5" y="34" width="13" height="13" rx="1.5" fill="var(--ember)"/>
       </svg>
 
       <h1>bothy</h1>
