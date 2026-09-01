@@ -571,6 +571,106 @@ describe("rows written per swept message", () => {
   });
 });
 
+// What the horizon does to rows READ, which is the other half of the
+// budget and the half an owner can watch move on /api/stats. Measured
+// here rather than reasoned about, like every figure in
+// test/read-cost.test.ts.
+describe("rows read per chat REQ", () => {
+  // Sums SqlStorageCursor.rowsRead. The cursor has to be drained before
+  // rowsRead is meaningful, so this consumes it and hands back an array
+  // the caller can still read.
+  function measureRowsRead(sql: SqlStorage, fn: (sql: SqlStorage) => void): number {
+    let total = 0;
+    const proxy = new Proxy(sql, {
+      get(target, property) {
+        if (property === "exec") {
+          return (query: string, ...bindings: unknown[]) => {
+            const cursor = target.exec(query, ...bindings);
+            const rows = cursor.toArray();
+            total += cursor.rowsRead;
+            return { toArray: () => rows } as never;
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function"
+          ? (value as (...a: unknown[]) => unknown).bind(target)
+          : value;
+      },
+    }) as SqlStorage;
+    fn(proxy);
+    return total;
+  }
+
+  it("makes a chat read cost what the last few minutes hold, not what the limit asks for", async () => {
+    await runInDurableObject(stub(), async (_instance: Relay, durable) => {
+      const sql = durable.storage.sql;
+      // A FIXED second rather than the wall clock, which the rest of this
+      // file can use freely and this test cannot: the figures below are
+      // exact row counts, and a moving `now` moves every event's id, which
+      // moves the `ORDER BY created_at DESC, id ASC` tie-break and the
+      // count with it by a row or two.
+      const now = 1_800_000_000;
+
+      // A day of a busy room, then an active conversation: thirteen
+      // messages inside the horizon window, which is what a real one holds
+      // while people are actually talking.
+      //
+      // 300 messages and limits of 50 and 200, rather than a larger
+      // fixture and larger limits. The property under test needs only that
+      // both limits BIND -- and this file runs in a suite whose timing
+      // tests are already load-sensitive, so a fixture costing seconds to
+      // build would make this test a contributor to that rather than a
+      // measurement of anything.
+      const history = 300;
+      for (let i = 0; i < history; i++) {
+        storeEvent(sql, chat(now - 86400 + Math.floor((i * 86400) / history), i), now);
+      }
+      for (let i = 0; i < 13; i++) storeEvent(sql, chat(now - 280 + i * 20, 1000 + i), now);
+
+      const horizon = now - CHAT_BACKLOG_SECONDS;
+      const cost = (filter: Record<string, unknown>, clamped: boolean) =>
+        measureRowsRead(sql, (metered) => {
+          queryFilter(metered, filter, now, {
+            scopes: [GROUP_SCOPE],
+            ...(clamped ? { chatHorizon: horizon } : {}),
+          });
+        });
+
+      // The shape hearth actually sends: the group named, the chat kind
+      // named, a page of history asked for.
+      // Without the tag first, where the kind index serves the query
+      // directly and the figures are exactly what limits.ts filterReadCost
+      // prices: 2 x limit + 1.
+      // Unclamped, the cost is exactly what limits.ts filterReadCost
+      // prices an index path at: 2 x limit + 1.
+      expect(cost({ kinds: [GROUP_CHAT_KIND], limit: 50 }, false)).toBe(101);
+      expect(cost({ kinds: [GROUP_CHAT_KIND], limit: 200 }, false)).toBe(401);
+
+      // THE PROPERTY THAT MATTERS, and it is this one rather than any
+      // single number: clamped, the cost stops depending on the limit at
+      // all. It is what the window HOLDS, not what the client ASKED FOR,
+      // so a client raising its limit stops buying rows read.
+      expect(cost({ kinds: [GROUP_CHAT_KIND], limit: 50 }, true)).toBe(29);
+      expect(cost({ kinds: [GROUP_CHAT_KIND], limit: 200 }, true)).toBe(29);
+
+
+      // The shape hearth actually sends -- the group named as well as the
+      // kind -- which goes through the tag subquery and so reads more.
+      // Asserted as a bound rather than pinned to the row: the tag path's
+      // exact count moves with the `ORDER BY created_at DESC, id ASC`
+      // tie-break, which moves with the fixture's ids, and a figure that
+      // wobbles by a row or two under an unrelated edit is a figure that
+      // gets updated without being read. The ratio is the finding.
+      const tagged = { kinds: [GROUP_CHAT_KIND], ["#h"]: [TOP_LEVEL_GROUP_ID], limit: 200 };
+      const taggedBefore = cost(tagged, false);
+      const taggedAfter = cost(tagged, true);
+      expect(taggedBefore).toBeGreaterThan(500);
+      expect(taggedAfter).toBeLessThan(60);
+      expect(taggedAfter * 10).toBeLessThan(taggedBefore);
+    });
+  });
+});
+
 // The one figure a reader of CLAUDE.md "The budget" will want to check
 // against the constant rather than against the prose.
 describe("the derived constants", () => {

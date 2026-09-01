@@ -382,6 +382,40 @@ two-tag message is **250 messages**: an ordinary evening clears in one or
 two ticks, a backlog drains at 6,000 a day, and `chat_state.swept_through`
 carries the remainder exactly as `drainVanish` does.
 
+### Rows read, per chat REQ
+
+Measured (`test/ephemeral-chat.test.ts`), against a room holding a day of
+talk (300 messages) with thirteen of them inside the horizon window — an
+active conversation:
+
+| filter | unclamped | clamped | falls by |
+|---|---|---|---|
+| `{"kinds":[9],"limit":50}` | 101 | 29 | 71% |
+| `{"kinds":[9],"limit":200}` | 401 | 29 | 93% |
+| `{"kinds":[9],"#h":["_"],"limit":200}` | ~714 | ~44 | ~94% |
+
+The pair of `kinds` rows is the finding, not either number: clamped, the
+cost **stops depending on the limit at all** — it is what the five-minute window holds,
+not what the client asked for, so a client raising its limit stops buying
+rows read. That is the horizon folding into `since` and becoming a bound
+on the index range rather than a condition applied to rows already read;
+emitted as a residual it would bound nothing, because `ORDER BY created_at
+DESC` walks back from the newest row and every row past the horizon fails
+the residual, so the scan would read the whole partition looking for a
+LIMIT it can never fill. The residual form is used only where there is no
+kind to pin.
+
+The tagged shape is asserted as a ratio rather than pinned to the row: the
+tag path's exact count moves with the `ORDER BY created_at DESC, id ASC`
+tie-break, so a pinned figure would wobble under unrelated edits and get
+updated without being read.
+
+Two effects compound over time and neither is in that table. The sweep
+means the group partition stops accumulating chat at all, so the index the
+clamped query seeks stays the size of a conversation rather than of a
+history; and `storageBytes` and `totalEvents` stop growing with the room's
+talk.
+
 The occupancy watermark costs one row per
 `CHAT_OCCUPANCY_WRITE_INTERVAL_SECONDS` while the room is occupied — 192
 rows a day with somebody in the room around the clock, 0.2% of the
