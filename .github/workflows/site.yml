@@ -1,0 +1,69 @@
+name: Build site
+
+# The website's documentation pages are generated from this repository's own
+# markdown, so there is one copy of the documentation rather than two that
+# drift apart. Everything else about the site -- the hand-written lander, the
+# stylesheet, the generator -- lives on the gh-pages branch rather than here,
+# because the "Deploy to Cloudflare" button copies this branch into the
+# deploying user's GitHub account and sync.yml keeps copying upstream files
+# down into it. A website is not part of a relay, and should not weigh
+# anything inside one.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - README.md
+      - docs/rungs.md
+      - .github/workflows/site.yml
+  # Editing the generator or the lander happens on gh-pages, which cannot
+  # trigger a workflow that lives here. This is how you rebuild after that.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Cloudflare's clone drops .github/, and sync.yml restores a downstream
+    # copy's own .github/ rather than overwriting it, so this file should
+    # never reach anyone else's repository. A genuine GitHub fork would get
+    # it, though, and a fork has no business pushing to this repo's gh-pages.
+    if: github.repository == 'sybenx/bothy'
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v7
+
+      - name: Checkout gh-pages
+        uses: actions/checkout@v7
+        with:
+          ref: gh-pages
+          path: site
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install the generator's dependencies
+        run: npm ci
+        working-directory: site/_src
+
+      - name: Generate the docs pages
+        run: node site/_src/build.mjs --repo . --out site
+
+      - name: Commit and push
+        working-directory: site
+        run: |
+          # Nothing to do is the common case: this runs on every push that
+          # touches the README, including ones that only changed a section
+          # the site does not render differently.
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "The site is already in step with the markdown."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Rebuild the docs pages from ${GITHUB_SHA:0:7}"
+          git push origin gh-pages
