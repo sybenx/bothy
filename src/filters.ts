@@ -1,5 +1,5 @@
 import { GIFT_WRAP_KIND, type Filter, type NostrEvent, tagFilterEntries } from "./nostr";
-import { CREATE_INVITE_KIND, type GroupScope, PUBLIC_SCOPE } from "./groups";
+import { CREATE_INVITE_KIND, GROUP_CHAT_KIND, type GroupScope, PUBLIC_SCOPE } from "./groups";
 
 // How many tag rows one `#<letter>` condition is allowed to look at, per
 // event the client asked for.
@@ -182,6 +182,39 @@ export interface FilterQueryOptions {
   // because group tag rows filled the whole scan depth, and 16 with the
   // depth split.
   tagScanDivisor?: number;
+
+  // The oldest `created_at` a kind-9 chat message may be returned at
+  // (storage.ts chatHorizon, limits.ts CHAT_BACKLOG_SECONDS).
+  //
+  // Rule four of ephemeral chat: somebody arriving partway through a
+  // conversation sees the last few minutes of it, not the whole session.
+  // Everyone who was already in the room holds the rest from their own
+  // live subscription, so this withholds nothing from the people it was
+  // said to -- it bounds what a REQ can reach back for.
+  //
+  // FOLDED INTO `since` where it can be, and this is the difference
+  // between a saving and a cost. expandFilter has already split `kinds`
+  // into singletons by the time this function runs, so a query for the
+  // chat kind is a query with `kind = 9` pinned -- and the horizon is
+  // then just a tighter lower bound on the same index range
+  // idx_events_kind_created_grp already serves. Emitted instead as a
+  // residual `(kind != 9 OR created_at >= ?)`, it would bound nothing:
+  // ORDER BY created_at DESC walks back from the newest row, every row
+  // past the horizon fails the residual, and the scan would read the
+  // whole partition looking for a LIMIT it can never fill. That is the
+  // opposite of the point.
+  //
+  // The residual form is used only where there is no kind to pin -- a
+  // filter naming no `kinds` at all, where the query is not being served
+  // by the kind index anyway. It can overshoot exactly as
+  // excludeGiftWraps can, and is bounded the same way: by the tag
+  // subquery's own LIMIT on a tag-driven filter, and by the group's own
+  // chat volume otherwise.
+  //
+  // Set by relay.ts handleReqInner for every session, the owner's
+  // included. It is not a permission -- it is what the group's chat IS
+  // now -- so there is nobody to exempt.
+  chatHorizon?: number;
 }
 
 export function buildFilterQuery(
@@ -191,6 +224,18 @@ export function buildFilterQuery(
 ): { sql: string; params: unknown[] } | null {
   const conditions: string[] = ["(expiration IS NULL OR expiration > ?)"];
   const params: unknown[] = [nowSec];
+
+  // See FilterQueryOptions.chatHorizon. `filter.kinds` is a singleton or
+  // absent here -- expandFilter split it before this function was
+  // reached -- so "this query is for the chat kind" is one comparison,
+  // and where it holds the horizon becomes a lower bound on the index
+  // range rather than a condition applied to rows already read.
+  const horizon = options.chatHorizon;
+  const pinnedToChat = filter.kinds?.length === 1 && filter.kinds[0] === GROUP_CHAT_KIND;
+  const since =
+    horizon !== undefined && pinnedToChat
+      ? Math.max(filter.since ?? horizon, horizon)
+      : filter.since;
 
   // The partition pin, on every query without exception -- see
   // FilterQueryOptions.scope. Emitted before the filter's own conditions
@@ -228,9 +273,17 @@ export function buildFilterQuery(
     conditions.push("kind != ?");
     params.push(CREATE_INVITE_KIND);
   }
-  if (filter.since !== undefined) {
+  // The horizon where it could not be folded into `since` above: a filter
+  // naming no `kinds` at all, which asks for chat among everything else.
+  // A residual rather than a range bound, with the cost that implies --
+  // see FilterQueryOptions.chatHorizon.
+  if (horizon !== undefined && filter.kinds === undefined) {
+    conditions.push("(kind != ? OR created_at >= ?)");
+    params.push(GROUP_CHAT_KIND, horizon);
+  }
+  if (since !== undefined) {
     conditions.push("created_at >= ?");
-    params.push(filter.since);
+    params.push(since);
   }
   if (filter.until !== undefined) {
     conditions.push("created_at <= ?");
@@ -256,9 +309,9 @@ export function buildFilterQuery(
     // the range scanned rather than discarding rows after they have been
     // read, and it is what makes `until` pagination work underneath the
     // LIMIT below.
-    if (filter.since !== undefined) {
+    if (since !== undefined) {
       subConditions.push("created_at >= ?");
-      subParams.push(filter.since);
+      subParams.push(since);
     }
     if (filter.until !== undefined) {
       subConditions.push("created_at <= ?");
@@ -307,6 +360,12 @@ function placeholders(count: number): string {
 // isUnconstrainedFilter/clampFilterLimit pair did -- test/read-limits.test.ts
 // asserts this against the real params.length of a built query.
 export function filterParamCount(filter: Filter): number {
+  // Counts the FILTER's own parameters and not the read gates'.
+  // excludeGiftWraps, excludeInvites and chatHorizon each add one or two
+  // more depending on the session asking, and none of them is visible to
+  // limits.ts boundFilter, which prices a filter before it knows who sent
+  // it. Four parameters at the very most, and MAX_QUERY_BOUND_PARAMS sits
+  // ten below SQLite's real ceiling for exactly this kind of slack.
   let count = 1; // the "(expiration IS NULL OR expiration > ?)" guard on every query
   count += 1; // the "is_group = ?" partition pin, also on every query
   if (filter.ids !== undefined && filter.ids.length > 0) count += filter.ids.length;

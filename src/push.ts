@@ -33,7 +33,15 @@ import {
 
 // NIP-29's own chat kind ("kind 9 is a chat message"), and the kind a
 // message notification is raised for.
-export const GROUP_CHAT_KIND = 9;
+//
+// Declared in groups.ts and re-exported here, the same arrangement
+// CREATE_INVITE_KIND has and for the identical reason: filters.ts needs
+// it to clamp a read of the group's chat to the horizon (limits.ts
+// CHAT_BACKLOG_SECONDS), and filters.ts -> push.ts -> limits.ts ->
+// filters.ts is a cycle. groups.ts is the read side of NIP-29, so a kind
+// the read path has to recognise belongs there; this file goes on naming
+// it from one place.
+export { GROUP_CHAT_KIND } from "./groups";
 
 // hearth's call presence beat -- its own kind, in the ephemeral range, no
 // NIP behind it (reference/push.md, hearth's kinds.js). Nothing is stored

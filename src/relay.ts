@@ -45,6 +45,11 @@ import {
   MAX_LIVE_FEED_CONNECTIONS,
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
   VANISH_BATCH_SIZE,
+  CHAT_OCCUPANCY_WRITE_INTERVAL_SECONDS,
+  CHAT_SWEEP_BATCH_SIZE,
+  chatMode,
+  type ChatMode,
+  MIN_ROOM_OCCUPANTS,
   nonOwnerStorageLimit,
   PUBKEY_RATE_LIMIT_MAX_TRACKED,
   PUBKEY_RATE_LIMIT_WINDOW_MS,
@@ -106,6 +111,7 @@ import {
   advancePush,
   applyDeletion,
   beginVanish,
+  chatHorizon,
   clearPresence,
   clearPush,
   forgetPushEndpoint,
@@ -115,7 +121,10 @@ import {
   type PushFanoutRow,
   pushSubscriptionsAfter,
   queuePush,
+  noteRoomOccupied,
+  readChatState,
   recordPresence,
+  sweepChat,
   auditMaintainedCounts,
   countEvents24h,
   type CountAuditStatus,
@@ -198,6 +207,21 @@ interface ConnState {
   subs: Subscriptions;
   challenge?: string;
   authedPubkey?: string;
+  // Whether this connection has ever been admitted to the group partition
+  // by handleReqInner's read gate -- i.e. whether the person on the other
+  // end is IN THE ROOM.
+  //
+  // Set there rather than derived here because that is where the
+  // membership lookup already happens: recomputing it per socket to count
+  // occupants would be one storage read per connection every time the
+  // room was sampled, to re-answer a question the read gate settled when
+  // the REQ arrived.
+  //
+  // It is what makes occupancy free (relay.ts groupOccupants): the whole
+  // count is a walk over sockets already in memory. One boolean in the
+  // attachment, so it survives hibernation like the rest of the state and
+  // costs a handful of bytes against MAX_CONN_STATE_BYTES.
+  groupReader?: boolean;
 }
 
 function getState(ws: WebSocket): ConnState {
@@ -333,6 +357,30 @@ export class Relay extends DurableObject<Env> {
   // answer out of storage on the first beat after the wake and repopulates
   // this map from it.
   private presenceWrites = new Map<string, number>();
+
+  // When this object last LOOKED at who is in the room -- the same
+  // in-memory tier presenceWrites is and for the same reason, except that
+  // this one is a single number rather than a map, because occupancy is a
+  // fact about the room and not about a person.
+  //
+  // It gates the LOOK and not just the write, which is the difference
+  // between a constant and a per-event cost. Gating only the write left
+  // the watermark unmoved whenever the room held fewer than two people --
+  // so the throttle never advanced, and every group event walked every
+  // socket to re-establish that nobody else was there. One integer
+  // comparison decides it now, the same early exit notePresence has.
+  //
+  // What that trades away is up to CHAT_OCCUPANCY_WRITE_INTERVAL_SECONDS
+  // of delay in noticing that a second person has arrived, which is the
+  // coarseness this watermark is designed around and errs in the safe
+  // direction (limits.ts).
+  //
+  // Lost on eviction, which costs one extra sample on the next event.
+  // That is the whole downside, and it is why storage.ts
+  // noteRoomOccupied takes a MAX rather than assigning: two entry points
+  // waking cold in the same second must not be able to move the watermark
+  // backwards.
+  private roomSampledAt = 0;
 
   // Set when this invocation queued something into `push_outbox`, and
   // cleared by settlePushAlarm() at the end of the invocation. A flag
@@ -644,6 +692,19 @@ export class Relay extends DurableObject<Env> {
     // that silently blocks every follow) has a visible signal instead of
     // a mystery.
     writePolicy: "owner" | "follows";
+    // What ephemeral group chat is currently allowed to do (limits.ts
+    // chatMode) -- "off", "reporting" or "deleting".
+    //
+    // The MODE and no numbers, which is the whole of the decision here.
+    // The mode is configuration: it is read off an environment variable
+    // and says nothing about what the group holds or how much it has been
+    // talking. A count of pending or swept messages would say both, on an
+    // endpoint that is public and unauthenticated, and the group
+    // partition is kept off these counters precisely so it cannot
+    // (CLAUDE.md "Threat model"). Those numbers go to the log, where the
+    // owner can read them and a stranger cannot -- see
+    // sweepEphemeralChat.
+    chatPolicy: ChatMode;
     // Maintained by ownership.ts refreshFollows, which is the only
     // function that writes the `follows` table -- so this comes out of
     // the same `maintained_counts` row as `totalEvents`, at no extra
@@ -816,6 +877,7 @@ export class Relay extends DurableObject<Env> {
       icon: resolveIcon(this.env, settings, profile),
       relayName: resolveName(this.env, settings, profile),
       writePolicy: allowFollowsEnabled(this.env) ? "follows" : "owner",
+      chatPolicy: chatMode(this.env),
       // Out of the same row as `totalEvents` above, at no additional read.
       followCount: counts.follows,
       countAudit: { lastRanAt: counts.lastRanAt, drift: counts.drift },
@@ -936,6 +998,24 @@ export class Relay extends DurableObject<Env> {
         // does for itself goes ahead of the step a stranger's request
         // sizes.
         auditMaintainedCounts(sql, now);
+        // The occupancy sample that no traffic-driven one can make: a
+        // room full of people sitting quietly is still occupied, and
+        // nothing else in this object would notice. Before the sweep in
+        // the same tick, so a conversation still in progress moves the
+        // watermark forward before the sweep reads it -- the other order
+        // would decide the room had been empty for two hours using a
+        // watermark it was about to correct.
+        this.noteRoomOccupancy(sql, now);
+        // Ephemeral group chat (limits.ts, the section beginning
+        // CONVERSATION_IDLE_SECONDS). Costs one row read and one row
+        // written on a quiet relay; on a busy one it is bounded by
+        // CHAT_SWEEP_BATCH_SIZE and checkpointed, exactly as the vanish
+        // drain below is.
+        //
+        // Ahead of the vanish drain for the same reason everything else
+        // in this tick is: this is the relay tidying its own room, and
+        // the one step a stranger's request sizes goes last.
+        withReadPath("chatSweep", () => this.sweepEphemeralChat(sql, now));
         // Last, and deliberately so: this is the only step whose cost is
         // set by a stranger's request rather than by the relay's own
         // state, and everything above gates the owner's own writes.
@@ -1167,7 +1247,7 @@ export class Relay extends DurableObject<Env> {
     // whether it may write to the group. Three integer comparisons decide
     // that an ordinary event is none of that file's business, so this
     // costs nothing on the path every non-group write takes.
-    const groupAuth = authorizeGroupWrite(sql, event, auth.isOwner, nowSeconds());
+    const groupAuth = authorizeGroupWrite(sql, this.env, event, auth.isOwner, nowSeconds());
     if (!groupAuth.ok) {
       ok(ws, event.id, false, groupAuth.message);
       return;
@@ -1646,6 +1726,17 @@ export class Relay extends DurableObject<Env> {
       if (event.pubkey === owner && event.kind === CONTACT_LIST_KIND) {
         refreshFollows(sql, this.env);
       }
+      // The occupancy sample on the write path (limits.ts, the section
+      // beginning CONVERSATION_IDLE_SECONDS). Under `result.stored` for
+      // the same reason the push below is: an event that was refused
+      // tells us nothing about who is in the room.
+      //
+      // Any group event and not only a chat message -- a reaction, a
+      // moderation action, anything scoped to the group is somebody
+      // being here. What it does NOT establish on its own is that
+      // somebody ELSE is; groupOccupants is what decides that, and it
+      // counts sockets rather than authors.
+      if (isGroupEvent(event)) this.noteRoomOccupancy(sql, nowSeconds());
       // Push, if this deployment has a key for it -- see notePush below.
       // Placed here, under `result.stored`, so it is reached only by an
       // event that passed every gate, verified its own signature and was
@@ -1665,6 +1756,123 @@ export class Relay extends DurableObject<Env> {
     for (const event of generated) {
       this.broadcast(event);
     }
+  }
+
+  // ------------------------------------------------------------------
+  // Ephemeral group chat, the occupancy half (limits.ts, the section
+  // beginning CONVERSATION_IDLE_SECONDS; storage.ts sweepChat).
+  //
+  // The relay is the right place for this because it is the only party
+  // that sees everyone at once, and this is that seeing: two functions,
+  // one that counts who is in the room and one that writes down that
+  // somebody was.
+  // ------------------------------------------------------------------
+
+  // How many distinct people are in the room right now.
+  //
+  // Zero storage reads. `getWebSockets()` is the object's own live socket
+  // list, and `groupReader` was settled by handleReqInner's read gate
+  // when each of those connections asked for the group -- so this is a
+  // walk over memory, cheap enough to call on any path that is already
+  // touching the group.
+  //
+  // Distinct PUBKEYS and not sockets: a phone and a laptop belonging to
+  // the same person are one person in the room, and counting them as two
+  // would make somebody talking to themselves look like a conversation.
+  // Live feed sockets carry a LiveFeedState with no `groupReader` at all
+  // and fall out here without needing to be excluded by name.
+  //
+  // AN OPEN SOCKET IS THE DEFINITION OF BEING HERE, and this is the one
+  // place where that definition can be wrong in a way nothing else
+  // corrects. Somebody sitting quietly with the room open is present --
+  // that is the case the cron sample exists to catch, and getting it
+  // right is the reason occupancy is not inferred from message traffic.
+  // A tab left open overnight is indistinguishable from that, at this
+  // layer and at every other: the relay sees a live, authenticated,
+  // group-subscribed connection either way, and no signal available to it
+  // separates a person who is being quiet from a person who has gone
+  // home without closing anything.
+  //
+  // So a room with two abandoned tabs in it never empties, its
+  // conversation never ends, and its chat accumulates for as long as that
+  // lasts. That used to be bounded by a ceiling on how long any message
+  // could live; there is no such ceiling now (see limits.ts, where it is
+  // argued out), so this is the failure mode with nothing under it. It is
+  // the honest one to have: the alternative is deleting a conversation
+  // out from under people the relay has every reason to believe are
+  // still in the room.
+  private groupOccupants(): number {
+    const present = new Set<string>();
+    for (const ws of this.ctx.getWebSockets()) {
+      const state = ws.deserializeAttachment() as ConnState | null;
+      if (state?.groupReader !== true) continue;
+      if (state.authedPubkey === undefined) continue;
+      present.add(state.authedPubkey);
+    }
+    return present.size;
+  }
+
+  // Records that the room was not empty, if it was not and if the stored
+  // watermark is stale enough to be worth moving.
+  //
+  // Three outcomes, cheapest first, the same shape notePresence has:
+  //
+  //   sampled recently           nothing at all: no socket walk, no read,
+  //                              no write. The ordinary case, and the
+  //                              only one an event on the write path
+  //                              normally reaches.
+  //   fewer than two present     the socket walk and nothing else. One
+  //                              person alone in the room IS an empty
+  //                              room for the only rule that cares -- a
+  //                              message with nobody to hear it is a
+  //                              note, not speech.
+  //   otherwise                  one row updated in place.
+  //
+  // Called from the three places that already know something about the
+  // group: an accepted group write, a REQ from somebody the read gate let
+  // into the partition, and the cron tick. The first two sample while
+  // people are talking; the third is what covers a room full of people
+  // sitting quietly, which is a conversation too and which no
+  // traffic-driven sample would ever see.
+  private noteRoomOccupancy(sql: SqlStorage, nowSec: number): void {
+    if (nowSec - this.roomSampledAt < CHAT_OCCUPANCY_WRITE_INTERVAL_SECONDS) return;
+    // Stamped before the count and regardless of what it finds, so an
+    // empty room throttles exactly as a busy one does -- see the field.
+    this.roomSampledAt = nowSec;
+    if (this.groupOccupants() < MIN_ROOM_OCCUPANTS) return;
+    noteRoomOccupied(sql, nowSec);
+  }
+
+  // One cron tick of the sweep, and the reporting mode that ships in front
+  // of it (limits.ts chatMode).
+  //
+  // THE LOG LINE IS THE PRODUCT in reporting mode, and it is a log line
+  // rather than a field on /api/stats because that endpoint is public and
+  // unauthenticated: a count of the group's chat is exactly the sort of
+  // group counter the partition keeps off it (CLAUDE.md "Threat model"),
+  // and the owner has a channel a stranger cannot read. It is the same
+  // call handleJoinRequest makes about its refusals and
+  // auditMaintainedCounts makes about drift.
+  //
+  // Logged on every tick that has something to say and silent otherwise,
+  // so a quiet relay does not fill a log with zeroes and a busy one can be
+  // watched for a few days before EPHEMERAL_CHAT is set to "on".
+  private sweepEphemeralChat(sql: SqlStorage, nowSec: number): void {
+    const mode = chatMode(this.env);
+    if (mode === "off") return;
+    const state = readChatState(sql);
+    const result = sweepChat(sql, state, nowSec, CHAT_SWEEP_BATCH_SIZE, mode === "deleting");
+    if (result.pending === 0 && result.removed === 0) return;
+    const occupants = this.groupOccupants();
+    console.log(
+      mode === "deleting"
+        ? `ephemeral chat: removed ${result.removed} of ${result.pending} chat messages at or before ` +
+          `${result.cutoff}${result.done ? "" : ", more to come next tick"}; ` +
+          `${occupants} in the room, last occupied ${state.lastOccupiedAt}`
+        : `ephemeral chat (reporting only, set EPHEMERAL_CHAT=on to act): would remove ` +
+          `${result.pending} chat messages at or before ${result.cutoff}; ` +
+          `${occupants} in the room, last occupied ${state.lastOccupiedAt}`,
+    );
   }
 
   // ------------------------------------------------------------------
@@ -2159,7 +2367,17 @@ export class Relay extends DurableObject<Env> {
     // Checked against a copy, so a refusal leaves the connection exactly
     // as it was -- a REQ that cannot be stored must not evict the
     // subscriptions that could.
-    const next: ConnState = { ...state, subs: { ...state.subs, [subId]: filters } };
+    const next: ConnState = {
+      ...state,
+      subs: { ...state.subs, [subId]: filters },
+      // Recorded once the read gate above has admitted this connection to
+      // the group partition: this is what "in the room" means, and
+      // groupOccupants counts it. Written here rather than beside
+      // `mayReadGroups` above so a REQ that is about to be refused for
+      // any other reason cannot put somebody in a room they never
+      // entered.
+      ...(mayReadGroups ? { groupReader: true } : {}),
+    };
     if (!stateFits(next)) {
       send(ws, [
         "CLOSED",
@@ -2175,8 +2393,31 @@ export class Relay extends DurableObject<Env> {
     // by broadcast() below, which drops kind-1059 events for any socket
     // not authenticated as the owner -- a subscription registered here
     // stays open, so the two have to agree.
-    const events = queryFilters(this.sql, filters, nowSeconds(), {
+    // The occupancy sample and the horizon, in that order and both paid
+    // only by somebody the read gate has admitted to the group.
+    //
+    // The sample first, because it can move the watermark this very
+    // second: somebody arriving into a room that already has one person
+    // in it makes two, and the horizon they are about to be given should
+    // describe the room as it is with them in it.
+    const now = nowSeconds();
+    let horizon: number | undefined;
+    if (mayReadGroups && chatMode(this.env) === "deleting") {
+      this.noteRoomOccupancy(this.sql, now);
+      horizon = chatHorizon(readChatState(this.sql), now);
+    }
+
+    const events = queryFilters(this.sql, filters, now, {
       excludeGiftWraps: !mayReadGiftWraps,
+      // Rule four: the last few minutes, not the whole session. Applied
+      // to the owner as well, because this is not a permission -- it is
+      // what the group's chat is -- and there is nobody to exempt.
+      //
+      // Undefined in reporting mode, which is the point of that mode:
+      // nothing is deleted AND nothing is withheld, so an owner watching
+      // the log for a few days is watching a relay that still behaves
+      // exactly as it did.
+      ...(horizon === undefined ? {} : { chatHorizon: horizon }),
       // Only where it can match something, which is a read that covers the
       // group partition at all. An unauthenticated read never sees a
       // kind-9009 -- it is a group event, and the partition already omits

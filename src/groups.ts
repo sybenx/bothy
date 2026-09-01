@@ -87,6 +87,18 @@ export const GROUP_METADATA_KIND = 39000;
 export const GROUP_ADMINS_KIND = 39001;
 export const GROUP_MEMBERS_KIND = 39002;
 
+// NIP-29's own chat kind: "kind 9 is a chat message". The one kind in the
+// group partition that is TALK, and therefore the one kind that expires
+// (limits.ts, the section beginning CONVERSATION_IDLE_SECONDS;
+// storage.ts sweepChat).
+//
+// It lives here rather than in push.ts, which raises a notification for
+// it and used to declare it, for the reason CREATE_INVITE_KIND below
+// lives here: the read gate needs it, and filters.ts -> push.ts ->
+// limits.ts -> filters.ts is a cycle. push.ts re-exports it, so the
+// notification side still names it from one place.
+export const GROUP_CHAT_KIND = 9;
+
 // NIP-29 kind-9009 create-invite: the one group event the group's own
 // MEMBERS may not read.
 //

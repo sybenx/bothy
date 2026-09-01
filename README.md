@@ -72,6 +72,7 @@ The deploy button only asks for a project name. Everything else is an optional v
 | `MAX_EVENTS_PER_PUBKEY_PER_MINUTE` | How fast any one non-owner pubkey may publish. Defaults to `20`/minute — far above human posting rates, slow enough that a runaway follow takes hours rather than minutes to spend the daily write budget. You are never throttled. Raise it to a number, or set it to `off`. |
 | `NON_OWNER_STORAGE_BYTES` | Point at which writes from anyone but you are refused, reserving what's left of the 5GB free-tier ceiling for your own archive. Defaults to `2684354560` (half). Raise it to a number, or set it to `off`. |
 | `ALLOW_FOLLOWS` | On by default: writes from your kind-3 follow list are accepted. The cache updates immediately when you publish a new contact list to this relay; hourly cron is just the fallback for when it arrived some other way. Set to `false` to disable and go back to owner-only writes. |
+| `EPHEMERAL_CHAT` | What the relay does about group chat expiring (see "Group chat is ephemeral" below). Unset, it only *reports* each hour what it would delete, deletes nothing, and hides nothing — so you can watch it be right before it acts. Set it to `on` to let it act. Set it to `off` to remove the behaviour entirely. |
 | `UPDATE_CHECK` | On by default: the relay asks this repo what the current release is (one request, cached for six hours, made by the Worker rather than by your browser) so the admin page can say when a newer one exists. Set it to `off` and the relay never makes that request; the footer then simply shows no notice. |
 
 One more piece of configuration is **a secret rather than a variable**, and the difference matters:
@@ -155,6 +156,23 @@ If you'd rather bothy only ever accept your own writes, set `ALLOW_FOLLOWS=false
 The admin page at your relay's URL is public — anyone with the link can see relay stats and your follow count. Never the follow list itself, only the count.
 
 This is one rung of a documented ladder — see [docs/rungs.md](docs/rungs.md) for the full progression from owner-only writes up to the open-relay case bothy deliberately refuses to become.
+
+## Group chat is ephemeral
+
+The group's chat exists for the conversation it was part of, and is then deleted — not hidden, not archived. Your own notes, your backfilled history, your gift wraps, reactions and the group's membership are all untouched; this is about the talk and nothing else.
+
+The rules:
+
+- **A conversation ends when the room has been empty for about two hours.** Everything said during it goes when it goes.
+- **A message sent while somebody else was there belongs to that conversation.**
+- **A message sent to an empty room is a note, not speech.** It waits for the next conversation, for as long as that takes. Nothing expires it: a note has not been read yet, and mail doesn't vanish because the person it was addressed to is away. If you want a note back, delete it the ordinary way — publish a NIP-09 kind-5 naming it, which any client can do.
+- **Arriving partway through shows you the last few minutes**, not the whole session. Enough to know what's being talked about, not enough to replace asking.
+
+The relay is where this has to live, because it's the only party that sees everyone at once.
+
+**It ships watching rather than acting.** With `EPHEMERAL_CHAT` unset — which is how it arrives — the relay works out once an hour exactly what it would delete, writes that to its log, and then deletes nothing and withholds nothing. Watch it for a few days: in the Cloudflare dashboard, open your Worker and look at Logs (or run `npx wrangler tail`) for lines beginning `ephemeral chat`. When you're satisfied, add `EPHEMERAL_CHAT` with the value `on` in the same Variables screen as everything above.
+
+One thing to expect the first time you turn it on: a relay that has been collecting chat until now loses all of it at the end of the first real conversation the room has afterwards, in one go, since that conversation's cutoff covers everything before it too. The reporting mode will have told you the number in advance.
 
 ## Relay management API
 

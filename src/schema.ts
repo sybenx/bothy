@@ -788,6 +788,67 @@ export const TABLES: readonly TableSpec[] = [
     columns: [col("pubkey", "TEXT PRIMARY KEY"), col("last_seen", "INTEGER NOT NULL")],
   },
   {
+    // Ephemeral group chat (limits.ts, the section beginning
+    // CONVERSATION_IDLE_SECONDS). Exactly one row, like `relay_meta` and
+    // `backfill_meta`: the group's chat has one conversation at a time
+    // because this relay hosts one group.
+    //
+    // No per-message row anywhere, deliberately. The obvious shape for
+    // "which conversation does this message belong to" is a column or a
+    // side table keyed by event id, and both cost rows written per
+    // message to record something the clock already knows. A conversation
+    // is a RANGE of `created_at`, so the whole of it is two integers here
+    // and an index seek on idx_events_kind_created_grp -- which exists
+    // already, is a partial index over exactly this partition, and
+    // answers both the sweep and the report without touching a tag row.
+    name: "chat_state",
+    columns: [
+      // The last wall-clock second at which MIN_ROOM_OCCUPANTS or more
+      // distinct group readers held a socket at the same time -- the
+      // moment the room was last not-empty, written coarsely (limits.ts
+      // CHAT_OCCUPANCY_WRITE_INTERVAL_SECONDS).
+      //
+      // It is the cutoff, and that is what makes the speech/note rule an
+      // arithmetic one rather than a per-message classification: a
+      // message at or before this second was said while somebody else was
+      // there, and a message after it was said into an empty room. The
+      // sweep needs no other input to tell them apart.
+      col("last_occupied_at", "INTEGER NOT NULL DEFAULT 0"),
+      // The highest cutoff already swept to completion. Two jobs, and the
+      // second is why it is stored rather than recomputed: it checkpoints
+      // a sweep too large for one cron tick (the same role
+      // `vanishing.cutoff_created_at` plays), and it is what the write
+      // gate compares an incoming chat message against, so a member
+      // holding a signed copy cannot replay a conversation back into a
+      // room that has finished having it.
+      //
+      // That second job is what makes tombstoning unnecessary here. Every
+      // other removal in this codebase writes a `deleted_ids` row to stop
+      // exactly that replay, and a tombstone per message would leave the
+      // relay accumulating two permanent rows for every message it
+      // deleted -- a record of the conversation surviving the
+      // conversation, which is the thing this feature exists to end. One
+      // integer refuses the same replay for every message at once.
+      col("swept_through", "INTEGER NOT NULL DEFAULT 0"),
+      // Diagnostic, and the shape `vanishing.deleted_so_far` already
+      // uses: how many messages have been removed since this shipped.
+      col("swept_total", "INTEGER NOT NULL DEFAULT 0"),
+      // The last report the sweep made, whether or not it acted on it --
+      // when it ran, and how many messages were eligible at that moment.
+      //
+      // Written in reporting mode so that "watch it be right for a few
+      // days" has a state to read back and not only a log line to catch;
+      // written in deleting mode too, where it is the same number seen
+      // one tick before it went. NOT published on /api/stats: that
+      // endpoint is public and unauthenticated, and a count of the
+      // group's chat is exactly the kind of group counter the partition
+      // keeps off it (CLAUDE.md "Threat model"). The owner reads it in
+      // the log line beside it.
+      col("reported_at", "INTEGER NOT NULL DEFAULT 0"),
+      col("reported_pending", "INTEGER NOT NULL DEFAULT 0"),
+    ],
+  },
+  {
     // Every count /api/stats reports that is maintained rather than
     // computed. Exactly one row.
     //
@@ -1852,6 +1913,23 @@ export function initSchema(sql: SqlStorage): void {
   // getOwnHost/recordHost (src/host.ts) never have to special-case "no
   // row yet".
   sql.exec(`INSERT INTO relay_meta (host) SELECT NULL WHERE NOT EXISTS (SELECT 1 FROM relay_meta)`);
+  // chat_state must have exactly one row, like the two above, so
+  // storage.ts readChatState never has to special-case "no row yet" and
+  // every column can be read back as the integer its DEFAULT declares.
+  //
+  // Seeded with `last_occupied_at` at 0 rather than at "now", which
+  // matters on the first wake after this ships: 0 reads as "the room has
+  // been empty since the epoch", so the very first sweep's conversation
+  // cutoff is 0 and removes nothing at all. An existing relay's chat is
+  // therefore carried into the first conversation the room actually
+  // holds, and is removed with it, rather than being deleted wholesale by
+  // a watermark that had no history to describe. An existing relay's
+  // accumulated chat therefore goes with the END of the first real
+  // conversation the room has after this ships -- all of it at once,
+  // since that conversation's cutoff covers everything before it too.
+  // That is a large, one-time deletion, and showing it to an owner
+  // before it happens is most of what the reporting mode is for.
+  sql.exec(`INSERT INTO chat_state (last_occupied_at) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM chat_state)`);
   seedMaintainedCounts(sql);
   seedIngestCounts(sql);
   seedRelayIdentity(sql);

@@ -36,6 +36,7 @@
 import {
   CREATE_INVITE_KIND,
   GROUP_ADMINS_KIND,
+  GROUP_CHAT_KIND,
   GROUP_MEMBERS_KIND,
   GROUP_METADATA_KIND,
   GROUP_SCOPE,
@@ -45,6 +46,7 @@ import {
   TOP_LEVEL_GROUP_ID,
 } from "./groups";
 import {
+  chatMode,
   INVITE_DEFAULT_TTL_SECONDS,
   INVITE_MAX_TTL_SECONDS,
   MAX_INVITE_CODE_LENGTH,
@@ -64,6 +66,7 @@ import {
   isPubkeyBanned,
   listGroupMembers,
   lookupInvite,
+  readChatState,
   redeemInvite,
   removeGroupMember,
   revokeGroupAllowance,
@@ -228,6 +231,7 @@ export type GroupWriteAuthorization = { ok: true } | { ok: false; message: strin
 //                join produces is the relay's own regenerated kind-39002.
 export function authorizeGroupWrite(
   sql: SqlStorage,
+  env: Env,
   event: NostrEvent,
   isOwner: boolean,
   nowSec: number,
@@ -288,6 +292,42 @@ export function authorizeGroupWrite(
     }
     if (event.kind === CREATE_INVITE_KIND) return authorizeCreateInvite(sql, event, nowSec);
     return { ok: true };
+  }
+
+  // A chat message whose conversation is already over.
+  //
+  // THIS IS WHAT REPLACES THE TOMBSTONE. Every other removal in this
+  // codebase writes a `deleted_ids` row so a sender holding their own
+  // signed copy cannot put it back; ephemeral chat cannot afford that,
+  // because a tombstone per message is a permanent record of every
+  // message ever deleted -- the conversation surviving the conversation,
+  // in a smaller box (storage.ts sweepChat). One integer refuses the
+  // replay of every swept message at once instead.
+  //
+  // Applied to the owner too, and before the membership check rather than
+  // after it, because this is not an authorization question: nobody can
+  // say something into a conversation that has finished, and answering
+  // `["OK", id, true]` to a message that the next sweep removes
+  // immediately would be telling a client its message landed when it did
+  // not.
+  //
+  // One row read, and only for the chat kind: an ordinary group event
+  // pays the comparison that decides it is not one and nothing else.
+  // `created_at` and not `ingested_at`, because `ingested_at` does not
+  // exist yet for an event this function is deciding whether to accept --
+  // and because `created_at` is what the sweep's own cutoff is measured
+  // against, so the two questions have to be asked of the same clock or
+  // the gate would refuse messages the sweep would keep.
+  if (event.kind === GROUP_CHAT_KIND && chatMode(env) === "deleting") {
+    const sweptThrough = readChatState(sql).sweptThrough;
+    if (event.created_at <= sweptThrough) {
+      return {
+        ok: false,
+        message:
+          "invalid: that conversation is over -- this relay keeps group chat only for the " +
+          "conversation it was part of",
+      };
+    }
   }
 
   // An ordinary `h`-tagged event: the inner list decides. The owner is

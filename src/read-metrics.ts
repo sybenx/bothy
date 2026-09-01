@@ -97,6 +97,14 @@ export const READ_PATHS = [
   // the write path, and averaging it into the per-event bucket would
   // describe a cost no event pays.
   "push",
+  // relay.ts runCron -> storage.ts sweepChat: the chat_state row, the
+  // COUNT behind the report, and whatever the sweep removed. Separate
+  // from "cron" because it is the one step of a tick whose size is set by
+  // how much the room has been talking, and because the whole claim of
+  // ephemeral chat is that this bucket stays proportional to a day's
+  // conversation rather than to the accumulated history -- a bucket
+  // growing with the table is that claim failing.
+  "chatSweep",
   // relay.ts fetch(): recordHost plus the once-per-connection
   // isIpBlocked lookup.
   "connect",
