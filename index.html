@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="light dark" />
+<title>bothy — a nostr relay of your own, in one click</title>
+<meta name="description" content="A single-user nostr relay that runs on the Cloudflare free tier and deploys in one click. No VPS, no domain, no terminal, no machine at home." />
+<link rel="icon" type="image/svg+xml" href="favicon.svg" />
+<link rel="stylesheet" href="style.css" />
+<meta property="og:type" content="website" />
+<meta property="og:title" content="bothy — a nostr relay of your own, in one click" />
+<meta property="og:description" content="A single-user nostr relay that runs on the Cloudflare free tier and deploys in one click. No VPS, no domain, no terminal, no machine at home." />
+<meta property="og:url" content="https://sybenx.github.io/bothy/" />
+<meta name="twitter:card" content="summary" />
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="wrap">
+    <a class="brand" href="./">
+      <svg viewBox="0 0 16 16" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M2.5 8.5 8 3l5.5 5.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><rect x="4.5" y="8" width="7" height="5.5" fill="currentColor"/></svg>
+      bothy
+    </a>
+    <nav>
+      <a href="docs/">Docs</a>
+      <a href="https://github.com/sybenx/bothy">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+  <section class="hero">
+    <div class="wrap">
+      <svg class="hut" viewBox="0 0 64 64" fill="none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+        <path d="M4 30 32 7l28 23" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round" opacity=".75"/>
+        <path d="M12 26v31h40V26" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round" opacity=".75"/>
+        <path d="M27 57V41h10v16" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round" opacity=".45"/>
+        <path d="M3 57h58" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" opacity=".2"/>
+        <rect x="17" y="33" width="7.5" height="7.5" rx="1" fill="var(--ember)"/>
+      </svg>
+
+      <h1>bothy</h1>
+      <p class="tagline">A nostr relay of your own, in one click.</p>
+      <p class="subline">It runs on Cloudflare's free tier, in your own account. There is nothing to rent and nothing to keep running.</p>
+
+      <p class="quote">A bothy is a shelter in the Scottish highlands that someone built and left unlocked for whoever needs it. Cloudflare's free tier is a bit like that, and this is a relay that runs in it.</p>
+
+      <div class="cta">
+        <a class="btn btn-primary" href="https://deploy.workers.cloudflare.com/?url=https://github.com/sybenx/bothy">Deploy to Cloudflare</a>
+        <a class="btn btn-ghost" href="docs/">Read the docs</a>
+      </div>
+      <p class="fineprint">Needs a free Cloudflare account and a free GitHub account. No card.</p>
+    </div>
+  </section>
+
+  <section class="block band band-surface">
+    <div class="wrap">
+      <h2>What you don't need</h2>
+      <p class="lede">Running your own relay usually means standing up a machine and looking after it. This is the same relay without any of that underneath it.</p>
+      <ul class="pills">
+        <li>a VPS</li>
+        <li>a domain name</li>
+        <li>Docker</li>
+        <li>a terminal</li>
+        <li>TLS certificates</li>
+        <li>a box at home</li>
+        <li>a monthly bill</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="block band">
+    <div class="wrap">
+      <h2>Four steps</h2>
+      <ol class="steps">
+        <li><p>Click <strong>Deploy to Cloudflare</strong> and pick your GitHub account. Cloudflare puts a copy of the code there and builds it.</p></li>
+        <li><p>Wait about thirty seconds, then <strong>refresh the page</strong> — the dashboard doesn't update on its own. A <strong>Visit</strong> button appears; that's your relay.</p></li>
+        <li><p>Open it and <strong>paste your npub</strong> into the claim form. The first pubkey to claim a relay owns it, permanently.</p></li>
+        <li><p><strong>Copy the <code>wss://</code> URL</strong> into your nostr client's relay list. Nothing in the Cloudflare dashboard needs configuring.</p></li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="block band band-surface">
+    <div class="wrap">
+      <h2>What it does</h2>
+      <div class="features">
+        <div>
+          <h3>Fetches your history, once, by itself</h3>
+          <p>Claiming starts a backfill: bothy reads the relay list you have already published, finds the relays you post to, and pulls your past notes in from them a page at a time until it has caught up. You don't have to do anything, and it stops when it's done.</p>
+        </div>
+        <div>
+          <h3>Takes writes from you and the people you follow</h3>
+          <p>It reads the follow list your client already keeps, so there is no second allowlist to maintain, and strangers are turned away. Everyone but you is size-capped, rate-limited, and cut off well before your storage fills.</p>
+        </div>
+        <div>
+          <h3>Receives your mail</h3>
+          <p>Gift-wrapped DMs from anyone, readable only by you. A query that would match one gets an auth challenge; a query that wouldn't is answered as though your inbox were empty — so nobody can count your mail by watching what gets refused.</p>
+        </div>
+        <div>
+          <h3>Hosts one private group</h3>
+          <p>One group, one admin, you. Invite links that expire and can't be reused twice. Everything in it is kept out of every unauthenticated read, including the member list. The chat is deleted when the conversation ends, because a conversation is not an archive.</p>
+        </div>
+        <div>
+          <h3>Wakes your phone</h3>
+          <p>Optional web push that says which room and what kind of thing happened, and nothing else. Not the message, not the sender. Off unless you set a key.</p>
+        </div>
+        <div>
+          <h3>Answers to your key, not a dashboard</h3>
+          <p>Ban an event, block an address, rename the relay — every management command is a request you sign from the command line. The status page stays read-only, which is what makes it safe to leave public.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block band">
+    <div class="wrap">
+      <h2>What it costs</h2>
+      <div class="panel">
+        <ul class="limits">
+          <li><span class="n">5 GB</span><span class="l">storage</span></li>
+          <li><span class="n">100,000</span><span class="l">database writes per day</span></li>
+          <li><span class="n">$0</span><span class="l">per month</span></li>
+        </ul>
+        <p>That's Cloudflare's free tier, and your relay shows both limits as bars on its own status page, so there is never a bill-shaped surprise. Writes from anyone but you stop at half the storage, which keeps the rest of it for your own archive.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="block band band-surface">
+    <div class="wrap">
+      <h2>What it is not</h2>
+      <p class="lede">No zaps, no media uploads, no NIP-05 hosting, no multi-region scaling, no moderation queue, and no public write mode. These are decisions rather than gaps, and the reasoning for each one is written down.</p>
+      <p>bothy is built to be one of the two-to-four relays your relay list already names, not your only one. Pair it with a permissive public relay and you get both: your own filtered archive of the people you actually follow, and a general-purpose inbox that already does the spam filtering you would otherwise have to build.</p>
+    </div>
+  </section>
+
+  <section class="closing band">
+    <div class="wrap">
+      <h2>Leave the light on</h2>
+      <p class="lede">Two minutes, two free accounts, and the relay is yours.</p>
+      <div class="cta">
+        <a class="btn btn-primary" href="https://deploy.workers.cloudflare.com/?url=https://github.com/sybenx/bothy">Deploy to Cloudflare</a>
+        <a class="btn btn-ghost" href="docs/">Read the docs</a>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <span>MIT licensed.</span>
+    <a href="https://github.com/sybenx/bothy">Source</a>
+    <a href="docs/">Docs</a>
+    <a href="https://github.com/sybenx/hearth">hearth, the client</a>
+    <span class="spacer"></span>
+  </div>
+</footer>
+
+</body>
+</html>

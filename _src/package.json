@@ -1,0 +1,12 @@
+{
+  "name": "bothy-site",
+  "private": true,
+  "type": "module",
+  "description": "Build script for the bothy website. Lives on the gh-pages branch so nothing here ships into a deployed relay's repository.",
+  "scripts": {
+    "build": "node build.mjs --repo ../../bothy --out .."
+  },
+  "dependencies": {
+    "marked": "18.0.11"
+  }
+}

@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="light dark" />
+<title>The write ladder — bothy</title>
+<meta name="description" content="A relay's write policy as a ladder of rungs, from owner-only up to the open relay bothy deliberately refuses to become." />
+<link rel="icon" type="image/svg+xml" href="../favicon.svg" />
+<link rel="stylesheet" href="../style.css" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="The write ladder — bothy" />
+<meta property="og:description" content="A relay's write policy as a ladder of rungs, from owner-only up to the open relay bothy deliberately refuses to become." />
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="wrap">
+    <a class="brand" href="../"><svg viewBox="0 0 16 16" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M2.5 8.5 8 3l5.5 5.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><rect x="4.5" y="8" width="7" height="5.5" fill="currentColor"/></svg> bothy</a>
+    <nav>
+      <a href="../docs/" aria-current="page">Docs</a>
+      <a href="https://github.com/sybenx/bothy">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="docs-layout">
+  <nav class="toc" aria-label="On this page">
+      <p class="toc-title">On this page</p>
+      <ul>
+        <li class="lvl-2"><a href="#why-the-cliff-sits-between-4-and-5">Why the cliff sits between 4 and 5</a></li>
+        <li class="lvl-2"><a href="#the-filter-ladder-underneath-it">The filter ladder underneath it</a></li>
+      </ul>
+    </nav>
+  <article class="doc" id="main">
+<h1>The write ladder</h1>
+<p>A relay&#39;s write policy as a ladder of rungs, from most closed to most open.
+Each rung is defined by <em>who may write</em> and <em>what bounds the volume</em>.</p>
+<ol>
+<li><p><strong>Owner only.</strong> Accepts only events signed by the relay&#39;s owner.
+Bounded by: the owner&#39;s own posting rate.</p>
+</li>
+<li><p><strong>Owner + addressed mail.</strong> Adds sealed/encrypted messages from anyone,
+addressed to the owner. Bounded by: per-message size, storage reserved
+for this class, and a per-sender rate limit.</p>
+</li>
+<li><p><strong>Owner&#39;s follows may write.</strong> Adds any event signed by a pubkey in the
+owner&#39;s published contact list. Bounded by: the size of that list.</p>
+</li>
+<li><p><strong>Anyone, if it concerns the owner.</strong> Adds any author, but the event
+must reference or address the owner. Bounded by: how many people
+mention the owner.</p>
+</li>
+</ol>
+<p>--- the cliff ---</p>
+<ol start="5">
+<li><strong>Open relay.</strong> Accepts anything from anyone.
+Bounded by: nothing.</li>
+</ol>
+<h2 id="why-the-cliff-sits-between-4-and-5">Why the cliff sits between 4 and 5<a class="anchor" href="#why-the-cliff-sits-between-4-and-5" aria-label="Link to this section">#</a></h2>
+<p>Rungs 1-4 each have a bound tied to a real-world quantity. Rung 5 has
+none. That is a difference in kind, not degree: rungs 1-4 all sit in a
+similar, bounded cost regime, while rung 5&#39;s resource use is unbounded.
+The ladder is not a smooth gradient of expense — it is a run of bounded
+rungs and then a cliff.</p>
+<p>Note the ladder is monotonic in <em>who</em>, not in <em>volume</em>: an earlier rung
+can admit fewer people to write anything at all, while a later rung
+admits everyone but only to write things addressed to the owner. By the
+dimension that costs resources, the narrower-audience rung is not always
+the cheaper one.</p>
+<h2 id="the-filter-ladder-underneath-it">The filter ladder underneath it<a class="anchor" href="#the-filter-ladder-underneath-it" aria-label="Link to this section">#</a></h2>
+<p>Opening a rung raises the question of how to close it again on an
+individual. Filters sort by what they need to know, and that ordering
+cuts across the rungs above:</p>
+<ol>
+<li><p><strong>Free</strong> — derived from something the owner already published.
+Read from local storage the relay already has. No outbound
+connection needed.</p>
+</li>
+<li><p><strong>Cheap</strong> — derived from the event itself. Kind, size, tags, tag
+count, proof-of-work. Already in hand at validation time.</p>
+</li>
+<li><p><strong>Expensive</strong> — derived from facts about the <em>author</em> that the event
+does not carry. Profile presence, domain verification, blocklists,
+web-of-trust scores. These require fetching data about the author,
+which means an outbound connection made at write time.</p>
+</li>
+</ol>
+<p>Tier 3 is expensive for architectural reasons as much as quota reasons:
+whether a relay can afford it depends on whether its write path is even
+able to make outbound connections.</p>
+
+  </article>
+</div>
+
+<footer class="site">
+  <div class="wrap">
+    <span>MIT licensed.</span>
+    <a href="https://github.com/sybenx/bothy">Source</a>
+    <a href="../">Home</a>
+    <a href="https://github.com/sybenx/hearth">hearth, the client</a>
+    <span class="spacer"></span>
+    <span>Generated from <a href="https://github.com/sybenx/bothy/blob/main/docs/rungs.md">docs/rungs.md</a>.</span>
+  </div>
+</footer>
+
+</body>
+</html>
