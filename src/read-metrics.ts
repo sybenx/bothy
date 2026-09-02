@@ -105,6 +105,14 @@ export const READ_PATHS = [
   // conversation rather than to the accumulated history -- a bucket
   // growing with the table is that claim failing.
   "chatSweep",
+  // relay.ts runCron -> storage.ts sweepExpiredGiftWraps: the walk over
+  // stored gift wraps looking for lapsed ones, plus whatever it removed.
+  // Separate from "chatSweep" and from "cron" because its size is set by
+  // how full the gift wrap inbox is rather than by the day's traffic, and
+  // this is the bucket that would show it: a relay whose inbox is
+  // permanently full pays a walk an hour to establish there is nothing to
+  // reclaim, which is the one cost of this sweep worth watching.
+  "giftWrapSweep",
   // relay.ts fetch(): recordHost plus the once-per-connection
   // isIpBlocked lookup.
   "connect",

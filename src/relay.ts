@@ -31,6 +31,7 @@ import {
   DAILY_ROWS_READ_LIMIT,
   DAILY_ROWS_WRITTEN_LIMIT,
   GIFT_WRAP_RATE_LIMIT_WINDOW_MS,
+  GIFT_WRAP_SWEEP_BATCH_SIZE,
   JOIN_REQUEST_RATE_LIMIT_WINDOW_MS,
   MAX_JOIN_REQUESTS_PER_IP_PER_WINDOW,
   LIVE_FEED_MAX_LIFETIME_MS,
@@ -143,6 +144,7 @@ import {
   fixMisclassifiedGroupEvents,
   getRelaySettings,
   giftWrapCount,
+  sweepExpiredGiftWraps,
   hasNonOwnerStorageHeadroom,
   isDeleted,
   isGroupMember,
@@ -1016,6 +1018,17 @@ export class Relay extends DurableObject<Env> {
         // in this tick is: this is the relay tidying its own room, and
         // the one step a stranger's request sizes goes last.
         withReadPath("chatSweep", () => this.sweepEphemeralChat(sql, now));
+        // Expired gift wraps (storage.ts sweepExpiredGiftWraps). Every
+        // other kind is content with being hidden once it expires; this
+        // one is capped by COUNT (limits.ts maxGiftWraps), so a hidden
+        // row still holds a slot and an inbox full of them refuses the
+        // owner's real mail.
+        //
+        // Alongside the relay's own upkeep and ahead of the vanish drain,
+        // for the reason every step above it is: this is the relay
+        // reclaiming space it allocated itself, not a cost a stranger's
+        // request sizes.
+        withReadPath("giftWrapSweep", () => this.sweepExpiredWraps(sql, now));
         // Last, and deliberately so: this is the only step whose cost is
         // set by a stranger's request rather than by the relay's own
         // state, and everything above gates the owner's own writes.
@@ -1872,6 +1885,29 @@ export class Relay extends DurableObject<Env> {
         : `ephemeral chat (reporting only, set EPHEMERAL_CHAT=on to act): would remove ` +
           `${result.pending} chat messages at or before ${result.cutoff}; ` +
           `${occupants} in the room, last occupied ${state.lastOccupiedAt}`,
+    );
+  }
+
+  // One cron tick of the expired-gift-wrap sweep (storage.ts
+  // sweepExpiredGiftWraps, which carries the reasoning).
+  //
+  // No mode switch and no reporting tier, unlike the chat sweep above.
+  // That one removes things a person said and had to be watchable for a
+  // few days before anyone let it act; this one removes rows their own
+  // author stamped with an expiry and that no query has returned since
+  // the moment it passed. There is nothing here for an owner to disagree
+  // with, so there is nothing to put behind a variable.
+  //
+  // Silent unless it removed something, so a relay carrying no expiring
+  // wraps -- which is every relay whose senders do not set the tag --
+  // never logs. Logged when it does, because the count is the only way to
+  // see the inbox cap being reclaimed rather than merely being full.
+  private sweepExpiredWraps(sql: SqlStorage, nowSec: number): void {
+    const result = sweepExpiredGiftWraps(sql, nowSec, GIFT_WRAP_SWEEP_BATCH_SIZE);
+    if (result.removed === 0) return;
+    console.log(
+      `gift wrap sweep: removed ${result.removed} expired gift wrap(s)` +
+        `${result.done ? "" : ", more to come next tick"}`,
     );
   }
 

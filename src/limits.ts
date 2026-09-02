@@ -942,7 +942,8 @@ const GIFT_WRAP_STORAGE_SHARE = STORAGE_BYTES_LIMIT / 40;
 // regardless of event size or count.
 //
 // New gift wraps are refused once reached; the owner deleting old ones
-// (or vanishing them) frees room.
+// (or vanishing them) frees room -- and so does the expiry sweep below,
+// which is what keeps this a count of mail rather than a count of rows.
 //
 // Bounded by MAX_FILTER_ROWS_READ as well as by the storage share, and
 // the second bound is a READ cost sitting on a write-path cap, which
@@ -977,6 +978,43 @@ export function maxGiftWraps(env: Env): number {
 // backfill's headroom check below needs the actual number to reason
 // about, not just a copy used for a progress bar.
 export const DAILY_ROWS_WRITTEN_LIMIT = 100_000;
+
+// Single-letter tags on a gift wrap: the one `p` tag naming its
+// recipient. NIP-59 puts nothing else there -- the sender is a random
+// one-time key and the contents are sealed -- so unlike
+// TAGS_PER_CHAT_MESSAGE above this is the shape of the kind rather than
+// an estimate that had to err high.
+const TAGS_PER_GIFT_WRAP = 1;
+
+// What one cron tick may spend removing expired gift wraps.
+//
+// Bounded TWICE, and the second bound is what makes this one cheap
+// insurance rather than the thing doing the work. maxGiftWraps above is
+// a ceiling on how many gift wraps exist at all, so the largest backlog
+// this sweep can ever face is that ceiling -- 2,048 at the defaults,
+// which at the charged cost of a one-tag event is ~32,000 rows written,
+// inside a single day and very nearly inside a single tick. A per-tick
+// share is still declared, for the reason CHAT_SWEEP_BATCH_SIZE declares
+// one: a backlog that arrives all at once -- every wrap of a 30-day TTL
+// expiring in the same hour -- should drain across ticks rather than be
+// attempted in one, and the remainder costs nothing to carry because the
+// next tick finds it exactly where it left it.
+//
+// Five percent of the day, matching the chat sweep, which at a one-tag
+// event is ~312 wraps a tick and ~7,500 a day: more than the inbox can
+// hold, so the cap is reached in hours and never binds twice.
+//
+// NO DAILY SHARE, for the reason the chat sweep gives and one more. Every
+// wrap this removes was written by this relay first, and writing one cost
+// more than removing it does, so a day's sweeping cannot exceed a day's
+// gift wrap ingest. And that ingest is itself bounded by
+// MAX_GIFT_WRAPS_PER_IP_PER_WINDOW and by maxGiftWraps, which is more
+// than the chat sweep can say about its own input.
+const GIFT_WRAP_SWEEP_TICK_SHARE = DAILY_ROWS_WRITTEN_LIMIT / 20;
+export const GIFT_WRAP_SWEEP_BATCH_SIZE = Math.max(
+  1,
+  Math.floor(GIFT_WRAP_SWEEP_TICK_SHARE / eventRowCost(TAGS_PER_GIFT_WRAP)),
+);
 
 // ---------------------------------------------------------------------
 // Call presence (src/push.ts CALL_PRESENCE_KIND, reference/push.md).

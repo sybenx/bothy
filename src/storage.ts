@@ -1161,6 +1161,99 @@ export function giftWrapCount(sql: SqlStorage): number {
   ).reduce((total, row) => total + row.n, 0);
 }
 
+export interface GiftWrapSweep {
+  // How many wraps this tick actually removed.
+  removed: number;
+  // Whether every expired wrap is now gone, or a remainder waits for the
+  // next tick.
+  done: boolean;
+}
+
+// Removes gift wraps whose NIP-40 `expiration` has passed.
+//
+// WHY THIS EXISTS AT ALL, since nothing else in this file deletes an
+// event for being expired. `filters.ts` hides an expired event from every
+// query -- NIP-40's "SHOULD NOT send expired events to clients, even if
+// they are stored" -- and for every other kind that is the whole of what
+// expiry means here: the row costs storage bytes, which
+// NON_OWNER_STORAGE_SHARE_LIMIT already bounds, and nothing else.
+//
+// Kind 1059 is the exception, because it is the one kind with a cap on
+// how many of it may exist. `giftWrapCount` above counts rows and not
+// mail, so an expired wrap occupies a slot in `maxGiftWraps` that no
+// query will ever serve from, permanently. Left alone, a relay carrying
+// expiring wraps fills its inbox with rows it is hiding and then answers
+// "blocked: gift wrap inbox storage is full" to the owner's real mail --
+// worse at the job it already had, in exchange for nothing.
+//
+// The count is deliberately NOT taught about expiry instead, which is the
+// smaller-looking fix. `SELECT COUNT(*) ... WHERE kind = ? AND is_group =
+// ?` is answered from idx_events_kind_created_* without touching the
+// table; adding `expiration` to it -- a column no index carries -- would
+// fetch every row behind those index entries, doubling a read that
+// relay.ts handleGiftWrap pays on every accepted wrap. And it would fix
+// only half the problem: `maxGiftWraps` is bounded by
+// MAX_FILTER_ROWS_READ as well as by the storage share, because
+// `excludeGiftWraps` skips past every stored wrap to reach the rows it
+// may return, and a dead row costs that skip exactly as a live one does.
+// The rows have to go, not just stop being counted.
+//
+// NO TOMBSTONE, and the argument is stronger here than the one sweepChat
+// makes for the same choice. That path needs `swept_through` to stand in
+// for the tombstones it does not write; this one needs nothing, because
+// the event refuses its own replay: relay.ts acceptEvent drops any event
+// whose `expiration` has passed, the tag is covered by the signature, and
+// so a re-send of the same signed copy is refused forever and for free. A
+// `deleted_ids` row would be a permanent row bought to duplicate a check
+// the event already carries.
+//
+// COST. Oldest first, so a batch that runs out leaves a contiguous
+// remainder and the checkpoint is just "run again next tick" -- the same
+// shape sweepChat and drainVanish use. `ORDER BY created_at ASC` is
+// served by the index rather than sorted, and the walk stops the moment
+// the batch fills, so a tick with work to do reads roughly what it
+// removes. A tick with nothing to do walks the whole kind-1059 range
+// once per partition to establish that, which is bounded by
+// `maxGiftWraps` -- ~2,048 rows at the defaults, ~49,000 a day, about 1%
+// of the rows-read ceiling, and only on a relay whose inbox is
+// permanently full. An ordinary personal inbox of a few dozen wraps pays
+// a few dozen rows an hour, and a relay that has never received one pays
+// nothing at all: there are no index entries to walk.
+//
+// Both partitions. `handleGiftWrap` now refuses a wrap carrying a group
+// tag, but rows stored before it did are still there, and `giftWrapCount`
+// counts both -- so a sweep that cleaned only one would leave the other
+// half of the cap silting up exactly as before.
+export function sweepExpiredGiftWraps(
+  sql: SqlStorage,
+  nowSec: number,
+  limit: number,
+): GiftWrapSweep {
+  const targets = acrossScopes((scope) =>
+    sql
+      .exec<{ id: string }>(
+        `SELECT id FROM events
+           WHERE kind = ? AND is_group = ? AND expiration IS NOT NULL AND expiration <= ?
+           ORDER BY created_at ASC LIMIT ?`,
+        GIFT_WRAP_KIND,
+        scope,
+        nowSec,
+        limit,
+      )
+      .toArray(),
+  );
+
+  // Fewer than asked for across both partitions means neither partition
+  // filled its own limit, so the range is exhausted -- checked against
+  // the limit rather than by re-running the query, the same call
+  // drainVanish and sweepChat both make. Equality counts as not done: two
+  // partitions summing to exactly the limit could still each be holding
+  // more, and re-checking next tick is cheaper than being wrong.
+  const done = targets.length < limit;
+  for (const target of targets.slice(0, limit)) deleteEventRow(sql, target.id);
+  return { removed: Math.min(targets.length, limit), done };
+}
+
 interface StoreResult {
   ok: boolean;
   message: string;
