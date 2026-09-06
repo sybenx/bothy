@@ -553,7 +553,7 @@ describe("who a message is pushed to", () => {
     const device = await makeDevice("https://push.example/ex-member");
     await callManagement("subscribepush", [device], { secretKeyHex: exMember.secretKeyHex });
     await runInDurableObject(stub(), (_i: Relay, state) => {
-      state.storage.sql.exec(`DELETE FROM group_members WHERE pubkey = ?`, exMember.pubkeyHex);
+      state.storage.sql.exec(`DELETE FROM group_membership WHERE group_id = '_' AND pubkey = ?`, exMember.pubkeyHex);
     });
 
     await sendChat(await joinGroup());
@@ -617,7 +617,8 @@ describe("the subrequest bound", () => {
       for (let i = 0; i < devices; i++) {
         const pubkey = `${String(i).padStart(2, "0")}${"c".repeat(62)}`;
         state.storage.sql.exec(
-          `INSERT INTO group_members (pubkey, added_at) VALUES (?, 0) ON CONFLICT DO NOTHING`,
+          `INSERT INTO group_membership (group_id, pubkey, added_at) VALUES ('_', ?, 0)
+           ON CONFLICT DO NOTHING`,
           pubkey,
         );
         state.storage.sql.exec(

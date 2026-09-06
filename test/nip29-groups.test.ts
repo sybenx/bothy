@@ -490,7 +490,7 @@ describe("membership", () => {
         const sql = state.storage.sql;
         return {
           members: sql
-            .exec<{ pubkey: string }>(`SELECT pubkey FROM group_members`)
+            .exec<{ pubkey: string }>(`SELECT pubkey FROM group_membership`)
             .toArray()
             .map((r) => r.pubkey),
           allowed: sql
@@ -530,7 +530,7 @@ describe("membership", () => {
       // owner-owned, because put-user must not demote a deliberate grant
       // into one remove-user can reclaim.
       expect(rows).toEqual([{ pubkey: member.pubkeyHex, source: "owner", reason: "a friend" }]);
-      expect(state.storage.sql.exec(`SELECT 1 FROM group_members`).toArray()).toEqual([]);
+      expect(state.storage.sql.exec(`SELECT 1 FROM group_membership`).toArray()).toEqual([]);
     });
   });
 
@@ -888,7 +888,7 @@ describe("the daily audit", () => {
       // function granting relay write access on the strength of a row it
       // has just decided it cannot trust.
       expect(sql.exec(`SELECT 1 FROM allowed_pubkeys`).toArray()).toEqual([]);
-      expect(sql.exec(`SELECT 1 FROM group_members`).toArray().length).toBe(1);
+      expect(sql.exec(`SELECT 1 FROM group_membership`).toArray().length).toBe(1);
 
       // And what gets STORED for /api/stats to read back counts rather than
       // names -- that endpoint is public and unauthenticated, so putting

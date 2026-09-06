@@ -143,6 +143,7 @@ import {
   eventExists,
   expirationOf,
   fixMisclassifiedGroupEvents,
+  migrateToMultiGroup,
   getRelaySettings,
   giftWrapCount,
   sweepExpiredGiftWraps,
@@ -981,6 +982,16 @@ export class Relay extends DurableObject<Env> {
         // step above it is: this is the relay fixing its own past
         // mistake, not a cost a stranger's request sizes.
         fixMisclassifiedGroupEvents(sql, this.ctx.storage, VANISH_BATCH_SIZE);
+        // The one-time migration to groups-as-rows, beside the correction
+        // above and paced against the same constant for the same reason:
+        // both are the relay fixing its own past, one UPDATE at a time,
+        // and neither is a cost a stranger's request sizes. It has to run
+        // here rather than at deploy because until it does, a relay's
+        // existing group metadata sits where an unauthenticated client
+        // cannot read it -- the state that made a NIP-29 client show no
+        // channels at all -- and nobody redeploys to finish a migration
+        // they cannot see is pending. See storage.ts migrateToMultiGroup.
+        migrateToMultiGroup(sql, this.ctx.storage, VANISH_BATCH_SIZE);
         // Once a day (paced by maintained_counts.audited_at, not by this
         // tick's frequency), recount `events` and `follows` and log if the
         // maintained counters disagree. E + F rows read, once -- against

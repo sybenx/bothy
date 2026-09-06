@@ -1,5 +1,8 @@
 import { buildFilterQuery, compareEvents, expandFilter, type FilterQueryOptions } from "./filters";
 import {
+  groupIdOf,
+  GROUP_METADATA_KIND,
+  GROUP_ADMINS_KIND,
   acrossScopes,
   GROUP_CHAT_KIND,
   GROUP_SCOPE,
@@ -1114,6 +1117,144 @@ export function fixMisclassifiedGroupEvents(
     if (wasFixed) fixed += 1;
   }
   return fixed;
+}
+
+// The one-time migration to groups-as-rows, for a relay that already
+// holds group history.
+//
+// Two things changed underneath the stored rows and neither rewrites
+// itself. The partition stopped meaning "is this group traffic" and
+// started meaning "does reading this need a membership check", which put
+// kind 39000 and kind 39001 on the public side of it (groups.ts); and an
+// event gained a `group_id`, which nothing before this wrote. New writes
+// are already correct -- storeEvent computes both from the event -- so
+// this is only ever about rows that predate the change.
+//
+// UNTIL IT RUNS, THE FIX DOES NOTHING VISIBLE. A relay's existing 39000
+// sits in the group partition where an unauthenticated read cannot reach
+// it, which is precisely the state that made a NIP-29 client show "no
+// channels on this server yet". That is the whole reason this is paced
+// across cron ticks rather than deferred to a redeploy: nobody redeploys
+// to finish a migration they cannot see is pending.
+//
+// Batched and checkpointed exactly as fixMisclassifiedGroupEvents above,
+// against the same VANISH_BATCH_SIZE and for the same reason: every write
+// here is an UPDATE moving a row between partial-index partitions, which
+// is the shape that constant is already paced against. The membership
+// copy is not batched -- it is bounded by the number of people in the
+// group, which is bounded by the owner having added them one at a time.
+//
+// Ordered so that a tick which dies partway leaves a state the next tick
+// finishes rather than one it double-counts: membership first (idempotent
+// by primary key), then the partition move (idempotent because it selects
+// only rows still on the wrong side), then the stamping (idempotent
+// because it selects only rows still missing it). The flag is set last
+// and only when a pass finds nothing left, so an interrupted run simply
+// repeats.
+export function migrateToMultiGroup(
+  sql: SqlStorage,
+  storage: DurableObjectStorage,
+  limit: number,
+): number {
+  const done =
+    sql
+      .exec<{ multi_group_migrated: number }>(`SELECT multi_group_migrated FROM relay_meta LIMIT 1`)
+      .toArray()[0]?.multi_group_migrated ?? 0;
+  if (done) return 0;
+
+  let changed = 0;
+
+  // 1. Membership, from the table keyed by pubkey alone into the one keyed
+  //    by (group_id, pubkey). Everyone who was a member was a member of the
+  //    id the relay used to force, because there was no other.
+  //
+  //    `source` is 'owner' for all of them: the column distinguishes a
+  //    grant the owner made from one the group's own invite bookkeeping
+  //    made, and the old table did not record which. Calling them all
+  //    owner-granted is the conservative reading -- a remove-user reclaims
+  //    only `invite` rows, so this preserves access rather than silently
+  //    revoking it, and the owner can still remove anybody by hand.
+  const legacy = sql
+    .exec<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'group_members'`,
+    )
+    .toArray()[0];
+  if ((legacy?.n ?? 0) > 0) {
+    sql.exec(
+      `INSERT OR IGNORE INTO group_membership (group_id, pubkey, added_at, source)
+         SELECT ?, pubkey, added_at, 'owner' FROM group_members`,
+      TOP_LEVEL_GROUP_ID,
+    );
+    sql.exec(`DROP TABLE group_members`);
+    changed += 1;
+  }
+
+  // 2. The 39000/39001 rows that are on the wrong side of the partition.
+  //    Moved one at a time inside a transaction, with the same counter
+  //    adjustment fixMisclassifiedGroupEvents makes for the same move: a
+  //    reclassification does not change how many events exist, only how
+  //    many of them are group events.
+  const misfiled = sql
+    .exec<{ id: string; created_at: number; ingested_at: number | null }>(
+      `SELECT id, created_at, ingested_at FROM events
+        WHERE is_group = 1 AND kind IN (?, ?) LIMIT ?`,
+      GROUP_METADATA_KIND,
+      GROUP_ADMINS_KIND,
+      limit,
+    )
+    .toArray();
+  for (const row of misfiled) {
+    storage.transactionSync(() => {
+      sql.exec(`UPDATE events SET is_group = 0 WHERE id = ?`, row.id);
+      sql.exec(`UPDATE event_tags SET is_group = 0 WHERE event_id = ?`, row.id);
+      sql.exec(`UPDATE maintained_counts SET group_events = group_events - 1`);
+      sql.exec(
+        `UPDATE event_hour_counts SET group_n = group_n - 1 WHERE hour = ?`,
+        hourBucket(row.created_at),
+      );
+      if (row.ingested_at !== null) {
+        sql.exec(
+          `UPDATE ingest_hour_counts SET group_n = group_n - 1 WHERE hour = ?`,
+          hourBucket(row.ingested_at),
+        );
+      }
+    });
+    changed += 1;
+  }
+
+  // 3. `group_id`, on every row that is in the group partition and has
+  //    none. Read from the event rather than assumed to be the forced id:
+  //    a relay that has already been running under this change may hold
+  //    rows for a group the owner created, and stamping those with `_`
+  //    would file them into the wrong group -- which, since membership is
+  //    what the column will eventually scope, is the one error here that
+  //    would disclose something.
+  const unstamped = sql
+    .exec<EventRow>(
+      `SELECT id, pubkey, created_at, kind, tags, content, sig FROM events
+        WHERE is_group = 1 AND group_id IS NULL LIMIT ?`,
+      limit,
+    )
+    .toArray();
+  for (const row of unstamped) {
+    const id = groupIdOf(rowToEvent(row));
+    // A group-partition row that names no group cannot happen through
+    // storeEvent, which is what put it there. Left alone and counted, so
+    // the pass does not spin on it forever: the flag below is set when a
+    // pass finds nothing it CAN do, and this row is not one of those.
+    if (id === null) continue;
+    storage.transactionSync(() => {
+      sql.exec(`UPDATE events SET group_id = ? WHERE id = ?`, id, row.id);
+      sql.exec(`UPDATE event_tags SET group_id = ? WHERE event_id = ?`, id, row.id);
+    });
+    changed += 1;
+  }
+
+  if (changed === 0) {
+    sql.exec(`UPDATE relay_meta SET multi_group_migrated = 1`);
+    invalidateHostedGroups();
+  }
+  return changed;
 }
 
 // ---------------------------------------------------------------------
@@ -2262,20 +2403,46 @@ export function revokeGroupAllowance(sql: SqlStorage, pubkey: string): void {
   sql.exec(`DELETE FROM allowed_pubkeys WHERE pubkey = ? AND source = 'invite'`, pubkey);
 }
 
-export function addGroupMember(sql: SqlStorage, pubkey: string, nowSec: number): void {
-  sql.exec(`INSERT INTO group_members (pubkey, added_at) VALUES (?, ?) ON CONFLICT(pubkey) DO NOTHING`,
+// `groupId` defaults to the id the relay used to force, which is what
+// keeps every existing caller correct while there is still exactly one
+// group to be a member of. The default goes when the callers learn to
+// pass the id off the event they are gating -- it is an intermediate
+// state, not the destination, and it is a default rather than a
+// hard-coded constant inside the query so that removing it is a
+// signature change the compiler finds every caller of.
+export function addGroupMember(
+  sql: SqlStorage,
+  pubkey: string,
+  nowSec: number,
+  groupId: string = TOP_LEVEL_GROUP_ID,
+): void {
+  sql.exec(
+    `INSERT INTO group_membership (group_id, pubkey, added_at) VALUES (?, ?, ?)
+       ON CONFLICT(group_id, pubkey) DO NOTHING`,
+    groupId,
     pubkey, nowSec);
 }
 
-export function removeGroupMember(sql: SqlStorage, pubkey: string): void {
-  sql.exec(`DELETE FROM group_members WHERE pubkey = ?`, pubkey);
+export function removeGroupMember(
+  sql: SqlStorage,
+  pubkey: string,
+  groupId: string = TOP_LEVEL_GROUP_ID,
+): void {
+  sql.exec(`DELETE FROM group_membership WHERE group_id = ? AND pubkey = ?`, groupId, pubkey);
 }
 
 // The write-path check (nip29.ts authorizeGroupWrite). Reached only for an
 // event carrying an `h` tag whose author is not the owner, so ordinary
 // traffic never pays it.
-export function isGroupMember(sql: SqlStorage, pubkey: string): boolean {
-  return sql.exec(`SELECT 1 FROM group_members WHERE pubkey = ?`, pubkey).toArray().length > 0;
+export function isGroupMember(
+  sql: SqlStorage,
+  pubkey: string,
+  groupId: string = TOP_LEVEL_GROUP_ID,
+): boolean {
+  return (
+    sql.exec(`SELECT 1 FROM group_membership WHERE group_id = ? AND pubkey = ?`, groupId, pubkey)
+      .toArray().length > 0
+  );
 }
 
 // Ordered by pubkey, which makes the regenerated kind-39002 member list a
@@ -2283,9 +2450,12 @@ export function isGroupMember(sql: SqlStorage, pubkey: string): boolean {
 // whether to write a new one by comparing tags: ordered by `added_at`
 // instead, removing a member and adding them back would move them to the
 // end and rewrite an event whose membership had not changed.
-export function listGroupMembers(sql: SqlStorage): string[] {
+export function listGroupMembers(sql: SqlStorage, groupId: string = TOP_LEVEL_GROUP_ID): string[] {
   return sql
-    .exec<{ pubkey: string }>(`SELECT pubkey FROM group_members ORDER BY pubkey ASC`)
+    .exec<{ pubkey: string }>(
+      `SELECT pubkey FROM group_membership WHERE group_id = ? ORDER BY pubkey ASC`,
+      groupId,
+    )
     .toArray()
     .map((r) => r.pubkey);
 }
@@ -2297,7 +2467,7 @@ export function listGroupMembers(sql: SqlStorage): string[] {
 export function groupMembersWithoutAllowance(sql: SqlStorage): string[] {
   return sql
     .exec<{ pubkey: string }>(
-      `SELECT m.pubkey FROM group_members m
+      `SELECT m.pubkey FROM group_membership m
          LEFT JOIN allowed_pubkeys a ON a.pubkey = m.pubkey
         WHERE a.pubkey IS NULL
         ORDER BY m.added_at ASC`,

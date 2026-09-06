@@ -30,7 +30,18 @@ import {
   type IndexSpec,
   type TableSpec,
 } from "../src/schema";
-import { estimateRowsWrittenSince } from "../src/storage";
+import {
+  estimateRowsWrittenSince,
+  isGroupMember,
+  migrateToMultiGroup,
+} from "../src/storage";
+import { getRelayPubkey } from "../src/relay-identity";
+import {
+  GROUP_ADMINS_KIND,
+  GROUP_MEMBERS_KIND,
+  GROUP_METADATA_KIND,
+  TOP_LEVEL_GROUP_ID,
+} from "../src/groups";
 import { refreshProfile } from "../src/ownership";
 import { isolateStorage } from "./helpers/isolate";
 import { OWNER_PUBKEY_HEX } from "./helpers/keys";
@@ -746,6 +757,131 @@ describe("row_cost across the migration boundary", () => {
         eventRowCost(0),
       );
       expect(estimateRowsWrittenSince(sql, now - 86400)).toBe(eventRowCost(0));
+    });
+  });
+});
+
+// The one-time migration to groups-as-rows (storage.ts migrateToMultiGroup).
+//
+// This is the only thing in the change that touches rows a deployed relay
+// already holds, so it is tested against a database built to look like one:
+// group state filed under the old partition rule, events with no group_id,
+// and membership in the table that no longer exists in TABLES. Building
+// that by hand is the same documented exception the rest of this file
+// makes -- an empty database has nothing to migrate, so a test that starts
+// from one cannot see this work at all.
+describe("the migration to groups-as-rows", () => {
+  // The old shape, written directly: the relay-generated state in the
+  // group partition (where the old rule put it), no group_id anywhere, and
+  // a group_members table with a member in it.
+  function seedOldShape(sql: SqlStorage, relayPubkey: string): void {
+    sql.exec(
+      `CREATE TABLE IF NOT EXISTS group_members (pubkey TEXT PRIMARY KEY, added_at INTEGER NOT NULL)`,
+    );
+    sql.exec(`INSERT OR IGNORE INTO group_members (pubkey, added_at) VALUES (?, ?)`, "a".repeat(64), 111);
+    const insert = (id: string, kind: number, tags: string[][]) => {
+      sql.exec(
+        `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, ingested_at, row_cost, is_group)
+         VALUES (?, ?, ?, ?, ?, '', '', ?, 1, 1)`,
+        id,
+        relayPubkey,
+        1_700_000_000,
+        kind,
+        JSON.stringify(tags),
+        1_700_000_000,
+      );
+      for (const [name, value] of tags) {
+        sql.exec(
+          `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at, is_group) VALUES (?, ?, ?, ?, 1)`,
+          name,
+          value,
+          id,
+          1_700_000_000,
+        );
+      }
+    };
+    insert("1".repeat(64), GROUP_METADATA_KIND, [["d", TOP_LEVEL_GROUP_ID]]);
+    insert("2".repeat(64), GROUP_ADMINS_KIND, [["d", TOP_LEVEL_GROUP_ID]]);
+    insert("3".repeat(64), GROUP_MEMBERS_KIND, [["d", TOP_LEVEL_GROUP_ID]]);
+    insert("4".repeat(64), 9, [["h", TOP_LEVEL_GROUP_ID]]);
+    // Counters, as the old writes would have left them: four events, all
+    // four of them group events.
+    sql.exec(`UPDATE maintained_counts SET events = events + 4, group_events = group_events + 4`);
+    sql.exec(`UPDATE relay_meta SET multi_group_migrated = 0`);
+  }
+
+  it("moves the public half out, stamps the rest, and carries membership across", async () => {
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      const relayPubkey = getRelayPubkey(sql);
+      seedOldShape(sql, relayPubkey);
+
+      // Drains in as many passes as it needs, exactly as the cron does.
+      let passes = 0;
+      while (migrateToMultiGroup(sql, state.storage, 100) > 0) {
+        passes += 1;
+        expect(passes).toBeLessThan(10); // it must terminate
+      }
+
+      const scope = (id: string) =>
+        sql.exec<{ is_group: number; group_id: string | null }>(
+          `SELECT is_group, group_id FROM events WHERE id = ?`,
+          id,
+        ).toArray()[0];
+
+      // A group's existence is public; its member list is not.
+      expect(scope("1".repeat(64))?.is_group).toBe(0);
+      expect(scope("2".repeat(64))?.is_group).toBe(0);
+      expect(scope("3".repeat(64))?.is_group).toBe(1);
+      expect(scope("4".repeat(64))?.is_group).toBe(1);
+
+      // Everything left in the group partition knows which group it is in.
+      expect(scope("3".repeat(64))?.group_id).toBe(TOP_LEVEL_GROUP_ID);
+      expect(scope("4".repeat(64))?.group_id).toBe(TOP_LEVEL_GROUP_ID);
+      const unstamped = sql
+        .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events WHERE is_group = 1 AND group_id IS NULL`)
+        .toArray()[0];
+      expect(unstamped?.n).toBe(0);
+
+      // The tag rows moved with their events -- a tag row disagreeing with
+      // its event is what would put a member list's tags on the public tag
+      // path while the event itself stayed hidden.
+      const tagScope = (id: string) =>
+        sql.exec<{ n: number; g: number }>(
+          `SELECT COUNT(*) AS n, COALESCE(SUM(is_group), 0) AS g FROM event_tags WHERE event_id = ?`,
+          id,
+        ).toArray()[0];
+      expect(tagScope("1".repeat(64))?.g).toBe(0);
+      expect(tagScope("3".repeat(64))?.g).toBe(tagScope("3".repeat(64))?.n);
+
+      // Membership came across, and the old table is gone rather than left
+      // to be recreated by the next initSchema and migrated again forever.
+      expect(isGroupMember(sql, "a".repeat(64))).toBe(true);
+      const legacy = sql
+        .exec<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'group_members'`,
+        )
+        .toArray()[0];
+      expect(legacy?.n).toBe(0);
+
+      // A reclassification does not change how many events exist, only how
+      // many of them are group events. Two moved, so two came off.
+      const counts = sql
+        .exec<{ events: number; group_events: number }>(
+          `SELECT events, group_events FROM maintained_counts`,
+        )
+        .toArray()[0];
+      expect(counts?.events).toBe(4);
+      expect(counts?.group_events).toBe(2);
+
+      // Done, and it says so -- a second call does nothing at all, which is
+      // what keeps it off every subsequent cron tick.
+      expect(migrateToMultiGroup(sql, state.storage, 100)).toBe(0);
+      const flag = sql
+        .exec<{ multi_group_migrated: number }>(`SELECT multi_group_migrated FROM relay_meta`)
+        .toArray()[0];
+      expect(flag?.multi_group_migrated).toBe(1);
     });
   });
 });

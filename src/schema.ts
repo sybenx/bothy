@@ -464,6 +464,13 @@ export const TABLES: readonly TableSpec[] = [
       // backfill_meta.exhaust_reset_applied guards its own one-time
       // reset below.
       col("group_scope_fixed", "INTEGER NOT NULL DEFAULT 0"),
+      // Guards the one-time migration to groups-as-rows (storage.ts
+      // migrateToMultiGroup, called from relay.ts runCron). Same shape and
+      // same reason as the flag above: 0 on every relay, fresh or not,
+      // until a cron tick finds nothing left to do, then permanently 1. A
+      // fresh relay has nothing to migrate and reaches 1 on its first
+      // tick, which costs the two COUNT queries that establish it.
+      col("multi_group_migrated", "INTEGER NOT NULL DEFAULT 0"),
       // Fingerprint of the follow SET the `follows` table currently
       // holds (ownership.ts computeFollowsHash) -- the same shape as
       // schema_meta.hash: derived from the content it describes, never
@@ -628,36 +635,6 @@ export const TABLES: readonly TableSpec[] = [
       // this column existed.
       col("source", "TEXT NOT NULL DEFAULT 'owner'"),
     ],
-  },
-  {
-    // NIP-29 group membership (src/nip29.ts) -- the INNER of the two
-    // nested lists described on `allowed_pubkeys.source` above. A row here
-    // means the pubkey may write `h`-tagged events; a row THERE means it
-    // may write to this relay at all, and a member needs both.
-    //
-    // No group id column, because there is exactly one group and its id is
-    // a constant (groups.ts TOP_LEVEL_GROUP_ID). A second group would need
-    // a composite primary key, which SQLite cannot add to an existing
-    // table (see whyNotAddable below) and which would therefore be a
-    // deliberate table rebuild rather than a column addition. That is the
-    // honest shape of the decision and it is recorded here rather than
-    // pre-paid for with a column nothing reads.
-    //
-    // Read on the write path, but only for events that carry an `h` tag
-    // and are not the owner's (nip29.ts authorizeGroupWrite), so it costs
-    // an indexed lookup on group traffic and nothing at all on the rest.
-    // Written at moderation pace: one row per put-user, one delete per
-    // remove-user.
-    //
-    // Members and their `allowed_pubkeys` rows can drift apart -- two
-    // tables, two writes -- and the failure that produces is silent: a
-    // member the relay believes is in the group, whose events the outer
-    // gate refuses with a message about follows that names nothing about
-    // groups. storage.ts auditMaintainedCounts checks the containment once
-    // a day and logs, like every other invariant there, without repairing
-    // it.
-    name: "group_members",
-    columns: [col("pubkey", "TEXT PRIMARY KEY"), col("added_at", "INTEGER NOT NULL")],
   },
   // The groups this relay hosts, one row each. NEW: the relay used to host
   // exactly one, whose id was a constant in groups.ts, so there was nothing

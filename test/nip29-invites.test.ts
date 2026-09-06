@@ -117,7 +117,7 @@ async function lists(): Promise<{
     const sql = state.storage.sql;
     return {
       members: sql
-        .exec<{ pubkey: string }>(`SELECT pubkey FROM group_members`)
+        .exec<{ pubkey: string }>(`SELECT pubkey FROM group_membership`)
         .toArray()
         .map((r) => r.pubkey),
       allowed: sql

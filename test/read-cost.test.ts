@@ -1168,14 +1168,14 @@ describe("rows read by partition", () => {
     await runInDurableObject(stub(), async (_instance: Relay, state) => {
       const sql = state.storage.sql;
       const member = "b".repeat(64);
-      sql.exec(`INSERT INTO group_members (pubkey, added_at) VALUES (?, ?)`, member, 0);
-      expect(rowsRead(sql, `SELECT 1 FROM group_members WHERE pubkey = ?`, member)).toBe(1);
+      sql.exec(`INSERT INTO group_membership (group_id, pubkey, added_at) VALUES ('_', ?, ?)`, member, 0);
+      expect(rowsRead(sql, `SELECT 1 FROM group_membership WHERE group_id = '_' AND pubkey = ?`, member)).toBe(1);
       // A pubkey that is not a member costs LESS than one that is -- the
       // seek lands between index entries and reads nothing. So the gate
       // is cheapest for exactly the callers there are most of, and a
       // stranger cannot make it expensive by failing it.
-      expect(rowsRead(sql, `SELECT 1 FROM group_members WHERE pubkey = ?`, "c".repeat(64))).toBe(0);
-      sql.exec(`DELETE FROM group_members WHERE pubkey = ?`, member);
+      expect(rowsRead(sql, `SELECT 1 FROM group_membership WHERE group_id = '_' AND pubkey = ?`, "c".repeat(64))).toBe(0);
+      sql.exec(`DELETE FROM group_membership WHERE group_id = '_' AND pubkey = ?`, member);
     });
   });
 
