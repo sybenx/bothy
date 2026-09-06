@@ -247,13 +247,43 @@ export function groupIdOf(event: NostrEvent): string | null {
 // happen to share an identifier. That filter is answered by omission
 // instead, which is the safe direction: omission returns the same answer
 // whether or not the group holds anything.
-export function filterNamesGroup(filter: Filter): boolean {
+export function filterNamesGroup(filter: Filter, readable?: readonly string[]): boolean {
   const values = filter[`#${GROUP_TAG}`];
-  if (Array.isArray(values) && values.length > 0) return true;
+  if (Array.isArray(values) && values.length > 0) {
+    // Which groups it names is now a question worth asking. A member of A
+    // sending `{"#h":["A"]}` has named a group they are entitled to, and
+    // refusing them would refuse the ordinary case; the same member
+    // sending `{"#h":["B"]}` has named one they are not, and that is the
+    // refusal this gate exists for.
+    //
+    // `undefined` means UNRESTRICTED -- the owner, who reads every group
+    // this relay hosts -- and it means that here for the same reason and
+    // with the same spelling as filters.ts FilterQueryOptions.groupIds.
+    // The two have to agree: this function decides whether to refuse and
+    // that option decides what the query returns, so a value that means
+    // "everything" to one and "nothing" to the other would refuse the
+    // owner their own group. It did, until a test said so.
+    //
+    // An empty array is the unauthenticated case and refuses every named
+    // group, which is where this gate started.
+    if (readable === undefined) return false;
+    return values.some((v) => !readable.includes(v));
+  }
   // Only the gated part of the 39000-series counts. A filter asking for
   // 39000 or 39001 has asked for something this relay publishes to
   // anybody, so refusing it would be refusing a public read -- and it is
   // precisely the filter a client sends to find out what groups exist,
   // which is the one thing that must not need an account.
-  return filter.kinds?.some((k) => isGroupMetadataKind(k) && !isPubliclyReadableGroupKind(k)) ?? false;
+  const namesGatedState =
+    filter.kinds?.some((k) => isGroupMetadataKind(k) && !isPubliclyReadableGroupKind(k)) ?? false;
+  if (!namesGatedState) return false;
+  // Unlike `#h`, a kind names no particular group, so there is nothing to
+  // check a member's list against -- the question it can answer is only
+  // "may this reader see any group at all". A member asking for kind
+  // 39002 is entitled to the member lists of the groups they are in, and
+  // the query's own scoping is what limits them to those; refusing here
+  // would refuse a member their own group's membership, which is the
+  // asymmetry that made the group unusable by anyone but the owner once
+  // before.
+  return readable !== undefined && readable.length === 0;
 }

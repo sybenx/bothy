@@ -2450,6 +2450,27 @@ export function isGroupMember(
 // whether to write a new one by comparing tags: ordered by `added_at`
 // instead, removing a member and adding them back would move them to the
 // end and rewrite an event whose membership had not changed.
+// Which groups this pubkey may READ, which is the same list it may write
+// to: a pubkey admitted to write to a group is by construction admitted to
+// read it back, and keeping the two answers one query is what stops them
+// drifting into a group somebody can post to and not see.
+//
+// One indexed seek on the (group_id, pubkey) primary key's second column
+// -- which is why `group_membership` is keyed that way round rather than
+// (pubkey, group_id): the far commoner question is "is THIS pubkey in
+// THIS group", asked once per group write and once per REQ, and it wants
+// the composite key's prefix. This question is asked once per REQ by a
+// non-owner and reads one row per group they are in.
+export function listMemberGroups(sql: SqlStorage, pubkey: string): string[] {
+  return sql
+    .exec<{ group_id: string }>(
+      `SELECT group_id FROM group_membership WHERE pubkey = ? ORDER BY group_id ASC`,
+      pubkey,
+    )
+    .toArray()
+    .map((r) => r.group_id);
+}
+
 export function listGroupMembers(sql: SqlStorage, groupId: string = TOP_LEVEL_GROUP_ID): string[] {
   return sql
     .exec<{ pubkey: string }>(

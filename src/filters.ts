@@ -1,5 +1,6 @@
 import { GIFT_WRAP_KIND, type Filter, type NostrEvent, tagFilterEntries } from "./nostr";
-import { CREATE_INVITE_KIND, GROUP_CHAT_KIND, type GroupScope, PUBLIC_SCOPE } from "./groups";
+import {
+  GROUP_SCOPE, CREATE_INVITE_KIND, GROUP_CHAT_KIND, type GroupScope, PUBLIC_SCOPE } from "./groups";
 
 // How many tag rows one `#<letter>` condition is allowed to look at, per
 // event the client asked for.
@@ -169,6 +170,31 @@ export interface FilterQueryOptions {
   // only when its key columns are pinned to one value each.
   scope?: GroupScope;
 
+  // WHICH groups this reader may see, when `scope` is the group partition.
+  //
+  // The partition pin above answers "does reading this need a membership
+  // check"; this answers "and is this reader in THAT group". They are two
+  // questions because a relay hosts more than one group: a member of one
+  // is an authenticated non-owner to every other, and the partition alone
+  // cannot tell those apart -- it would hand a member of A everything in
+  // B, which is the whole of what per-group scoping has to prevent.
+  //
+  // `undefined` means unrestricted and is what the OWNER reads with. That
+  // is not a shortcut around the check but the correct answer for them,
+  // and it is worth being explicit about because it also happens to be
+  // the cheap one: the owner is in every group by construction, so an
+  // `IN` list naming them all would bind a parameter per group to express
+  // a condition that excludes nothing, and it would count against
+  // MAX_QUERY_BOUND_PARAMS on the one reader most likely to ask for a lot.
+  //
+  // An EMPTY array is not the same as `undefined` and must not be
+  // conflated with it: it means this reader may see no group at all, and
+  // it is the caller's job never to reach the group partition with one
+  // (relay.ts reads only PUBLIC_SCOPE in that case). Emitted as a
+  // condition that matches nothing rather than being dropped, so that a
+  // caller which gets there anyway fails closed.
+  groupIds?: readonly string[];
+
   // How many partitions the caller is reading in total, used only to split
   // the tag subquery's scan depth between them.
   //
@@ -243,6 +269,18 @@ export function buildFilterQuery(
   conditions.push("is_group = ?");
   params.push(options.scope ?? PUBLIC_SCOPE);
 
+  // Scoped to the groups this reader belongs to, on the group partition
+  // only -- a public row has no group_id and `IN` against NULL matches
+  // nothing, so emitting it there would silently return an empty result.
+  if ((options.scope ?? PUBLIC_SCOPE) === GROUP_SCOPE && options.groupIds !== undefined) {
+    if (options.groupIds.length === 0) {
+      conditions.push("0");
+    } else {
+      conditions.push(`group_id IN (${placeholders(options.groupIds.length)})`);
+      params.push(...options.groupIds);
+    }
+  }
+
   if (filter.ids !== undefined) {
     if (filter.ids.length === 0) return null;
     conditions.push(`id IN (${placeholders(filter.ids.length)})`);
@@ -302,6 +340,18 @@ export function buildFilterQuery(
       `tag_name = ? AND tag_value IN (${placeholders(values.length)})`,
     ];
     const subParams: unknown[] = [options.scope ?? PUBLIC_SCOPE, letter, ...values];
+    // The same scoping as the outer query, and needed here for the same
+    // reason the partition pin is: this subquery reads event_tags alone,
+    // so a tag row for a group the reader is not in would select an event
+    // id the outer query then fetches by primary key.
+    if ((options.scope ?? PUBLIC_SCOPE) === GROUP_SCOPE && options.groupIds !== undefined) {
+      if (options.groupIds.length === 0) {
+        subConditions.push("0");
+      } else {
+        subConditions.push(`group_id IN (${placeholders(options.groupIds.length)})`);
+        subParams.push(...options.groupIds);
+      }
+    }
     // `since`/`until` are pushed down into the subquery, not left to the
     // outer query. `event_tags.created_at` IS the event's own created_at
     // (storage.ts insertEventRow copies it), so this is the same bound
