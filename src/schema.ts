@@ -170,6 +170,14 @@ export interface ColumnSpec {
 export interface TableSpec {
   readonly name: string;
   readonly columns: readonly ColumnSpec[];
+  // Table-level constraints that are not expressible on a single column --
+  // in practice a composite PRIMARY KEY. They go into the CREATE TABLE and
+  // NOWHERE ELSE, because SQLite's ALTER TABLE cannot add one
+  // (sqlite.org/lang_altertable.html), which is the same reason a table
+  // whose key changes needs a new NAME rather than an altered definition.
+  // reconcileColumns therefore never sees these, and computeSchemaHash
+  // covers them so a change to one cannot silently skip a fresh CREATE.
+  readonly tableConstraints?: readonly string[];
 }
 
 function col(name: string, definition: string, resetsOnAdd?: readonly string[]): ColumnSpec {
@@ -285,6 +293,26 @@ export const TABLES: readonly TableSpec[] = [
       // could have been stored before this shipped, because nothing
       // distinguished it.
       col("is_group", "INTEGER NOT NULL DEFAULT 0"),
+      // WHICH group, where `is_group = 1` says only THAT it is one.
+      //
+      // Two columns rather than one, and the boolean is the one that
+      // cannot be replaced. The three REQ-serving indexes are partial
+      // PAIRS keyed on `is_group` (see INDEXES below), and a partial index
+      // needs a predicate SQLite can prove from a query's WHERE --
+      // `is_group = 0` / `= 1` are two fixed predicates, while
+      // `group_id = ?` is a value not known when the index is declared. A
+      // relay hosting twenty groups cannot have twenty partial index
+      // pairs. So the PARTITION stays boolean and keeps the plans that
+      // were measured for it (a widened key column took the owner's own
+      // gift wrap read from 601 rows to 204,701), and group IDENTITY
+      // rides alongside as an ordinary column, scoping a read WITHIN the
+      // group partition after the partition seek has done the expensive
+      // part.
+      //
+      // NULL exactly when `is_group = 0`. The relay-generated 39000-series
+      // names its group in `d` rather than `h` (groups.ts groupIdOf), and
+      // this column is what spares every reader from knowing that.
+      col("group_id", "TEXT"),
     ],
   },
   {
@@ -309,6 +337,10 @@ export const TABLES: readonly TableSpec[] = [
       // PAIR on this column rather than a second index, so a tag row still
       // pays one base row and one lookup entry, plus idx_event_tags_event.
       col("is_group", "INTEGER NOT NULL DEFAULT 0"),
+      // Copied from the event, for the same reason `is_group` is: the
+      // tag-filter subquery reads this table alone, so it has to scope to
+      // a group without joining back to `events`.
+      col("group_id", "TEXT"),
     ],
   },
   {
@@ -626,6 +658,64 @@ export const TABLES: readonly TableSpec[] = [
     name: "group_members",
     columns: [col("pubkey", "TEXT PRIMARY KEY"), col("added_at", "INTEGER NOT NULL")],
   },
+  // The groups this relay hosts, one row each. NEW: the relay used to host
+  // exactly one, whose id was a constant in groups.ts, so there was nothing
+  // to enumerate and nowhere to keep what a group IS beyond what it is
+  // called.
+  //
+  // NIP-29 has no create-group step in the protocol sense -- "what happens
+  // is just that relays (most likely when asked by users) will create rules
+  // around some specific ids" -- so this table IS those rules. A row here
+  // is what makes an id a group this relay hosts; an `h` tag naming an id
+  // with no row is not a group but a stranger's tag, and it lands in the
+  // public partition exactly as a backfilled message to somebody else's
+  // group already does.
+  {
+    name: "groups",
+    columns: [
+      col("id", "TEXT PRIMARY KEY"),
+      col("created_at", "INTEGER NOT NULL"),
+      // The operator-set metadata a kind-9002 carries, kept here so a
+      // 39000 can be regenerated without re-reading the previous one.
+      col("name", "TEXT"),
+      col("picture", "TEXT"),
+      col("about", "TEXT"),
+      // NIP-29's own two axes, and the reason this table exists at all.
+      // `is_private` decides whether CONTENT is readable without being a
+      // member; `is_closed` decides whether joining needs an invite. They
+      // are independent: a public closed group is one anybody may read and
+      // only the invited may write to, which is an announcement channel.
+      //
+      // Both default to the posture the single forced group had
+      // unconditionally, which is the whole of the migration story for it:
+      // a row created with these defaults describes it exactly, and no
+      // group becomes readable by anyone who could not read it before.
+      col("is_private", "INTEGER NOT NULL DEFAULT 1"),
+      col("is_closed", "INTEGER NOT NULL DEFAULT 1"),
+    ],
+  },
+  {
+    // Membership, per group. REPLACES `group_members`, which was keyed by
+    // pubkey alone because there was one group to be a member of.
+    //
+    // A new table rather than a column added to that one: the key has to
+    // become (group_id, pubkey), and a PRIMARY KEY cannot be ALTERed onto
+    // a table that already exists. storage.ts migrates the old rows in as
+    // members of the previously-forced id, after which initSchema drops
+    // whatever TABLES no longer declares.
+    name: "group_membership",
+    columns: [
+      col("group_id", "TEXT NOT NULL"),
+      col("pubkey", "TEXT NOT NULL"),
+      col("added_at", "INTEGER NOT NULL"),
+      // Keeps the meaning it has on allowed_pubkeys: `owner` for a grant
+      // the owner made deliberately, `invite` for one the group's own
+      // bookkeeping made, so a remove-user reclaims the second and leaves
+      // the first alone.
+      col("source", "TEXT NOT NULL DEFAULT 'owner'"),
+    ],
+    tableConstraints: ["PRIMARY KEY (group_id, pubkey)"],
+  },
   {
     // NIP-29 invite codes (src/nip29.ts): one row per kind-9009
     // create-invite the owner publishes, and the thing a kind-9021 join
@@ -666,6 +756,11 @@ export const TABLES: readonly TableSpec[] = [
     name: "group_invites",
     columns: [
       col("code", "TEXT PRIMARY KEY"),
+      // Which group the code admits to. DEFAULT is the id the relay used
+      // to force, so every invite issued before groups had ids keeps
+      // admitting to the group it was actually issued for -- the column
+      // migrates its own rows and no separate pass is needed.
+      col("group_id", "TEXT NOT NULL DEFAULT '_'"),
       col("created_at", "INTEGER NOT NULL"),
       // Always set. See limits.ts INVITE_DEFAULT_TTL_SECONDS: there is no
       // never-expiring invite, so this column has no "unset" state to
@@ -803,6 +898,14 @@ export const TABLES: readonly TableSpec[] = [
     // answers both the sweep and the report without touching a tag row.
     name: "chat_state",
     columns: [
+      // One row per group. DEFAULT '_' is what turns the single row this
+      // table used to hold into that group's row, so the conversation
+      // already in progress when this shipped keeps its watermark and its
+      // swept-through checkpoint rather than restarting -- which would
+      // have re-admitted every message a completed sweep had refused.
+      // Uniqueness is idx_chat_state_group below; a composite PRIMARY KEY
+      // cannot be added to a table that already exists.
+      col("group_id", "TEXT NOT NULL DEFAULT '_'"),
       // The last wall-clock second at which MIN_ROOM_OCCUPANTS or more
       // distinct group readers held a socket at the same time -- the
       // moment the room was last not-empty, written coarsely (limits.ts
@@ -1559,8 +1662,9 @@ export function eventRemovalBudget(indexedTagCount: number): number {
 }
 
 function createTableSql(spec: TableSpec): string {
-  const columns = spec.columns.map((c) => `${c.name} ${c.definition}`).join(", ");
-  return `CREATE TABLE IF NOT EXISTS ${spec.name} (${columns})`;
+  const parts = spec.columns.map((c) => `${c.name} ${c.definition}`);
+  for (const constraint of spec.tableConstraints ?? []) parts.push(constraint);
+  return `CREATE TABLE IF NOT EXISTS ${spec.name} (${parts.join(", ")})`;
 }
 
 // SQLite's ALTER TABLE ADD COLUMN cannot add every column a CREATE TABLE
@@ -1702,6 +1806,11 @@ export function computeSchemaHash(tables: readonly TableSpec[], indexes: readonl
   const fingerprint = {
     tables: tables.map((t) => ({
       name: t.name,
+      // Covered for the reason the header gives: a field this hash does not
+      // walk is a field whose change silently skips its own migration. A
+      // composite key only reaches the database through CREATE TABLE, so a
+      // change to one has to force the mismatch that makes initSchema run.
+      tableConstraints: t.tableConstraints ?? [],
       columns: t.columns.map((c) => ({
         name: c.name,
         definition: c.definition,
