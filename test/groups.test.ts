@@ -37,6 +37,11 @@ import { isolateStorage } from "./helpers/isolate";
 import { type Keypair, OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
 import { connectLiveFeed, connectRelay, publish, type RelayConn } from "./helpers/socket";
 
+// A group is a row now, not a constant, so isGroupEvent asks whether
+// this relay hosts the id rather than comparing against one. These
+// tests host exactly the group they use.
+const hosts = (id: string) => id === TOP_LEVEL_GROUP_ID;
+
 isolateStorage();
 
 // This relay hosts exactly one group, TOP_LEVEL_GROUP_ID -- isGroupEvent
@@ -120,16 +125,16 @@ async function collect(conn: RelayConn, subId: string, filter: unknown): Promise
 describe("what makes an event a group event", () => {
   it("is the `h` tag and nothing else -- any kind may carry one", () => {
     for (const kind of [1, 7, 11, 1063, 10002, 30023]) {
-      expect(isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind, tags: [["h", GROUP_ID]] }))).toBe(true);
-      expect(isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind }))).toBe(false);
+      expect(isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind, tags: [["h", GROUP_ID]] }), hosts)).toBe(true);
+      expect(isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind }), hosts)).toBe(false);
     }
   });
 
   it("does not count an `h` tag that names nothing", () => {
     // Otherwise an author could hide an event from public reads by tagging
     // it with an empty group.
-    expect(isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, tags: [["h"]] }))).toBe(false);
-    expect(isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, tags: [["h", ""]] }))).toBe(false);
+    expect(isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, tags: [["h"]] }), hosts)).toBe(false);
+    expect(isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, tags: [["h", ""]] }), hosts)).toBe(false);
   });
 
   // THE DEFECT THIS FIXES: isGroupEvent used to count ANY `h` tag as this
@@ -145,6 +150,7 @@ describe("what makes an event a group event", () => {
       expect(
         isGroupEvent(
           signEvent(OWNER_SECRET_KEY_HEX, { kind, tags: [["h", "some-other-relays-group"]] }),
+          hosts,
         ),
       ).toBe(false);
     }

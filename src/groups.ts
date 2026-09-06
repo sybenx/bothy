@@ -21,37 +21,17 @@ import { dTagValue, type Filter, type NostrEvent } from "./nostr";
 // storage.
 export const GROUP_TAG = "h";
 
-// The one group this relay hosts, and its id.
+// The id the relay used to force on every group event, kept for one
+// reason: it is the group that already exists on every deployed relay,
+// and the migration names it.
 //
-// NIP-29 has no notion of creating a group -- "what happens is just that
-// relays (most likely when asked by users) will create rules around some
-// specific ids" -- so a relay with exactly one group needs no id
-// negotiation and no kind-9007 create-group event: the id is a constant,
-// and the rules around it are this file plus src/nip29.ts. `_` is the
-// convention other NIP-29 relays use for a relay's own top-level group,
-// and it is chosen here for the same reason bothy has one owner: a
-// single-user relay hosting a single group needs no namespace.
-//
-// Enforced at two different points, on purpose, in two different ways:
-//
-//   - The WRITE GATE (nip29.ts authorizeGroupWrite) is id-agnostic on
-//     ordinary group traffic: an `h` tag naming some OTHER id still marks
-//     its event as needing the one member list's say-so (isAnyGroupEvent
-//     below), because refusing an unrecognised id at the gate would mean
-//     deciding what a group IS at write time rather than at the partition
-//     -- and because the alternative is a bypass, a client dodging the
-//     member check by tagging `h` with anything other than `_`. Moderation
-//     events ARE checked against this id specifically, because the id
-//     there selects what gets mutated and there is exactly one thing it
-//     can select.
-//   - The PARTITION (isGroupEvent below) is not id-agnostic. An event
-//     carrying an `h` tag that names some OTHER relay's group -- reached
-//     here because backfill fetched it as part of the OWNER's own
-//     authored history, published elsewhere, not written to this relay at
-//     all -- is not this relay's group and must not be filed in it: doing
-//     so made it unreadable to anyone who is not a member of the one group
-//     this relay actually hosts, which is a stranger's private content
-//     gated behind a membership list that has nothing to do with it.
+// It is NO LONGER what makes something a group. A group is a row in the
+// `groups` table (schema.ts), created by the owner, and this id is simply
+// the first such row on a relay that predates them being creatable. New
+// groups get whatever id their creator asks for, and nothing in the read
+// or write path compares against this constant any more -- an `h` tag
+// naming an id with no row is a stranger's tag, exactly as an `h` tag
+// naming somebody else's relay's group always was.
 export const TOP_LEVEL_GROUP_ID = "_";
 
 // The relay-generated group state events (nips/29.md "Group metadata
@@ -163,44 +143,51 @@ export function acrossScopes<T>(run: (scope: GroupScope) => T[]): T[] {
   return ALL_SCOPES.flatMap(run);
 }
 
-export function scopeOf(event: NostrEvent): GroupScope {
-  return isGroupEvent(event) ? GROUP_SCOPE : PUBLIC_SCOPE;
+export function scopeOf(event: NostrEvent, hosts: (id: string) => boolean): GroupScope {
+  return isGroupEvent(event, hosts) ? GROUP_SCOPE : PUBLIC_SCOPE;
 }
 
-// The partition test: whether an event is IN THIS RELAY'S OWN group, not
-// whether it merely looks like group traffic of some kind. One rule,
-// keyed to TOP_LEVEL_GROUP_ID, for every kind including the relay-
-// generated metadata range: an event counts only when groupIdOf reports
-// exactly this relay's own id.
+// The partition test, and the whole of this relay's group privacy rule:
 //
-// This used to special-case the metadata range, treating a MISSING or
-// empty `d` as group state too -- the reasoning being that the safe
-// reading of a malformed member/admin list is "hide it", not "here is a
-// public event." That reasoning was right for a reader deciding what to
-// disclose and wrong for the PARTITION: a malformed-or-foreign 39000-series
-// event and this relay's own genuine one are otherwise identical in shape
-// (same kind, same read gate), so leaving either of them classified as
-// "ours" put two candidate kind-39002 member lists in the one partition a
-// bare `{"kinds":[39002]}` reads, with no way for a client to tell which
-// one is real. storage.ts storeEvent is what actually closes that: a
-// metadata-kind event only reaches insertEventRow (and therefore this
-// function) if it was signed by THIS RELAY'S OWN identity, which always
-// stamps `d` as TOP_LEVEL_GROUP_ID correctly -- so a stored metadata event
-// is guaranteed well-formed, and there is no remaining malformed case for
-// this function to special-case. See storeEvent's own comment for why the
-// check belongs there (by SIGNER) and not here (by `d` tag): a forged `d`
-// that merely reads TOP_LEVEL_GROUP_ID would defeat a check made here.
+//   A GROUP'S EXISTENCE IS PUBLIC. ITS MESSAGES AND ITS MEMBER LIST ARE NOT.
 //
-// NARROWER than "carries a group tag of some kind" -- see isAnyGroupEvent
-// below for that test, which two callers still need. This one backs the
-// PARTITION (storage.ts scopeOf, and the broadcast()/liveBroadcast()
-// mirrors of the REQ-time read gate), and an unauthenticated read is
-// measured against the partition: an event this relay did not host the
-// group for must land in the public partition, or a member of this
-// relay's one group ends up the only reader who can ever see somebody
-// else's.
-export function isGroupEvent(event: NostrEvent): boolean {
-  return groupIdOf(event) === TOP_LEVEL_GROUP_ID;
+// So the partition no longer means "is this group traffic" -- it means
+// "does reading this need a membership check", and the two are not the
+// same set. Kind 39000 (metadata: the group's name and picture) and kind
+// 39001 (admins: on this relay always the owner, whose pubkey the NIP-11
+// document already publishes unauthenticated) are group state that
+// discloses nothing a stranger may not have, and they live in the PUBLIC
+// partition. Kind 39002 (members) and every `h`-tagged message live in
+// the group partition.
+//
+// Expressed as WHICH PARTITION A ROW LANDS IN rather than as an exception
+// in the read gate, deliberately. A gate exception is a rule that has to
+// be repeated on every surface that reads -- REQ, the broadcast push, the
+// live feed, the public counters -- and the gift wrap review is the
+// record of what happens when one of those copies drifts. A partition
+// decision is made once, at the only two functions that write a row, and
+// every reader inherits it for free: `{"kinds":[39000]}` from an
+// unauthenticated client is answered by the ordinary public path with no
+// group code involved at all, which is exactly what a NIP-29 client
+// listing a relay's groups sends.
+//
+// The event must still name a group this relay actually hosts. An `h` tag
+// naming somebody else's group -- reached here because backfill fetches
+// the owner's own history wherever it was published -- is not ours to
+// gate, and filing it in the group partition would hide a stranger's
+// content behind a membership list that has nothing to do with it.
+export function isGroupEvent(event: NostrEvent, hosts: (id: string) => boolean): boolean {
+  if (isPubliclyReadableGroupKind(event.kind)) return false;
+  const id = groupIdOf(event);
+  return id !== null && hosts(id);
+}
+
+// The group state that is public: metadata and admins, never members.
+// Named as a predicate rather than inlined so the write side (which puts
+// a row in a partition) and the read side (which reasons about what a
+// filter may see) cannot disagree about which kinds these are.
+export function isPubliclyReadableGroupKind(kind: number): boolean {
+  return kind === GROUP_METADATA_KIND || kind === GROUP_ADMINS_KIND;
 }
 
 // The loose test isGroupEvent used to BE, before it was scoped to this
@@ -263,5 +250,10 @@ export function groupIdOf(event: NostrEvent): string | null {
 export function filterNamesGroup(filter: Filter): boolean {
   const values = filter[`#${GROUP_TAG}`];
   if (Array.isArray(values) && values.length > 0) return true;
-  return filter.kinds?.some(isGroupMetadataKind) ?? false;
+  // Only the gated part of the 39000-series counts. A filter asking for
+  // 39000 or 39001 has asked for something this relay publishes to
+  // anybody, so refusing it would be refusing a public read -- and it is
+  // precisely the filter a client sends to find out what groups exist,
+  // which is the one thing that must not need an account.
+  return filter.kinds?.some((k) => isGroupMetadataKind(k) && !isPubliclyReadableGroupKind(k)) ?? false;
 }

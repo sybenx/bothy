@@ -21,7 +21,8 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { GROUP_MEMBERS_KIND, GROUP_SCOPE, TOP_LEVEL_GROUP_ID } from "../src/groups";
+import {
+  GROUP_ADMINS_KIND, GROUP_MEMBERS_KIND, GROUP_SCOPE, TOP_LEVEL_GROUP_ID } from "../src/groups";
 import {
   INVITE_DEFAULT_TTL_SECONDS,
   INVITE_MAX_TTL_SECONDS,
@@ -873,8 +874,13 @@ describe("what a member can read", () => {
     expect(frameType).toBe("CLOSED");
     expect(String(reason)).toContain("restricted:");
     // And the omission half: a filter that does not name the group is
-    // answered normally, with the group's rows simply absent.
-    expect(await collectStored(conn, "byP", [{ "#p": [OWNER_PUBKEY_HEX], limit: 50 }])).toEqual([]);
+    // answered normally, with the group's gated rows simply absent. What
+    // does come back is the admin list, which p-tags the owner and is
+    // public on purpose -- so this asserts the boundary rather than
+    // emptiness, and a change that let a chat message or the member list
+    // onto this path fails here.
+    const seen = await collectStored(conn, "byP", [{ "#p": [OWNER_PUBKEY_HEX], limit: 50 }]);
+    expect(seen.map((e) => e.kind)).toEqual([GROUP_ADMINS_KIND]);
     conn.close();
   });
 

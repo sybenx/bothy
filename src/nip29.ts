@@ -34,6 +34,7 @@
 // storeEvent reimplemented is half of the budget accounting missing, and
 // the accounting is the part nothing would notice was wrong.
 import {
+  acrossScopes,
   CREATE_INVITE_KIND,
   GROUP_ADMINS_KIND,
   GROUP_CHAT_KIND,
@@ -643,22 +644,35 @@ interface StoredGroupState {
 
 // The relay's own three group state events, in one query.
 //
-// Pinned to the group partition AND to the relay's own pubkey, which is
-// what makes it an index seek on idx_events_pubkey_created_grp rather
-// than a scan -- the partition rule in storage.ts, obeyed here like
-// everywhere else. Reads at most three rows: exactly the events this
+// Pinned to the relay's own pubkey and run ONCE PER PARTITION, which is
+// what makes each half an index seek on idx_events_pubkey_created_grp*
+// rather than a scan -- the partition rule in storage.ts, obeyed here
+// like everywhere else. Reads at most three rows: exactly the events this
 // relay has signed.
+//
+// Both partitions, because these three no longer live together. 39000 and
+// 39001 are public (groups.ts: a group's existence is public, its member
+// list is not) and 39002 is not, so a lookup pinned to one partition finds
+// two of the three and reports the third as absent. That is not a missed
+// read but a WRITE: the caller compares what it found against what it is
+// about to generate and skips the write when they match, so a state event
+// it cannot see is one it regenerates every time. Measured, pinning the
+// group partition alone cost 38 extra rows written per membership change
+// -- the whole of 39000 and 39001 rewritten unchanged, on every put-user
+// -- which test/nip29-groups.test.ts is what caught.
 function readGroupState(sql: SqlStorage, relayPubkey: string): Map<number, StoredGroupState> {
-  const rows = sql
-    .exec<{ kind: number; created_at: number; tags: string; content: string }>(
-      `SELECT kind, created_at, tags, content FROM events
-        WHERE pubkey = ? AND is_group = ? AND kind >= ? AND kind <= ?`,
-      relayPubkey,
-      GROUP_SCOPE,
-      GROUP_METADATA_KIND,
-      GROUP_MEMBERS_KIND,
-    )
-    .toArray();
+  const rows = acrossScopes((scope) =>
+    sql
+      .exec<{ kind: number; created_at: number; tags: string; content: string }>(
+        `SELECT kind, created_at, tags, content FROM events
+          WHERE pubkey = ? AND is_group = ? AND kind >= ? AND kind <= ?`,
+        relayPubkey,
+        scope,
+        GROUP_METADATA_KIND,
+        GROUP_MEMBERS_KIND,
+      )
+      .toArray(),
+  );
   return new Map(
     rows.map((row) => [
       row.kind,

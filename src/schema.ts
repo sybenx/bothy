@@ -1,4 +1,5 @@
 import { sha256 } from "@noble/hashes/sha2.js";
+import { TOP_LEVEL_GROUP_ID } from "./groups";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { generateRelayKeypair } from "./relay-identity";
 
@@ -680,17 +681,14 @@ export const TABLES: readonly TableSpec[] = [
       col("name", "TEXT"),
       col("picture", "TEXT"),
       col("about", "TEXT"),
-      // NIP-29's own two axes, and the reason this table exists at all.
-      // `is_private` decides whether CONTENT is readable without being a
-      // member; `is_closed` decides whether joining needs an invite. They
-      // are independent: a public closed group is one anybody may read and
-      // only the invited may write to, which is an announcement channel.
-      //
-      // Both default to the posture the single forced group had
-      // unconditionally, which is the whole of the migration story for it:
-      // a row created with these defaults describes it exactly, and no
-      // group becomes readable by anyone who could not read it before.
-      col("is_private", "INTEGER NOT NULL DEFAULT 1"),
+      // Whether joining needs an invite. NIP-29's other axis, `private`,
+      // is deliberately NOT here: on this relay the answer is the same for
+      // every group and is a property of the relay rather than of any one
+      // of them -- a group's existence, name and picture are public, and
+      // its messages and its member list are not. A per-group column
+      // would be a policy nobody applies, which is worse than no column.
+      // See groups.ts, where that rule is stated once and enforced by
+      // which partition a row lands in.
       col("is_closed", "INTEGER NOT NULL DEFAULT 1"),
     ],
   },
@@ -1947,6 +1945,34 @@ function seedRelayIdentity(sql: SqlStorage): void {
   sql.exec(`INSERT INTO relay_identity (secret_key, public_key) VALUES (?, ?)`, secretKeyHex, publicKeyHex);
 }
 
+// Makes the group that already existed real.
+//
+// `_` was hosted by every deployed relay before groups had rows -- not by
+// a row but by a constant in groups.ts that every `h` tag was compared
+// against. Seeding it unconditionally is what makes this change a no-op
+// for a relay that already has one: the same id, the same members, the
+// same closed posture, and events that were in the group partition
+// yesterday are in it today.
+//
+// Unconditional rather than "only if the relay has group data", because
+// the constant was unconditional too. A fresh relay had `_` available to
+// write to the moment it was claimed, and it still does.
+//
+// This runs on every wake and is one row read on the common path. It sits
+// beside seedRelayIdentity for the same reason that one is here rather
+// than in claim(): the row has to exist under OWNER_PUBKEY too, where
+// claim() never runs.
+function seedTopLevelGroup(sql: SqlStorage): void {
+  if (sql.exec(`SELECT 1 FROM groups WHERE id = ? LIMIT 1`, TOP_LEVEL_GROUP_ID).toArray().length > 0) {
+    return;
+  }
+  sql.exec(
+    `INSERT INTO groups (id, created_at, is_closed) VALUES (?, ?, 1)`,
+    TOP_LEVEL_GROUP_ID,
+    Math.floor(Date.now() / 1000),
+  );
+}
+
 // Drops any index this file no longer declares.
 //
 // Needed because CREATE INDEX IF NOT EXISTS does exactly what it says: it
@@ -2042,6 +2068,7 @@ export function initSchema(sql: SqlStorage): void {
   seedMaintainedCounts(sql);
   seedIngestCounts(sql);
   seedRelayIdentity(sql);
+  seedTopLevelGroup(sql);
 
   // Stored only now that every statement above has run without throwing --
   // see the header comment on this function for why that ordering is the

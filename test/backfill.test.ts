@@ -29,6 +29,11 @@ import { isolateStorage } from "./helpers/isolate";
 import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
 import { connectRelay, publish } from "./helpers/socket";
 
+// A group is a row now, not a constant, so isGroupEvent asks whether
+// this relay hosts the id rather than comparing against one. These
+// tests host exactly the group they use.
+const hosts = (id: string) => id === TOP_LEVEL_GROUP_ID;
+
 isolateStorage();
 
 function eventRows(sql: SqlStorage, extra = ""): { id: string; kind: number; content: string }[] {
@@ -503,7 +508,7 @@ describe("backfill ingest", () => {
       tags: [["h", "someone-elses-group"]],
       created_at: 1000,
     });
-    expect(isGroupEvent(foreign)).toBe(false);
+    expect(isGroupEvent(foreign, hosts)).toBe(false);
 
     const id = env.RELAY.idFromName("relay");
     const stub = env.RELAY.get(id);
@@ -537,7 +542,7 @@ describe("backfill ingest", () => {
       tags: [["h", TOP_LEVEL_GROUP_ID]],
       created_at: 1000,
     });
-    expect(isGroupEvent(ours)).toBe(true);
+    expect(isGroupEvent(ours, hosts)).toBe(true);
 
     const id = env.RELAY.idFromName("relay");
     const stub = env.RELAY.get(id);

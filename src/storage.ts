@@ -99,7 +99,7 @@ function insertEventRow(
   // reason `deleteEventRow` reads `created_at` itself: this is one of the
   // two functions in the codebase that write to `events`, so "what an
   // event is" and "what gets stored about it" are the same lines of code.
-  const scope = scopeOf(event);
+  const scope = scopeOf(event, groupHost(sql));
   sql.exec(
     `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost, is_group)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -165,6 +165,38 @@ function insertEventRow(
   // superseded version before reaching this line, and deleteEventRow
   // accounts for that removal into the same accumulator.
   bumpIngestCounters(sql, hourBucket(ingestedAt), 1, scope === GROUP_SCOPE ? 1 : 0, takeRowsWritten());
+}
+
+// Whether this relay hosts a group with this id -- which is what makes an
+// `h` tag a group tag rather than a stranger's, now that no constant does.
+//
+// Memoised in instance memory, not because the read is expensive (one row
+// off a primary key on a table with as many rows as the owner has made
+// groups) but because it sits on the broadcast path, which runs per event
+// per open socket. Groups are created by the owner and never by anybody
+// else, so the set changes at owner pace and a cache invalidated on that
+// one write is exact rather than eventually-consistent. Instance memory,
+// so an eviction reloads it -- the same trade the presence and rate-limit
+// maps already make, and safe the same way: losing it costs a read, never
+// a wrong answer.
+let hostedGroups: Set<string> | null = null;
+
+export function invalidateHostedGroups(): void {
+  hostedGroups = null;
+}
+
+export function hostsGroup(sql: SqlStorage, id: string): boolean {
+  if (hostedGroups === null) {
+    hostedGroups = new Set(
+      sql.exec<{ id: string }>(`SELECT id FROM groups`).toArray().map((r) => r.id),
+    );
+  }
+  return hostedGroups.has(id);
+}
+
+// The predicate shape groups.ts wants, bound to one storage handle.
+export function groupHost(sql: SqlStorage): (id: string) => boolean {
+  return (id) => hostsGroup(sql, id);
 }
 
 // ---------------------------------------------------------------------
@@ -1058,7 +1090,7 @@ export function fixMisclassifiedGroupEvents(
       // describes. An event can carry more than one `h` tag, and
       // groupIdOf reads only the FIRST one, so a second, mismatched tag
       // on an event that is genuinely ours must not be reclassified.
-      if (isGroupEvent(event)) return false;
+      if (isGroupEvent(event, groupHost(sql))) return false;
 
       sql.exec(`UPDATE events SET is_group = 0 WHERE id = ?`, event_id);
       sql.exec(`UPDATE event_tags SET is_group = 0 WHERE event_id = ?`, event_id);

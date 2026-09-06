@@ -109,6 +109,7 @@ import {
 import { getRelayPubkey } from "./relay-identity";
 import { initSchema } from "./schema";
 import {
+  groupHost,
   advancePush,
   applyDeletion,
   beginVanish,
@@ -1749,7 +1750,7 @@ export class Relay extends DurableObject<Env> {
       // being here. What it does NOT establish on its own is that
       // somebody ELSE is; groupOccupants is what decides that, and it
       // counts sockets rather than authors.
-      if (isGroupEvent(event)) this.noteRoomOccupancy(sql, nowSeconds());
+      if (isGroupEvent(event, groupHost(sql))) this.noteRoomOccupancy(sql, nowSeconds());
       // Push, if this deployment has a key for it -- see notePush below.
       // Placed here, under `result.stored`, so it is reached only by an
       // event that passed every gate, verified its own signature and was
@@ -1931,7 +1932,7 @@ export class Relay extends DurableObject<Env> {
     // kind-9 tagged into somebody else's group id is not a message in
     // this room, and waking this room's members about it would be
     // notifying them of something they cannot read.
-    if (event.kind === GROUP_CHAT_KIND && isGroupEvent(event)) {
+    if (event.kind === GROUP_CHAT_KIND && isGroupEvent(event, groupHost(sql))) {
       withReadPath("push", () => {
         queuePush(sql, "message", event.pubkey, nowSeconds());
         this.pushAlarmWanted = true;
@@ -2561,7 +2562,7 @@ export class Relay extends DurableObject<Env> {
     // open connections is one lookup, not three, and a broadcast to
     // sockets that are all the owner's or all unauthenticated does none.
     const giftWrap = event.kind === GIFT_WRAP_KIND;
-    const gated = giftWrap || isGroupEvent(event);
+    const gated = giftWrap || isGroupEvent(event, groupHost(this.sql));
     const ownerOnly = giftWrap || event.kind === CREATE_INVITE_KIND;
     const owner = gated ? getOwnerPubkey(this.sql, this.env) : null;
     const membership = new Map<string, boolean>();
@@ -2618,7 +2619,7 @@ export class Relay extends DurableObject<Env> {
     // here. Stated rather than left implicit, so a later reading of
     // "members may now read the group" does not arrive at this function
     // and take the absence of a member case for an oversight.
-    if (event.kind === GIFT_WRAP_KIND || isGroupEvent(event)) return;
+    if (event.kind === GIFT_WRAP_KIND || isGroupEvent(event, groupHost(this.sql))) return;
     const live = this.ctx.getWebSockets(LIVE_FEED_TAG);
     if (live.length === 0) return;
     const notice = JSON.stringify({ kind: event.kind, created_at: event.created_at, id: event.id.slice(0, 8) });
