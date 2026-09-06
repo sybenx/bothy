@@ -21,6 +21,7 @@ import {
   PUBLIC_SCOPE,
 } from "./groups";
 import {
+  MAX_SCOPED_GROUPS,
   boundFilter,
   MAX_PUSHES_PER_TICK,
   MAX_PUSH_ENDPOINTS_PER_NOTIFICATION,
@@ -2328,6 +2329,18 @@ export class Relay extends DurableObject<Env> {
         ? []
         : listMemberGroups(this.sql, authedPubkey);
     const mayReadGroups = readableGroups === undefined || readableGroups.length > 0;
+    // Bounded because the scoping condition binds a parameter per group and
+    // nothing downstream counts them -- see limits.ts MAX_SCOPED_GROUPS.
+    // Refused with a message that says what to do about it, rather than
+    // silently reading fewer groups than the reader is entitled to.
+    if (readableGroups !== undefined && readableGroups.length > MAX_SCOPED_GROUPS) {
+      send(ws, [
+        "CLOSED",
+        subId,
+        `restricted: you are in more than ${MAX_SCOPED_GROUPS} groups -- name the one you want with "#h"`,
+      ]);
+      return;
+    }
     // Which partitions this read covers. Passed into boundFilter because
     // it multiplies the query count -- storage.ts runs the filter once per
     // partition -- so an authorised reader is priced for what it actually

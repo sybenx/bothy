@@ -3074,9 +3074,13 @@ export function chatSweepCutoff(state: ChatState, nowSec: number): number {
 export function countChatBefore(sql: SqlStorage, cutoff: number): number {
   const row = sql
     .exec<{ n: number }>(
-      `SELECT COUNT(*) AS n FROM events WHERE kind = ? AND is_group = ? AND created_at <= ?`,
+      // Same scope as the delete below, or the reporting mode would name a
+      // number larger than deleting mode would ever remove.
+      `SELECT COUNT(*) AS n FROM events
+        WHERE kind = ? AND is_group = ? AND group_id = ? AND created_at <= ?`,
       GROUP_CHAT_KIND,
       GROUP_SCOPE,
+      TOP_LEVEL_GROUP_ID,
       cutoff,
     )
     .toArray()[0];
@@ -3147,12 +3151,27 @@ export function sweepChat(
     return { cutoff, pending, removed: 0, done: pending === 0 };
   }
 
+  // Scoped to the group whose watermark this cutoff came from.
+  //
+  // `chat_state` is still one row, so the occupancy watermark and the
+  // swept-through checkpoint both describe the group that row is for. The
+  // sweep therefore has to delete that group's chat and nothing else: a
+  // relay hosting two groups would otherwise decide when group B's
+  // conversation ended by watching who was in group A, and delete B's
+  // messages on A's schedule. Bounded here rather than by making the whole
+  // sweep per-group, which is the correct shape and a larger change --
+  // this is the part that must not be wrong in the meantime, because it is
+  // the part that deletes.
+  //
+  // The consequence, stated so it is a known limit rather than a surprise:
+  // chat in a group other than this one does not expire at all.
   const targets = sql
     .exec<{ id: string }>(
-      `SELECT id FROM events WHERE kind = ? AND is_group = ? AND created_at <= ?
+      `SELECT id FROM events WHERE kind = ? AND is_group = ? AND group_id = ? AND created_at <= ?
          ORDER BY created_at ASC LIMIT ?`,
       GROUP_CHAT_KIND,
       GROUP_SCOPE,
+      TOP_LEVEL_GROUP_ID,
       cutoff,
       limit,
     )

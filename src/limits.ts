@@ -685,6 +685,27 @@ export type FilterBound =
 // whole of it -- and relay.ts handleReqInner passes a SHARE of it when a
 // REQ carries several, so the frame as a whole stays inside the number
 // this file has always claimed for it. Divided equally rather than spent
+// How many groups one REQ may be scoped over.
+//
+// The scoping condition (filters.ts FilterQueryOptions.groupIds) binds one
+// parameter per group on the outer query AND one per group on every tag
+// subquery, and filterParamCount cannot see them: it prices a filter
+// before the relay knows who sent it, which is the whole reason its own
+// comment budgets "four at the very most" against the ten parameters
+// MAX_QUERY_BOUND_PARAMS holds back from SQLite's real ceiling. A reader
+// in a dozen groups spends that slack several times over and reaches the
+// uncaught SQLITE_ERROR this project already fixed once, from the other
+// direction, when a filter naming enough ids passed the rows-read cap and
+// blew the parameter one.
+//
+// So it is bounded rather than accounted. Sixteen because the owner is the
+// only person who can create a group on this relay and the only person who
+// can put anybody in one -- a member of seventeen groups is not a scale
+// this deployment reaches by accident, and a reader who does hit it is
+// told to name the group they want rather than being crashed or silently
+// under-served.
+export const MAX_SCOPED_GROUPS = 16;
+
 // first-come, so the answer does not depend on the order the client
 // happened to write its filters in.
 export function boundFilter(
