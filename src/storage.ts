@@ -103,9 +103,14 @@ function insertEventRow(
   // two functions in the codebase that write to `events`, so "what an
   // event is" and "what gets stored about it" are the same lines of code.
   const scope = scopeOf(event, groupHost(sql));
+  // WHICH group, decided in the same breath as whether. Null for a public
+  // row, and null for the two 39000-series kinds that are public -- those
+  // name their group in `d` and are readable by anybody, so scoping them
+  // would be scoping a row nothing scopes reads.
+  const groupId = scope === GROUP_SCOPE ? groupIdOf(event) : null;
   sql.exec(
-    `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost, is_group)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost, is_group, group_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     event.id,
     event.pubkey,
     event.created_at,
@@ -117,6 +122,7 @@ function insertEventRow(
     ingestedAt,
     eventRowCost(indexedTags.length),
     scope,
+    groupId,
   );
   // Immediately after the row exists and before anything else can fail.
   //
@@ -142,12 +148,14 @@ function insertEventRow(
   bumpEventCounters(sql, event.created_at, 1, scope);
   for (const tag of indexedTags) {
     sql.exec(
-      `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at, is_group) VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at, is_group, group_id)
+       VALUES (?, ?, ?, ?, ?, ?)`,
       tag[0],
       tag[1],
       event.id,
       event.created_at,
       scope,
+      groupId,
     );
   }
   // LAST, and after the tag rows rather than beside the counters above,
@@ -1958,6 +1966,9 @@ export interface ReadOptions {
   // Not a permission, unlike the three fields above it: it does not
   // depend on who is asking, and the owner gets it too.
   chatHorizon?: number;
+  // See FilterQueryOptions.groupIds. `undefined` is the owner, who reads
+  // every group; an empty array is a reader who may read none.
+  groupIds?: readonly string[];
 }
 
 export function queryFilter(
@@ -1972,6 +1983,15 @@ export function queryFilter(
     ...(options.excludeGiftWraps === undefined ? {} : { excludeGiftWraps: options.excludeGiftWraps }),
     ...(options.excludeInvites === undefined ? {} : { excludeInvites: options.excludeInvites }),
     ...(options.chatHorizon === undefined ? {} : { chatHorizon: options.chatHorizon }),
+    // Which groups the reader may see. Forwarded here and not merged with
+    // a spread, like everything above it, because this object is an
+    // explicit allowlist of what reaches the query builder -- which is the
+    // right shape for a security boundary and is also exactly how this
+    // option came to be dropped the first time: the gate computed it, the
+    // builder supported it, and nothing carried it between them, so a
+    // member of one group read every group through a filter that named
+    // none. test/nip29-groups.test.ts is what said so.
+    ...(options.groupIds === undefined ? {} : { groupIds: options.groupIds }),
     scope,
     // The tag scan budget is shared across the partitions this read
     // covers, so an authorised read costs what limits.ts prices a tag
@@ -2461,6 +2481,24 @@ export function isGroupMember(
 // THIS group", asked once per group write and once per REQ, and it wants
 // the composite key's prefix. This question is asked once per REQ by a
 // non-owner and reads one row per group they are in.
+// Brings a group into being -- the row that makes an id one this relay
+// hosts, and therefore the whole of what NIP-29 means by a relay creating
+// "rules around some specific ids".
+//
+// Invalidates the hosted-group memo, which is the one write that changes
+// it: everything downstream of `hostsGroup` -- which partition a row lands
+// in, whether a moderation event names something real -- is wrong until it
+// does, and wrong in the direction of filing a new group's traffic into
+// the public partition.
+export function createGroup(sql: SqlStorage, id: string, nowSec: number): void {
+  sql.exec(
+    `INSERT INTO groups (id, created_at, is_closed) VALUES (?, ?, 1) ON CONFLICT(id) DO NOTHING`,
+    id,
+    nowSec,
+  );
+  invalidateHostedGroups();
+}
+
 export function listMemberGroups(sql: SqlStorage, pubkey: string): string[] {
   return sql
     .exec<{ group_id: string }>(

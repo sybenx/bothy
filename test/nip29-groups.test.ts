@@ -26,7 +26,13 @@ import {
   PUBLIC_SCOPE,
   TOP_LEVEL_GROUP_ID,
 } from "../src/groups";
-import { applyModeration, EDIT_METADATA_KIND, PUT_USER_KIND, REMOVE_USER_KIND } from "../src/nip29";
+import {
+  applyModeration,
+  CREATE_GROUP_KIND,
+  EDIT_METADATA_KIND,
+  PUT_USER_KIND,
+  REMOVE_USER_KIND,
+} from "../src/nip29";
 import type { Relay } from "../src/relay";
 import { auditMaintainedCounts, readMaintainedCounts, storeEvent } from "../src/storage";
 import { computeEventId } from "../src/validate";
@@ -73,6 +79,27 @@ async function authenticateAsOwner(conn: RelayConn): Promise<void> {
     ],
   });
   conn.send(["AUTH", authEvent]);
+  const [, , ok] = await conn.nextMessage();
+  expect(ok).toBe(true);
+}
+
+// Authenticates a connection as an arbitrary key. Same shape as
+// authenticateAsOwner above; the trigger is a filter gated by shape alone
+// so it works before anything is stored.
+async function authenticateAs(conn: RelayConn, secretKeyHex: string): Promise<void> {
+  conn.send(["REQ", "challengeTrigger", { kinds: [1059] }]);
+  const [, challenge] = await conn.nextMessage();
+  await conn.nextMessage(); // CLOSED, auth-required
+  conn.send([
+    "AUTH",
+    signEvent(secretKeyHex, {
+      kind: 22242,
+      tags: [
+        ["relay", "wss://example.com"],
+        ["challenge", challenge as string],
+      ],
+    }),
+  ]);
   const [, , ok] = await conn.nextMessage();
   expect(ok).toBe(true);
 }
@@ -602,7 +629,11 @@ describe("membership", () => {
       kind: PUT_USER_KIND,
       tags: [["h", "some-other-group"], ["p", randomKeypair().pubkeyHex]],
     });
-    expect((await publish(conn, wrongGroup))[3]).toContain(`["h", "${TOP_LEVEL_GROUP_ID}"]`);
+    // Refused because this relay hosts no such group -- not because the id
+    // is not `_`. The distinction is the change: a moderation event may
+    // name any group this relay actually hosts, and there is now more than
+    // one it could be.
+    expect((await publish(conn, wrongGroup))[3]).toContain("hosts no group with id some-other-group");
 
     // kind 9005 delete-event: in NIP-29's moderation range, not implemented
     // here. Refused by name rather than stored as an inert group note that
@@ -900,5 +931,98 @@ describe("the daily audit", () => {
       expect(stored).toContain("no allowed_pubkeys row");
       expect(stored).not.toContain(member.pubkeyHex);
     });
+  });
+});
+
+// Two groups, which is the case every rule above was written for and none
+// of the tests above could reach while the relay hosted exactly one.
+//
+// The property is per-group scoping: a member of A is an authenticated
+// non-owner to B, and must be answered as one. Before the scoping existed
+// this suite would have passed with membership relay-wide, because with a
+// single group "is a member" and "is a member of THIS group" are the same
+// sentence.
+describe("more than one group", () => {
+  function createGroup(id: string): NostrEvent {
+    return signEvent(OWNER_SECRET_KEY_HEX, { kind: CREATE_GROUP_KIND, tags: [["h", id]] });
+  }
+  function chat(secretKeyHex: string, id: string, body: string): NostrEvent {
+    return signEvent(secretKeyHex, { kind: 9, tags: [["h", id]], content: body });
+  }
+
+  it("keeps a member of one group out of the other", async () => {
+    const conn = await connectRelay();
+    const alice = randomKeypair();
+
+    expect((await publish(conn, createGroup("alpha")))[2]).toBe(true);
+    expect((await publish(conn, createGroup("beta")))[2]).toBe(true);
+    // Alice is put into alpha and never into beta.
+    const intoAlpha = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: PUT_USER_KIND,
+      tags: [["h", "alpha"], ["p", alice.pubkeyHex]],
+    });
+    expect((await publish(conn, intoAlpha))[2]).toBe(true);
+
+    // The owner writes into both.
+    expect((await publish(conn, chat(OWNER_SECRET_KEY_HEX, "alpha", "in alpha")))[2]).toBe(true);
+    expect((await publish(conn, chat(OWNER_SECRET_KEY_HEX, "beta", "in beta")))[2]).toBe(true);
+    conn.close();
+
+    const asAlice = await connectRelay();
+    await authenticateAs(asAlice, alice.secretKeyHex);
+
+    // Her own group answers, and carries only her own group's talk.
+    const alpha = await collectStored(asAlice, "alpha", [{ kinds: [9], "#h": ["alpha"] }]);
+    expect(alpha.map((e) => e.content)).toEqual(["in alpha"]);
+
+    // The other group is refused outright -- she named it, so telling her
+    // to authenticate says nothing she did not already say.
+    asAlice.send(["REQ", "beta", { kinds: [9], "#h": ["beta"] }]);
+    const [frameType, , reason] = await asAlice.nextMessage();
+    expect(frameType).toBe("CLOSED");
+    expect(String(reason)).toContain("restricted:");
+
+    // And the omission half, which is the one that would leak silently: a
+    // filter naming NO group is answered normally, and must come back with
+    // alpha's message and not beta's. A gate that only refuses named
+    // groups, with membership still relay-wide underneath, passes the
+    // assertion above and fails this one.
+    const unnamed = await collectStored(asAlice, "any", [{ kinds: [9], limit: 50 }]);
+    expect(unnamed.map((e) => e.content)).toEqual(["in alpha"]);
+    asAlice.close();
+  });
+
+  it("refuses to create a group that already exists", async () => {
+    const conn = await connectRelay();
+    expect((await publish(conn, createGroup("gamma")))[2]).toBe(true);
+    const [, , accepted, message] = await publish(conn, createGroup("gamma"));
+    expect(accepted).toBe(false);
+    expect(String(message)).toContain("already hosts a group");
+    conn.close();
+  });
+
+  it("gives each group its own state, addressed by its own id", async () => {
+    const conn = await connectRelay();
+    expect((await publish(conn, createGroup("delta")))[2]).toBe(true);
+    conn.close();
+
+    // Both groups' metadata is public, which is what lets a client list
+    // what this relay hosts without an account at all.
+    const anon = await connectRelay();
+    const meta = await collectStored(anon, "meta", [{ kinds: [GROUP_METADATA_KIND] }]);
+    const ids = meta
+      .map((e) => e.tags.find((tag) => tag[0] === "d")?.[1])
+      .filter((v): v is string => v !== undefined)
+      .sort();
+    expect(ids).toContain("delta");
+    // `_` is NOT here, and that is the honest answer rather than a gap in
+    // this assertion. It is seeded as a row so that a relay which predates
+    // creatable groups keeps the one it had, but a seeded row is not a
+    // configured group: nothing has named it, so there is no metadata
+    // event to publish and nothing for a client to list. It appears the
+    // moment the owner does anything with it -- a put-user or an
+    // edit-metadata regenerates its state like any other group's.
+    expect(ids).not.toContain(TOP_LEVEL_GROUP_ID);
+    anon.close();
   });
 });

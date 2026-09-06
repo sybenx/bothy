@@ -58,6 +58,9 @@ import { type NostrEvent, pTagValues } from "./nostr";
 import { getOwnerPubkey } from "./ownership";
 import { signAsRelay, getRelayPubkey } from "./relay-identity";
 import {
+  hostsGroup,
+  invalidateHostedGroups,
+  createGroup,
   addGroupMember,
   allowPubkeyForGroup,
   countOutstandingInvites,
@@ -81,6 +84,17 @@ import { computeEventId } from "./validate";
 export const PUT_USER_KIND = 9000;
 export const REMOVE_USER_KIND = 9001;
 export const EDIT_METADATA_KIND = 9002;
+// NIP-29 create-group. It was deliberately absent while this relay hosted
+// exactly one group whose id was a constant: "what happens is just that
+// relays will create rules around some specific ids", and with one id
+// fixed in the source there was nothing for a client to create.
+//
+// It is here now because the id is no longer fixed, and it is the ONLY
+// event that may name a group this relay does not yet host -- every other
+// moderation kind selects something that must already exist. Owner-only,
+// like every other moderation kind, because this relay has one owner who
+// is the sole admin of everything on it.
+export const CREATE_GROUP_KIND = 9007;
 // Defined in groups.ts and re-exported here, so the write side still
 // names it from one place. It lives over there because the READ gate is
 // what has to recognise it -- see its comment for the bearer-token
@@ -111,6 +125,7 @@ export function isModerationKind(kind: number): boolean {
 
 export function isSupportedModerationKind(kind: number): boolean {
   return (
+    kind === CREATE_GROUP_KIND ||
     kind === PUT_USER_KIND ||
     kind === REMOVE_USER_KIND ||
     kind === EDIT_METADATA_KIND ||
@@ -257,14 +272,21 @@ export function authorizeGroupWrite(
   }
 
   if (isModerationKind(event.kind)) {
-    // The id selects what gets mutated, and there is exactly one thing it
-    // can select -- see groups.ts TOP_LEVEL_GROUP_ID for why ordinary group
-    // traffic is NOT held to this.
-    if (groupIdOf(event) !== TOP_LEVEL_GROUP_ID) {
-      return {
-        ok: false,
-        message: `invalid: a moderation event must carry ["h", "${TOP_LEVEL_GROUP_ID}"], this relay's only group`,
-      };
+    // The id selects what gets mutated, so it has to select something --
+    // see groups.ts for why ordinary group traffic is NOT held to this.
+    // Create-group is the one exception and the reason the check is
+    // written this way round: it names the group it is about to bring into
+    // being, which by definition this relay does not host yet.
+    const targetGroup = groupIdOf(event);
+    if (targetGroup === null) {
+      return { ok: false, message: `invalid: a moderation event must carry an "h" tag naming a group` };
+    }
+    if (event.kind === CREATE_GROUP_KIND) {
+      if (hostsGroup(sql, targetGroup)) {
+        return { ok: false, message: `duplicate: this relay already hosts a group with id ${targetGroup}` };
+      }
+    } else if (!hostsGroup(sql, targetGroup)) {
+      return { ok: false, message: `invalid: this relay hosts no group with id ${targetGroup}` };
     }
     // Sole admin. Checked before the supported-kind test below so an
     // unauthorized caller learns nothing about which kinds are implemented.
@@ -275,8 +297,9 @@ export function authorizeGroupWrite(
       return {
         ok: false,
         message:
-          `invalid: kind ${event.kind} is not implemented -- this relay supports put-user (${PUT_USER_KIND}), ` +
-          `remove-user (${REMOVE_USER_KIND}) and edit-metadata (${EDIT_METADATA_KIND})`,
+          `invalid: kind ${event.kind} is not implemented -- this relay supports create-group ` +
+          `(${CREATE_GROUP_KIND}), put-user (${PUT_USER_KIND}), remove-user (${REMOVE_USER_KIND}) ` +
+          `and edit-metadata (${EDIT_METADATA_KIND})`,
       };
     }
     // The owner is the sole admin and is a member by exemption, so a
@@ -433,6 +456,19 @@ export function applyModeration(sql: SqlStorage, env: Env, event: NostrEvent, no
   // keeps a future caller from taking the object down over it.
   if (owner === null) return [];
 
+  // The group this event is about. Non-null by the time we are here:
+  // authorizeGroupWrite refused a moderation event that named none.
+  const groupId = groupIdOf(event) ?? TOP_LEVEL_GROUP_ID;
+
+  if (event.kind === CREATE_GROUP_KIND) {
+    // The row first, so that everything below -- and every write that
+    // follows on any later tick -- agrees this is a group this relay
+    // hosts. Without it the generated state for the new group would be
+    // classified against a `groups` table that does not mention it and
+    // land in the public partition.
+    createGroup(sql, groupId, nowSec);
+  }
+
   if (event.kind === PUT_USER_KIND) {
     for (const pubkey of pTagValues(event.tags)) {
       // The owner is a member by exemption rather than by row
@@ -441,7 +477,7 @@ export function applyModeration(sql: SqlStorage, env: Env, event: NostrEvent, no
       // membership row nothing reads and an `allowed_pubkeys` row for the
       // one pubkey the outer gate never consults.
       if (pubkey === owner) continue;
-      addGroupMember(sql, pubkey, nowSec);
+      addGroupMember(sql, pubkey, nowSec, groupId);
       // Both tables, together, in that order. The write gate reads the
       // OUTER list, so a member without this row is a member who cannot
       // write -- see storage.ts auditMaintainedCounts, which checks daily
@@ -457,7 +493,7 @@ export function applyModeration(sql: SqlStorage, env: Env, event: NostrEvent, no
   } else if (event.kind === REMOVE_USER_KIND) {
     for (const pubkey of pTagValues(event.tags)) {
       if (pubkey === owner) continue;
-      removeGroupMember(sql, pubkey);
+      removeGroupMember(sql, pubkey, groupId);
       // Only what put-user granted. An `allowed_pubkeys` row the operator
       // created by hand through NIP-86 allowpubkey survives being removed
       // from the group, because it was never the group's to take back.
@@ -471,7 +507,7 @@ export function applyModeration(sql: SqlStorage, env: Env, event: NostrEvent, no
   // than special-cased out, because on a relay whose owner has issued an
   // invite before ever sending any other moderation event, this is the
   // call that brings the group's state into being.
-  return regenerateGroupState(sql, owner, event.kind === EDIT_METADATA_KIND ? event : null, nowSec);
+  return regenerateGroupState(sql, owner, event.kind === EDIT_METADATA_KIND ? event : null, nowSec, groupId);
 }
 
 // ---------------------------------------------------------------------
@@ -580,7 +616,11 @@ export function handleJoinRequest(
   // request naming another relay's group is refused before any storage,
   // with the uniform message, since answering "wrong group id" would
   // confirm which id this relay does host.
-  if (groupIdOf(event) !== TOP_LEVEL_GROUP_ID) return refuse("not this relay's group", null);
+  // The group the request names has to be one this relay hosts. Refused
+  // with JOIN_REFUSAL_MESSAGE like everything else here: naming which id
+  // does exist would tell a stranger what to ask for next.
+  const groupId = groupIdOf(event);
+  if (groupId === null || !hostsGroup(sql, groupId)) return refuse("not a group this relay hosts", null);
   const code = codeTagValue(event.tags);
 
   const owner = getOwnerPubkey(sql, env);
@@ -633,7 +673,11 @@ export function handleJoinRequest(
   allowPubkeyForGroup(sql, event.pubkey, "joined the group with a NIP-29 invite code", nowSec);
 
   console.warn(`[nip29] join request accepted: pubkey=${event.pubkey} code=${codeLabel(code)}`);
-  return { accepted: true, message: "", generated: regenerateGroupState(sql, owner, null, nowSec) };
+  return {
+    accepted: true,
+    message: "",
+    generated: regenerateGroupState(sql, owner, null, nowSec, groupId),
+  };
 }
 
 interface StoredGroupState {
@@ -660,16 +704,25 @@ interface StoredGroupState {
 // group partition alone cost 38 extra rows written per membership change
 // -- the whole of 39000 and 39001 rewritten unchanged, on every put-user
 // -- which test/nip29-groups.test.ts is what caught.
-function readGroupState(sql: SqlStorage, relayPubkey: string): Map<number, StoredGroupState> {
+function readGroupState(
+  sql: SqlStorage,
+  relayPubkey: string,
+  groupId: string,
+): Map<number, StoredGroupState> {
   const rows = acrossScopes((scope) =>
     sql
       .exec<{ kind: number; created_at: number; tags: string; content: string }>(
         `SELECT kind, created_at, tags, content FROM events
-          WHERE pubkey = ? AND is_group = ? AND kind >= ? AND kind <= ?`,
+          WHERE pubkey = ? AND is_group = ? AND kind >= ? AND kind <= ?
+            AND EXISTS (
+              SELECT 1 FROM event_tags t
+               WHERE t.event_id = events.id AND t.tag_name = 'd' AND t.tag_value = ?
+            )`,
         relayPubkey,
         scope,
         GROUP_METADATA_KIND,
         GROUP_MEMBERS_KIND,
+        groupId,
       )
       .toArray(),
   );
@@ -697,9 +750,10 @@ function regenerateGroupState(
   owner: string,
   metadataSource: NostrEvent | null,
   nowSec: number,
+  groupId: string,
 ): NostrEvent[] {
   const relayPubkey = getRelayPubkey(sql);
-  const existing = readGroupState(sql, relayPubkey);
+  const existing = readGroupState(sql, relayPubkey, groupId);
   const generated: NostrEvent[] = [];
 
   const emit = (kind: number, tags: string[][], content: string): void => {
@@ -725,16 +779,20 @@ function regenerateGroupState(
     generated.push(event);
   };
 
-  emit(GROUP_METADATA_KIND, metadataTags(metadataSource, existing.get(GROUP_METADATA_KIND)), "");
-  emit(GROUP_ADMINS_KIND, [["d", TOP_LEVEL_GROUP_ID], ["p", owner, OWNER_ROLE]], "");
+  emit(
+    GROUP_METADATA_KIND,
+    metadataTags(metadataSource, existing.get(GROUP_METADATA_KIND), groupId),
+    "",
+  );
+  emit(GROUP_ADMINS_KIND, [["d", groupId], ["p", owner, OWNER_ROLE]], "");
   emit(
     GROUP_MEMBERS_KIND,
     [
-      ["d", TOP_LEVEL_GROUP_ID],
+      ["d", groupId],
       // The admin first, matching NIP-29's own example, and present
       // because the owner is a member by exemption rather than by row.
       ["p", owner],
-      ...listGroupMembers(sql).map((pubkey) => ["p", pubkey]),
+      ...listGroupMembers(sql, groupId).map((pubkey) => ["p", pubkey]),
     ],
     "",
   );
@@ -750,9 +808,13 @@ function regenerateGroupState(
 // carried forward, so regenerating for an unrelated reason cannot quietly
 // blank the group's name. With neither, the document carries the policy
 // tags alone, which is a truthful description of a group nobody has named.
-function metadataTags(source: NostrEvent | null, prior: StoredGroupState | undefined): string[][] {
+function metadataTags(
+  source: NostrEvent | null,
+  prior: StoredGroupState | undefined,
+  groupId: string,
+): string[][] {
   const from = source?.tags ?? prior?.tags ?? [];
-  const tags: string[][] = [["d", TOP_LEVEL_GROUP_ID]];
+  const tags: string[][] = [["d", groupId]];
   for (const field of METADATA_FIELDS) {
     const value = from.find((tag) => tag[0] === field)?.[1];
     if (value !== undefined && value !== "") tags.push([field, value]);
