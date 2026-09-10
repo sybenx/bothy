@@ -23,6 +23,13 @@ export default defineConfig({
           // and stubs fetch, so it exercises both states without either
           // one leaving the machine.
           UPDATE_CHECK: "off",
+          // NIP-29 groups are PAUSED unless this is "on" (limits.ts
+          // groupsEnabled). The group suites (test/nip29-*.test.ts,
+          // test/groups.test.ts, test/ephemeral-chat.test.ts,
+          // test/push.test.ts) exercise the machinery and need it live;
+          // the paused state is tested by test/groups-paused.test.ts,
+          // which passes its own env to the functions that read it.
+          GROUPS: "on",
         },
       },
     }),

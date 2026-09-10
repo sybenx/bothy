@@ -11,7 +11,7 @@
 // (nip11.ts, ownership.ts) since they may be undefined. ALLOW_FOLLOWS is
 // an opt-OUT: writes from the owner's follows are enabled by default, and
 // setting it to the exact string "false" is the only way to turn them
-// off (ownership.ts allowFollowsEnabled).
+// off (write-policy.ts resolveWriteRung reads it as rung 2, below WRITE_RUNG).
 // MAX_EVENT_BYTES/MAX_EVENTS_PER_PUBKEY_PER_MINUTE/NON_OWNER_STORAGE_BYTES
 // are the three write-path abuse caps (limits.ts), raisable for anyone on
 // a paid plan where the free tier's ceilings don't apply. Each takes a
@@ -67,6 +67,22 @@ interface Env {
   // guard a safety cap, where turning one off is the act that must be
   // spelled out, and here it is the deletion that must be.
   EPHEMERAL_CHAT?: string;
+  // The write ladder's rung (src/write-policy.ts): "1".."4" or a rung
+  // name (owner/inbox/follows/mentions). Set here it outranks the value
+  // stored through NIP-86 changewritepolicy, the same way RELAY_NAME
+  // outranks changerelayname. Unset means the stored value, then the
+  // default of 3 (follows). A malformed value is logged and ignored,
+  // never read as any particular rung. ALLOW_FOLLOWS=false above is the
+  // legacy way of saying rung 2 and is read as exactly that, below this
+  // variable in the chain.
+  WRITE_RUNG?: string;
+  // NIP-29 groups (limits.ts groupsEnabled). PAUSED unless this is the
+  // exact string "on" -- the group code stays and stays tested, but no
+  // group-scoped write, moderation event or join request is honoured
+  // and the NIP-11 document does not list 29 until an operator says so.
+  // What is already in the group partition stays readable by the owner
+  // and the members on the list.
+  GROUPS?: string;
   MAX_EVENT_BYTES?: string;
   MAX_EVENTS_PER_PUBKEY_PER_MINUTE?: string;
   NON_OWNER_STORAGE_BYTES?: string;

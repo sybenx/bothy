@@ -72,7 +72,7 @@ describe("GET /api/stats", () => {
     };
 
     // The global test env leaves ALLOW_FOLLOWS unset (vitest.config.ts),
-    // and it's an opt-out (ownership.ts allowFollowsEnabled), so this is
+    // and it's an opt-out (write-policy.ts resolveWriteRung, which reads ALLOW_FOLLOWS=false as rung 2), so this is
     // "follows" here even with an empty follow list -- see
     // follows.test.ts for the ALLOW_FOLLOWS=false owner-only case.
     expect(body.writePolicy).toBe("follows");
@@ -92,7 +92,7 @@ describe("GET /api/stats", () => {
     });
 
     const conn = await connectRelay();
-    // ALLOW_FOLLOWS is an opt-out (ownership.ts allowFollowsEnabled) and
+    // ALLOW_FOLLOWS is an opt-out (write-policy.ts resolveWriteRung, which reads ALLOW_FOLLOWS=false as rung 2) and
     // the global test env leaves it unset, so relay.ts's immediate
     // refresh on this owner kind-3 already populates `follows` for real.
     await publish(conn, contacts);

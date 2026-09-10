@@ -3,7 +3,7 @@
 // under the ALLOW_FOLLOWS default, one of the owner's follows).
 //
 // The global test env leaves ALLOW_FOLLOWS unset (vitest.config.ts), which
-// under the opt-out default (ownership.ts allowFollowsEnabled) means
+// under the opt-out default (write-policy.ts resolveWriteRung, which reads ALLOW_FOLLOWS=false as rung 2) means
 // follows mode is ON -- a non-owner stranger here is rejected for not
 // being a follow, not for a blanket owner-only rule. See
 // test/follows.test.ts for the ALLOW_FOLLOWS=false owner-only case.

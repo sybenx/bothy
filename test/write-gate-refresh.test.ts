@@ -21,7 +21,7 @@ import { isolateStorage } from "./helpers/isolate";
 import { OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
 import { connectRelay, publish } from "./helpers/socket";
 
-// ALLOW_FOLLOWS is an opt-out (ownership.ts allowFollowsEnabled), so the
+// ALLOW_FOLLOWS is an opt-out (write-policy.ts resolveWriteRung, which reads ALLOW_FOLLOWS=false as rung 2), so the
 // global test env's unset value already means follows mode is on -- but
 // refreshFollows is still wrapped to force ALLOW_FOLLOWS on explicitly
 // (mirroring the custom FOLLOWS_ENV test/follows.test.ts builds), so the

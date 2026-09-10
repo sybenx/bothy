@@ -358,16 +358,19 @@ function formatBytes(n) {
   return (n / 1024 ** 3).toFixed(2) + " GB";
 }
 
-// Write access policy (ALLOW_FOLLOWS). A bare follow
-// count of 0 while writePolicy is "follows" reads as healthy at a glance
-// -- it isn't, it means the allowlist is empty and every follow is being
-// silently rejected -- so that case gets its own plain-language sentence
-// instead of just a number.
+// Write access policy: the write ladder's rung (src/write-policy.ts,
+// docs/rungs.md), reported by /api/stats as a number, a name and where
+// it came from. A bare follow count of 0 at rung 3 or above reads as
+// healthy at a glance -- it isn't, it means the allowlist is empty and
+// every follow is being silently rejected -- so that case gets its own
+// plain-language sentence instead of just a number.
 function renderWritePolicyStatus(stats) {
   const el = document.getElementById("write-policy-status");
-  const parts = [];
-  if (stats.writePolicy === "owner") {
+  const parts = ["Write policy: rung " + stats.writeRung + " (" + stats.writePolicy + ")."];
+  if (stats.writeRung === 1) {
     parts.push("Only the owner can publish here.");
+  } else if (stats.writeRung === 2) {
+    parts.push("Only the owner can publish here, plus gift-wrapped mail addressed to them from anyone.");
   } else if (stats.followCount === 0) {
     parts.push("Follows are allowed to publish, but the follow list is empty -- no one but the owner can write until the owner's kind-3 contact list is stored on this relay.");
   } else {
@@ -383,8 +386,24 @@ function renderWritePolicyStatus(stats) {
     // timestamp is in the diagnostics panel below.
     parts.push(
       "Owner plus " + stats.followCount + (stats.followCount === 1 ? " follow" : " follows") +
+      (stats.writeRung >= 4 ? ", and anyone whose event mentions the owner," : "") +
       " can publish here.",
     );
+  }
+  // Where the rung is set decides how it gets changed, so say so:
+  // an environment variable has to be edited in the Cloudflare
+  // dashboard, everything else moves with one management call.
+  if (stats.writeRungSource === "env") {
+    parts.push("Set by WRITE_RUNG in the Cloudflare dashboard.");
+  } else if (stats.writeRungSource === "legacy-env") {
+    parts.push("Set by ALLOW_FOLLOWS=false in the Cloudflare dashboard.");
+  } else if (stats.writeRungSource === "stored") {
+    parts.push("Set through the management API (changewritepolicy).");
+  } else {
+    parts.push("The default; change it with the management API (changewritepolicy) or WRITE_RUNG.");
+  }
+  if (stats.groupPolicy === "paused") {
+    parts.push("NIP-29 groups are paused.");
   }
   el.textContent = parts.join(" ");
 }
@@ -446,8 +465,8 @@ function renderDiagnostics(stats) {
   // the absence being reported is a missing kind-3, not a refresh that
   // has not run.
   document.getElementById("diag-follows-at").textContent =
-    stats.writePolicy !== "follows"
-      ? "n/a (owner-only writes)"
+    stats.writeRung < 3
+      ? "n/a (follows cannot write at this rung)"
       : stats.followsListAt
         ? new Date(stats.followsListAt * 1000).toLocaleString()
         : "none stored";
