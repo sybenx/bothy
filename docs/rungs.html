@@ -32,6 +32,7 @@
       <ul>
         <li class="lvl-2"><a href="#why-the-cliff-sits-between-4-and-5">Why the cliff sits between 4 and 5</a></li>
         <li class="lvl-2"><a href="#the-filter-ladder-underneath-it">The filter ladder underneath it</a></li>
+        <li class="lvl-2"><a href="#what-bothy-implements">What bothy implements</a></li>
       </ul>
     </nav>
   <article class="doc" id="main">
@@ -91,6 +92,54 @@ which means an outbound connection made at write time.</p>
 <p>Tier 3 is expensive for architectural reasons as much as quota reasons:
 whether a relay can afford it depends on whether its write path is even
 able to make outbound connections.</p>
+<h2 id="what-bothy-implements">What bothy implements<a class="anchor" href="#what-bothy-implements" aria-label="Link to this section">#</a></h2>
+<p>bothy sits on one rung at a time and lets the owner choose which, with
+rung 5 refused by name. Each rung is cumulative — it admits everyone the
+rung below admits — so the policy is one integer:</p>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>Rung</th>
+<th>Name in bothy</th>
+<th>Set with</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td><code>owner</code></td>
+<td><code>changewritepolicy owner</code> (NIP-86), or <code>WRITE_RUNG=1</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>inbox</code></td>
+<td><code>changewritepolicy inbox</code> — NIP-59 gift wraps p-tagged to the owner, from anyone</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>follows</code></td>
+<td><code>changewritepolicy follows</code> — the owner&#39;s kind-3 contact list. The default.</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>mentions</code></td>
+<td><code>changewritepolicy mentions</code> — any author, if the event p-tags the owner</td>
+</tr>
+<tr>
+<td>5</td>
+<td>—</td>
+<td>refused</td>
+</tr>
+</tbody></table></div>
+<p>Rung 4&#39;s &quot;reference or address the owner&quot; is decided from the event&#39;s own
+<code>p</code> tags, which puts it on the <em>cheap</em> tier of the filter ladder above:
+no storage read, no outbound connection. Because &quot;anyone&quot; is a number
+strangers choose, bothy adds one bound the ladder does not name — a cap
+on how many indexed tags a stranger&#39;s event may carry — so that opening
+rung 4 bounds rows written and not only authors.</p>
+<p>The explicit allowlist (<code>allowpubkey</code>) and blocklist (<code>banpubkey</code>) sit
+outside the ladder and apply at every rung: named individuals are what
+rung 1 already describes, and a ban is the owner closing the door on one
+person whatever the door&#39;s general setting is. See <code>src/write-policy.ts</code>.</p>
 
   </article>
 </div>
