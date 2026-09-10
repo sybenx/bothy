@@ -76,6 +76,17 @@ export const GIFT_WRAP_KIND = 1059;
 // NIP-62 (nips/62.md) Request to Vanish.
 export const VANISH_KIND = 62;
 
+// True for a tag this relay writes an `event_tags` row for. Only
+// single-letter tag names are indexed (NIP-01 `#<letter>` filters only
+// ever query those), and only each tag's first value -- see schema.ts's
+// write-cost comment. Shared by storage.ts insertEventRow and its
+// row-cost stamp so the count and the inserts can never disagree, and by
+// write-policy.ts exceedsMentionTagCap so the cap on a stranger's event
+// counts exactly the tags that cost rows.
+export function isIndexedTag(tag: string[]): boolean {
+  return tag[0]?.length === 1 && tag[1] !== undefined;
+}
+
 // All `p` tag values on an event -- used to find a gift wrap's
 // recipient(s), since `pubkey` on a gift wrap is a random one-time key
 // and carries no identity.

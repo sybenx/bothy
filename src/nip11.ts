@@ -3,6 +3,7 @@
 // support, not ahead of them.
 
 import {
+  groupsEnabled,
   MAX_CREATED_AT_FUTURE_SECONDS,
   MAX_FILTER_LIMIT,
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
@@ -135,15 +136,19 @@ export function buildRelayInfo(
     // listed -- it is verified here only as NIP-86's authentication
     // (src/nip98.ts), and this relay offers no general NIP-98 HTTP auth
     // a client could use for anything else.
-    // 29 is listed for what is actually implemented, which is a subset and
-    // is stated as one in the group's own metadata: one group, one admin,
-    // put-user/remove-user/edit-metadata, and relay-generated
-    // 39000/39001/39002 signed by `self` above. What a NIP-29 client will
-    // find missing is advertised by the group document itself -- `closed`
-    // (no join requests or invites yet) and `hidden`/`private` (metadata
-    // and messages are owner-only reads) -- rather than left for it to
-    // discover by being refused. See CLAUDE.md "What it refuses to be".
-    supported_nips: [1, 9, 11, 29, 40, 42, 59, 62, 86],
+    // 29 is listed only while groups are ON (limits.ts groupsEnabled) --
+    // paused, the relay refuses every group-scoped write and join, and a
+    // document advertising 29 would be advertising a refusal. When it is
+    // listed it is for what is actually implemented, which is a subset
+    // and is stated as one in the group's own metadata: one group, one
+    // admin, put-user/remove-user/edit-metadata/create-invite, and
+    // relay-generated 39000/39001/39002 signed by `self` above. What a
+    // NIP-29 client will find missing is advertised by the group document
+    // itself -- `closed` (join by invite only) and `hidden`/`private`
+    // (metadata and messages are member-only reads) -- rather than left
+    // for it to discover by being refused. See CLAUDE.md "What it refuses
+    // to be".
+    supported_nips: groupsEnabled(env) ? [1, 9, 11, 29, 40, 42, 59, 62, 86] : [1, 9, 11, 40, 42, 59, 62, 86],
     // Points at the upstream project, not the deployer's own cloned repo
     // -- the NIP requires a URL identifying the implementation, not the
     // deployment, and every deploy button clone shares this same software.

@@ -2,7 +2,7 @@
 // owner's kind-3 follow list"). Follows are re-derived from the owner's
 // own most recent kind-3 event already stored on this relay, not fetched
 // from elsewhere -- see ownership.ts refreshFollows(). ALLOW_FOLLOWS is an
-// opt-out (ownership.ts allowFollowsEnabled), so both states are exercised
+// opt-out (write-policy.ts resolveWriteRung, which reads ALLOW_FOLLOWS=false as rung 2), so both states are exercised
 // explicitly below with a hand-built env against real SqlStorage via
 // runInDurableObject, rather than relying on whatever the global test env
 // happens to default to.

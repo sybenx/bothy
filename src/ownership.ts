@@ -4,7 +4,15 @@ import type { OwnerProfile } from "./nip11";
 import type { Profile } from "./profile-lookup";
 import { acrossScopes } from "./groups";
 import { normalizePubkey } from "./pubkey";
-import { isPubkeyAllowed, isPubkeyBanned, setFollowCount } from "./storage";
+import { getStoredWriteRung, isPubkeyAllowed, isPubkeyBanned, setFollowCount } from "./storage";
+import {
+  exceedsMentionTagCap,
+  FOLLOWS_RUNG,
+  MENTIONS_RUNG,
+  mentionsPubkey,
+  resolveWriteRung,
+  type WriteRung,
+} from "./write-policy";
 
 // Kind-3 is NIP-01/NIP-02's contact list; its `p` tags are the follow set.
 // Exported so relay.ts can recognize an owner kind-3 write and refresh the
@@ -16,15 +24,6 @@ const PROFILE_KIND = 0;
 // Icon refresh cadence (see refreshProfile below) -- at most once/day
 // regardless of how often the hourly cron fires.
 const ICON_REFRESH_INTERVAL_SECONDS = 86400;
-
-// ALLOW_FOLLOWS is not declared in wrangler.jsonc's `vars`, so it's
-// undefined unless someone adds it in the Cloudflare dashboard -- it's
-// an opt-OUT, per CLAUDE.md "Configuration": enabled
-// unless explicitly set to the exact string "false". An unset, empty, or
-// malformed value all resolve to enabled -- only "false" disables it.
-export function allowFollowsEnabled(env: Env): boolean {
-  return env.ALLOW_FOLLOWS !== "false";
-}
 
 // Memoised per isolate, keyed on the raw string, because this function
 // is on the write path: every event compares its author against the
@@ -117,13 +116,51 @@ export function getOwnerProfile(sql: SqlStorage, env: Env): OwnerProfile {
 // doesn't have to re-read the owner pubkey to answer "is this the owner?"
 // -- isAllowedWriter has already resolved it, and the abuse caps in
 // acceptEvent (limits.ts) exempt the owner from two of the three.
+export type WriteRejection =
+  | "unclaimed"
+  | "not-follow"
+  | "owner-only"
+  | "banned"
+  | "not-mention"
+  | "too-many-tags";
+
 export type WriteAuthorization =
   | { allowed: true; isOwner: boolean }
-  | { allowed: false; reason: "unclaimed" | "not-follow" | "owner-only" | "banned" };
+  | { allowed: false; reason: WriteRejection };
 
-// Owner writes are always allowed. NIP-86 banpubkey/allowpubkey (phase
-// two, CLAUDE.md "The budget") add two lookups beyond the owner/follows check
-// that shipped in phase one:
+// What the write gate needs beyond the pubkey, and why each is optional.
+//
+// `rung` is the effective write rung (write-policy.ts). relay.ts caches
+// it per instance and passes it in, so the gate pays no row for it per
+// event; a caller that omits it (the tests that drive this function
+// directly against real storage) gets it resolved from the environment
+// and the stored setting at one row read.
+//
+// `tags` are the event's tags, consulted only at rung 4 and only on the
+// path already about to refuse -- rung 4's test is "does this event
+// p-tag the owner", which is answered from the event itself. Omitted,
+// rung 4 admits nobody it would not have admitted at rung 3, which is the
+// safe direction for a caller that has no event in hand.
+export interface WriterContext {
+  rung?: WriteRung;
+  tags?: string[][];
+}
+
+// The write ladder (write-policy.ts, docs/rungs.md), enforced.
+//
+// Owner writes are always allowed, and so is an explicitly allowlisted
+// pubkey (NIP-86 allowpubkey) at every rung -- docs/rungs.md places named
+// individuals inside rung 1, the owner deciding by hand who else may
+// write. banpubkey is the mirror image and refuses at every rung. The
+// rung then decides who ELSE gets in:
+//
+//   - rung 3 and above consult the follow cache (refreshFollows below);
+//   - rung 4 admits any author whose event p-tags the owner, provided
+//     the event carries no more indexed tags than
+//     MAX_MENTION_EVENT_INDEXED_TAGS -- see limits.ts for why a bound on
+//     WHO is not a bound on ROWS once "who" is anyone.
+//
+// Ordering is by cost and by certainty, per CLAUDE.md "Conventions":
 //
 //   - banned_pubkeys is checked for every non-owner write, before the
 //     follows lookup, so a banned pubkey is refused even if it is also a
@@ -131,23 +168,41 @@ export type WriteAuthorization =
 //     pubkey be banned, so there's no owner-lockout case to guard against
 //     here.
 //   - allowed_pubkeys is checked only on the path already about to
-//     reject a write (owner-only mode, or "not a follow"), so it costs
+//     reject a write (rung below 3, or "not a follow"), so it costs
 //     nothing on the common accept path.
-export function isAllowedWriter(sql: SqlStorage, env: Env, pubkey: string): WriteAuthorization {
+//   - the rung-4 mention test runs last, after both lookups, and costs
+//     no storage at all: it reads the event's own tags.
+//
+// The refusal names the rung's OWN boundary -- "not a follow" at rung 3,
+// "does not mention the owner" at rung 4 -- so the message a stranger
+// reads in their client tells them what this relay would have accepted,
+// which is the one thing a refused writer wants to know.
+export function isAllowedWriter(
+  sql: SqlStorage,
+  env: Env,
+  pubkey: string,
+  context: WriterContext = {},
+): WriteAuthorization {
   const owner = getOwnerPubkey(sql, env);
   if (owner === null) return { allowed: false, reason: "unclaimed" };
   if (pubkey === owner) return { allowed: true, isOwner: true };
   if (isPubkeyBanned(sql, pubkey)) return { allowed: false, reason: "banned" };
-  if (!allowFollowsEnabled(env)) {
-    return isPubkeyAllowed(sql, pubkey)
-      ? { allowed: true, isOwner: false }
-      : { allowed: false, reason: "owner-only" };
+  const rung = context.rung ?? resolveWriteRung(env, getStoredWriteRung(sql)).rung;
+  if (rung >= FOLLOWS_RUNG) {
+    const row = sql.exec(`SELECT 1 FROM follows WHERE pubkey = ?`, pubkey).toArray();
+    if (row.length > 0) return { allowed: true, isOwner: false };
   }
-  const row = sql.exec(`SELECT 1 FROM follows WHERE pubkey = ?`, pubkey).toArray();
-  if (row.length > 0) return { allowed: true, isOwner: false };
-  return isPubkeyAllowed(sql, pubkey)
-    ? { allowed: true, isOwner: false }
-    : { allowed: false, reason: "not-follow" };
+  if (isPubkeyAllowed(sql, pubkey)) return { allowed: true, isOwner: false };
+  if (rung >= MENTIONS_RUNG && context.tags !== undefined) {
+    const event = { tags: context.tags };
+    if (mentionsPubkey(event, owner)) {
+      return exceedsMentionTagCap(event)
+        ? { allowed: false, reason: "too-many-tags" }
+        : { allowed: true, isOwner: false };
+    }
+    return { allowed: false, reason: "not-mention" };
+  }
+  return { allowed: false, reason: rung >= FOLLOWS_RUNG ? "not-follow" : "owner-only" };
 }
 
 // Fingerprint of a follow set, in the style of schema.ts
@@ -246,9 +301,19 @@ export function computeFollowsHash(follows: ReadonlySet<string>): string {
 // one change is ~3F rows and a day of ordinary follow activity starts
 // to crowd the budget; not worth the refactor to shave a cost that
 // human-rate actions bound today.
+//
+// NOT gated on the write rung, deliberately. The cache is a fact about
+// the owner's contact list and the rung is a policy about who may write;
+// isAllowedWriter consults the cache only at rung 3 and above, so a
+// relay at rung 1 or 2 maintains a table nothing reads -- at the cost of
+// the hash comparison above, one row and a sha256, per tick. What that
+// buys is a rung change that takes effect the moment it is made: a
+// changewritepolicy call raising the relay to rung 3 finds the cache
+// already current, rather than admitting nobody until the next cron
+// tick rebuilt it.
 export function refreshFollows(sql: SqlStorage, env: Env): void {
   const owner = getOwnerPubkey(sql, env);
-  if (owner === null || !allowFollowsEnabled(env)) return;
+  if (owner === null) return;
 
   // Once per partition, newest wins. `is_group` splits the REQ-serving
   // indexes into partial pairs (schema.ts), so a lookup that names no

@@ -22,6 +22,7 @@ import {
   banPubkey,
   blockIp,
   deletePushSubscription,
+  getStoredWriteRung,
   listAllowedPubkeys,
   listBannedEvents,
   listBannedPubkeys,
@@ -39,6 +40,17 @@ import { pushConfigured } from "./push";
 import { getOwnerPubkey } from "./ownership";
 import { normalizeIp } from "./ip";
 import { normalizePubkey } from "./pubkey";
+import {
+  DEFAULT_WRITE_RUNG,
+  envOverridingRung,
+  MAX_WRITE_RUNG,
+  parseRung,
+  resolveWriteRung,
+  RUNG_DESCRIPTIONS,
+  RUNG_NAMES,
+  rungName,
+  type WriteRung,
+} from "./write-policy";
 
 // nips/86.md: "a JSON-RPC-like request-response protocol over HTTP, on
 // the same URI as the relay's websocket", distinguished by this
@@ -78,6 +90,15 @@ export const SUPPORTED_METHODS = [
   "changerelayname",
   "changerelaydescription",
   "changerelayicon",
+  // bothy's own: the write ladder (src/write-policy.ts, docs/rungs.md).
+  // NIP-86 has no notion of a write policy beyond its per-pubkey lists,
+  // and the ladder is the thing those lists sit inside. changewritepolicy
+  // takes a rung number or name and follows the change* conventions
+  // (empty string clears, an environment variable outranks the stored
+  // value and the response says so); getwritepolicy reads back the rung
+  // in force and where it came from, which NIP-11 has no field for.
+  "changewritepolicy",
+  "getwritepolicy",
   // bothy's own, not NIP-86's. The spec defines no invite methods at all,
   // so these two are an extension in the same spirit as the empty-string
   // unset convention on the change* methods, and are documented in the
@@ -179,6 +200,34 @@ function identityNote(
   parts.push(
     `The value actually in effect is whatever this relay's NIP-11 document reports -- request it with an ` +
       `Accept: application/nostr+json header.`,
+  );
+  return parts.join(" ");
+}
+
+// The advisory note every changewritepolicy response carries, in the
+// error field for the reason identityNote gives: it is the one field
+// NIP-86 offers for saying anything beside a result. It always ends by
+// stating the rung actually IN FORCE after the call, because that is the
+// question the operator has and there are two ways the answer differs
+// from what they just stored: WRITE_RUNG (or the legacy ALLOW_FOLLOWS)
+// in the environment outranks the stored value, and clearing the stored
+// value falls back to the default. Store and warn, never silently
+// discard -- the same rule as the name/description/icon methods.
+function writePolicyNote(sql: SqlStorage, env: Env, headline: string): string {
+  const parts = [headline];
+  const overriding = envOverridingRung(env);
+  if (overriding) {
+    parts.push(
+      `Note: ${overriding} is set in this deployment's environment and takes precedence over the stored ` +
+        `value, so the stored value takes effect only once ${overriding} is cleared in the Cloudflare dashboard.`,
+    );
+  }
+  const resolved = resolveWriteRung(env, getStoredWriteRung(sql));
+  parts.push(
+    `The write policy now in force is ${resolved.rung} (${rungName(resolved.rung)}): ` +
+      `${RUNG_DESCRIPTIONS[resolved.rung]} ` +
+      `Calling changewritepolicy with an empty string clears the stored value and falls back to the ` +
+      `default of ${DEFAULT_WRITE_RUNG} (${rungName(DEFAULT_WRITE_RUNG)}).`,
   );
   return parts.join(" ");
 }
@@ -498,6 +547,64 @@ export function handleManagementCall(
 
     case "changerelayicon":
       return changeIdentity(sql, params, "icon", method, "RELAY_ICON", env.RELAY_ICON);
+
+    // The write ladder (src/write-policy.ts). Stored as the operator gave
+    // it, resolved on the write path through the same env-then-stored-
+    // then-default chain the relay's name uses -- see writePolicyNote
+    // for what the response has to tell them and why.
+    case "changewritepolicy": {
+      const raw = params[0];
+      if (raw === "") {
+        setRelaySetting(sql, "write_rung", "");
+        return { result: true, error: writePolicyNote(sql, env, "Cleared the stored write policy.") };
+      }
+      const parsed = parseRung(raw);
+      if (!parsed.ok) {
+        // Rung 5 is refused BY NAME, with the reason, rather than as a
+        // malformed value: the ladder document is explicit that an open
+        // relay is a cliff and not a step, and an operator asking for it
+        // deserves the design answer -- the same call the kind allowlist
+        // methods below make.
+        if (parsed.reason === "open") {
+          return err(
+            "changewritepolicy: rung 5 (an open relay) is the one rung bothy refuses to implement. " +
+              "Rungs 1-4 are each bounded by something real -- the owner's posting rate, their " +
+              "correspondents, their follow list, the people who mention them -- and rung 5 is bounded " +
+              "by nothing, which is a difference in kind rather than degree (docs/rungs.md). The widest " +
+              `available policy is ${MAX_WRITE_RUNG} (${rungName(MAX_WRITE_RUNG)}).`,
+          );
+        }
+        return err(
+          "changewritepolicy takes one parameter: a rung number from 1 to 4, or its name " +
+            `(${Object.values(RUNG_NAMES).join(", ")}). An empty string clears the stored policy.`,
+        );
+      }
+      setRelaySetting(sql, "write_rung", String(parsed.rung));
+      return {
+        result: true,
+        error: writePolicyNote(
+          sql,
+          env,
+          `Stored write policy ${parsed.rung} (${rungName(parsed.rung)}).`,
+        ),
+      };
+    }
+
+    case "getwritepolicy": {
+      const resolved = resolveWriteRung(env, getStoredWriteRung(sql));
+      return {
+        result: {
+          rung: resolved.rung,
+          name: rungName(resolved.rung),
+          source: resolved.source,
+          description: RUNG_DESCRIPTIONS[resolved.rung],
+          rungs: (Object.keys(RUNG_NAMES) as unknown as string[]).map((key) => {
+            const rung = Number(key) as WriteRung;
+            return { rung, name: RUNG_NAMES[rung], description: RUNG_DESCRIPTIONS[rung] };
+          }),
+        },
+      };
+    }
 
     // Implemented as an explanation rather than left to the
     // unknown-method fallback below. "Unknown method" would read as

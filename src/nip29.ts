@@ -42,11 +42,13 @@ import {
   GROUP_SCOPE,
   groupIdOf,
   isAnyGroupEvent,
+  isGroupEvent,
   isGroupMetadataKind,
   TOP_LEVEL_GROUP_ID,
 } from "./groups";
 import {
   chatMode,
+  groupsEnabled,
   INVITE_DEFAULT_TTL_SECONDS,
   INVITE_MAX_TTL_SECONDS,
   MAX_INVITE_CODE_LENGTH,
@@ -93,6 +95,13 @@ export { CREATE_INVITE_KIND };
 // at the bottom of this file for where it is decided and why it has to be
 // dispatched above the relay-wide write gate.
 export const JOIN_REQUEST_KIND = 9021;
+
+// What every group-scoped write and every join request is answered with
+// while GROUPS is not "on" (limits.ts groupsEnabled). One string for
+// both, exported so relay.ts handleJoin says exactly what
+// authorizeGroupWrite says.
+export const GROUPS_PAUSED_MESSAGE =
+  "restricted: NIP-29 groups are paused on this relay (set GROUPS=on in its environment to resume)";
 
 // NIP-29 reserves 9000-9020 for moderation actions. bothy implements
 // three of them and REFUSES the rest by name rather than letting them
@@ -241,6 +250,19 @@ export function authorizeGroupWrite(
   // with anything other than `_` would be a way to dodge it entirely (see
   // groups.ts TOP_LEVEL_GROUP_ID).
   if (!isAnyGroupEvent(event) && !isModerationKind(event.kind)) return { ok: true };
+
+  // Paused (limits.ts groupsEnabled): nothing group-shaped is accepted
+  // from anyone, the owner included. One environment read, ahead of
+  // every storage lookup below, and the SAME refusal for every shape --
+  // a moderation event, a chat message, a client-signed 39000 -- since
+  // the reason is the relay's configuration and not anything about the
+  // event. An event tagged into some other relay's group is still held
+  // to the member list below rather than refused here: that traffic is
+  // not this relay's group and pausing this relay's group says nothing
+  // about it.
+  if (!groupsEnabled(env) && (isGroupEvent(event) || isModerationKind(event.kind))) {
+    return { ok: false, message: GROUPS_PAUSED_MESSAGE };
+  }
 
   // NIP-29: these "MUST be created by the relay master key only (as stated
   // by the NIP-11 `self` pubkey)... Relays shouldn't accept these events if

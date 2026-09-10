@@ -36,11 +36,12 @@ const WITH_VARS = {
 
 // Nothing written by the management API -- the state a relay is in until
 // someone calls a change* method.
-const NO_SETTINGS: RelaySettings = { name: null, description: null, icon: null };
+const NO_SETTINGS: RelaySettings = { name: null, description: null, icon: null, writeRung: null };
 const STORED: RelaySettings = {
   name: "stored-name",
   description: "stored-description",
   icon: "https://example.com/stored.png",
+  writeRung: null,
 };
 
 const PROFILE = {
