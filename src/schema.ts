@@ -391,6 +391,33 @@ export const TABLES: readonly TableSpec[] = [
       // resetWronglyExhaustedRelays, which runs after it, down with it.
       col("profile_synced_at", "INTEGER"),
       col("icon_refreshed_at", "INTEGER"),
+      // The claim nonce that won, on the signed claim path (src/nip42.ts,
+      // src/ownership.ts claimOwner/getClaimStatus) -- NULL for a relay
+      // claimed by paste, which is every relay before this column existed
+      // and every one that stays on the default path. This is what lets
+      // GET /api/claim-status answer "was *this* QR the one that worked"
+      // rather than just "is the relay claimed by someone, somehow": the
+      // nonce table itself is wiped the moment a claim succeeds
+      // (ownership.ts clearClaimNonces), so by the time a poll can ask,
+      // the nonce row is gone whichever path or which nonce actually won.
+      col("claim_nonce", "TEXT"),
+    ],
+  },
+  {
+    // Short-lived, single-use claim nonces for the QR/signed claim path
+    // (src/nip42.ts, src/index.ts POST /api/claim-nonce and
+    // /api/claim-signed). Unlike group_invites, which only the owner can
+    // grow, this table can be grown by anyone who loads a public,
+    // unclaimed relay's admin page and clicks the button -- so
+    // ownership.ts issueClaimNonce deletes expired rows on every issuance
+    // rather than merely excluding them from the outstanding count, which
+    // bounds this table at MAX_OUTSTANDING_CLAIM_NONCES rows forever,
+    // whatever a flood does. See CLAUDE.md "The budget".
+    name: "claim_nonces",
+    columns: [
+      col("nonce", "TEXT PRIMARY KEY"),
+      col("created_at", "INTEGER NOT NULL"),
+      col("expires_at", "INTEGER NOT NULL"),
     ],
   },
   {

@@ -3,6 +3,9 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import type { OwnerProfile } from "./nip11";
 import type { Profile } from "./profile-lookup";
 import { acrossScopes } from "./groups";
+import { normalizeHost } from "./host";
+import { CLAIM_NONCE_TTL_SECONDS, MAX_OUTSTANDING_CLAIM_NONCES } from "./limits";
+import { RELAY_LIST_KIND } from "./nostr";
 import { normalizePubkey } from "./pubkey";
 import { getStoredWritePolicy, isPubkeyAllowed, isPubkeyBanned, setFollowCount } from "./storage";
 import {
@@ -74,18 +77,131 @@ export function getOwnerPubkey(sql: SqlStorage, env: Env): string | null {
 // written to DO storage there. Optional and best-effort --
 // undefined fields are stored as null and nip11.ts falls back to
 // hardcoded defaults.
-export function claimOwner(sql: SqlStorage, pubkey: string, profile?: Profile): boolean {
+//
+// `nonce` is set only by the QR/signed claim path (relay.ts claimSigned)
+// -- the claim nonce that won, so getClaimStatus below can answer "was
+// *this* QR the one that worked" rather than just "is the relay claimed by
+// someone, somehow". The paste path passes nothing and the column stays
+// NULL, which is also what every relay claimed before this column existed
+// reads as.
+export function claimOwner(sql: SqlStorage, pubkey: string, profile?: Profile, nonce: string | null = null): boolean {
   const existing = sql.exec(`SELECT 1 FROM owner LIMIT 1`).toArray();
   if (existing.length > 0) return false;
   sql.exec(
-    `INSERT INTO owner (pubkey, name, picture, about, website) VALUES (?, ?, ?, ?, ?)`,
+    `INSERT INTO owner (pubkey, name, picture, about, website, claim_nonce) VALUES (?, ?, ?, ?, ?, ?)`,
     pubkey,
     profile?.name ?? null,
     profile?.picture ?? null,
     profile?.about ?? null,
     profile?.website ?? null,
+    nonce,
   );
   return true;
+}
+
+// ---------------------------------------------------------------------
+// QR/signed claim (src/nip42.ts, src/relay.ts issueClaimNonce/claimSigned,
+// src/index.ts POST /api/claim-nonce, /api/claim-signed, GET
+// /api/claim-status). See CLAUDE.md "The budget" for the row-cost
+// reasoning behind the sweep-on-issue below.
+// ---------------------------------------------------------------------
+
+export type IssueClaimNonceResult = { nonce: string; expiresAt: number } | "capped";
+
+// Mints a short-lived, single-use nonce for the QR/signed claim flow.
+// Sweeps expired rows FIRST, not just excludes them from the count --
+// unlike group_invites, which only the owner can grow, this table can be
+// grown by anyone loading a public, unclaimed relay's admin page, so
+// merely excluding expired rows from MAX_OUTSTANDING_CLAIM_NONCES would
+// let a sustained flood mint that many more every CLAIM_NONCE_TTL_SECONDS,
+// forever. The sweep bounds the table at exactly that many rows, total,
+// permanently.
+export function issueClaimNonce(sql: SqlStorage, nowSec: number): IssueClaimNonceResult {
+  sql.exec(`DELETE FROM claim_nonces WHERE expires_at < ?`, nowSec);
+  const outstanding = sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM claim_nonces`).toArray()[0]?.n ?? 0;
+  if (outstanding >= MAX_OUTSTANDING_CLAIM_NONCES) return "capped";
+  const nonce = crypto.randomUUID();
+  const expiresAt = nowSec + CLAIM_NONCE_TTL_SECONDS;
+  sql.exec(`INSERT INTO claim_nonces (nonce, created_at, expires_at) VALUES (?, ?, ?)`, nonce, nowSec, expiresAt);
+  return { nonce, expiresAt };
+}
+
+// The "nonce freshness" check the QR/signed claim flow needs: does this
+// nonce exist and hasn't it expired. Deletes it either way it matters --
+// a nonce that's about to become the winning claim has no further use,
+// and clearClaimNonces below wipes whatever's left the moment the claim
+// actually succeeds -- so this is single-use by construction rather than
+// by a separate "used" flag. Looked up before deleting, the same
+// check-then-write shape storage.ts redeemInvite uses for the same reason:
+// a DELETE's own row count isn't otherwise read as application logic
+// anywhere in this codebase.
+export function consumeClaimNonce(sql: SqlStorage, nonce: string, nowSec: number): boolean {
+  const row = sql
+    .exec<{ expires_at: number }>(`SELECT expires_at FROM claim_nonces WHERE nonce = ?`, nonce)
+    .toArray()[0];
+  if (!row || row.expires_at < nowSec) return false;
+  sql.exec(`DELETE FROM claim_nonces WHERE nonce = ?`, nonce);
+  return true;
+}
+
+// Called once a claim succeeds, whichever nonce won -- every remaining
+// nonce is moot the instant the relay has an owner, since a second claim
+// is refused regardless of what it names.
+export function clearClaimNonces(sql: SqlStorage): void {
+  sql.exec(`DELETE FROM claim_nonces`);
+}
+
+export type ClaimStatus = "pending" | "claimed" | "claimed-elsewhere";
+
+// Backs GET /api/claim-status. Answers from the `owner` row's
+// `claim_nonce` alone -- no row yet -> "pending"; the row's nonce matches
+// the one this poll is asking about -> "claimed"; anything else,
+// including a paste-claimed relay where the column is NULL -> the caller
+// asked about a QR that didn't win, but the relay is claimed regardless.
+export function getClaimStatus(sql: SqlStorage, nonce: string): ClaimStatus {
+  const row = sql.exec<{ claim_nonce: string | null }>(`SELECT claim_nonce FROM owner LIMIT 1`).toArray()[0];
+  if (!row) return "pending";
+  return row.claim_nonce === nonce ? "claimed" : "claimed-elsewhere";
+}
+
+// Whether the owner's own resolved kind-10002 already names this relay --
+// the outcome public/index.html's claimed view actually cares about when
+// deciding whether the wss:// copy box still has a job to do. Deliberately
+// NOT keyed to which claim path was used: a phone signing a NIP-42 AUTH
+// event to claim the relay does not also publish a relay-list update as a
+// side effect, so "claimed by QR" and "already in the owner's relay list"
+// are two different facts, and only the second one makes the box
+// redundant.
+//
+// Reads the owner's own most recently stored kind-10002 the same way
+// refreshFollows reads their kind-3 -- both partitions, newest wins -- so
+// this needs no schema of its own and no change to backfill.ts at all: it
+// sees whatever kind-10002 bothy already has locally, however it arrived
+// (backfill, or a live publish), and self-corrects the moment a fresher
+// one lands rather than describing a snapshot taken once at claim time.
+// Every `r`-tag URL counts, not just the write-marked ones NIP-65 would
+// have backfill.ts prioritize -- the box is redundant the moment the
+// relay is listed at all, read or write.
+export function ownerListsThisRelay(sql: SqlStorage, env: Env, host: string): boolean {
+  const owner = getOwnerPubkey(sql, env);
+  if (owner === null) return false;
+
+  const latest = acrossScopes((scope) =>
+    sql
+      .exec<{ tags: string; created_at: number }>(
+        `SELECT tags, created_at FROM events WHERE pubkey = ? AND kind = ? AND is_group = ?
+         ORDER BY created_at DESC LIMIT 1`,
+        owner,
+        RELAY_LIST_KIND,
+        scope,
+      )
+      .toArray(),
+  ).sort((a, b) => b.created_at - a.created_at)[0];
+  if (!latest) return false;
+
+  const relayHost = normalizeHost(host);
+  const tags = JSON.parse(latest.tags) as string[][];
+  return tags.some((t) => t[0] === "r" && t[1] && normalizeHost(t[1]) === relayHost);
 }
 
 // Backs the NIP-11 document's name/icon (nip11.ts, via Relay.getProfile

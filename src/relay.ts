@@ -92,15 +92,22 @@ import {
   VANISH_KIND,
 } from "./nostr";
 import {
+  type ClaimStatus,
   CONTACT_LIST_KIND,
   claimOwner,
+  clearClaimNonces,
+  consumeClaimNonce,
+  getClaimStatus,
   getOwnerPubkey,
   getOwnerProfile,
   isAllowedWriter,
+  issueClaimNonce,
+  ownerListsThisRelay,
   refreshFollows,
   refreshProfile,
   type WriteRejection,
 } from "./ownership";
+import { authChallenge, checkAuthFreshness, checkAuthRelayTag, relayTagMatchesHost } from "./nip42";
 import { admitsAtLeast, resolveWritePolicy, type ResolvedWritePolicy, type WritePolicy } from "./write-policy";
 import type { Profile } from "./profile-lookup";
 import { normalizePubkey } from "./pubkey";
@@ -192,13 +199,6 @@ function getLiveFeedState(ws: WebSocket): LiveFeedState {
   return (ws.deserializeAttachment() as LiveFeedState | null) ?? { connectedAt: Date.now() };
 }
 
-// NIP-42's own kind for AUTH events (nips/42.md).
-const AUTH_KIND = 22242;
-// How far a client's AUTH `created_at` may drift from "now" before it's
-// rejected as stale -- NIP-42 doesn't fix a number, this mirrors the
-// ~10 minute window other relays use.
-const AUTH_MAX_DRIFT_SECONDS = 600;
-
 // Per-connection subscriptions, keyed by subscription id, plus the
 // connecting IP for per-IP throttling. Persisted via WebSocket
 // attachment (not object memory) so it survives hibernation -- see
@@ -208,7 +208,7 @@ const AUTH_MAX_DRIFT_SECONDS = 600;
 //
 // `host` is this connection's own request host (captured at connect
 // time from the upgrade request's URL), used to check NIP-42 AUTH and
-// NIP-62 vanish `relay` tags against -- see relayTagMatchesHost below.
+// NIP-62 vanish `relay` tags against -- see nip42.ts relayTagMatchesHost.
 // `challenge`/`authedPubkey` back the real NIP-42 challenge/response flow
 // gating gift wrap reads: a challenge is issued
 // lazily, the first time a REQ needs one, not proactively at connect.
@@ -252,18 +252,6 @@ function setState(ws: WebSocket, state: ConnState): void {
 // client can act on.
 function stateFits(state: ConnState): boolean {
   return new TextEncoder().encode(JSON.stringify(state)).length <= MAX_CONN_STATE_BYTES;
-}
-
-// NIP-42 (nips/42.md "Signed Event Verification"): "checking if the
-// domain name is correct should be enough." Also used for NIP-62's
-// `relay` tag, which additionally allows the literal sentinel
-// `ALL_RELAYS` (nips/62.md) -- checked by the caller, not here.
-function relayTagMatchesHost(tagValue: string, host: string): boolean {
-  try {
-    return new URL(tagValue).host.toLowerCase() === host.toLowerCase();
-  } catch {
-    return false;
-  }
 }
 
 // Per-IP message rate limit (CLAUDE.md "Threat model": "Per-IP
@@ -574,6 +562,60 @@ export class Relay extends DurableObject<Env> {
     );
   }
 
+  // POST /api/claim-nonce, DO-side half. One round trip rather than
+  // claim()'s two-RPC split -- there is no outbound work here to protect
+  // from an "already claimed" caller, so checking that and inserting the
+  // row happen in the same call.
+  async issueClaimNonce(): Promise<
+    { status: "disabled" | "conflict" | "limited" } | { status: "issued"; nonce: string; expiresAt: number }
+  > {
+    if (this.env.OWNER_PUBKEY) return { status: "disabled" };
+    return this.metered(() =>
+      withReadPath("identity", () => {
+        const sql = this.sql;
+        if (getOwnerPubkey(sql, this.env) !== null) return { status: "conflict" as const };
+        const result = issueClaimNonce(sql, nowSeconds());
+        if (result === "capped") return { status: "limited" as const };
+        return { status: "issued" as const, nonce: result.nonce, expiresAt: result.expiresAt };
+      }),
+    );
+  }
+
+  // POST /api/claim-signed, DO-side half -- the second, proof-of-possession
+  // claim path (CLAUDE.md "What it is"). `nonce`/`pubkey` have already been
+  // extracted and verified against the event's own signature and its
+  // kind/freshness/relay-tag checklist in the Worker (src/nip42.ts
+  // verifyClaimAuthEvent) before this is ever called; what's left is the
+  // one check that needs storage -- is this nonce actually a live one this
+  // relay issued -- and the same single-writer claim() already makes
+  // atomic.
+  //
+  // No profile lookup here, unlike claim(): there's no paste-and-preview
+  // step to serve on this path, and refreshProfile's existing cron picks
+  // up the owner's kind-0 the same way it already does under OWNER_PUBKEY.
+  async claimSigned(
+    nonce: string,
+    pubkey: string,
+    host?: string,
+  ): Promise<{ status: "disabled" | "invalid-nonce" | "conflict"; pubkey?: string } | { status: "claimed"; pubkey: string }> {
+    if (this.env.OWNER_PUBKEY) return { status: "disabled" };
+    return this.metered(() =>
+      withReadPath("identity", () => {
+        const sql = this.sql;
+        if (host) recordHost(sql, host);
+        if (!consumeClaimNonce(sql, nonce, nowSeconds())) return { status: "invalid-nonce" as const };
+        if (!claimOwner(sql, pubkey, undefined, nonce)) return { status: "conflict" as const };
+        clearClaimNonces(sql);
+        return { status: "claimed" as const, pubkey };
+      }),
+    );
+  }
+
+  // GET /api/claim-status, DO-side half. One indexed row read.
+  async getClaimStatus(nonce: string): Promise<ClaimStatus> {
+    return this.metered(() => withReadPath("identity", () => getClaimStatus(this.sql, nonce)));
+  }
+
   // Backs the NIP-11 document's name/icon (src/nip11.ts) -- derived from
   // the owner's kind 0 at claim time rather than a deploy-time var, see
   // Null when unclaimed, when OWNER_PUBKEY skips storage entirely, or
@@ -793,6 +835,20 @@ export class Relay extends DurableObject<Env> {
     // it, and the exposure it described is bounded by the write gate and
     // the storage cap rather than by knowing the number.
     vanishing: VanishSummary;
+    // The host the QR/signed claim flow's link should point at
+    // (src/nip42.ts, public/index.html's claim button) -- `BOUNCE_HOST` if
+    // set, else this relay's own host, so a clean deploy needs no external
+    // service to show a working QR. Always present, claimed or not, the
+    // same way `relayPubkey` is: the unclaimed page is the one place that
+    // actually reads it.
+    bounceHost: string;
+    // Whether the owner's own resolved kind-10002 already names this
+    // relay (ownership.ts ownerListsThisRelay) -- what the claimed view
+    // uses to decide whether the wss:// copy box still has a job to do.
+    // False while unclaimed; not gated on which claim path was used, since
+    // a phone signing a NIP-42 AUTH event doesn't also publish a relay-list
+    // update as a side effect of claiming.
+    ownerListsThisRelay: boolean;
     // DIAGNOSTIC, and expected to be removed with src/read-metrics.ts.
     // Rows read attributed to the code path that caused them, since the
     // relay's last outage was the 5,000,000 rows-read/day ceiling and
@@ -929,6 +985,12 @@ export class Relay extends DurableObject<Env> {
       countAudit: { lastRanAt: counts.lastRanAt, drift: counts.drift },
       followsListAt: followsListAt(sql),
       vanishing: vanishSummary(sql),
+      // Falls back to the stored own-host (src/host.ts getOwnHost) rather
+      // than an empty string when this call carries no live host -- the
+      // unit tests that call getStats() with no argument are the only
+      // callers that hit this, and every real request passes one.
+      bounceHost: this.env.BOUNCE_HOST ?? host ?? getOwnHost(sql) ?? "",
+      ownerListsThisRelay: owner !== null && ownerListsThisRelay(sql, this.env, host ?? getOwnHost(sql) ?? ""),
     };
   }
 
@@ -2612,27 +2674,25 @@ export class Relay extends DurableObject<Env> {
       ok(ws, event.id, false, "invalid: signature verification failed");
       return;
     }
-    if (event.kind !== AUTH_KIND) {
-      ok(ws, event.id, false, `invalid: kind must be ${AUTH_KIND}`);
-      return;
-    }
-    if (Math.abs(nowSeconds() - event.created_at) > AUTH_MAX_DRIFT_SECONDS) {
-      ok(ws, event.id, false, "invalid: created_at is too far from now");
+    // Kind, freshness, challenge-match, relay-tag, in that order -- see
+    // nip42.ts's header comment for why this file still owns the
+    // challenge-match step (it compares against this connection's own
+    // state, which the shared module has no way to see) while the other
+    // three checks are shared with the HTTP claim path.
+    const fresh = checkAuthFreshness(event, nowSeconds());
+    if (!fresh.ok) {
+      ok(ws, event.id, false, fresh.reason);
       return;
     }
     const state = getState(ws);
-    const challenge = event.tags.find((t) => t[0] === "challenge")?.[1];
+    const challenge = authChallenge(event);
     if (!challenge || !state.challenge || challenge !== state.challenge) {
       ok(ws, event.id, false, "invalid: no matching challenge was issued");
       return;
     }
-    // NIP-42 "Signed Event Verification": "that the relay tag matches
-    // the relay URL." Without this, an AUTH event signed for a
-    // *different* relay's challenge-less flow could be replayed here to
-    // claim the owner's identity.
-    const relayTag = event.tags.find((t) => t[0] === "relay")?.[1];
-    if (!relayTag || !relayTagMatchesHost(relayTag, state.host)) {
-      ok(ws, event.id, false, "invalid: relay tag does not name this relay");
+    const relayCheck = checkAuthRelayTag(event, state.host);
+    if (!relayCheck.ok) {
+      ok(ws, event.id, false, relayCheck.reason);
       return;
     }
     state.authedPubkey = event.pubkey;

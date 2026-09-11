@@ -114,10 +114,17 @@
 <h1 id="relay-name">bothy</h1>
 
 <div id="claimed-view" hidden>
-  <p>This relay is live at:</p>
-  <div class="url-row">
-    <input id="ws-url" readonly />
-    <button id="copy-btn">Copy</button>
+  <!-- Hidden when the owner's own resolved kind-10002 already names this
+       relay (src/ownership.ts ownerListsThisRelay), whichever path claimed
+       it -- the copy box exists to get this relay into that list, and once
+       it's there, copying the URL again does nothing. See
+       renderWsUrlSection below. -->
+  <div id="ws-url-section">
+    <p>This relay is live at:</p>
+    <div class="url-row">
+      <input id="ws-url" readonly />
+      <button id="copy-btn">Copy</button>
+    </div>
   </div>
 
   <div class="stats">
@@ -144,7 +151,23 @@
 </div>
 
 <div id="unclaimed-view" hidden>
-  <p>This relay hasn't been claimed yet. Paste your <code>npub</code> or hex pubkey to claim it &mdash; this binds the relay to you, permanently.</p>
+  <p>This relay hasn't been claimed yet.</p>
+
+  <!-- The QR/signed claim path (CLAUDE.md "What it is"): your phone signs
+       a NIP-42 proof rather than trusting whoever pastes a key first. The
+       nonce is only minted on this button's click, never on page load --
+       an unclaimed relay is public, and minting one per page view would
+       let a crawler write rows for free. -->
+  <div id="qr-section">
+    <button type="button" id="show-qr-btn">Claim from your phone</button>
+    <div id="qr-area" hidden>
+      <p>Scan this with a Nostr signer that supports claiming (or open <a id="qr-link" href="#" target="_blank" rel="noopener">this link</a> on your phone).</p>
+      <div id="qr-code"></div>
+      <p id="qr-status" class="live-status"></p>
+    </div>
+  </div>
+
+  <p>Or paste your <code>npub</code> or hex pubkey to claim it &mdash; this binds the relay to you, permanently.</p>
   <form id="claim-form">
     <input type="text" id="pubkey-input" placeholder="npub1... or hex pubkey" autocomplete="off" />
     <div id="profile-preview"></div>
@@ -192,6 +215,13 @@
   </dl>
 </details>
 
+<!-- Vendored, unmodified, from kazuhikoarase/qrcode-generator (MIT), tag
+     v20170724 -- see public/qrcode-generator.LICENSE and CLAUDE.md
+     "Architecture map" for why this is the one third-party file on this
+     page. Loaded before the inline script below so `qrcode` exists by
+     the time wireClaimQr needs it, but only actually called once the
+     "Claim from your phone" button is pressed. -->
+<script src="qrcode-generator.js"></script>
 <script>
 // The three Workers-free-tier ceilings this page displays progress
 // against (CLAUDE.md "The budget"), read from /api/stats rather than
@@ -243,6 +273,13 @@ async function main() {
     document.getElementById("copy-btn").addEventListener("click", () => {
       navigator.clipboard.writeText(wsUrl);
     });
+    // See src/ownership.ts ownerListsThisRelay: hidden once the owner's
+    // own resolved kind-10002 already names this relay, whichever path
+    // claimed it. Not gated on how the relay was claimed -- a phone
+    // signing a NIP-42 AUTH event doesn't also publish a relay-list
+    // update as a side effect, so a QR-claimed relay still needs this box
+    // until its owner's client actually lists it.
+    document.getElementById("ws-url-section").hidden = stats.ownerListsThisRelay;
 
     document.getElementById("stat-total").textContent = stats.totalEvents;
     // No age suffix any more, and the missing suffix is the point.
@@ -278,6 +315,7 @@ async function main() {
   } else {
     document.getElementById("unclaimed-view").hidden = false;
     wireClaimForm();
+    wireClaimQr(stats);
   }
 }
 
@@ -630,6 +668,109 @@ function wireLiveFeed() {
   });
 
   connect();
+}
+
+// Polling interval for GET /api/claim-status while a QR is on screen.
+// Five seconds, not something tighter -- this IP shares the 60/min
+// RATE_LIMIT_API bucket with /api/stats and everything else this page
+// calls, and there's nothing time-sensitive enough here to warrant
+// spending more of it.
+const CLAIM_STATUS_POLL_MS = 5000;
+
+// The QR/signed claim path (src/nip42.ts, CLAUDE.md "What it is"): mints a
+// nonce, builds the link the QR encodes, and polls until it's used or
+// expires. Deliberately does nothing until show-qr-btn is clicked --
+// this page is reachable by anyone while the relay is unclaimed, and
+// minting a nonce on page load would let a crawler write rows for free.
+function wireClaimQr(stats) {
+  const btn = document.getElementById("show-qr-btn");
+  const area = document.getElementById("qr-area");
+  const codeEl = document.getElementById("qr-code");
+  const linkEl = document.getElementById("qr-link");
+  const statusEl = document.getElementById("qr-status");
+  let pollTimer = null;
+  let expiresAt = 0;
+
+  function claimUrl(nonce, exp) {
+    const params = new URLSearchParams({ v: "1", mode: "claim", origin: location.host, nonce, exp: String(exp) });
+    return "https://" + stats.bounceHost + "/claim.html#" + params.toString();
+  }
+
+  function renderQr(url) {
+    // typeNumber 0 auto-sizes to the data; "M" matches the error-
+    // correction level most QR readers assume by default.
+    const qr = qrcode(0, "M");
+    qr.addData(url);
+    qr.make();
+    codeEl.innerHTML = qr.createSvgTag(6, 8);
+    linkEl.href = url;
+  }
+
+  function showExpired() {
+    clearTimeout(pollTimer);
+    statusEl.textContent = "";
+    const msg = document.createElement("span");
+    msg.textContent = "This code expired. ";
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.textContent = "Generate a new code";
+    retry.addEventListener("click", start, { once: true });
+    statusEl.append(msg, retry);
+  }
+
+  function poll(nonce) {
+    pollTimer = setTimeout(async () => {
+      if (Math.floor(Date.now() / 1000) >= expiresAt) {
+        showExpired();
+        return;
+      }
+      try {
+        const res = await fetch("/api/claim-status?nonce=" + encodeURIComponent(nonce));
+        if (res.status === 404) {
+          // Only reachable if OWNER_PUBKEY got set out from under this
+          // page -- treat it the same as a claim landing, since /api/stats
+          // is the actual source of truth either way.
+          location.reload();
+          return;
+        }
+        const { status } = await res.json();
+        if (status === "claimed" || status === "claimed-elsewhere") {
+          location.reload();
+          return;
+        }
+      } catch {
+        // transient network hiccup -- next poll will retry.
+      }
+      poll(nonce);
+    }, CLAIM_STATUS_POLL_MS);
+  }
+
+  async function start() {
+    btn.disabled = true;
+    statusEl.textContent = "";
+    try {
+      const res = await fetch("/api/claim-nonce", { method: "POST" });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        area.hidden = false;
+        btn.hidden = false;
+        btn.disabled = false;
+        statusEl.textContent = body.error || "could not generate a claim code";
+        return;
+      }
+      expiresAt = body.exp;
+      renderQr(claimUrl(body.nonce, body.exp));
+      area.hidden = false;
+      btn.hidden = true;
+      statusEl.textContent = "waiting for your phone…";
+      poll(body.nonce);
+    } catch {
+      btn.disabled = false;
+      statusEl.textContent = "could not reach the relay -- try again";
+    }
+  }
+
+  btn.addEventListener("click", start);
 }
 
 function wireClaimForm() {

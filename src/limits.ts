@@ -177,6 +177,30 @@ export const MAX_INVITE_CODE_LENGTH = 128;
 // person can look at.
 export const MAX_OUTSTANDING_INVITES = 64;
 
+// ---------------------------------------------------------------------
+// QR/signed claim nonces (src/nip42.ts, src/ownership.ts issueClaimNonce).
+// Not the same shape as the invite cap just above: an invite can only be
+// grown by the owner, who is already trusted with everything else this
+// relay does, while a claim nonce can be minted by anyone who loads a
+// public, unclaimed relay's admin page and clicks the button -- the
+// "stranger at your expense" case the README already worries about.
+// ---------------------------------------------------------------------
+
+// How long an issued nonce stays valid. Ten minutes is enough to scan a
+// QR, open a signer, and approve, without leaving a long-lived credential
+// sitting in a URL fragment on a screen someone photographed.
+export const CLAIM_NONCE_TTL_SECONDS = 10 * 60;
+
+// How many unexpired nonces may exist at once. Far more than one owner
+// scanning a code -- and occasionally regenerating one that expired before
+// they got to it -- will ever need. Paired with the sweep in
+// ownership.ts issueClaimNonce (delete-expired-before-counting, not
+// merely exclude-expired-from-the-count, the way group_invites does),
+// this bounds `claim_nonces` at exactly this many rows, forever, however
+// long a relay sits unclaimed and however hard something floods
+// POST /api/claim-nonce.
+export const MAX_OUTSTANDING_CLAIM_NONCES = 8;
+
 // Per-IP join request throttle, the same shape and the same reasoning as
 // the gift wrap one above: kind-9021 is the second write path a stranger
 // can reach without being authorized by anything this relay stored in

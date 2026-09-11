@@ -82,4 +82,11 @@ interface Env {
   MAX_EVENT_BYTES?: string;
   MAX_EVENTS_PER_PUBKEY_PER_MINUTE?: string;
   NON_OWNER_STORAGE_BYTES?: string;
+  // The QR/signed claim path's bounce host (src/nip42.ts, public/claim.html).
+  // Unlike every other var here, its default isn't a fixed constant --
+  // unset, the QR points at this relay's own host (src/relay.ts getStats
+  // `env.BOUNCE_HOST ?? host`), which bothy already serves a bounce page
+  // at (public/claim.html), so a clean deploy needs no external service to
+  // show a working QR. Set this once a real community bounce host exists.
+  BOUNCE_HOST?: string;
 }
