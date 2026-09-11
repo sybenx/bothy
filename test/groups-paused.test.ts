@@ -35,9 +35,12 @@ function stub() {
 }
 
 describe("groupsEnabled", () => {
-  it("is on for the exact string 'on' and paused for anything else", () => {
+  it("is on for the word 'on', however it is cased or spaced, and paused for anything else", () => {
     expect(groupsEnabled(ON)).toBe(true);
-    for (const value of [undefined, "", "true", "ON", "yes", "1", "off"]) {
+    for (const value of ["On", "ON", " on "]) {
+      expect(groupsEnabled({ ...PAUSED, GROUPS: value } as unknown as Env)).toBe(true);
+    }
+    for (const value of [undefined, "", "true", "yes", "1", "off"]) {
       expect(groupsEnabled({ ...PAUSED, GROUPS: value } as unknown as Env)).toBe(false);
     }
   });
@@ -133,6 +136,12 @@ describe("what the relay advertises", () => {
     expect(supportedMethods(PAUSED)).toEqual(SUPPORTED_METHODS.filter((m) => !GROUP_METHODS.includes(m)));
     expect(supportedMethods(ON)).toEqual([...SUPPORTED_METHODS]);
     for (const method of GROUP_METHODS) expect(supportedMethods(PAUSED)).not.toContain(method);
+    // The off-state stays reachable: a device that registered before the
+    // pause can still be unregistered, so the removing half of the pair
+    // is not a group method even though the registering half is.
+    expect(GROUP_METHODS).toContain("subscribepush");
+    expect(GROUP_METHODS).not.toContain("unsubscribepush");
+    expect(supportedMethods(PAUSED)).toContain("unsubscribepush");
     await runInDurableObject(stub(), async (_instance, state) => {
       const sql = state.storage.sql;
       for (const method of GROUP_METHODS) {
@@ -155,11 +164,12 @@ describe("what the relay advertises", () => {
     expect(on.supported_nips.filter((n) => n !== 29)).toEqual(paused.supported_nips);
   });
 
-  it("reports the switch on /api/stats as a mode and nothing more", async () => {
-    // The global bindings have GROUPS=on; the field exists and carries
-    // the mode, the way chatPolicy does. No counts ride with it.
-    const stats = (await stub().getStats()) as { groupPolicy: string; chatPolicy: string };
-    expect(stats.groupPolicy).toBe("on");
-    expect(["on", "paused"]).toContain(stats.groupPolicy);
+  it("puts nothing about groups on /api/stats", async () => {
+    // Configuration a stranger has no use for, and a paused feature the
+    // README does not claim; the switch is read off the environment and
+    // nothing renders it. No mode, and above all no counts.
+    const stats = (await stub().getStats()) as unknown as Record<string, unknown>;
+    expect("groupPolicy" in stats).toBe(false);
+    expect("chatPolicy" in stats).toBe(false);
   });
 });

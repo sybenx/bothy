@@ -127,7 +127,7 @@ function insertEventRow(
   // the upsert is one row in a rowid-aliased table with no index. Both
   // now carry the group half in a second column, which is free: a column
   // added to a statement that already runs is not a row.
-  // CLAUDE.md "The budget" carries the arithmetic.
+  // docs/budget.md carries the arithmetic.
   bumpEventCounters(sql, event.created_at, 1, scope);
   for (const tag of indexedTags) {
     sql.exec(
@@ -673,12 +673,16 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   const driftMessages: string[] = [];
   // `message` is what survives into `maintained_counts.last_drift`, which
   // /api/stats reads back -- and that endpoint is PUBLIC and
-  // unauthenticated. `detail` is the part that goes only to the log line.
-  // The split exists for the group membership check below, whose useful
-  // detail is a list of pubkeys: naming them in `last_drift` would publish
-  // part of this group's membership on the one document anybody can fetch,
-  // which is the disclosure the whole partition exists to prevent. The
-  // stored half therefore counts; the logged half names.
+  // unauthenticated, and the admin page renders it to the owner. So the
+  // stored half is a plain sentence naming the figure as the page names
+  // it and how far off it is; `detail` is the part that goes only to the
+  // log line, and that is where the table, the column and the writer that
+  // must have been bypassed are named, since the person reading a log is
+  // the one who can act on them. The split exists above all for the group
+  // membership check below, whose useful detail is a list of pubkeys:
+  // naming them in `last_drift` would publish part of this group's
+  // membership on the one document anybody can fetch, which is the
+  // disclosure the whole partition exists to prevent.
   const report = (message: string, where: string, detail = "") => {
     driftMessages.push(message);
     console.error(
@@ -687,12 +691,20 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
         `Every write to the counted table must go through ${where}.`,
     );
   };
-  const drift = (what: string, said: number, is: number, where: string) => {
-    report(`${what} says ${said}, the table says ${is} (off by ${said - is})`, where);
+  const drift = (what: string, column: string, said: number, is: number, where: string) => {
+    const gap = Math.abs(said - is);
+    const direction = said > is ? "too high" : "too low";
+    report(`${what} is ${gap} ${direction}`, where, `${column} says ${said}, the table says ${is}`);
   };
 
   if (actual.total !== state.events) {
-    drift("maintained_counts.events", state.events, actual.total, "insertEventRow/deleteEventRow");
+    drift(
+      "the event count",
+      "maintained_counts.events",
+      state.events,
+      actual.total,
+      "insertEventRow/deleteEventRow",
+    );
   }
   // The group halves are audited separately rather than folded into the
   // totals above, because they are what /api/stats SUBTRACTS: a group
@@ -701,6 +713,7 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   // matched would say nothing was wrong.
   if (actual.groupTotal !== state.groupEvents) {
     drift(
+      "the group event count",
       "maintained_counts.group_events",
       state.groupEvents,
       actual.groupTotal,
@@ -709,6 +722,7 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   }
   if (actual.windowed !== counted24h.total) {
     drift(
+      "the 24-hour event count",
       "event_hour_counts, summed over the last 24h",
       counted24h.total,
       actual.windowed,
@@ -717,6 +731,7 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   }
   if (actual.groupWindowed !== counted24h.group) {
     drift(
+      "the 24-hour group event count",
       "event_hour_counts.group_n, summed over the last 24h",
       counted24h.group,
       actual.groupWindowed,
@@ -724,10 +739,11 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
     );
   }
   if (actualFollows !== state.follows) {
-    drift("maintained_counts.follows", state.follows, actualFollows, "refreshFollows");
+    drift("the follow count", "maintained_counts.follows", state.follows, actualFollows, "refreshFollows");
   }
   if (actual.ingested !== ingestBuckets.ingested24h) {
     drift(
+      "the 24-hour count of events received",
       "ingest_hour_counts, summed over the last 24h",
       ingestBuckets.ingested24h,
       actual.ingested,
@@ -736,6 +752,7 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   }
   if (actual.groupIngested !== ingestBuckets.ingestedGroup24h) {
     drift(
+      "the 24-hour count of group events received",
       "ingest_hour_counts.group_n, summed over the last 24h",
       ingestBuckets.ingestedGroup24h,
       actual.groupIngested,
@@ -785,11 +802,11 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
     actual.ingestedCosted * measuredPerEvent + tagRowsInWindow * TAG_ROW_COST_MEASURED,
   );
   if (ingestBuckets.rowsWrittenToday < measuredCost) {
-    drift(
-      "ingest_hour_counts.rows_written, summed over the last 24h, is BELOW the cost of the events in it",
-      ingestBuckets.rowsWrittenToday,
-      measuredCost,
+    report(
+      "rows written today is below the cost of the events stored today",
       "the read-metrics.ts wrapper, landed by storage.ts settleRowsWritten at every entry point",
+      `ingest_hour_counts.rows_written, summed over the last 24h, says ${ingestBuckets.rowsWrittenToday}, ` +
+        `and the events in it cost at least ${measuredCost}`,
     );
   }
 
@@ -820,10 +837,10 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   const unallowedMembers = groupMembersWithoutAllowance(sql);
   if (unallowedMembers.length > 0) {
     report(
-      `${unallowedMembers.length} group member(s) have no allowed_pubkeys row, so the relay-wide write ` +
-        `gate refuses their events even though the group holds them as members`,
+      `${unallowedMembers.length} group member(s) cannot publish here even though the group holds them`,
       "nip29.ts applyModeration, which writes both tables together",
-      `Affected pubkeys: ${unallowedMembers.join(", ")}`,
+      `They have no allowed_pubkeys row, so the relay-wide write gate refuses their events. ` +
+        `Affected pubkeys: ${unallowedMembers.join(", ")}`,
     );
   }
 
@@ -1134,8 +1151,7 @@ export function hasNonOwnerStorageHeadroom(sql: SqlStorage, limit: number): bool
 
 // Current count of stored gift wraps -- backs the maxGiftWraps cap
 // (limits.ts) on the write path. A read against the 5,000,000/day
-// rows-read ceiling, not the rows-written one -- see CLAUDE.md "The
-// budget".
+// rows-read ceiling, not the rows-written one -- see docs/budget.md.
 export function giftWrapCount(sql: SqlStorage): number {
   // Both partitions: nothing stops a sender putting an `h` tag on a gift
   // wrap, and a storage cap that only counted half of what it is capping
@@ -1865,7 +1881,7 @@ function runFilterQuery(
 // backfill.ts hasBackfillHeadroom calls this twice per cron tick, so on
 // an hourly cron that one query was ~288E rows read per day, and at
 // E ~= 17,400 it was the entire 5,000,000/day ceiling on its own with no
-// client connected (CLAUDE.md "The budget").
+// client connected (docs/budget.md).
 //
 // Summing a stamped column removed the join outright and never touches
 // `event_tags` at all. What remained was a scan of `events` itself,
@@ -1878,7 +1894,7 @@ function runFilterQuery(
 // It was not enough, and the reason is that E is not a constant. A cost
 // proportional to everything ever stored, paid twice per cron tick
 // forever, gets worse as the relay fills whether or not anything else
-// changes; it was the last remaining line in CLAUDE.md "The budget"'s
+// changes; it was the last remaining line in docs/budget.md's
 // cron floor, binding at E ~= 104,000. Measured live at E = 4,232:
 // 4,224 rows read per call, which is to say it read the entire table to
 // answer a question about roughly a thousand rows.

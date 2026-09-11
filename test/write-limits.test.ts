@@ -10,7 +10,12 @@
 // refuses, not for the constant it reads.
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MAX_EVENT_BYTES, MAX_EVENTS_PER_PUBKEY_PER_WINDOW } from "../src/limits";
+import {
+  MAX_EVENT_BYTES,
+  MAX_EVENTS_PER_PUBKEY_PER_WINDOW,
+  maxEventBytes,
+  nonOwnerStorageLimit,
+} from "../src/limits";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
 import { type Keypair, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
@@ -85,7 +90,7 @@ describe("event size cap", () => {
     expect(message.startsWith("invalid:")).toBe(true);
     // The signature on this event is genuinely valid -- if the size check
     // ran after schnorr, verifySignature would show a call here. It is the
-    // whole point of putting the cheapest check first (CLAUDE.md "The budget").
+    // whole point of putting the cheapest check first (docs/budget.md).
     expect(verifySignature).not.toHaveBeenCalled();
     conn.close();
   });
@@ -262,5 +267,18 @@ describe("non-owner storage headroom", () => {
 
     expect((await publish(conn, note))[2]).toBe(true);
     conn.close();
+  });
+
+  it("reads the word the way every switch is read: case and spaces do not count", () => {
+    // limits.ts readSwitch: `" OFF "` is `off`, and a value that is
+    // neither a number nor the word keeps the default -- a typo in the
+    // dashboard costs the override, never the cap.
+    const withCap = (value: string | undefined) => ({ NON_OWNER_STORAGE_BYTES: value }) as unknown as Env;
+    expect(nonOwnerStorageLimit(withCap(" OFF "))).toBeNull();
+    expect(nonOwnerStorageLimit(withCap("Off"))).toBeNull();
+    expect(nonOwnerStorageLimit(withCap("no"))).toBe(nonOwnerStorageLimit(withCap(undefined)));
+    expect(nonOwnerStorageLimit(withCap("12345"))).toBe(12345);
+    expect(maxEventBytes({ MAX_EVENT_BYTES: " off" } as unknown as Env)).toBeNull();
+    expect(maxEventBytes({ MAX_EVENT_BYTES: "true" } as unknown as Env)).toBe(MAX_EVENT_BYTES);
   });
 });

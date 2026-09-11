@@ -6,7 +6,7 @@
 //
 // Phase one deliberately implemented only the methods that cost nothing
 // on the per-event write path. banpubkey/allowpubkey and their list
-// methods (phase two, CLAUDE.md "The budget") are the one addition that costs a
+// methods (phase two, docs/budget.md) are the one addition that costs a
 // per-event lookup, added only once a metrics baseline existed to compare
 // against. bothy pairs each with its own inverse (unbanpubkey,
 // unallowpubkey) for symmetry with blockip/unblockip, rather than
@@ -139,12 +139,12 @@ export const MEMBER_CALLABLE_METHODS: readonly string[] = ["subscribepush", "uns
 // discovery list is what a client trusts, and a listed method that
 // belongs to a feature the relay is not running is an advertisement for
 // something that does not work.
-export const GROUP_METHODS: readonly string[] = [
-  "listunusedinvites",
-  "revokeinvite",
-  "subscribepush",
-  "unsubscribepush",
-];
+//
+// unsubscribepush is NOT on it. Pausing must never strand a device that
+// registered before the pause: the off-state has to be reachable from
+// every state, so the one method that removes a subscription keeps
+// answering while the one that adds one is refused.
+export const GROUP_METHODS: readonly string[] = ["listunusedinvites", "revokeinvite", "subscribepush"];
 
 export function supportedMethods(env: Env): string[] {
   return groupsEnabled(env)
@@ -447,8 +447,8 @@ export function handleManagementCall(
         // stop somebody getting in, and being told somebody already did.
         case "spent":
           return err(
-            "revokeinvite: that invite has already been redeemed, so there is nothing left to revoke -- " +
-              "remove the member with a NIP-29 kind-9001 remove-user event instead",
+            "revokeinvite: that invite has already been redeemed, so there is nothing left to revoke; " +
+              "remove the member from the group instead",
           );
         case "already-revoked":
           return err("revokeinvite: that invite was already revoked");

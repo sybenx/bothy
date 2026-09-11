@@ -770,7 +770,7 @@ describe("backfill ingest", () => {
       expect(result.exhausted).toBe(false);
 
       const status = getBackfillStatus(sql);
-      expect(status.status).toBe("paused-budget");
+      expect(status.status).toBe("paused");
       // Cursor must not move past `a` (the event that failed to store) --
       // it needs to be retried once the daily quota resets, not skipped.
       expect(status.nextUntil).toBe(5000);

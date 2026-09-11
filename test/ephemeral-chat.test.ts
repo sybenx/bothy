@@ -17,7 +17,7 @@
 //     relay, which is the assertion with the most ways to go wrong.
 //   + the cost: what a conversation of a few hundred messages spends
 //     against the 100,000 rows-written/day ceiling, measured on a real
-//     SqlStorageCursor like every other figure in CLAUDE.md "The budget".
+//     SqlStorageCursor like every other figure in docs/budget.md.
 //
 // Driven at the storage layer rather than over the wire, for the reason
 // test/nip29-groups.test.ts gives: these are assertions about what got
@@ -483,17 +483,20 @@ describe("reporting mode", () => {
     expect(chatMode({} as unknown as Env)).toBe("reporting");
     expect(chatMode({ EPHEMERAL_CHAT: "on" } as unknown as Env)).toBe("deleting");
     expect(chatMode({ EPHEMERAL_CHAT: "off" } as unknown as Env)).toBe("off");
-    // Only those two exact strings mean anything. Anything else -- a typo
-    // in the dashboard most of all -- lands on the cautious default
-    // rather than on either of the two states that change behaviour.
-    expect(chatMode({ EPHEMERAL_CHAT: "ON" } as unknown as Env)).toBe("reporting");
+    // Only those two words mean anything, read the way every switch is
+    // (limits.ts readSwitch): case and surrounding spaces do not count.
+    // Anything else -- a typo in the dashboard most of all -- lands on
+    // the cautious default rather than on either of the two states that
+    // change behaviour.
+    expect(chatMode({ EPHEMERAL_CHAT: "ON" } as unknown as Env)).toBe("deleting");
+    expect(chatMode({ EPHEMERAL_CHAT: " Off " } as unknown as Env)).toBe("off");
     expect(chatMode({ EPHEMERAL_CHAT: "true" } as unknown as Env)).toBe("reporting");
     expect(chatMode({ EPHEMERAL_CHAT: "" } as unknown as Env)).toBe("reporting");
   });
 });
 
 // What this costs against the 100,000 rows-written/day ceiling
-// (CLAUDE.md "The budget"). Measured on a real SqlStorageCursor, so a
+// (docs/budget.md). Measured on a real SqlStorageCursor, so a
 // change that moves it fails here rather than drifting.
 describe("rows written per swept message", () => {
   function measureRowsWritten(sql: SqlStorage, fn: (sql: SqlStorage) => void): number {
@@ -525,7 +528,7 @@ describe("rows written per swept message", () => {
       const message = chat(emptiedAt - 60, 1);
 
       const stored = measureRowsWritten(sql, (metered) => storeEvent(metered, message, now));
-      // 9 base + 3 for the one `h` tag -- CLAUDE.md "The budget", the
+      // 9 base + 3 for the one `h` tag -- docs/budget.md, the
       // measured figure.
       expect(stored).toBe(12);
 
@@ -671,7 +674,7 @@ describe("rows read per chat REQ", () => {
   });
 });
 
-// The one figure a reader of CLAUDE.md "The budget" will want to check
+// The one figure a reader of docs/budget.md will want to check
 // against the constant rather than against the prose.
 describe("the derived constants", () => {
   it("sizes one tick's sweep at five percent of the day's rows-written ceiling", () => {

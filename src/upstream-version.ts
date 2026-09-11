@@ -11,7 +11,7 @@
 //
 // Runs in the Worker (index.ts handleStats), never in the Durable Object.
 // The DO's outbound requests are budgeted and hibernation-sensitive
-// (CLAUDE.md "The budget"); this is a courtesy notice on an
+// (docs/budget.md); this is a courtesy notice on an
 // unauthenticated read path, which is the last thing that should be able
 // to wake or hold the object. It also means the check costs zero rows
 // written and zero rows read: nothing about it is stored.
@@ -23,6 +23,7 @@
 // having to do that comparison themselves, by hand, having first thought
 // to.
 import {
+  readSwitch,
   UPSTREAM_VERSION_CACHE_TTL_MS,
   UPSTREAM_VERSION_ERROR_CACHE_TTL_MS,
   UPSTREAM_VERSION_MAX_BYTES,
@@ -197,7 +198,7 @@ export function describeUpdate(latest: string | null, current: string): Upstream
 // with latestVersion: null, which the admin page renders as no notice at
 // all -- the same as a check that found nothing.
 export function updateCheckEnabled(env: Env): boolean {
-  return (env.UPDATE_CHECK ?? "").trim().toLowerCase() !== "off";
+  return readSwitch("UPDATE_CHECK", env.UPDATE_CHECK, ["off"]) !== "off";
 }
 
 // Test seam only, beside profile-lookup.ts's resetProfileCache and for

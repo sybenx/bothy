@@ -2,16 +2,19 @@
 // from the write relays in their kind 10002 and store them." This module
 // is the DO-storage-facing half -- pure functions over SqlStorage, called
 // from relay.ts's RPC methods, exactly like ownership.ts/storage.ts. The
-// Worker-side half (outbound sockets, never here -- CLAUDE.md "The
-// budget") lives in backfill-worker.ts.
+// Worker-side half (outbound sockets, never here -- docs/budget.md)
+// lives in backfill-worker.ts.
 import { getOwnHost, normalizeHost } from "./host";
-import { BACKFILL_PAGE_SIZE, BACKFILL_ROWS_SHARE_LIMIT, utcDayStartSeconds } from "./limits";
+import { BACKFILL_ROWS_SHARE_LIMIT, utcDayStartSeconds } from "./limits";
 import { isEphemeralKind } from "./nostr";
 import { estimateRowsWrittenSince, isDeleted, eventExists, storeEvent } from "./storage";
 import { idMatchesContent, isCreatedAtTooFarInFuture, parseEventShape, verifySignature } from "./validate";
 
 export interface BackfillStatus {
-  status: "pending" | "running" | "paused-budget" | "done";
+  // `paused` has one cause -- today's write budget is spent -- and
+  // resolves itself at 00:00 UTC, so the wire carries the state and the
+  // admin page says the reason in words.
+  status: "pending" | "running" | "paused" | "done";
   totalStored: number;
   relayCount: number;
   exhaustedCount: number;
@@ -29,20 +32,12 @@ export interface BackfillStatus {
   // not moving means it runs but stores nothing (a storage/validation
   // problem) -- a distinction nothing else on this object can make.
   lastRunAt: number | null;
-  // Events one run asks each relay for -- limits.ts BACKFILL_PAGE_SIZE,
-  // reported rather than restated. Reading it off the wire is what keeps
-  // the admin page honest when the constant moves: it is derived from
-  // the declared index set (CLAUDE.md "The budget"), so adding an index
-  // shrinks it, and that comment records it having been silently wrong
-  // twice already as a hand-copied literal. A second copy in the page
-  // would be a third.
+  // The page size (limits.ts BACKFILL_PAGE_SIZE) is deliberately NOT on
+  // the wire. It was, so the admin page could say "N events per run"
+  // without a hand-copied literal that had been silently wrong twice;
+  // the page no longer says it, since it is a tuning figure and not a
+  // state, and a script wanting it reads limits.ts.
   //
-  // A constant, not persisted state, so unlike every field above it does
-  // not describe what backfill has done -- it describes what the next
-  // run will ask for. It lives here because it is what the `lastRunAt`
-  // beside it is a run OF, and because this object is already the whole
-  // wire contract for backfill.
-  pageSize: number;
   // What `nextRelay` last said instead of sending history -- its CLOSED,
   // NOTICE or AUTH frames, verbatim and truncated (backfill-worker.ts
   // fetchPage). Null when the last page carried events, or when the relay
@@ -59,7 +54,7 @@ export interface BackfillStatus {
 // backfill-worker.ts needs it for every outbound REQ filter and
 // shouldn't have to make a second RPC call just to learn it.
 // canIngestNow is deliberately not part of the persisted BackfillStatus
-// state machine (pending/running/paused-budget/done) -- it's a
+// state machine (pending/running/paused/done) -- it's a
 // moment-to-moment read of today's rows-written headroom (below), not a
 // transition backfill itself makes, and it can flip from tick to tick
 // purely because of how much the owner posted in between.
@@ -117,7 +112,6 @@ export function getBackfillStatus(sql: SqlStorage): BackfillStatus {
     nextUntil: next?.until_cursor ?? null,
     lastRunAt: meta.last_run_at,
     nextRefusal: next?.last_refusal ?? null,
-    pageSize: BACKFILL_PAGE_SIZE,
   };
 }
 
@@ -167,7 +161,7 @@ interface IngestResult {
 
 // Backs Relay.ingestBackfillPage (relay.ts): the Worker has already
 // fetched one page of raw EVENT payloads from `relayUrl` (authors:
-// [ownerPubkey], until: this relay's current cursor, limit: pageSize) and
+// [ownerPubkey], until: this relay's current cursor, limit: BACKFILL_PAGE_SIZE) and
 // hands them here to be validated and stored. Nothing in this function
 // opens a connection -- see backfill-worker.ts for the outbound half.
 //
@@ -323,7 +317,7 @@ export function applyBackfillPage(
 
   const allExhausted =
     sql.exec(`SELECT 1 FROM backfill_relays WHERE exhausted = 0 LIMIT 1`).toArray().length === 0;
-  const nextStatus = budgetExceeded ? "paused-budget" : allExhausted ? "done" : "running";
+  const nextStatus = budgetExceeded ? "paused" : allExhausted ? "done" : "running";
   sql.exec(
     `UPDATE backfill_meta SET total_stored = total_stored + ?, last_run_at = ?, status = ?`,
     stored,

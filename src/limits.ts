@@ -37,7 +37,7 @@ export const MAX_EVENTS_PER_REQ = 500;
 // pubkeys the owner has merely followed" -- without moving any of the
 // gift wrap caps across. A single compromised or malicious follow was
 // then bounded only by the per-IP message rate limit in relay.ts: at 300
-// messages/minute and the measured 13 rows/event (CLAUDE.md "The budget"), about
+// messages/minute and the measured 13 rows/event (docs/budget.md), about
 // 26 minutes to exhaust the daily rows-written ceiling, and -- far worse,
 // because storage does not reset daily -- under ten minutes to fill the
 // free tier's whole 5GB permanently. Nothing in this codebase bounded an
@@ -45,30 +45,61 @@ export const MAX_EVENTS_PER_REQ = 500;
 // size (developers.cloudflare.com/durable-objects/platform/limits/,
 // checked 2026-08-25), which is a limit on what can be stored, not a
 // defence. 5GB / 2MB is 2,560 events, and 2,560 events at 300/minute is
-// eight and a half minutes. See CLAUDE.md "The budget" for the full before/after.
+// eight and a half minutes. See docs/budget.md for the full before/after.
 //
 // Each cap is raisable or disablable through an environment variable
 // (see resolveLimit below), since none of these ceilings apply on a paid
 // plan.
 // ---------------------------------------------------------------------
 
-// The exact string that turns a cap off. Only this one value, because removing a
+// The one word that turns a cap off. Only this one value, because removing a
 // safety cap must be a deliberate, spelled-out act, never something any
 // truthy value does by accident. A malformed or empty value falls back
 // to the default rather than resolving to "no limit" -- a typo in the
 // Cloudflare dashboard should cost you the override, not the cap.
 const DISABLE_VALUE = "off";
 
+// ONE way to read a switch off the environment, for every variable that
+// takes a word rather than a number: trimmed and lowercased, so
+// `GROUPS=On` and `UPDATE_CHECK=" off"` both do what they look like they
+// do, and the reading cannot differ between two variables because it is
+// the same function. Unset and empty both mean "not set", which every
+// caller resolves to its own default. A non-empty value that is not one
+// of the accepted words is logged ONCE per isolate and then treated as
+// unset -- the same shape write-policy.ts resolveWritePolicy gives a
+// malformed WRITE_POLICY, and for the same reason: the operator who
+// typed it needs to be told, and the relay must not read a typo as any
+// particular setting.
+const warnedSwitches = new Set<string>();
+export function readSwitch(
+  name: string,
+  raw: string | undefined,
+  accepted: readonly string[],
+): string | undefined {
+  if (raw === undefined) return undefined;
+  const value = raw.trim().toLowerCase();
+  if (value === "") return undefined;
+  if (accepted.includes(value)) return value;
+  if (!warnedSwitches.has(name)) {
+    warnedSwitches.add(name);
+    console.warn(
+      `${name} is set to ${JSON.stringify(raw)}, which is not one of ${accepted.join("/")}; ignoring it`,
+    );
+  }
+  return undefined;
+}
+
 // Resolves one of the three env-overridable caps below. Null means the
 // cap is disabled; callers skip the check entirely rather than comparing
 // against Infinity. Read defensively (`env.X` may be undefined) because
-// none of these are declared in wrangler.jsonc -- see src/env.d.ts.
-function resolveLimit(raw: string | undefined, fallback: number): number | null {
+// none of these are declared in wrangler.jsonc -- see src/env.d.ts. The
+// word goes through readSwitch like every other switch; a number is
+// parsed here, since readSwitch knows words only.
+function resolveLimit(name: string, raw: string | undefined, fallback: number): number | null {
   if (raw === undefined) return fallback;
-  if (raw === DISABLE_VALUE) return null;
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
-  return parsed;
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  return readSwitch(name, raw, [DISABLE_VALUE]) === DISABLE_VALUE ? null : fallback;
 }
 
 // Rejects any event larger than this many bytes (JSON-serialized wire
@@ -90,7 +121,7 @@ function resolveLimit(raw: string | undefined, fallback: number): number | null 
 export const MAX_EVENT_BYTES = 64 * 1024;
 
 export function maxEventBytes(env: Env): number | null {
-  return resolveLimit(env.MAX_EVENT_BYTES, MAX_EVENT_BYTES);
+  return resolveLimit("MAX_EVENT_BYTES", env.MAX_EVENT_BYTES, MAX_EVENT_BYTES);
 }
 
 // Total gift wraps this relay will hold at once -- see maxGiftWraps below
@@ -101,7 +132,7 @@ export function maxEventBytes(env: Env): number | null {
 // rate limit in relay.ts (which counts REQ/CLOSE/AUTH too and is tuned
 // for connection-level spam, not specifically for rows-written risk). At
 // 100,000 rows-written/day and ~5 rows per stored gift wrap (see
-// CLAUDE.md "The budget"), an unthrottled flood could exhaust the daily write
+// docs/budget.md), an unthrottled flood could exhaust the daily write
 // budget in minutes; this window is generous for real DM traffic
 // (nobody legitimately sends more than a handful of messages a minute)
 // while keeping a sustained flood far below the daily ceiling.
@@ -169,8 +200,8 @@ export const MAX_INVITE_CODE_LENGTH = 128;
 // at one time.
 //
 // Not a defence against the owner, who is the only pubkey that can create
-// one and whom this relay does not defend against (CLAUDE.md "Threat
-// model"). It is a bound on the LIST: the NIP-86 listunusedinvites method
+// one and whom this relay does not defend against (docs/threat-model.md).
+// It is a bound on the LIST: the NIP-86 listunusedinvites method
 // returns every outstanding code in one response, and an admin who cannot
 // read the list cannot use it to revoke anything. Sixty-four live invites
 // is far past what a single-owner relay hands out and still a response a
@@ -206,7 +237,7 @@ export const MAX_JOIN_REQUESTS_PER_IP_PER_WINDOW = 5;
 // be attached to.
 //
 // Sized against rows-written, not intuition. At the measured 13 rows per
-// stored event (CLAUDE.md "The budget", the corrected figure) and the free tier's
+// stored event (docs/budget.md, the corrected figure) and the free tier's
 // 100,000 rows-written/day:
 //
 //   100,000 / 13 = 7,692 events to exhaust the daily write budget
@@ -247,11 +278,20 @@ export const MAX_JOIN_REQUESTS_PER_IP_PER_WINDOW = 5;
 // events alone, so a signalling burst has to fit inside 50 messages / 10s
 // = 5 events/second/connection, shared with whatever else that connection
 // sends in the same window.
+// The window is pinned at one minute by the NAME of the variable an
+// operator raises the count with, MAX_EVENTS_PER_PUBKEY_PER_MINUTE:
+// a relay that read that variable against any other window would be
+// enforcing a number the operator did not set. Change the window and
+// the variable is renamed with it, with a README migration line.
 export const PUBKEY_RATE_LIMIT_WINDOW_MS = 60_000;
 export const MAX_EVENTS_PER_PUBKEY_PER_WINDOW = 20;
 
 export function maxEventsPerPubkeyPerWindow(env: Env): number | null {
-  return resolveLimit(env.MAX_EVENTS_PER_PUBKEY_PER_MINUTE, MAX_EVENTS_PER_PUBKEY_PER_WINDOW);
+  return resolveLimit(
+    "MAX_EVENTS_PER_PUBKEY_PER_MINUTE",
+    env.MAX_EVENTS_PER_PUBKEY_PER_MINUTE,
+    MAX_EVENTS_PER_PUBKEY_PER_WINDOW,
+  );
 }
 
 // Ceiling on how many pubkeys the in-memory throttle map tracks at once.
@@ -276,7 +316,7 @@ export const PUBKEY_RATE_LIMIT_MAX_TRACKED = 10_000;
 // table; so did `{"authors":[owner],"limit":20}`, on a relay where every
 // row carries the owner's pubkey. 125 such REQs a day cleared the whole
 // 5,000,000 rows-read ceiling, and an ordinary client that re-subscribes
-// on reconnect issues far more than 125 (CLAUDE.md "The budget" "Rows read, by
+// on reconnect issues far more than 125 (docs/budget.md "Rows read, by
 // path").
 //
 // What replaces it asks a different question: WHICH INDEX SERVES THIS
@@ -722,10 +762,12 @@ export function boundFilter(
   if (paramCount > MAX_QUERY_BOUND_PARAMS) {
     return {
       ok: false,
+      // The remedy and nothing about the mechanism: how many parameters a
+      // query binds is this relay's business, and a client can act only
+      // on the shape of its own filter.
       reason:
-        `invalid: filter binds ${paramCount} SQL parameters, over the ` +
-        `${MAX_QUERY_BOUND_PARAMS} limit; name fewer ids, or fewer values in a ` +
-        `#<letter> tag condition, and split it across several REQs`,
+        `invalid: filter names too many ids or tag values at once; name fewer ids, ` +
+        `or fewer values in a #<letter> tag condition, and split it across several REQs`,
     };
   }
 
@@ -742,9 +784,7 @@ export function boundFilter(
       // Unbounded at any limit -- the limit is not what is wrong with it.
       return {
         ok: false,
-        reason:
-          "invalid: filter must constrain ids, kinds, authors or a #<letter> tag; " +
-          "since/until alone would scan the whole table",
+        reason: "invalid: filter must name ids, kinds, authors or a #<letter> tag; since/until alone is not enough",
       };
     }
     if (cost.rowsRead <= budget) return { ok: true, filter: candidate, cost };
@@ -761,9 +801,8 @@ export function boundFilter(
   return {
     ok: false,
     reason:
-      `invalid: filter is too broad to answer within ${budget} rows read ` +
-      `at any limit; name fewer ids, or fewer authors x kinds combinations, ` +
-      `and split it across several REQs`,
+      `invalid: filter is too broad to answer at any limit; name fewer ids, ` +
+      `or fewer authors x kinds combinations, and split it across several REQs`,
   };
 }
 
@@ -910,14 +949,14 @@ export const STORAGE_BYTES_LIMIT = 5 * 1024 * 1024 * 1024;
 export const NON_OWNER_STORAGE_SHARE_LIMIT = STORAGE_BYTES_LIMIT / 2;
 
 export function nonOwnerStorageLimit(env: Env): number | null {
-  return resolveLimit(env.NON_OWNER_STORAGE_BYTES, NON_OWNER_STORAGE_SHARE_LIMIT);
+  return resolveLimit("NON_OWNER_STORAGE_BYTES", env.NON_OWNER_STORAGE_BYTES, NON_OWNER_STORAGE_SHARE_LIMIT);
 }
 
 // Share of total storage the gift wrap inbox may occupy: 1/40 of the 5GB
 // ceiling, ~128MB, well under it even alongside the owner's own data.
 // Generous for a real personal inbox, bounded against storage exhaustion
 // from an anonymous write path -- kind-1059 is the one write path with no
-// ownership check at all (CLAUDE.md "Threat model"), so this cap doesn't
+// ownership check at all (docs/threat-model.md), so this cap doesn't
 // get to trust the size of anything it admits the way NON_OWNER_STORAGE_-
 // SHARE_LIMIT above already bounds non-owner writers generally.
 const GIFT_WRAP_STORAGE_SHARE = STORAGE_BYTES_LIMIT / 40;
@@ -971,8 +1010,8 @@ export function maxGiftWraps(env: Env): number {
   );
 }
 
-// Cloudflare Workers Free's daily rows-written ceiling (CLAUDE.md "The
-// budget"). Named here, not just left as the bare `100000` already
+// Cloudflare Workers Free's daily rows-written ceiling (docs/budget.md).
+// Named here, not just left as the bare `100000` already
 // hardcoded in public/index.html's admin-page display, because
 // backfill's headroom check below needs the actual number to reason
 // about, not just a copy used for a progress bar.
@@ -1314,7 +1353,7 @@ export const BACKFILL_ROWS_SHARE_LIMIT = DAILY_ROWS_WRITTEN_LIMIT / 2;
 
 // One-shot backfill -- events requested per relay per cron tick.
 // Cloudflare's own docs distinguish the Worker's 10ms/request CPU limit
-// (CLAUDE.md "The budget" table) from a Durable Object's own CPU
+// (docs/budget.md table) from a Durable Object's own CPU
 // allowance, which defaults to 30 seconds per incoming request/RPC call
 // (developers.cloudflare.com/durable-objects/platform/limits/, checked
 // 2026-08-22) -- at the ~1.1ms/schnorr-verify baseline (src/validate.ts),
@@ -1614,7 +1653,7 @@ export const CHAT_SWEEP_BATCH_SIZE = Math.max(
 // the exact string is paused.
 // ---------------------------------------------------------------------
 export function groupsEnabled(env: Env): boolean {
-  return env.GROUPS === "on";
+  return readSwitch("GROUPS", env.GROUPS, ["on"]) === "on";
 }
 
 // ---------------------------------------------------------------------
@@ -1647,7 +1686,8 @@ export const MAX_MENTION_EVENT_INDEXED_TAGS = 32;
 export type ChatMode = "off" | "reporting" | "deleting";
 
 export function chatMode(env: Env): ChatMode {
-  if (env.EPHEMERAL_CHAT === "on") return "deleting";
-  if (env.EPHEMERAL_CHAT === DISABLE_VALUE) return "off";
+  const value = readSwitch("EPHEMERAL_CHAT", env.EPHEMERAL_CHAT, ["on", DISABLE_VALUE]);
+  if (value === "on") return "deleting";
+  if (value === DISABLE_VALUE) return "off";
   return "reporting";
 }

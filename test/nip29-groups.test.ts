@@ -682,7 +682,7 @@ describe("regeneration", () => {
 });
 
 // ITEM 3, second half: what a membership change actually costs against the
-// 100,000 rows-written/day ceiling (CLAUDE.md "The budget"). Measured on a
+// 100,000 rows-written/day ceiling (docs/budget.md). Measured on a
 // real SqlStorageCursor, like every other figure in that section, so a
 // change that moves it fails here rather than drifting.
 describe("rows written per membership change", () => {
@@ -834,11 +834,13 @@ describe("the daily audit", () => {
       // And what gets STORED for /api/stats to read back counts rather than
       // names -- that endpoint is public and unauthenticated, so putting
       // member pubkeys in `last_drift` would publish part of this group's
-      // membership to anybody who asked for the page.
+      // membership to anybody who asked for the page. A plain sentence,
+      // too: the table name stays in the log line above.
       const stored = sql
         .exec<{ last_drift: string | null }>(`SELECT last_drift FROM maintained_counts`)
         .toArray()[0]?.last_drift;
-      expect(stored).toContain("no allowed_pubkeys row");
+      expect(stored).toContain("1 group member(s) cannot publish here");
+      expect(stored).not.toContain("allowed_pubkeys");
       expect(stored).not.toContain(member.pubkeyHex);
     });
   });

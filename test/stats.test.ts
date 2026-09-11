@@ -135,9 +135,20 @@ describe("GET /api/profile", () => {
     expect(response.status).toBe(400);
   });
 
-  it("rejects a pubkey that is not 64 hex characters", async () => {
+  it("rejects a pubkey that is neither an npub nor 64 hex characters", async () => {
     const response = await exports.default.fetch("https://example.com/api/profile?pubkey=npub1nope");
     expect(response.status).toBe(400);
+  });
+
+  it("accepts an npub, since that is what the claim form is handed", async () => {
+    // bech32("npub", OWNER_PUBKEY_HEX), as test/claim.test.ts uses it. The
+    // relay under test is claimed, so a well-formed pubkey gets the
+    // endpoint's 404 rather than the 400 a malformed one gets -- the
+    // status that proves the npub passed the same normalisation the claim
+    // itself applies.
+    const npub = "npub17vjpx0uj7gp4xlxhl8z0rncs0qpqzkg3rgvy27qfec7pr9gdsl4suwp7ea";
+    const response = await exports.default.fetch("https://example.com/api/profile?pubkey=" + npub);
+    expect(response.status).toBe(404);
   });
 
   it("is gone once the relay is claimed", async () => {
@@ -343,12 +354,17 @@ describe("maintained event counters", () => {
         // logs at the exact moment this ran.
         expect(status.lastRanAt).not.toBeNull();
         expect(status.drift).not.toBeNull();
-        expect(status.drift?.some((d) => d.includes("maintained_counts.events says 41"))).toBe(true);
+        // A plain sentence, since /api/stats is public and the admin page
+        // renders it; the table and column are in the log line instead.
+        // One event was stored above, so 41 is forty too many.
+        expect(status.drift).toContain("the event count is 40 too high");
+        expect(status.drift?.join(" ")).not.toMatch(/_/);
       });
     } finally {
       console.error = original;
     }
     expect(errors.join("\n")).toContain("MAINTAINED COUNT DRIFT");
+    expect(errors.join("\n")).toContain("maintained_counts.events says 41");
   });
 
   it("reports the audit as never having run until it first runs, and clean thereafter", async () => {

@@ -117,13 +117,24 @@ export function isModerationKind(kind: number): boolean {
   return kind >= MODERATION_KIND_MIN && kind <= MODERATION_KIND_MAX;
 }
 
+// The moderation kinds this relay implements, with NIP-29's name for
+// each. ONE list, and the refusal below is built from it, so the message
+// cannot list three kinds when four are supported -- which it did, for
+// one release after create-invite landed.
+const SUPPORTED_MODERATION_KINDS: ReadonlyArray<readonly [number, string]> = [
+  [PUT_USER_KIND, "put-user"],
+  [REMOVE_USER_KIND, "remove-user"],
+  [EDIT_METADATA_KIND, "edit-metadata"],
+  [CREATE_INVITE_KIND, "create-invite"],
+];
+
 export function isSupportedModerationKind(kind: number): boolean {
-  return (
-    kind === PUT_USER_KIND ||
-    kind === REMOVE_USER_KIND ||
-    kind === EDIT_METADATA_KIND ||
-    kind === CREATE_INVITE_KIND
-  );
+  return SUPPORTED_MODERATION_KINDS.some(([supported]) => supported === kind);
+}
+
+function supportedModerationKindsSentence(): string {
+  const named = SUPPORTED_MODERATION_KINDS.map(([kind, name]) => `${name} (${kind})`);
+  return `${named.slice(0, -1).join(", ")} and ${named[named.length - 1]}`;
 }
 
 // The invite code carried by a kind-9009 create-invite or a kind-9021
@@ -295,9 +306,7 @@ export function authorizeGroupWrite(
     if (!isSupportedModerationKind(event.kind)) {
       return {
         ok: false,
-        message:
-          `invalid: kind ${event.kind} is not implemented -- this relay supports put-user (${PUT_USER_KIND}), ` +
-          `remove-user (${REMOVE_USER_KIND}) and edit-metadata (${EDIT_METADATA_KIND})`,
+        message: `invalid: kind ${event.kind} is not implemented; this relay supports ${supportedModerationKindsSentence()}`,
       };
     }
     // The owner is the sole admin and is a member by exemption, so a
@@ -354,8 +363,8 @@ export function authorizeGroupWrite(
 
   // An ordinary `h`-tagged event: the inner list decides. The owner is
   // exempt for the reason they are exempt from everything else here --
-  // this relay is not defended against its own owner (CLAUDE.md "Threat
-  // model") -- and being exempt is also what keeps the sole admin able to
+  // this relay is not defended against its own owner (docs/threat-model.md)
+  // -- and being exempt is also what keeps the sole admin able to
   // moderate a group they were never put-user'd into.
   if (isOwner) return { ok: true };
   if (isGroupMember(sql, event.pubkey)) return { ok: true };
@@ -430,8 +439,8 @@ function authorizeCreateInvite(
     return {
       ok: false,
       message:
-        `blocked: this relay already has ${MAX_OUTSTANDING_INVITES} unused invites outstanding -- revoke ` +
-        `some with the NIP-86 revokeinvite method, or let them expire`,
+        `blocked: this relay already has ${MAX_OUTSTANDING_INVITES} unused invites outstanding; ` +
+        `revoke some with revokeinvite, or let them expire`,
     };
   }
 

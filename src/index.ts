@@ -74,7 +74,7 @@ async function handleClaim(request: Request, env: Env): Promise<Response> {
   const rawPubkey = (body as { pubkey?: unknown } | null)?.pubkey;
   // Looked up here, in the stateless Worker, not inside the claim() RPC --
   // an outbound WebSocket from inside the DO would pin it in memory for
-  // up to 15 minutes (CLAUDE.md "The budget"; profile-lookup.ts). This
+  // up to 15 minutes (docs/budget.md; profile-lookup.ts). This
   // duplicates claim()'s own normalization, but that's cheap and pure;
   // it's the only way to know which pubkey to look up before calling in.
   //
@@ -149,7 +149,7 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
   // hibernation and spent a request against the daily 100,000. An
   // unauthenticated flood therefore cost a DO wake each, at no cost to
   // the sender. Exactly the shape of the gift wrap gate probe
-  // (CLAUDE.md "The budget"): an expensive operation sitting on the far
+  // (docs/budget.md): an expensive operation sitting on the far
   // side of no gate.
   //
   // Now the DO is reached only by a caller who has already produced a
@@ -289,8 +289,8 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
   // The "a newer bothy exists" notice (src/upstream-version.ts), merged
   // in HERE rather than inside getStats, and the placement is the point:
   // it is an outbound request, and the Durable Object is the one place in
-  // this project that must not make one on a read path (CLAUDE.md "The
-  // budget" -- a socket held there costs duration and blocks
+  // this project that must not make one on a read path (docs/budget.md)
+  // -- a socket held there costs duration and blocks
   // hibernation). The Worker is stateless and pays neither.
   //
   // Started before the DO round trip and awaited after it, so the two
@@ -343,9 +343,13 @@ async function handleProfile(request: Request, env: Env): Promise<Response> {
   const limited = await rateLimited(env.RATE_LIMIT_PROFILE, request);
   if (limited !== null) return limited;
 
-  const pubkey = new URL(request.url).searchParams.get("pubkey");
-  if (!pubkey || !/^[0-9a-f]{64}$/.test(pubkey)) {
-    return json({ error: "expected a ?pubkey= hex query param" }, 400);
+  // Whatever the person pasted into the claim form, npub or hex, through
+  // the same normalisation every other pubkey boundary uses -- this is
+  // the preview OF that paste, so it has to accept what the claim does.
+  const rawPubkey = new URL(request.url).searchParams.get("pubkey");
+  const pubkey = rawPubkey === null ? null : normalizePubkey(rawPubkey);
+  if (pubkey === null) {
+    return json({ error: "expected a ?pubkey= query param carrying an npub or 64 hex characters" }, 400);
   }
 
   // 404, matching /api/claim's disabled branch above rather than
@@ -441,7 +445,9 @@ export default {
       // midnight" -- a distinction the owner could not make last time.
       return new Response(
         JSON.stringify({
-          error: `relay is out of its daily ${verdict.resource} allowance`,
+          // One sentence for the person; the resource name stays in the
+          // `exhausted` field for a script, and in the log line above.
+          error: "this relay is over its daily limit and will accept traffic again at 00:00 UTC",
           exhausted: verdict.resource,
           resets: "00:00 UTC",
         }),
@@ -470,7 +476,7 @@ export default {
   // Both go through logExhaustion rather than a bare console.error. The
   // cron tick is where budget exhaustion shows up FIRST -- it runs hourly
   // whether or not anyone is connected, and the whole of the relay's
-  // client-independent read floor is spent here (CLAUDE.md "The budget")
+  // client-independent read floor is spent here (docs/budget.md)
   // -- so a tick that dies on an allowance is the earliest warning the
   // deployment gets.
   async scheduled(_event: ScheduledController, env: Env): Promise<void> {

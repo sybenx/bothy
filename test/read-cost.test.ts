@@ -4,15 +4,15 @@
 // This file exists because the live relay exhausted the Workers Free
 // plan's 5,000,000 rows-read/day allowance under ordinary single-owner
 // operation and nothing here could say which path spent them --
-// CLAUDE.md "The budget" had measured rows *written* per event to four decimal
+// docs/budget.md had measured rows *written* per event to four decimal
 // places and rows *read* only at the two places somebody was already
-// suspicious of. The figures below are the ones CLAUDE.md "The budget"'s
+// suspicious of. The figures below are the ones docs/budget.md's
 // "Rows read, by path" section reasons from; if a change moves one,
 // that section's arithmetic is stale and has to be redone.
 //
 // Most costs here are measured BOTH ways -- the pre-v0.7.2 form and the
 // current one, against the same rows in the same Durable Object -- so the
-// before/after table in CLAUDE.md "The budget" is a measurement rather than two
+// before/after table in docs/budget.md is a measurement rather than two
 // runs compared from memory. Where an index is what changed, the "before"
 // case is reproduced with SQLite's unary + operator, which suppresses
 // index use on a term (sqlite.org/optoverview.html). Dropping the index
@@ -22,7 +22,7 @@
 // One assertion is still shaped as "this is expensive and scales with the
 // table" rather than "this must stay under N": the event_tags delete. It
 // records a cost that was deliberately NOT fixed, for a reason
-// CLAUDE.md "The budget" states, and a test that pretended otherwise would hide
+// docs/budget.md states, and a test that pretended otherwise would hide
 // it.
 //
 // Rows are inserted straight into `events`/`event_tags` rather than
@@ -384,7 +384,7 @@ describe("rows read by query shape", () => {
   it("costs estimateRowsWrittenSince the size of the 24h window, not the size of the table", async () => {
     // The last line of the fixed daily floor, removed in two steps, and
     // both steps are measured here against the same rows in the same
-    // Durable Object so the before/after in CLAUDE.md "The budget" is a
+    // Durable Object so the before/after in docs/budget.md is a
     // measurement rather than two runs compared from memory.
     //
     // Step one (v0.7.2) removed a LEFT JOIN. The query derived each
@@ -655,14 +655,21 @@ describe("read attribution", () => {
     expect(byPath.has("unattributed")).toBe(false);
   });
 
-  it("surfaces the breakdown on /api/stats", async () => {
+  it("serves the total and its projection on /api/stats, and never the per-path breakdown", async () => {
+    // The breakdown's path names are function names from this repository
+    // and the page never rendered them; the module snapshot above is
+    // where the tests pin the baseline. What a script may read off the
+    // public document is how much has been read and how fast.
     const response = await SELF.fetch("https://example.com/api/stats");
     const stats = (await response.json()) as {
-      reads: { totalRowsRead: number; sinceMs: number; paths: { path: string }[] };
+      reads: { totalRowsRead: number; sinceMs: number; projected24h: number; paths?: unknown };
+      writes?: unknown;
     };
     expect(stats.reads.totalRowsRead).toBeGreaterThan(0);
     expect(stats.reads.sinceMs).toBeGreaterThanOrEqual(0);
-    expect(stats.reads.paths.map((p) => p.path)).toContain("getStats");
+    expect(stats.reads.projected24h).toBeGreaterThanOrEqual(0);
+    expect("paths" in stats.reads).toBe(false);
+    expect("writes" in stats).toBe(false);
   });
 
   it("bounds the events24h window read at 26 rows however deep the history", async () => {

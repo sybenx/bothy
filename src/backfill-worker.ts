@@ -1,7 +1,7 @@
 // One-shot backfill, Worker-side half. Every
 // outbound WebSocket this feature ever opens lives here, in the
 // stateless Worker's scheduled() handler -- never inside the Relay
-// Durable Object. CLAUDE.md "The budget": "an outbound connection keeps
+// Durable Object. docs/budget.md: "an outbound connection keeps
 // the DO in memory for up to 15 minutes even with no traffic," which is
 // exactly the cost hibernation exists to avoid. The DO's role is limited
 // to answering "what's the state" (getBackfillState) and "here's a page
@@ -158,8 +158,8 @@ async function discoverWriteRelays(ownerPubkey: string): Promise<string[]> {
 export async function runBackfillTick(env: Env): Promise<void> {
   const stub = relayStub(env);
   const state = await stub.getBackfillState();
-  if (state === null || state.status === "done" || state.status === "paused-budget") {
-    // paused-budget resolves itself: the next successful ingest call
+  if (state === null || state.status === "done" || state.status === "paused") {
+    // paused resolves itself: the next successful ingest call
     // (once the daily quota resets) flips status back via
     // applyBackfillPage, not this function -- but there is nothing to
     // fetch until then, so skip opening a socket for a page that would

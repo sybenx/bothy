@@ -43,6 +43,7 @@ import {
   maxEventsPerPubkeyPerWindow,
   maxGiftWraps,
   MAX_GIFT_WRAPS_PER_IP_PER_WINDOW,
+  MAX_CREATED_AT_FUTURE_SECONDS,
   MAX_LIVE_FEED_CONNECTIONS,
   MAX_MENTION_EVENT_INDEXED_TAGS,
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
@@ -50,7 +51,6 @@ import {
   CHAT_OCCUPANCY_WRITE_INTERVAL_SECONDS,
   CHAT_SWEEP_BATCH_SIZE,
   chatMode,
-  type ChatMode,
   groupsEnabled,
   MIN_ROOM_OCCUPANTS,
   nonOwnerStorageLimit,
@@ -107,8 +107,6 @@ import {
   readMetricsSnapshot,
   type ReadMetricsSnapshot,
   withReadPath,
-  writeMetricsSnapshot,
-  type WriteMetricsSnapshot,
 } from "./read-metrics";
 import { getRelayPubkey } from "./relay-identity";
 import { initSchema } from "./schema";
@@ -197,7 +195,7 @@ const AUTH_MAX_DRIFT_SECONDS = 600;
 // Per-connection subscriptions, keyed by subscription id, plus the
 // connecting IP for per-IP throttling. Persisted via WebSocket
 // attachment (not object memory) so it survives hibernation -- see
-// CLAUDE.md "The budget" on why an in-memory-only map would be wrong
+// docs/budget.md on why an in-memory-only map would be wrong
 // here: the object can be evicted between messages on an otherwise idle
 // connection, and the attachment is what's still there on the next one.
 //
@@ -261,7 +259,7 @@ function relayTagMatchesHost(tagValue: string, host: string): boolean {
   }
 }
 
-// Per-IP message rate limit (CLAUDE.md "Threat model": "Per-IP
+// Per-IP message rate limit (docs/threat-model.md: "Per-IP
 // throttling inside the DO"). Deliberately in-memory rather than in
 // SQLite: it's a best-effort abuse mitigation, not a correctness
 // guarantee, so it's fine for it to reset on hibernation -- persisting
@@ -503,7 +501,10 @@ export class Relay extends DurableObject<Env> {
       // (liveBroadcast below iterates every open live socket per stored
       // event) and concurrent DO-side attachment state.
       if (this.ctx.getWebSockets(LIVE_FEED_TAG).length >= MAX_LIVE_FEED_CONNECTIONS) {
-        return new Response("too many live feed connections", { status: 503 });
+        return new Response(
+          "the status feed has as many viewers as it allows; close another tab and reload",
+          { status: 503 },
+        );
       }
 
       // acceptWebSocket (not server.accept()) is what makes this
@@ -705,7 +706,7 @@ export class Relay extends DurableObject<Env> {
     rowsWrittenToday: number;
     // The three Workers-free-tier ceilings limits.ts declares, transported
     // rather than left for public/index.html to hardcode a second copy of
-    // -- see CLAUDE.md "The budget". Static per deployment (none of these
+    // -- see docs/budget.md. Static per deployment (none of these
     // are env-overridable), but served from the one place that already
     // knows them so the admin page's progress bars can never drift from
     // what this relay is actually being measured against.
@@ -727,23 +728,11 @@ export class Relay extends DurableObject<Env> {
     // list is empty" when it is, rather than reading as healthy.
     writePolicy: WritePolicy;
     writePolicySource: ResolvedWritePolicy["source"];
-    // Whether NIP-29 groups are accepting anything (limits.ts
-    // groupsEnabled): "on" or "paused". Configuration, like chatPolicy
-    // below, and nothing about what the group holds.
-    groupPolicy: "on" | "paused";
-    // What ephemeral group chat is currently allowed to do (limits.ts
-    // chatMode) -- "off", "reporting" or "deleting".
-    //
-    // The MODE and no numbers, which is the whole of the decision here.
-    // The mode is configuration: it is read off an environment variable
-    // and says nothing about what the group holds or how much it has been
-    // talking. A count of pending or swept messages would say both, on an
-    // endpoint that is public and unauthenticated, and the group
-    // partition is kept off these counters precisely so it cannot
-    // (CLAUDE.md "Threat model"). Those numbers go to the log, where the
-    // owner can read them and a stranger cannot -- see
-    // sweepEphemeralChat.
-    chatPolicy: ChatMode;
+    // Neither the group switch nor the chat mode is on this document. Both
+    // are configuration read off an environment variable, nothing renders
+    // them, and the group partition is kept off every public counter here
+    // (docs/threat-model.md) -- the sweep's numbers go to the log, where
+    // the owner can read them and a stranger cannot; see sweepEphemeralChat.
     // Maintained by ownership.ts refreshFollows, which is the only
     // function that writes the `follows` table -- so this comes out of
     // the same `maintained_counts` row as `totalEvents`, at no extra
@@ -795,13 +784,14 @@ export class Relay extends DurableObject<Env> {
     // so this describes `reads.sinceMs` of uptime, NOT a day -- read it
     // for proportions, and read `projected24h` as an extrapolation of
     // exactly that sample, not as a measurement.
-    reads: ReadMetricsSnapshot;
-    // The write-side twin, over the same in-memory counters. Answers what
-    // `rowsWrittenToday` on its own cannot: WHICH path is spending the
-    // write budget, not just how much of it is spent. `rowsWrittenToday`
-    // stays the authoritative, durable figure -- this is a diagnostic
-    // breakdown of it, with the same reset-on-eviction caveat as `reads`.
-    writes: WriteMetricsSnapshot;
+    //
+    // The total and its projection only. The per-path breakdown
+    // (read-metrics.ts `paths`, and the write-side twin beside it) stays
+    // in the module for the tests that pin the budget baseline through
+    // it, and is not served: its path names are function names from this
+    // repository, the admin page never rendered them, and a diagnostic
+    // marked for removal does not belong on a document scripts read.
+    reads: Omit<ReadMetricsSnapshot, "paths">;
   }> {
     // Scoped to "getStats" rather than measured per query: the nested
     // estimateRowsWrittenSince declares its own scope and so reports
@@ -812,14 +802,15 @@ export class Relay extends DurableObject<Env> {
     // bucket climbing with the request count is that cache broken.
     return this.metered(() => {
       const stats = withReadPath("getStats", () => this.collectStats(host));
-      // Snapshotted after the scope closes so this call's own reads/writes
-      // are included in what it reports -- a breakdown that excluded the
-      // request producing it would understate getStats by exactly one call.
-      return { ...stats, reads: readMetricsSnapshot(), writes: writeMetricsSnapshot() };
+      // Snapshotted after the scope closes so this call's own reads are
+      // included in what it reports -- a total that excluded the request
+      // producing it would understate getStats by exactly one call.
+      const { sinceMs, totalRowsRead, projected24h } = readMetricsSnapshot();
+      return { ...stats, reads: { sinceMs, totalRowsRead, projected24h } };
     });
   }
 
-  private collectStats(host?: string): Omit<Awaited<ReturnType<Relay["getStats"]>>, "reads" | "writes"> {
+  private collectStats(host?: string): Omit<Awaited<ReturnType<Relay["getStats"]>>, "reads"> {
     // recordHost is a write, and it is a no-op once the host is already
     // known (src/host.ts), so it costs nothing to keep honest.
     if (host) recordHost(this.sql, host);
@@ -860,7 +851,7 @@ export class Relay extends DurableObject<Env> {
       claimed: owner !== null,
       ownerPubkey: owner,
       // One more row, from the singleton relay_identity table -- see
-      // CLAUDE.md "The budget" for /api/stats' overall read cost.
+      // docs/budget.md for /api/stats' overall read cost.
       relayPubkey: getRelayPubkey(sql),
       // Both maintained: the row read above, plus at most 26 bucket rows.
       // Current as of this request.
@@ -917,8 +908,6 @@ export class Relay extends DurableObject<Env> {
       relayName: resolveName(this.env, settings, profile),
       writePolicy: this.writePolicy().policy,
       writePolicySource: this.writePolicy().source,
-      groupPolicy: groupsEnabled(this.env) ? "on" : "paused",
-      chatPolicy: chatMode(this.env),
       // Out of the same row as `totalEvents` above, at no additional read.
       followCount: counts.follows,
       countAudit: { lastRanAt: counts.lastRanAt, drift: counts.drift },
@@ -1133,7 +1122,7 @@ export class Relay extends DurableObject<Env> {
     // Scoped here, at the RPC entry, rather than inside applyBackfillPage
     // -- one entry per cron tick, so `rowsPerCall` in the /api/stats
     // breakdown reads as "rows read per backfill tick", which is the unit
-    // the arithmetic in CLAUDE.md "The budget" multiplies by 24.
+    // the arithmetic in docs/budget.md multiplies by 24.
     return this.metered(() =>
       withReadPath("backfillIngest", () => {
         const sql = this.sql;
@@ -1199,7 +1188,7 @@ export class Relay extends DurableObject<Env> {
   }
 
   // True when this connection's IP has sent too many messages within
-  // the current window -- CLAUDE.md "Threat model": "Per-IP throttling
+  // the current window -- docs/threat-model.md: "Per-IP throttling
   // inside the DO."
   private isRateLimited(ws: WebSocket): boolean {
     const { ip } = getState(ws);
@@ -1287,7 +1276,7 @@ export class Relay extends DurableObject<Env> {
 
     // Ownership is checked before id/signature validity, not after.
     // Schnorr verification is the most expensive per-event operation
-    // (CLAUDE.md "The budget": "the CPU risk") and a non-owner write is
+    // (docs/budget.md: "the CPU risk") and a non-owner write is
     // rejected unconditionally regardless of whether it's well-formed --
     // there's no reason to pay for a check whose result can't change the
     // outcome. This also means a non-owner event with a bad id or bad
@@ -1320,8 +1309,8 @@ export class Relay extends DurableObject<Env> {
 
   // NIP-59 (nips/59.md) Gift Wrap accept path -- the one deliberate
   // exception to owner-only writes: any pubkey may write a
-  // kind-1059 event as long as it p-tags the owner. CLAUDE.md "Threat
-  // model" calls this out as "the only unauthenticated write path in the
+  // kind-1059 event as long as it p-tags the owner. docs/threat-model.md
+  // calls this out as "the only unauthenticated write path in the
   // project" and "the only unbounded write path" -- hence the extra
   // abuse controls below, on top of the general per-connection rate
   // limit already applied to every message in webSocketMessage.
@@ -1370,7 +1359,7 @@ export class Relay extends DurableObject<Env> {
     const sql = this.sql;
     const owner = getOwnerPubkey(sql, this.env);
     if (owner === null) {
-      ok(ws, event.id, false, "restricted: relay has not been claimed yet");
+      ok(ws, event.id, false, writeRejectionMessage("unclaimed"));
       return;
     }
     if (!pTagValues(event.tags).includes(owner)) {
@@ -1389,7 +1378,7 @@ export class Relay extends DurableObject<Env> {
     }
 
     if (giftWrapCount(sql) >= maxGiftWraps(this.env)) {
-      ok(ws, event.id, false, "blocked: gift wrap inbox storage is full");
+      ok(ws, event.id, false, "blocked: this relay's mail inbox is full; try again later");
       return;
     }
 
@@ -1593,7 +1582,7 @@ export class Relay extends DurableObject<Env> {
         ws,
         event.id,
         true,
-        "vanish already accepted and in progress: the rest will be removed on subsequent cron ticks",
+        "vanish already accepted and in progress: the rest is still being removed",
       );
       return;
     }
@@ -1637,7 +1626,7 @@ export class Relay extends DurableObject<Env> {
       progress.done
         ? ""
         : `vanish accepted and in progress: ${progress.deleted} events removed, ` +
-          `the rest will be removed on subsequent cron ticks`,
+          `the rest is still being removed`,
     );
   }
 
@@ -1677,10 +1666,15 @@ export class Relay extends DurableObject<Env> {
     // A plain integer comparison -- the cheapest check here after the
     // length above, and still well ahead of id/signature verification, for
     // the same cheapest-check-first reason as the tombstone check below
-    // (CLAUDE.md "Conventions", CLAUDE.md "The budget"). See limits.ts
+    // (CLAUDE.md "Conventions", docs/budget.md). See limits.ts
     // MAX_CREATED_AT_FUTURE_SECONDS for why this rejects at all.
     if (isCreatedAtTooFarInFuture(event, nowSeconds())) {
-      ok(ws, event.id, false, "invalid: created_at is too far in the future");
+      ok(
+        ws,
+        event.id,
+        false,
+        `invalid: created_at is more than ${MAX_CREATED_AT_FUTURE_SECONDS} seconds in the future`,
+      );
       return;
     }
 
@@ -1694,7 +1688,7 @@ export class Relay extends DurableObject<Env> {
     // ~3F + 1 rows a touch with no abuse anywhere in it, until
     // ownership.ts refreshFollows started comparing content instead of
     // timestamps), but because the budget this cap protects is the
-    // owner's own. CLAUDE.md "Threat model" already draws the line:
+    // owner's own. docs/threat-model.md already draws the line:
     // "Nothing here defends the relay against its own owner, and the
     // storage and rate caps deliberately exempt them." Refusing the
     // owner's events would spend the thing the relay exists for --
@@ -1931,7 +1925,7 @@ export class Relay extends DurableObject<Env> {
   // THE LOG LINE IS THE PRODUCT in reporting mode, and it is a log line
   // rather than a field on /api/stats because that endpoint is public and
   // unauthenticated: a count of the group's chat is exactly the sort of
-  // group counter the partition keeps off it (CLAUDE.md "Threat model"),
+  // group counter the partition keeps off it (docs/threat-model.md),
   // and the owner has a channel a stranger cannot read. It is the same
   // call handleJoinRequest makes about its refusals and
   // auditMaintainedCounts makes about drift.
@@ -2117,6 +2111,12 @@ export class Relay extends DurableObject<Env> {
   // synchronous and must not straddle an await -- the same rule fetch()
   // observes for its connect scope.
   private async drainPushOutbox(): Promise<boolean> {
+    // Paused groups send nothing: a row queued before the pause would
+    // otherwise go out the next time the alarm fired for any reason, and
+    // the notification is FOR a room that is not accepting anything. The
+    // rows stay, and the alarm is not rescheduled for them, so unpausing
+    // resumes exactly where it stopped without an empty tick per row.
+    if (!groupsEnabled(this.env)) return false;
     const keys = vapidKeys(this.env);
     if (keys === null) return false;
     const sql = this.sql;
@@ -2262,7 +2262,7 @@ export class Relay extends DurableObject<Env> {
 
   // Scoped as one "req" entry per REQ frame (read-metrics.ts). The
   // NIP-42 gift wrap probe inside declares its own scope, so the two
-  // report separately: the probe is a cost CLAUDE.md "The budget" already
+  // report separately: the probe is a cost docs/budget.md already
   // measured and defended, the REQ query itself is one it never did.
   private handleReq(ws: WebSocket, frame: unknown[]): void {
     withReadPath("req", () => this.handleReqInner(ws, frame));
@@ -2277,7 +2277,12 @@ export class Relay extends DurableObject<Env> {
 
     const state = getState(ws);
     if (!(subId in state.subs) && Object.keys(state.subs).length >= MAX_SUBSCRIPTIONS_PER_CONNECTION) {
-      send(ws, ["CLOSED", subId, "rate-limited: too many open subscriptions"]);
+      send(ws, [
+        "CLOSED",
+        subId,
+        `rate-limited: at most ${MAX_SUBSCRIPTIONS_PER_CONNECTION} open subscriptions per connection; ` +
+          `CLOSE one first`,
+      ]);
       return;
     }
 
@@ -2393,7 +2398,7 @@ export class Relay extends DurableObject<Env> {
       filters.push(bound.filter);
     }
 
-    // NIP-42 gate on gift wrap reads (CLAUDE.md "Threat model": "an
+    // NIP-42 gate on gift wrap reads (docs/threat-model.md: "an
     // anonymous query returns every DM envelope the owner has received,
     // leaking volume and timing"), in two halves that answer to two
     // different rules.
@@ -2570,13 +2575,23 @@ export class Relay extends DurableObject<Env> {
       return;
     }
     if (Math.abs(nowSeconds() - event.created_at) > AUTH_MAX_DRIFT_SECONDS) {
-      ok(ws, event.id, false, "invalid: created_at is too far from now");
+      ok(
+        ws,
+        event.id,
+        false,
+        `invalid: created_at is more than ${AUTH_MAX_DRIFT_SECONDS} seconds from the relay's clock`,
+      );
       return;
     }
     const state = getState(ws);
     const challenge = event.tags.find((t) => t[0] === "challenge")?.[1];
     if (!challenge || !state.challenge || challenge !== state.challenge) {
-      ok(ws, event.id, false, "invalid: no matching challenge was issued");
+      ok(
+        ws,
+        event.id,
+        false,
+        "invalid: no matching challenge was issued; send the request again for a fresh AUTH challenge",
+      );
       return;
     }
     // NIP-42 "Signed Event Verification": "that the relay tag matches
@@ -2703,7 +2718,7 @@ export class Relay extends DurableObject<Env> {
   // at the scheduled time even if it evicted in the meantime, runs
   // alarm() below, and lets it hibernate again afterward, so this never
   // pins the object in memory the way an open outbound connection or an
-  // in-process setTimeout would (CLAUDE.md "The budget"). Only schedules
+  // in-process setTimeout would (docs/budget.md). Only schedules
   // when the existing alarm (if any) is later than this connection's own
   // expiry -- an earlier live feed connection's alarm already fires
   // first and, in alarm() below, reschedules for whatever's next, so a

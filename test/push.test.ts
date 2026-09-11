@@ -270,6 +270,16 @@ describe("the NIP-11 document", () => {
     const info = buildRelayInfo(withKey(), settings, null, OWNER_PUBKEY_HEX, "f".repeat(64));
     expect(info.push_key).toBe(VAPID_PUBLIC);
   });
+
+  it("omits push_key while groups are paused, key or no key", () => {
+    // Push notifies about the group's room. A client that reads a key
+    // subscribes, and a subscription to a room that is not accepting
+    // anything advertises something that does not work -- the same
+    // reason 29 is left off supported_nips.
+    const paused = { ...withKey(), GROUPS: undefined } as unknown as Env;
+    const info = buildRelayInfo(paused, settings, null, OWNER_PUBKEY_HEX, "f".repeat(64));
+    expect("push_key" in info).toBe(false);
+  });
 });
 
 describe("CORS on the management endpoint", () => {
@@ -772,6 +782,37 @@ describe("call presence", () => {
     // they were going, so coming back is an arrival rather than a
     // reconnect.
     expect(captured.length).toBe(1);
+  });
+});
+
+describe("a relay whose groups are paused", () => {
+  it("sends nothing queued before the pause, and keeps the queue for when it lifts", async () => {
+    const member = await joinGroup();
+    const device = await makeDevice("https://push.example/paused");
+    await callManagement("subscribepush", [device], { secretKeyHex: member.secretKeyHex });
+
+    // Queue a notification with groups on, then pause before the alarm
+    // fires -- the shape a pause has in practice, since the variable is
+    // set in the dashboard while the object may hold rows already.
+    const conn = await connect();
+    const [, , accepted] = await publish(conn, chat((await joinGroup()).secretKeyHex, "before the pause"));
+    expect(accepted).toBe(true);
+    conn.close();
+
+    mutableEnv.GROUPS = "paused";
+    try {
+      await fireAlarm();
+      expect(captured).toEqual([]);
+      const outbox = await runInDurableObject(stub(), (_i: Relay, s) =>
+        s.storage.sql.exec(`SELECT reason FROM push_outbox`).toArray().length,
+      );
+      expect(outbox).toBe(1);
+    } finally {
+      mutableEnv.GROUPS = "on";
+    }
+
+    await fireAlarm();
+    expect(captured.map((p) => p.url)).toEqual([device.endpoint]);
   });
 });
 

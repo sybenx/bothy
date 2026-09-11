@@ -194,7 +194,7 @@
 
 <script>
 // The three Workers-free-tier ceilings this page displays progress
-// against (CLAUDE.md "The budget"), read from /api/stats rather than
+// against (docs/budget.md), read from /api/stats rather than
 // hardcoded here a second time -- src/limits.ts STORAGE_BYTES_LIMIT /
 // DAILY_ROWS_WRITTEN_LIMIT / DAILY_ROWS_READ_LIMIT is the one place that
 // declares them. Assigned once main() has the response; every consumer
@@ -370,7 +370,7 @@ function renderBackfillStatus(backfill) {
       case "running":
         el.textContent = count + " imported so far (" + backfill.exhaustedCount + "/" + backfill.relayCount + " relays done)" + lastRun;
         break;
-      case "paused-budget":
+      case "paused":
         el.textContent = count + " imported -- paused, resumes after today's write limit resets at 00:00 UTC" + lastRun;
         break;
     }
@@ -446,15 +446,13 @@ function renderDiagnostics(stats) {
       : "ran " + when + ", counts agree";
   }
 
-  // History import (backfill). pageSize comes off the wire rather than
-  // being copied here; it is derived from the index set on the server.
+  // History import (backfill).
   const backfill = stats.backfill;
   if (!backfill) {
     document.getElementById("diag-backfill-at").textContent = "n/a";
   } else {
     const lastRun = backfill.lastRunAt ? new Date(backfill.lastRunAt * 1000).toLocaleString() : "not yet run";
-    let text = lastRun + " (" + backfill.pageSize + " events per run; " +
-      backfill.exhaustedCount + " of " + backfill.relayCount + " relays finished";
+    let text = lastRun + " (" + backfill.exhaustedCount + " of " + backfill.relayCount + " relays finished";
     if (backfill.nextRelay) {
       text += "; next: " + backfill.nextRelay;
       // textContent below, never innerHTML -- nextRefusal is a string a
@@ -542,7 +540,7 @@ function describeKind(kind) {
 // Closed whenever the tab isn't visible, and only reopened when it is --
 // this is the live feed's idle timeout: a background tab
 // left open for hours must not hold a live DO connection the whole time
-// (CLAUDE.md "The budget": duration only stays cheap if hibernation
+// (docs/budget.md: duration only stays cheap if hibernation
 // actually works, and a socket nobody is looking at is exactly the kind
 // of thing that's easy to forget is still open).
 function wireLiveFeed() {

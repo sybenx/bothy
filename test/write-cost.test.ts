@@ -3,7 +3,7 @@
 //
 // This file exists because a live relay reported rowsWrittenToday at 42,006
 // of 100,000 with only 146 events ingested that day -- roughly 3,000 of that
-// is event storage (CLAUDE.md "The budget"'s per-event figures), and nothing
+// is event storage (docs/budget.md's per-event figures), and nothing
 // before this file could say what the other ~39,000 was. src/read-metrics.ts
 // WriteMetricsSnapshot answers "which path", mirroring the rows-read
 // attribution row for row; this file asserts that mirror is wired correctly
@@ -12,7 +12,7 @@
 // ownership.ts refreshFollows is rebuilding the follow cache on every cron
 // tick because backfill keeps ingesting a kind-3 older than the one already
 // cached.
-import { env, runInDurableObject, SELF } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
@@ -77,21 +77,6 @@ describe("write attribution", () => {
     expect(snapshot.totalRowsWritten).toBeGreaterThanOrEqual(write?.rowsWritten ?? 0);
   });
 
-  it("surfaces the write breakdown on /api/stats, mirroring the read breakdown", async () => {
-    const conn = await connectRelay();
-    const note = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "hi" });
-    await publish(conn, note);
-    conn.close();
-
-    const response = await SELF.fetch("https://example.com/api/stats");
-    const stats = (await response.json()) as {
-      writes: { totalRowsWritten: number; sinceMs: number; paths: { path: string; rowsWritten: number }[] };
-    };
-    expect(stats.writes.totalRowsWritten).toBeGreaterThan(0);
-    expect(stats.writes.sinceMs).toBeGreaterThanOrEqual(0);
-    expect(stats.writes.paths.map((p) => p.path)).toContain("write");
-  });
-
   it("does not attribute a read-only REQ to any write path", async () => {
     const conn = await connectRelay();
     conn.send(["REQ", "sub", { kinds: [1], limit: 1 }]);
@@ -105,7 +90,7 @@ describe("write attribution", () => {
   });
 });
 
-// CLAUDE.md "The budget" ascribes refreshFollows's own cost to "3 rows per
+// docs/budget.md ascribes refreshFollows's own cost to "3 rows per
 // member on the insert and 1 on the removal" for a NIP-29 membership
 // change; a full follow-cache rebuild is the same shape (delete all, insert
 // all) over a much larger N. The hypothesis under test: does an ordinary

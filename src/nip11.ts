@@ -249,8 +249,12 @@ export function buildRelayInfo(
   // absence is the entire degradation path: hearth reads no key, never
   // calls subscribepush, keeps raising notifications while it is open,
   // and says so in its account overlay. A relay with push switched off is
-  // not a relay with push broken.
-  const pushKey = pushPublicKey(env);
+  // not a relay with push broken. Omitted while groups are paused for the
+  // same reason 29 is left off supported_nips above: push notifies about
+  // the group's room, a client that reads a key subscribes, and a
+  // subscription to a room that is not accepting anything is an
+  // advertisement for something that does not work.
+  const pushKey = groupsEnabled(env) ? pushPublicKey(env) : null;
   if (pushKey) {
     info.push_key = pushKey;
   }
