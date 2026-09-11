@@ -32,8 +32,8 @@ export const MAX_EVENTS_PER_REQ = 500;
 // The original threat model had exactly one
 // untrusted write path: kind-1059 gift wraps, "the only unbounded write
 // path", since every other write was the owner's own and the owner is
-// trusted not to attack their own relay. v0.2.0 made ALLOW_FOLLOWS an
-// opt-OUT, which quietly turned "one trusted author" into "hundreds of
+// trusted not to attack their own relay. v0.2.0 opened writes to the
+// owner's follows by default, which quietly turned "one trusted author" into "hundreds of
 // pubkeys the owner has merely followed" -- without moving any of the
 // gift wrap caps across. A single compromised or malicious follow was
 // then bounded only by the per-IP message rate limit in relay.ts: at 300
@@ -52,8 +52,7 @@ export const MAX_EVENTS_PER_REQ = 500;
 // plan.
 // ---------------------------------------------------------------------
 
-// The exact string that turns a cap off. Same shape as ALLOW_FOLLOWS
-// (ownership.ts allowFollowsEnabled) and for the same reason: removing a
+// The exact string that turns a cap off. Only this one value, because removing a
 // safety cap must be a deliberate, spelled-out act, never something any
 // truthy value does by accident. A malformed or empty value falls back
 // to the default rather than resolving to "no limit" -- a typo in the
@@ -1599,7 +1598,7 @@ export const CHAT_SWEEP_BATCH_SIZE = Math.max(
 //
 // Three states, and the default is the cautious one, which inverts this
 // file's usual only-one-exact-string-disables-it shape (DISABLE_VALUE
-// above, ALLOW_FOLLOWS, UPDATE_CHECK). Those guard a SAFETY limit, so the
+// above, UPDATE_CHECK). Those guard a SAFETY limit, so the
 // dangerous act is turning one off and that is what must be spelled out.
 // Here the dangerous act is deletion itself, so it is deletion that has to
 // be spelled out and everything else defaults to watching:
@@ -1615,6 +1614,57 @@ export const CHAT_SWEEP_BATCH_SIZE = Math.max(
 //
 // Reporting rather than off as the default because a feature that ships
 // switched off ships untested on the only deployment that matters.
+// ---------------------------------------------------------------------
+// NIP-29 groups: PAUSED unless GROUPS is the exact string "on".
+//
+// The group code (src/nip29.ts, src/groups.ts, the ephemeral chat sweep,
+// web push) stays in the tree and stays tested, and README.md "What this
+// is not" already declined to claim it; this is the switch that makes the
+// relay match that stance at runtime. Paused means: no group-scoped event
+// is accepted from any client including the owner, no moderation event
+// and no join request is honoured, the cron tick neither samples the
+// room nor sweeps it, and the NIP-11 document does not list 29. What is
+// already IN the group partition stays where it is, still hidden from
+// unauthenticated reads and still readable by the owner and the members
+// on the list -- pausing a room is not emptying it.
+//
+// Same inverted shape as EPHEMERAL_CHAT below and for the same reason:
+// the write-path caps are safety limits, so turning one OFF is the act
+// that has to be spelled out; here it is turning the feature ON that
+// admits new writers to a partition, so that is the act. Any value but
+// the exact string is paused.
+// ---------------------------------------------------------------------
+export function groupsEnabled(env: Env): boolean {
+  return env.GROUPS === "on";
+}
+
+// ---------------------------------------------------------------------
+// The `mentions` write policy (src/write-policy.ts): anyone may write, if
+// the event p-tags the owner. The policies below it are bounded by
+// somebody the owner chose -- themselves, their correspondents, their
+// follows -- and this one is bounded by "how many people mention the
+// owner", which is a number strangers pick. Every non-owner write already
+// pays MAX_EVENT_BYTES, MAX_EVENTS_PER_PUBKEY_PER_WINDOW and the
+// non-owner storage share; what none of those bound is rows written PER
+// EVENT, which is 3 per single-letter tag (schema.ts TAG_ROW_COST). A
+// 64KB event can carry ~2,000 of them, so one stranger under `mentions` could
+// spend ~6,000 rows -- six percent of the day -- per event, twenty a
+// minute per pubkey, from as many pubkeys as they like.
+//
+// So a stranger's event is capped in indexed tags, and the number is
+// sized to a real conversation rather than to the budget: a NIP-10 reply
+// carries an `e` for the root, one for the parent, a `p` for everyone in
+// the thread and a handful of `t`/`q`/`r` tags -- a deep thread reaches
+// twenty, and nothing a person writes by hand reaches thirty. At 32 tags
+// the worst event costs 12 + 4 x 32 = 140 charged rows, and a pubkey at
+// the rate cap spends ~2,800 rows a minute -- visible on the admin page
+// and revocable by banpubkey long before it matters. Not applied to the
+// owner's follows: a follow is somebody the owner chose, and their
+// contact list (a kind-3 with hundreds of `p` tags) is exactly the event
+// this cap would refuse.
+// ---------------------------------------------------------------------
+export const MAX_MENTION_EVENT_INDEXED_TAGS = 32;
+
 export type ChatMode = "off" | "reporting" | "deleting";
 
 export function chatMode(env: Env): ChatMode {

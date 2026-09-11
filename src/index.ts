@@ -456,7 +456,7 @@ export default {
     }
   },
 
-  // ALLOW_FOLLOWS refresh -- a no-op when the env var is unset, see
+  // follow-cache refresh -- see
   // Relay.runCron(). One-shot backfill shares this same trigger rather
   // than requesting a second of the account's 5 available cron triggers
   // -- see backfill-worker.ts for why its outbound sockets are opened

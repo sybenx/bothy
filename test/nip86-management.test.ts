@@ -406,16 +406,18 @@ describe("changerelayname / changerelaydescription / changerelayicon", () => {
     expect((await relayInfo()).name).toBe("bothy");
   });
 
-  it("teaches the empty-string escape hatch and the NIP-11 readback on every successful change", async () => {
-    for (const [method, value] of [
-      ["changerelayname", "Signal Hill"],
-      ["changerelaydescription", "Notes."],
-      ["changerelayicon", "https://example.com/i.png"],
+  it("states what was stored and nothing else when no environment variable is in the way", async () => {
+    // How to clear a value and where to read it back are in the README,
+    // once. A response that repeats the lesson on every call is noise on
+    // the second call and every one after it.
+    for (const [method, value, field] of [
+      ["changerelayname", "Signal Hill", "name"],
+      ["changerelaydescription", "Notes.", "description"],
+      ["changerelayicon", "https://example.com/i.png", "icon"],
     ]) {
       const reply = await callManagement(method, [value]);
       expect(reply.result).toBe(true);
-      expect(reply.error).toContain("empty string");
-      expect(reply.error).toContain("application/nostr+json");
+      expect(reply.error).toBe(`Stored the relay ${field}.`);
     }
   });
 

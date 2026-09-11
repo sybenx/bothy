@@ -43,11 +43,13 @@ import {
   GROUP_SCOPE,
   groupIdOf,
   isAnyGroupEvent,
+  isGroupEvent,
   isGroupMetadataKind,
   TOP_LEVEL_GROUP_ID,
 } from "./groups";
 import {
   chatMode,
+  groupsEnabled,
   INVITE_DEFAULT_TTL_SECONDS,
   INVITE_MAX_TTL_SECONDS,
   MAX_INVITE_CODE_LENGTH,
@@ -58,6 +60,7 @@ import { type NostrEvent, pTagValues } from "./nostr";
 import { getOwnerPubkey } from "./ownership";
 import { signAsRelay, getRelayPubkey } from "./relay-identity";
 import {
+  groupHost,
   hostsGroup,
   invalidateHostedGroups,
   createGroup,
@@ -108,6 +111,13 @@ export { CREATE_INVITE_KIND };
 // at the bottom of this file for where it is decided and why it has to be
 // dispatched above the relay-wide write gate.
 export const JOIN_REQUEST_KIND = 9021;
+
+// What every group-scoped write and every join request is answered with
+// while GROUPS is not "on" (limits.ts groupsEnabled). One string for
+// both, exported so relay.ts handleJoin and nip86.ts say exactly what
+// authorizeGroupWrite says. It names no configuration: the person being
+// refused is not the operator, and the operator reads the README.
+export const GROUPS_PAUSED_MESSAGE = "restricted: groups are paused on this relay";
 
 // NIP-29 reserves 9000-9020 for moderation actions. bothy implements
 // three of them and REFUSES the rest by name rather than letting them
@@ -262,6 +272,19 @@ export function authorizeGroupWrite(
   // by the NIP-11 `self` pubkey)... Relays shouldn't accept these events if
   // they're signed by anyone else." Refused for every client including the
   // owner -- the relay's own regeneration does not come through here.
+  //
+  // AHEAD of the pause check below, and that ordering is the answer to a
+  // question the two halves of this function disagreed about. A forged
+  // 39000-series event is refused whether groups are paused or not, so
+  // `restricted: groups are paused` would be the wrong reason twice over:
+  // it names configuration for something that is not about configuration,
+  // and it implies unpausing would let the event through. It also has to
+  // be here rather than after, because isGroupEvent deliberately does not
+  // count 39000/39001 (groups.ts isPubliclyReadableGroupKind, which is
+  // what makes the public half of the group's state publicly readable) --
+  // so with the pause check first, a client-signed 39000 got this refusal
+  // and a client-signed 39002 got the pause message. Same forgery, two
+  // answers, decided by nothing the client did.
   if (isGroupMetadataKind(event.kind)) {
     return {
       ok: false,
@@ -269,6 +292,30 @@ export function authorizeGroupWrite(
         `invalid: kind ${event.kind} is group state generated and signed by this relay itself, ` +
         `not accepted from clients`,
     };
+  }
+
+  // Paused (limits.ts groupsEnabled): nothing group-shaped is accepted
+  // from anyone, the owner included. The SAME refusal for every shape --
+  // a moderation event, a member's note, the owner's own chat message --
+  // since the reason is the relay's configuration and not anything about
+  // the event. The one shape that is NOT answered here is the forged
+  // 39000-series above, for the reason given there.
+  //
+  // An event tagged into some OTHER relay's group is still held to the
+  // member list below rather than refused here: that traffic is not this
+  // relay's group, and pausing this relay's group says nothing about it.
+  // That is why the test is isGroupEvent (a group this relay hosts) and
+  // not isAnyGroupEvent.
+  //
+  // The environment read runs FIRST and short-circuits, so the hosted-group
+  // lookup beside it is reached only while groups are paused -- and it is
+  // memoised in instance memory anyway (storage.ts hostsGroup), so the
+  // unpaused path pays one boolean and no storage access at all.
+  if (
+    !groupsEnabled(env) &&
+    (isGroupEvent(event, groupHost(sql)) || isModerationKind(event.kind))
+  ) {
+    return { ok: false, message: GROUPS_PAUSED_MESSAGE };
   }
 
   if (isModerationKind(event.kind)) {

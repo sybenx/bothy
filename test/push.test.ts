@@ -253,7 +253,7 @@ describe("the VAPID keypair", () => {
 });
 
 describe("the NIP-11 document", () => {
-  const settings = { name: null, description: null, icon: null };
+  const settings = { name: null, description: null, icon: null, writePolicy: null };
 
   it("omits push_key entirely when no key is configured", () => {
     const info = buildRelayInfo(

@@ -29,7 +29,7 @@ function stub() {
   return env.RELAY.get(env.RELAY.idFromName("relay"));
 }
 
-const FOLLOWS_ENV = { OWNER_PUBKEY: OWNER_PUBKEY_HEX, ALLOW_FOLLOWS: "true" } as unknown as Env;
+const FOLLOWS_ENV = { OWNER_PUBKEY: OWNER_PUBKEY_HEX, WRITE_POLICY: "follows" } as unknown as Env;
 
 // The same local instrument test/follows.test.ts and test/hibernation.test.ts
 // use for a real SqlStorageCursor.rowsWritten total, independent of

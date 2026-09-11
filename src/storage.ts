@@ -35,6 +35,7 @@ import {
   isReplaceableKind,
   type NostrEvent,
   pTagValues,
+  isIndexedTag,
 } from "./nostr";
 
 interface EventRow extends Record<string, string | number | null> {
@@ -65,15 +66,6 @@ export function expirationOf(event: NostrEvent): number | null {
   if (!tag?.[1]) return null;
   const value = Number(tag[1]);
   return Number.isInteger(value) ? value : null;
-}
-
-// True for a tag this relay writes an `event_tags` row for. Only
-// single-letter tag names are indexed (NIP-01 `#<letter>` filters only
-// ever query those), and only each tag's first value -- see schema.ts's
-// write-cost comment. Shared by insertEventRow and the row-cost stamp
-// below so the count and the inserts can never disagree.
-function isIndexedTag(tag: string[]): boolean {
-  return tag[0]?.length === 1 && tag[1] !== undefined;
 }
 
 // `ingestedAt` is wall-clock now, not event.created_at -- see schema.ts's
@@ -2290,6 +2282,11 @@ export interface RelaySettings {
   name: string | null;
   description: string | null;
   icon: string | null;
+  // The stored write policy (write-policy.ts resolveWritePolicy), what
+  // NIP-86 changewritepolicy writes. Kept as the string the operator
+  // supplied and parsed at resolution time, so an unparseable stored
+  // value falls through to the default rather than refusing every write.
+  writePolicy: string | null;
 }
 
 export function getRelaySettings(sql: SqlStorage): RelaySettings {
@@ -2299,7 +2296,18 @@ export function getRelaySettings(sql: SqlStorage): RelaySettings {
     name: byKey.get("name") ?? null,
     description: byKey.get("description") ?? null,
     icon: byKey.get("icon") ?? null,
+    writePolicy: byKey.get("write_policy") ?? null,
   };
+}
+
+// Just the stored policy, for the write path. One indexed row read, paid
+// by relay.ts once per wake (it caches the resolved policy per instance
+// and invalidates it on a management call) rather than per event.
+export function getStoredWritePolicy(sql: SqlStorage): string | null {
+  const row = sql
+    .exec<{ value: string }>(`SELECT value FROM relay_settings WHERE key = ?`, "write_policy")
+    .toArray()[0];
+  return row?.value ?? null;
 }
 
 // An empty string clears the stored value rather than storing one --
@@ -2307,7 +2315,9 @@ export function getRelaySettings(sql: SqlStorage): RelaySettings {
 // falling back down the chain (README.md "Relay management API"). Storing
 // "" instead would be indistinguishable from a deliberate empty name and
 // would shadow the kind-0 and hardcoded rungs forever.
-export function setRelaySetting(sql: SqlStorage, key: "name" | "description" | "icon", value: string): void {
+export type RelaySettingKey = "name" | "description" | "icon" | "write_policy";
+
+export function setRelaySetting(sql: SqlStorage, key: RelaySettingKey, value: string): void {
   if (value === "") {
     sql.exec(`DELETE FROM relay_settings WHERE key = ?`, key);
     return;

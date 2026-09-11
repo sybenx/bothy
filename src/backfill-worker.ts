@@ -151,7 +151,7 @@ async function discoverWriteRelays(ownerPubkey: string): Promise<string[]> {
 }
 
 // Called once per cron tick (src/index.ts scheduled()), alongside the
-// existing ALLOW_FOLLOWS refresh. A cheap no-op once backfill is done or
+// existing follow-cache refresh. A cheap no-op once backfill is done or
 // the relay is unclaimed -- getBackfillState's single RPC call covers
 // both checks so this function only ever opens an outbound socket when
 // there's real work to do.

@@ -22,6 +22,7 @@ import {
   banPubkey,
   blockIp,
   deletePushSubscription,
+  getStoredWritePolicy,
   listAllowedPubkeys,
   listBannedEvents,
   listBannedPubkeys,
@@ -34,11 +35,20 @@ import {
   unblockIp,
   upsertPushSubscription,
 } from "./storage";
-import { MAX_PUSH_SUBSCRIPTIONS_PER_PUBKEY } from "./limits";
+import { groupsEnabled, MAX_PUSH_SUBSCRIPTIONS_PER_PUBKEY } from "./limits";
+import { GROUPS_PAUSED_MESSAGE } from "./nip29";
 import { pushConfigured } from "./push";
 import { getOwnerPubkey } from "./ownership";
 import { normalizeIp } from "./ip";
 import { normalizePubkey } from "./pubkey";
+import {
+  envOverridesPolicy,
+  OPEN_POLICY_CONFIRMATION,
+  parsePolicy,
+  POLICY_DESCRIPTIONS,
+  resolveWritePolicy,
+  WRITE_POLICIES,
+} from "./write-policy";
 
 // nips/86.md: "a JSON-RPC-like request-response protocol over HTTP, on
 // the same URI as the relay's websocket", distinguished by this
@@ -78,6 +88,15 @@ export const SUPPORTED_METHODS = [
   "changerelayname",
   "changerelaydescription",
   "changerelayicon",
+  // bothy's own: the write policy (src/write-policy.ts). NIP-86 has no
+  // notion of a write policy beyond its per-pubkey lists, and the policy
+  // is the thing those lists sit inside. changewritepolicy takes a policy
+  // name and follows the change* conventions (empty string clears, an
+  // environment variable outranks the stored value and the response
+  // says so); getwritepolicy reads back the policy in force and where it
+  // came from, which NIP-11 has no field for.
+  "changewritepolicy",
+  "getwritepolicy",
   // bothy's own, not NIP-86's. The spec defines no invite methods at all,
   // so these two are an extension in the same spirit as the empty-string
   // unset convention on the change* methods, and are documented in the
@@ -114,6 +133,25 @@ export const SUPPORTED_METHODS = [
 // subscription row.
 export const MEMBER_CALLABLE_METHODS: readonly string[] = ["subscribepush", "unsubscribepush"];
 
+// The methods that belong to the group feature (limits.ts groupsEnabled).
+// While groups are paused they are left out of supportedmethods and
+// answer with the same refusal every other group path gives: the
+// discovery list is what a client trusts, and a listed method that
+// belongs to a feature the relay is not running is an advertisement for
+// something that does not work.
+export const GROUP_METHODS: readonly string[] = [
+  "listunusedinvites",
+  "revokeinvite",
+  "subscribepush",
+  "unsubscribepush",
+];
+
+export function supportedMethods(env: Env): string[] {
+  return groupsEnabled(env)
+    ? [...SUPPORTED_METHODS]
+    : SUPPORTED_METHODS.filter((method) => !GROUP_METHODS.includes(method));
+}
+
 // The exact string blockip demands back as its `reason` before it will
 // block the address the management request itself came from. Chosen to
 // be unmistakably deliberate and impossible to send by accident, and
@@ -147,39 +185,48 @@ function pubkeyParam(params: unknown[], index: number): string | null {
   return typeof value === "string" ? normalizePubkey(value) : null;
 }
 
-// The advisory note every successful change* call carries back in the
-// `error` field. Two things every operator needs and NIP-86 gives them no
-// other way to learn: that an empty string is the unset operation (the
-// spec defines none, so this is bothy's convention -- README.md "Relay
-// management API"), and that the value which actually takes effect is
-// whatever the NIP-11 document reports, not necessarily what was just
-// stored. When an environment variable outranks the stored value, that is
-// said plainly here too, because the alternative -- refusing the call, or
-// storing silently -- either loses the operator's input or lies about it.
+// The note a successful change* call carries back in the `error` field,
+// which is the one field NIP-86 offers for saying anything beside a
+// result. It states what happened, and adds one sentence only when an
+// environment variable is outranking the value just stored -- the case
+// where the call otherwise appears to have done nothing. How to clear a
+// value and where to read it back are in the README, once, rather than
+// repeated on every call.
 function identityNote(
   field: "name" | "description" | "icon",
-  method: string,
   envVarName: string,
   envValue: string | undefined,
   cleared: boolean,
 ): string {
-  const parts = [
-    cleared ? `Cleared the stored relay ${field}.` : `Stored the relay ${field}.`,
-  ];
+  const parts = [cleared ? `Cleared the stored relay ${field}.` : `Stored the relay ${field}.`];
   if (envValue) {
     parts.push(
       `Note: ${envVarName} is set in this deployment's environment and takes precedence over the stored value, ` +
         `so the stored value takes effect only once ${envVarName} is cleared in the Cloudflare dashboard.`,
     );
   }
-  parts.push(
-    `Calling ${method} with an empty string is what clears the stored value, falling back to the owner's ` +
-      `kind-0 profile and then to the built-in default.`,
-  );
-  parts.push(
-    `The value actually in effect is whatever this relay's NIP-11 document reports -- request it with an ` +
-      `Accept: application/nostr+json header.`,
-  );
+  return parts.join(" ");
+}
+
+// The advisory note every changewritepolicy response carries, in the
+// error field for the reason identityNote gives: it is the one field
+// NIP-86 offers for saying anything beside a result. It always ends by
+// stating the policy actually IN FORCE after the call, because that is
+// the question the operator has and there are two ways the answer
+// differs from what they just stored: WRITE_POLICY in the environment
+// outranks the stored value, and clearing the stored value falls back to
+// the default. Store and warn, never silently discard -- the same rule
+// as the name/description/icon methods.
+function writePolicyNote(sql: SqlStorage, env: Env, headline: string): string {
+  const parts = [headline];
+  if (envOverridesPolicy(env)) {
+    parts.push(
+      `Note: WRITE_POLICY is set in this deployment's environment and takes precedence over the stored ` +
+        `value, so the stored value takes effect only once WRITE_POLICY is cleared in the Cloudflare dashboard.`,
+    );
+  }
+  const resolved = resolveWritePolicy(env, getStoredWritePolicy(sql));
+  parts.push(`The write policy now in force is "${resolved.policy}": ${POLICY_DESCRIPTIONS[resolved.policy]}`);
   return parts.join(" ");
 }
 
@@ -196,7 +243,7 @@ function changeIdentity(
   setRelaySetting(sql, field, value);
   // A successful call returns result true AND an error-field note -- see
   // identityNote. The note is advisory; the write already happened.
-  return { result: true, error: identityNote(field, method, envVarName, envValue, value === "") };
+  return { result: true, error: identityNote(field, envVarName, envValue, value === "") };
 }
 
 // The subscription object hearth sends as subscribepush's one parameter
@@ -290,9 +337,15 @@ export function handleManagementCall(
 ): ManagementResponse {
   if (typeof method !== "string") return err("request is missing a string 'method'");
 
+  // See GROUP_METHODS: a paused feature's methods answer the way every
+  // other group path answers, ahead of any parameter parsing.
+  if (GROUP_METHODS.includes(method) && !groupsEnabled(env)) {
+    return err(GROUPS_PAUSED_MESSAGE.replace(/^restricted: /, ""));
+  }
+
   switch (method) {
     case "supportedmethods":
-      return { result: [...SUPPORTED_METHODS] };
+      return { result: supportedMethods(env) };
 
     case "banevent": {
       const id = stringParam(params, 0);
@@ -340,7 +393,7 @@ export function handleManagementCall(
 
     // A manual allowlist, independent of banned_pubkeys -- see the header
     // comment above. Grants write access to a pubkey the owner doesn't
-    // follow (or, with ALLOW_FOLLOWS off, to anyone named individually)
+    // follow (or, under the owner/inbox policies, to anyone named individually)
     // without opening writes more broadly.
     case "allowpubkey": {
       const pubkey = pubkeyParam(params, 0);
@@ -498,6 +551,51 @@ export function handleManagementCall(
 
     case "changerelayicon":
       return changeIdentity(sql, params, "icon", method, "RELAY_ICON", env.RELAY_ICON);
+
+    // The write policy (src/write-policy.ts). Stored as the operator gave
+    // it, resolved on the write path through the same env-then-stored-
+    // then-default chain the relay's name uses -- see writePolicyNote
+    // for what the response has to tell them and why.
+    case "changewritepolicy": {
+      const raw = params[0];
+      if (raw === "") {
+        setRelaySetting(sql, "write_policy", "");
+        return { result: true, error: writePolicyNote(sql, env, "Cleared the stored write policy.") };
+      }
+      const policy = parsePolicy(raw);
+      if (policy === null) {
+        return err(
+          `changewritepolicy takes one parameter, a policy name: ${WRITE_POLICIES.join(", ")}. ` +
+            `An empty string clears the stored policy.`,
+        );
+      }
+      // Opening the relay to everyone is allowed, but never on the first
+      // try -- the blockip self-block shape. It is the one policy whose
+      // consequence is unbounded by anything the owner chose, and the
+      // command that sets it is one word long.
+      if (policy === "all" && params[1] !== OPEN_POLICY_CONFIRMATION) {
+        return err(
+          `changewritepolicy: "all" lets anyone publish any event to this relay, bounded only by the ` +
+            `per-event size cap, the per-pubkey rate cap and the storage share reserved for you. ` +
+            `Every other policy is bounded by people you chose. To proceed, call changewritepolicy again ` +
+            `with "all" and a second parameter set to exactly: ${OPEN_POLICY_CONFIRMATION}`,
+        );
+      }
+      setRelaySetting(sql, "write_policy", policy);
+      return { result: true, error: writePolicyNote(sql, env, `Stored write policy "${policy}".`) };
+    }
+
+    case "getwritepolicy": {
+      const resolved = resolveWritePolicy(env, getStoredWritePolicy(sql));
+      return {
+        result: {
+          policy: resolved.policy,
+          source: resolved.source,
+          description: POLICY_DESCRIPTIONS[resolved.policy],
+          policies: WRITE_POLICIES.map((name) => ({ name, description: POLICY_DESCRIPTIONS[name] })),
+        },
+      };
+    }
 
     // Implemented as an explanation rather than left to the
     // unknown-method fallback below. "Unknown method" would read as

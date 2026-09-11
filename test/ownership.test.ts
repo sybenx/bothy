@@ -1,12 +1,11 @@
 // Owner-gated writes (CLAUDE.md "Threat model": "Writes
 // are owner-only and signature-verified" for anyone not the owner or,
-// under the ALLOW_FOLLOWS default, one of the owner's follows).
+// under the default write policy, one of the owner's follows).
 //
-// The global test env leaves ALLOW_FOLLOWS unset (vitest.config.ts), which
-// under the opt-out default (ownership.ts allowFollowsEnabled) means
-// follows mode is ON -- a non-owner stranger here is rejected for not
-// being a follow, not for a blanket owner-only rule. See
-// test/follows.test.ts for the ALLOW_FOLLOWS=false owner-only case.
+// The global test env sets no WRITE_POLICY (vitest.config.ts), and the
+// default policy is "follows" -- a non-owner stranger here is rejected
+// for not being a follow, not for a blanket owner-only rule. See
+// test/follows.test.ts for the owner-only case.
 //
 // The OWNER_PUBKEY fixture here is injected as a miniflare binding in
 // vitest.config.ts, matching CLAUDE.md's documented env-override path:

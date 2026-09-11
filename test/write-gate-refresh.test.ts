@@ -7,7 +7,7 @@
 //
 // isAllowedWriter is mocked to always accept so a non-owner kind-3 can
 // reach relay.ts's acceptEvent path at all -- with the real gate,
-// ALLOW_FOLLOWS would have to be on *and* the sender already a follow just
+// the sender would already have to be a follow just
 // to get this far, which would obscure the thing actually under test
 // here: that relay.ts's own `event.pubkey === owner` check, not
 // isAllowedWriter, is what decides whether a stored event triggers a
@@ -21,19 +21,15 @@ import { isolateStorage } from "./helpers/isolate";
 import { OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
 import { connectRelay, publish } from "./helpers/socket";
 
-// ALLOW_FOLLOWS is an opt-out (ownership.ts allowFollowsEnabled), so the
-// global test env's unset value already means follows mode is on -- but
-// refreshFollows is still wrapped to force ALLOW_FOLLOWS on explicitly
-// (mirroring the custom FOLLOWS_ENV test/follows.test.ts builds), so the
-// assertions below don't depend on the default staying what it is today.
+// refreshFollows is wrapped rather than replaced so the real cache-rebuild
+// logic still runs and can be asserted on. It is not gated on the write
+// policy (ownership.ts), so no env override is needed.
 vi.mock("../src/ownership", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/ownership")>();
   return {
     ...actual,
     isAllowedWriter: vi.fn(() => ({ allowed: true }) as const),
-    refreshFollows: vi.fn((sql: SqlStorage, env: Env) =>
-      actual.refreshFollows(sql, { ...env, ALLOW_FOLLOWS: "true" }),
-    ),
+    refreshFollows: vi.fn((sql: SqlStorage, env: Env) => actual.refreshFollows(sql, env)),
   };
 });
 

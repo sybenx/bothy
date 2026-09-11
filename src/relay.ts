@@ -46,12 +46,14 @@ import {
   maxGiftWraps,
   MAX_GIFT_WRAPS_PER_IP_PER_WINDOW,
   MAX_LIVE_FEED_CONNECTIONS,
+  MAX_MENTION_EVENT_INDEXED_TAGS,
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
   VANISH_BATCH_SIZE,
   CHAT_OCCUPANCY_WRITE_INTERVAL_SECONDS,
   CHAT_SWEEP_BATCH_SIZE,
   chatMode,
   type ChatMode,
+  groupsEnabled,
   MIN_ROOM_OCCUPANTS,
   nonOwnerStorageLimit,
   PUBKEY_RATE_LIMIT_MAX_TRACKED,
@@ -62,6 +64,7 @@ import {
 import {
   applyModeration,
   authorizeGroupWrite,
+  GROUPS_PAUSED_MESSAGE,
   handleJoinRequest,
   isSupportedModerationKind,
   JOIN_REQUEST_KIND,
@@ -89,7 +92,6 @@ import {
   VANISH_KIND,
 } from "./nostr";
 import {
-  allowFollowsEnabled,
   CONTACT_LIST_KIND,
   claimOwner,
   getOwnerPubkey,
@@ -97,7 +99,9 @@ import {
   isAllowedWriter,
   refreshFollows,
   refreshProfile,
+  type WriteRejection,
 } from "./ownership";
+import { admitsAtLeast, resolveWritePolicy, type ResolvedWritePolicy, type WritePolicy } from "./write-policy";
 import type { Profile } from "./profile-lookup";
 import { normalizePubkey } from "./pubkey";
 import {
@@ -147,6 +151,7 @@ import {
   fixMisclassifiedGroupEvents,
   migrateToMultiGroup,
   getRelaySettings,
+  getStoredWritePolicy,
   giftWrapCount,
   sweepExpiredGiftWraps,
   hasNonOwnerStorageHeadroom,
@@ -308,7 +313,7 @@ function ok(ws: WebSocket, id: string, accepted: boolean, message: string): void
 // client rather than for a developer reading logs. All get the
 // `restricted:` prefix per NIP-01's own worked example (nips/01.md line
 // 173).
-function writeRejectionMessage(reason: "unclaimed" | "not-follow" | "owner-only" | "banned"): string {
+function writeRejectionMessage(reason: WriteRejection): string {
   switch (reason) {
     case "unclaimed":
       return "restricted: relay has not been claimed yet";
@@ -318,6 +323,13 @@ function writeRejectionMessage(reason: "unclaimed" | "not-follow" | "owner-only"
       return "restricted: writes are limited to the relay owner";
     case "banned":
       return "blocked: this pubkey is banned from writing here";
+    // The two `mentions` refusals (write-policy.ts). Each names the
+    // boundary it enforces, so a stranger learns what this relay WOULD
+    // accept.
+    case "not-mention":
+      return "restricted: only the owner, people they follow, and events that mention the owner can publish here";
+    case "too-many-tags":
+      return `restricted: an event from someone the owner does not follow may carry at most ${MAX_MENTION_EVENT_INDEXED_TAGS} indexed tags`;
   }
 }
 
@@ -388,6 +400,22 @@ export class Relay extends DurableObject<Env> {
   // waking cold in the same second must not be able to move the watermark
   // backwards.
   private roomSampledAt = 0;
+
+  // The effective write policy (write-policy.ts resolveWritePolicy),
+  // cached per instance so the write gate pays no row for it per event:
+  // the one stored-setting read happens on the first non-owner write
+  // after a wake and is then answered from memory until the next one.
+  // Cleared by manage() after every management call, because
+  // changewritepolicy is the only thing that can change the stored half
+  // and it arrives through that method on this same single-threaded
+  // object -- so a policy change takes effect on the very next event
+  // rather than on the next eviction.
+  private cachedWritePolicy: ResolvedWritePolicy | undefined;
+
+  private writePolicy(): ResolvedWritePolicy {
+    this.cachedWritePolicy ??= resolveWritePolicy(this.env, getStoredWritePolicy(this.sql));
+    return this.cachedWritePolicy;
+  }
 
   // Set when this invocation queued something into `push_outbox`, and
   // cleared by settlePushAlarm() at the end of the invocation. A flag
@@ -601,11 +629,17 @@ export class Relay extends DurableObject<Env> {
     callerIp: string,
     signer: string,
   ): Promise<ManagementResponse> {
-    return this.metered(() =>
+    const response = await this.metered(() =>
       withReadPath("management", () =>
         handleManagementCall(this.sql, this.env, method, params, callerIp, nowSeconds(), signer),
       ),
     );
+    // See cachedWritePolicy. Cleared unconditionally rather than only for
+    // changewritepolicy: the cost is one row read on the next non-owner
+    // write, and a cache that has to know which methods invalidate it is
+    // a cache that will one day be wrong about one.
+    this.cachedWritePolicy = undefined;
+    return response;
   }
 
   // Whether a pubkey is in this relay's one group -- for the Worker's
@@ -691,14 +725,17 @@ export class Relay extends DurableObject<Env> {
     // NIP-86 has no getrelayname, so this is the read side for
     // changerelayname.
     relayName: string;
-    // Whether writes beyond the owner are currently possible at all
-    // (CLAUDE.md "What it is"), plus the numbers that
-    // back that state -- see the ALLOW_FOLLOWS-gate comment in
-    // ownership.ts isAllowedWriter. Surfaced so an owner who enabled
-    // ALLOW_FOLLOWS but never published a kind-3 here (an empty allowlist
-    // that silently blocks every follow) has a visible signal instead of
-    // a mystery.
-    writePolicy: "owner" | "follows";
+    // The write policy in force (write-policy.ts), by name, and where it
+    // came from -- the environment, a stored changewritepolicy, or the
+    // default. The admin page renders the policy as one sentence; the
+    // follow count beside it is what lets that sentence say "the follow
+    // list is empty" when it is, rather than reading as healthy.
+    writePolicy: WritePolicy;
+    writePolicySource: ResolvedWritePolicy["source"];
+    // Whether NIP-29 groups are accepting anything (limits.ts
+    // groupsEnabled): "on" or "paused". Configuration, like chatPolicy
+    // below, and nothing about what the group holds.
+    groupPolicy: "on" | "paused";
     // What ephemeral group chat is currently allowed to do (limits.ts
     // chatMode) -- "off", "reporting" or "deleting".
     //
@@ -883,7 +920,9 @@ export class Relay extends DurableObject<Env> {
       // to the static default favicon client-side.
       icon: resolveIcon(this.env, settings, profile),
       relayName: resolveName(this.env, settings, profile),
-      writePolicy: allowFollowsEnabled(this.env) ? "follows" : "owner",
+      writePolicy: this.writePolicy().policy,
+      writePolicySource: this.writePolicy().source,
+      groupPolicy: groupsEnabled(this.env) ? "on" : "paused",
       chatPolicy: chatMode(this.env),
       // Out of the same row as `totalEvents` above, at no additional read.
       followCount: counts.follows,
@@ -934,7 +973,7 @@ export class Relay extends DurableObject<Env> {
   }
 
   // Cron entry point (src/index.ts scheduled()) -- refreshes the
-  // ALLOW_FOLLOWS cache and, at most once/day, the cached NIP-11/favicon
+  // follow cache and, at most once/day, the cached NIP-11/favicon
   // icon from the owner's locally-stored kind-0 (ownership.ts
   // refreshProfile). Both are no-ops on their common paths (feature off;
   // empty list; already refreshed today), so this stays cheap on most
@@ -1022,17 +1061,24 @@ export class Relay extends DurableObject<Env> {
         // watermark forward before the sweep reads it -- the other order
         // would decide the room had been empty for two hours using a
         // watermark it was about to correct.
-        this.noteRoomOccupancy(sql, now);
-        // Ephemeral group chat (limits.ts, the section beginning
-        // CONVERSATION_IDLE_SECONDS). Costs one row read and one row
-        // written on a quiet relay; on a busy one it is bounded by
-        // CHAT_SWEEP_BATCH_SIZE and checkpointed, exactly as the vanish
-        // drain below is.
         //
-        // Ahead of the vanish drain for the same reason everything else
-        // in this tick is: this is the relay tidying its own room, and
-        // the one step a stranger's request sizes goes last.
-        withReadPath("chatSweep", () => this.sweepEphemeralChat(sql, now));
+        // Both this and the sweep below are skipped while groups are
+        // paused (limits.ts groupsEnabled): a paused room takes no new
+        // chat, so there is no conversation to time and nothing whose
+        // removal the reporting mode should be describing.
+        if (groupsEnabled(this.env)) {
+          this.noteRoomOccupancy(sql, now);
+          // Ephemeral group chat (limits.ts, the section beginning
+          // CONVERSATION_IDLE_SECONDS). Costs one row read and one row
+          // written on a quiet relay; on a busy one it is bounded by
+          // CHAT_SWEEP_BATCH_SIZE and checkpointed, exactly as the vanish
+          // drain below is.
+          //
+          // Ahead of the vanish drain for the same reason everything else
+          // in this tick is: this is the relay tidying its own room, and
+          // the one step a stranger's request sizes goes last.
+          withReadPath("chatSweep", () => this.sweepEphemeralChat(sql, now));
+        }
         // Expired gift wraps (storage.ts sweepExpiredGiftWraps). Every
         // other kind is content with being hidden once it expires; this
         // one is capped by COUNT (limits.ts maxGiftWraps), so a hidden
@@ -1263,7 +1309,10 @@ export class Relay extends DurableObject<Env> {
     // signature still gets "restricted:"/"blocked:", not "invalid:", which
     // is fine: NIP-01 doesn't require checking id/sig before authorization.
     const sql = this.sql;
-    const auth = isAllowedWriter(sql, this.env, event.pubkey);
+    const auth = isAllowedWriter(sql, this.env, event.pubkey, {
+      policy: this.writePolicy().policy,
+      tags: event.tags,
+    });
     if (!auth.allowed) {
       ok(ws, event.id, false, writeRejectionMessage(auth.reason));
       return;
@@ -1324,6 +1373,15 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
+    // The `inbox` policy (write-policy.ts): a gift wrap is addressed
+    // mail, and a relay under `owner` accepts only its owner's own events
+    // -- which a wrap, signed by a throwaway key, never is. Ahead of the
+    // owner lookup because it is answered from the cached policy.
+    if (!admitsAtLeast(this.writePolicy().policy, "inbox")) {
+      ok(ws, event.id, false, "restricted: writes are limited to the relay owner, and that includes mail");
+      return;
+    }
+
     const sql = this.sql;
     const owner = getOwnerPubkey(sql, this.env);
     if (owner === null) {
@@ -1365,6 +1423,17 @@ export class Relay extends DurableObject<Env> {
   // here is the wire-level work that has to happen before any invite code
   // is looked at, and the ORDER of it is the part that matters.
   private handleJoin(ws: WebSocket, event: NostrEvent): void {
+    // Paused groups (limits.ts groupsEnabled) refuse the join before
+    // anything else: it is an environment read, and there is no invite
+    // to redeem into a group that is not accepting anyone. Said plainly
+    // rather than with JOIN_REFUSAL_MESSAGE, because this is
+    // configuration and not a fact about any code -- it is the same
+    // answer whatever the request carried.
+    if (!groupsEnabled(this.env)) {
+      ok(ws, event.id, false, GROUPS_PAUSED_MESSAGE);
+      return;
+    }
+
     // Size first, for the reason acceptEvent states about its own copy of
     // this check: it is the only check whose result bounds the cost of
     // the rest, and idMatchesContent below re-serializes and hashes the
@@ -1744,7 +1813,7 @@ export class Relay extends DurableObject<Env> {
       // Refresh the follow cache the instant the owner publishes a new
       // kind-3, rather than waiting up to an hour for the next cron tick
       // (CLAUDE.md "What it is"). Gated on `event.pubkey === owner`,
-      // not just `event.kind` -- under ALLOW_FOLLOWS a follow can publish
+      // not just `event.kind` -- under the follows policy a follow can publish
       // their own kind-3 through this same accept path, and refreshFollows
       // always re-derives from the *owner's* most recent event regardless
       // of whose write triggered the call, so this only costs an extra
@@ -2563,7 +2632,7 @@ export class Relay extends DurableObject<Env> {
     // claim the owner's identity.
     const relayTag = event.tags.find((t) => t[0] === "relay")?.[1];
     if (!relayTag || !relayTagMatchesHost(relayTag, state.host)) {
-      ok(ws, event.id, false, "invalid: relay tag does not match this relay");
+      ok(ws, event.id, false, "invalid: relay tag does not name this relay");
       return;
     }
     state.authedPubkey = event.pubkey;
