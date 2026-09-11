@@ -76,7 +76,7 @@ and cheaper; hand it the plan and the exact list.
 ### 4. Review (held by the human, produced by a fresh session)
 
 A session that did not write the code reads the diff against two
-things: the approved plan, and the ten questions at the end of
+things: the approved plan, and the checklist at the end of
 [principles.md](principles.md). Its instruction is to find what is
 wrong, not to summarise what was done. It reports findings; it changes
 nothing. The human decides which findings go back to stage 3.

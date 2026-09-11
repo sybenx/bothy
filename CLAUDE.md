@@ -6,7 +6,7 @@ This file describes what the relay is and does. The reasoning behind it lives in
 
 ## Documents
 
-- [docs/principles.md](docs/principles.md) — the design principles every change is held against, and the ten-question checklist.
+- [docs/principles.md](docs/principles.md) — the design principles every change is held against, and the checklist.
 - [docs/workflow.md](docs/workflow.md) — how a human and an AI assistant work on this repository: the four stages, the gates, which model does what.
 - [docs/rungs.md](docs/rungs.md) — the write-policy ladder, the internal vocabulary behind the five policy names.
 - [docs/budget.md](docs/budget.md) — the rows-written and rows-read measurements the suite asserts, and the arithmetic against the free-tier ceilings.
