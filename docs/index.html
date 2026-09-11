@@ -115,22 +115,19 @@ npx wrangler deploy
 <td>Point at which writes from anyone but you are refused, reserving what&#39;s left of the 5GB free-tier ceiling for your own archive. Defaults to <code>2684354560</code> (half). Raise it to a number, or set it to <code>off</code>.</td>
 </tr>
 <tr>
-<td><code>WRITE_RUNG</code></td>
-<td>Pin the write policy to a rung of the ladder (see &quot;Who can write here&quot; below): <code>1</code>–<code>4</code>, or <code>owner</code>, <code>inbox</code>, <code>follows</code>, <code>mentions</code>. Set here it outranks whatever was set through the management API. Unset, the stored value applies, and then the default of <code>3</code> (follows).</td>
-</tr>
-<tr>
-<td><code>ALLOW_FOLLOWS</code></td>
-<td>The older way of narrowing writes, kept so existing deployments keep behaving: <code>false</code> reads as rung <code>2</code> (owner plus mail), which is exactly what it always produced. Prefer <code>WRITE_RUNG</code>, which outranks it.</td>
+<td><code>WRITE_POLICY</code></td>
+<td>Who can publish here: <code>owner</code>, <code>inbox</code>, <code>follows</code>, <code>mentions</code> or <code>all</code> (see &quot;Who can write here&quot; below). Set here it outranks the value set through the management API. Unset, the management API&#39;s value applies, then the default, <code>follows</code>.</td>
 </tr>
 <tr>
 <td><code>GROUPS</code></td>
-<td>NIP-29 groups are <strong>paused</strong> unless this is the exact string <code>on</code>. Paused, the relay refuses every group-scoped write, moderation event and join request, and stops advertising NIP-29; what is already in the group partition stays readable by the owner and the members on the list. The group code is not documented here yet — see &quot;What this is not&quot;.</td>
+<td>NIP-29 groups are paused unless this is <code>on</code>. See &quot;What this is not&quot;.</td>
 </tr>
 <tr>
 <td><code>UPDATE_CHECK</code></td>
 <td>On by default: the relay asks this repo what the current release is (one request, cached for six hours, made by the Worker rather than by your browser) so the admin page can say when a newer one exists. Set it to <code>off</code> and the relay never makes that request; the footer then simply shows no notice.</td>
 </tr>
 </tbody></table></div>
+<p><code>ALLOW_FOLLOWS</code> is no longer read. If you had set it to <code>false</code>, set <code>WRITE_POLICY=owner</code> instead.</p>
 <p>If your Worker is connected to a GitHub repo, Cloudflare may sync <code>wrangler.jsonc</code>&#39;s config on every deploy, which can overwrite a variable you added in the dashboard by hand — worth knowing if a dashboard-added variable seems to reset after a deploy.</p>
 <p>This relay&#39;s read path is intentionally public, so it is worth adding a free Cloudflare rate-limiting rule against abusive traffic: in the Cloudflare dashboard, go to <strong>Security → WAF → Rate limiting rules</strong> for your zone and cap requests per IP to your Worker&#39;s route. The relay enforces its own per-connection and per-IP limits regardless, but an edge rule catches abuse before it reaches the Worker at all.</p>
 <h2 id="inbox-mode-gift-wrapped-dms">Inbox mode (gift-wrapped DMs)<a class="anchor" href="#inbox-mode-gift-wrapped-dms" aria-label="Link to this section">#</a></h2>
@@ -138,61 +135,53 @@ npx wrangler deploy
 <p>Reading them back is restricted to you. A query that names kind 1059 gets a <a href="https://github.com/nostr-protocol/nips/blob/master/42.md">NIP-42</a> AUTH challenge instead of results; a query that doesn&#39;t name a kind is answered normally, with the gift wraps simply absent from what comes back. The second half matters as much as the first: refusing a query only when it would have matched a gift wrap makes the refusal itself the answer, and a stranger sliding a time window across your relay could count and time-correlate your incoming DMs from the refusals alone, without ever mentioning kind 1059. Leaving them out answers the same way whether your inbox is full or empty. You can delete a gift wrap the same way you&#39;d delete any note (<a href="https://github.com/nostr-protocol/nips/blob/master/09.md">NIP-09</a>), and <a href="https://github.com/nostr-protocol/nips/blob/master/62.md">NIP-62</a> &quot;Request to Vanish&quot; support means either you or a message&#39;s sender can ask for it to be permanently purged.</p>
 <p><strong>Worth knowing:</strong> Cloudflare terminates the TLS connection in front of this relay, so it necessarily sees the <code>p</code> tag (who a gift wrap is addressed to), the arrival time, and the sender&#39;s IP address, the same as any other Worker traffic. On a personal relay the <code>p</code> tag is always you, so that part leaks nothing new; the sender IPs, though, belong to other people sending you mail through infrastructure that you chose.</p>
 <h2 id="who-can-write-here">Who can write here<a class="anchor" href="#who-can-write-here" aria-label="Link to this section">#</a></h2>
-<p>Write access is a ladder with four rungs, and your relay sits on one of them. Each rung admits everyone the rung below it admits, plus one more class of author — so the number says how open the relay is, and moving it is one command.</p>
+<p>Your relay has one write policy, and you choose it:</p>
 <div class="table-scroll"><table>
 <thead>
 <tr>
-<th>Rung</th>
-<th>Name</th>
+<th>Policy</th>
 <th>Who can publish</th>
-<th>What bounds the volume</th>
 </tr>
 </thead>
 <tbody><tr>
-<td>1</td>
 <td><code>owner</code></td>
-<td>You.</td>
-<td>Your own posting rate.</td>
+<td>Only you.</td>
 </tr>
 <tr>
-<td>2</td>
 <td><code>inbox</code></td>
-<td>You, plus gift-wrapped mail addressed to you from anyone (see &quot;Inbox mode&quot; above).</td>
-<td>Per-message size, a storage share reserved for mail, and a per-sender throttle.</td>
+<td>You, and anyone sending you gift-wrapped mail (see &quot;Inbox mode&quot; above).</td>
 </tr>
 <tr>
-<td>3</td>
 <td><code>follows</code></td>
-<td>Everything above, plus the people in your kind-3 follow list. <strong>The default.</strong></td>
-<td>The size of your follow list.</td>
+<td>Everything above, plus the people you follow. <strong>The default.</strong></td>
 </tr>
 <tr>
-<td>4</td>
 <td><code>mentions</code></td>
-<td>Everything above, plus anyone at all — if their event mentions you (carries your pubkey in a <code>p</code> tag: a reply, a reaction, a mention, a zap).</td>
-<td>How many people mention you, with a cap on how many indexed tags a stranger&#39;s event may carry so that &quot;anyone&quot; stays a bound on rows and not just on people.</td>
+<td>Everything above, plus anyone whose event mentions or replies to you. An event from someone you don&#39;t follow may carry at most 32 indexed tags.</td>
+</tr>
+<tr>
+<td><code>all</code></td>
+<td>Anyone, any event.</td>
 </tr>
 </tbody></table></div>
-<p>There is no rung 5. An open relay that accepts anything from anyone is bounded by nothing, and that is a difference in kind rather than degree — see <a href="rungs.html">docs/rungs.md</a>, which this table implements. Ask for it and the management API tells you the same thing.</p>
-<p>Two things sit outside the ladder and apply at every rung. A pubkey you name with <code>allowpubkey</code> (management API, below) can always write, whatever the rung — that is you deciding by hand, which the ladder document places inside rung 1. A pubkey you <code>banpubkey</code> can never write, follow or not, mention or not.</p>
-<p>To move the ladder, send the rung as a number or a name:</p>
+<p>Each policy includes everything the one above it allows. Whatever the policy, a pubkey you <code>allowpubkey</code> can always publish and a pubkey you <code>banpubkey</code> never can (see &quot;Relay management API&quot; below).</p>
+<p>To change it:</p>
 <pre><code class="language-bash">nak admin changewritepolicy --sec &lt;your nsec&gt; mentions your-relay.workers.dev
 nak admin getwritepolicy --sec &lt;your nsec&gt; your-relay.workers.dev
 </code></pre>
-<p>It takes effect on the next event, without a redeploy. An empty string clears the stored rung and falls back to the default; <code>getwritepolicy</code> reads back the rung in force and where it came from (the <code>WRITE_RUNG</code> variable, the stored value, or the default), and the admin page shows the same line. If you set <code>WRITE_RUNG</code> in the Cloudflare dashboard it outranks the stored value, and <code>changewritepolicy</code> will still store yours and tell you the variable is winning — nothing is silently discarded.</p>
+<p>It takes effect immediately. <code>getwritepolicy</code> reads back the policy in force and where it was set. An empty string clears the stored policy and returns to the default. <code>all</code> asks you to confirm: the first call refuses and tells you the exact confirmation string to pass as a second parameter. If <code>WRITE_POLICY</code> is set in the Cloudflare dashboard it outranks the management API, and <code>changewritepolicy</code> tells you so.</p>
+<p>Under <code>all</code>, NIP-11 advertises <code>restricted_writes: false</code>; under every other policy it is <code>true</code>.</p>
 <p>By default, then, bothy accepts events from two kinds of author: you (the owner), and the people you follow. Not strangers. It works by reading the follow list (kind 3) you&#39;ve already published — bothy doesn&#39;t ask you to maintain a separate allowlist, it just uses the one your nostr client already keeps.</p>
 <p>Why this is the default rather than a limitation: bothy is meant to be one of the 2-4 relays your NIP-65 relay list already tells clients to keep, not your only relay. Pair it with a permissive public relay and you get both — your own filtered archive of people you actually follow, plus a general-purpose inbox that already does the spam filtering you&#39;d otherwise have to build yourself. A reply from someone you don&#39;t follow isn&#39;t lost; it still lands on your other relay, and on the sender&#39;s own.</p>
-<p>Following someone is not unlimited trust. Anyone writing here is capped at 64KB per event and 20 events a minute, and writes from anyone but you stop once the relay is half full — so an account that gets compromised or goes haywire slows to something you&#39;ll notice and can revoke (unfollow, or <code>banpubkey</code> through the management API) long before it can fill your storage or spend a day&#39;s write budget. All three limits are adjustable; see &quot;Configuration&quot; above.</p>
-<p>If you&#39;d rather bothy only ever accept your own writes, move to rung 1 (<code>changewritepolicy owner</code>, or <code>WRITE_RUNG=1</code>); rung 2 keeps the mail. NIP-11 advertises <code>restricted_writes: true</code> at every rung, so well-behaved clients know not to bother trying before they publish.</p>
+<p>Following someone is not unlimited trust. Anyone writing here is capped at 64KB per event and 20 events a minute, and writes from anyone but you stop once the relay is half full — so an account that gets compromised or goes haywire slows to something you&#39;ll notice and can revoke (unfollow, or <code>banpubkey</code> through the management API) long before it can fill your storage or spend a day&#39;s write budget. All three limits are adjustable; see &quot;Configuration&quot; above. The same caps are all that bounds a stranger under <code>all</code>.</p>
 <p>The admin page at your relay&#39;s URL is public — anyone with the link can see relay stats and your follow count. Never the follow list itself, only the count.</p>
-<p>The ladder itself is documented generically in <a href="rungs.html">docs/rungs.md</a>, from owner-only writes up to the open-relay case bothy deliberately refuses to become.</p>
 <h2 id="relay-management-api">Relay management API<a class="anchor" href="#relay-management-api" aria-label="Link to this section">#</a></h2>
 <p>bothy implements <a href="https://github.com/nostr-protocol/nips/blob/master/86.md">NIP-86</a>, the relay management API. It lets you ban an event, block an IP address, or change the relay&#39;s name, description and icon, without redeploying and without touching the Cloudflare dashboard. There is no web interface for it, deliberately: the admin page stays a read-only status page that is safe to leave public, and every management command is a signed request you send from the command line.</p>
 <p>The tool to send them with is <a href="https://github.com/fiatjaf/nak"><code>nak</code></a>, whose <code>admin</code> subcommand speaks NIP-86. The shape of every command is the same — the method, your secret key, whatever parameters the method takes, and your relay&#39;s host last:</p>
 <pre><code class="language-bash">nak admin supportedmethods --sec &lt;your nsec&gt; your-relay.workers.dev
 </code></pre>
 <p>Start there. <code>supportedmethods</code> returns exactly what this relay implements, which is the honest answer to what you can do with it, and <code>nak admin --help</code> lists the flags each method takes. Every request is authenticated with a <a href="https://github.com/nostr-protocol/nips/blob/master/98.md">NIP-98</a> event signed by the relay owner&#39;s key — the same key you claimed the relay with. Nothing else is accepted, and an unsigned or wrongly signed request gets a 401.</p>
-<p>What this relay implements: <code>banevent</code> and <code>allowevent</code> and <code>listbannedevents</code>; <code>banpubkey</code>, <code>unbanpubkey</code> and <code>listbannedpubkeys</code>; <code>allowpubkey</code>, <code>unallowpubkey</code> and <code>listallowedpubkeys</code>; <code>blockip</code> and <code>unblockip</code> and <code>listblockedips</code>; <code>changerelayname</code>, <code>changerelaydescription</code> and <code>changerelayicon</code>; and, bothy&#39;s own, <code>changewritepolicy</code> and <code>getwritepolicy</code> for the write ladder (see &quot;Who can write here&quot; above). What it does not: the kind allowlist, because bothy stores every kind on purpose; and the moderation queue, because bothy has nothing to report events into.</p>
+<p>What this relay implements: <code>banevent</code> and <code>allowevent</code> and <code>listbannedevents</code>; <code>banpubkey</code>, <code>unbanpubkey</code> and <code>listbannedpubkeys</code>; <code>allowpubkey</code>, <code>unallowpubkey</code> and <code>listallowedpubkeys</code>; <code>blockip</code> and <code>unblockip</code> and <code>listblockedips</code>; <code>changerelayname</code>, <code>changerelaydescription</code> and <code>changerelayicon</code>; and, bothy&#39;s own, <code>changewritepolicy</code> and <code>getwritepolicy</code> (see &quot;Who can write here&quot; above). What it does not: the kind allowlist, because bothy stores every kind on purpose; and the moderation queue, because bothy has nothing to report events into.</p>
 <p>The endpoint sends CORS headers and answers a preflight, so a client hosted somewhere other than the relay can call it from a browser. That weakens nothing: every call is a signed NIP-98 event, there is no cookie or session for a cross-origin request to borrow, and an unauthenticated preflight reveals only that the endpoint exists — which the NIP-11 document already advertises to anybody. Without it the API is reachable only from a page the relay itself served, which is not where most clients live.</p>
 <p>Banning an event tombstones its id, so the event is refused if it arrives again — including from a client re-sending it and from backfill pulling it out of another relay&#39;s history. You can ban an id you don&#39;t hold yet, and it will be refused on arrival. <code>allowevent</code> reverses this and is the only thing in bothy that lifts a tombstone.</p>
 <p>Banning a pubkey refuses every future write from it, checked on the same write path as the follow list — a banned pubkey is refused even if it&#39;s also someone you follow. <code>unbanpubkey</code> lifts the ban. Separately, <code>allowpubkey</code> grants write access to a specific pubkey you don&#39;t follow, without opening writes any wider than that one key; <code>unallowpubkey</code> revokes it. Banning and allowing are independent: allowing a pubkey never overrides a ban on the same key. Both accept an npub or hex pubkey.</p>
@@ -213,7 +202,7 @@ nak admin getwritepolicy --sec &lt;your nsec&gt; your-relay.workers.dev
 <p>The effective name also appears on the admin page, since NIP-86 has no <code>getrelayname</code> to pair with <code>changerelayname</code>.</p>
 <h2 id="http-endpoints">HTTP endpoints<a class="anchor" href="#http-endpoints" aria-label="Link to this section">#</a></h2>
 <ul>
-<li><code>GET /api/stats</code> — relay stats for the admin page. Returns <code>{ version, claimed, ownerPubkey, totalEvents, events24h, ingested24h, rowsWrittenToday, storageBytes, storageBytesLimit, dailyRowsWrittenLimit, dailyRowsReadLimit, backfill, icon, relayName, writePolicy, writeRung, writeRungSource, groupPolicy, chatPolicy, followCount, countAudit, followsListAt, vanishing, reads }</code>. <code>writePolicy</code>/<code>writeRung</code>/<code>writeRungSource</code> are the write ladder&#39;s rung in force, its name, and whether it came from <code>WRITE_RUNG</code>, the legacy <code>ALLOW_FOLLOWS</code>, a stored <code>changewritepolicy</code>, or the default; <code>groupPolicy</code> is <code>on</code> or <code>paused</code>. <code>events24h</code> counts events by their own timestamp, which is what you posted; <code>ingested24h</code> counts what this relay actually took in, backfill included. During a backfill those differ by orders of magnitude. <code>vanishing</code> is a count, a progress total and an age — never the pubkeys that asked, since this endpoint is public and naming them would publish exactly the list a vanish request exists to remove someone from.
+<li><code>GET /api/stats</code> — relay stats for the admin page. Returns <code>{ version, claimed, ownerPubkey, totalEvents, events24h, ingested24h, rowsWrittenToday, storageBytes, storageBytesLimit, dailyRowsWrittenLimit, dailyRowsReadLimit, backfill, icon, relayName, writePolicy, writePolicySource, groupPolicy, chatPolicy, followCount, countAudit, followsListAt, vanishing, reads }</code>. <code>writePolicy</code> is the write policy in force by name and <code>writePolicySource</code> is where it was set (<code>env</code>, <code>stored</code> or <code>default</code>); <code>groupPolicy</code> is <code>on</code> or <code>paused</code>. <code>events24h</code> counts events by their own timestamp, which is what you posted; <code>ingested24h</code> counts what this relay actually took in, backfill included. During a backfill those differ by orders of magnitude. <code>vanishing</code> is a count, a progress total and an age — never the pubkeys that asked, since this endpoint is public and naming them would publish exactly the list a vanish request exists to remove someone from.
 Every figure here is a maintained counter, exact and current as of the request — nothing on this document is cached or dated. <code>events24h</code> and <code>ingested24h</code> are windowed in whole hours, so each spans 24–25 hours rather than exactly 24; <code>rowsWrittenToday</code> is exact, since a UTC day starts on a whole hour.
 <code>rowsWrittenToday</code> means rows written, all of them: event rows and their index entries, tag rows, tombstones, counter updates, the follow-list rebuild, NIP-86 calls, backfill bookkeeping. It is measured rather than estimated, and it reads slightly high, because a removal is charged the pessimistic figure Cloudflare&#39;s cursor cannot confirm — see CLAUDE.md &quot;The budget&quot;. There used to be two timestamps here, <code>snapshotAt</code> and <code>liveAt</code>, dating a six-hour cache over the counts that walked a table and a five-minute cache over these last two; both caches were removed as each figure became a counter.</li>
 <li><code>POST /api/claim</code> — TOFU claim; body <code>{ pubkey }</code> (npub or hex). See &quot;Ownership and lifecycle&quot; above.</li>
@@ -231,9 +220,8 @@ Every figure here is a maintained counter, exact and current as of the request �
 <li>NIP-86 defines no way to unset a relay name, description or icon. bothy treats an empty string as the unset operation, which falls back to your kind-0 profile and then to a built-in default. <code>changewritepolicy</code> follows the same convention.</li>
 </ul>
 <h2 id="what-this-is-not">What this is not<a class="anchor" href="#what-this-is-not" aria-label="Link to this section">#</a></h2>
-<p>This project deliberately does not do: payments/zaps, multi-region scaling, NIP-05 hosting, media uploads, community moderation tooling, or a public write mode. The NIP-86 management API is the owner administering their own relay, not moderation tooling in the community sense.</p>
-<p>Public writes sit at the top of a documented ladder (<a href="rungs.html">docs/rungs.md</a>) rather than being an unexplained refusal — see &quot;Who can write here&quot; above for the rungs bothy does implement. See <code>CLAUDE.md</code> for the full list and reasoning — most feature requests are already ruled out there.</p>
-<p><strong>Group support is paused.</strong> There is code in this relay for a single NIP-29 group, with invites, private reads and ephemeral chat, and web push to go with it. None of it is documented here, because it does not yet work well enough to rely on — voice is unreliable with the client it was built against and worse with others. It is left out rather than described with a warning attached: a feature documented with a caveat still reads as a feature, and this one should be judged when it works. The code stays and the tests stay, and the relay now matches the stance at runtime: groups are off unless <code>GROUPS=on</code> is set (see &quot;Configuration&quot;), and a paused relay refuses group writes and does not advertise NIP-29. The claim comes back with the fix.</p>
+<p>This project deliberately does not do: payments/zaps, multi-region scaling, NIP-05 hosting, media uploads, or community moderation tooling. The NIP-86 management API is the owner administering their own relay, not moderation tooling in the community sense. See <code>CLAUDE.md</code> for the full list — most feature requests are already ruled out there. The write policies in &quot;Who can write here&quot; follow the ladder described in <a href="rungs.html">docs/rungs.md</a>.</p>
+<p><strong>Group support is paused.</strong> There is code in this relay for a single NIP-29 group, with invites, private reads and ephemeral chat, and web push to go with it. It is not documented here because it does not yet work well enough to rely on, and it is off unless <code>GROUPS=on</code> is set (see &quot;Configuration&quot;): a paused relay refuses group writes and does not advertise NIP-29. The code and tests stay; the documentation comes back when it works.</p>
 <h2 id="attribution">Attribution<a class="anchor" href="#attribution" aria-label="Link to this section">#</a></h2>
 <p><a href="https://github.com/Spl0itable/nosflare">Nosflare</a> by Spl0itable is prior art that proved a nostr relay works on Workers + Durable Objects, and was a useful reference for NIP-01 filter-matching edge cases while building this. bothy is an original implementation, with no code shared between the two projects.</p>
 <h2 id="development">Development<a class="anchor" href="#development" aria-label="Link to this section">#</a></h2>
