@@ -373,7 +373,7 @@ describe("changewritepolicy / getwritepolicy over the wire", () => {
 
     const first = await callManagement("changewritepolicy", ["all"]);
     expect(first.result).toBeUndefined();
-    expect(first.error).toContain("ANYONE");
+    expect(first.error).toContain("anyone publish any event");
     expect(first.error).toContain(OPEN_POLICY_CONFIRMATION);
     // Nothing stored by the refused attempt, and the wrong string is as
     // good as none.

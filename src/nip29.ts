@@ -98,10 +98,10 @@ export const JOIN_REQUEST_KIND = 9021;
 
 // What every group-scoped write and every join request is answered with
 // while GROUPS is not "on" (limits.ts groupsEnabled). One string for
-// both, exported so relay.ts handleJoin says exactly what
-// authorizeGroupWrite says.
-export const GROUPS_PAUSED_MESSAGE =
-  "restricted: NIP-29 groups are paused on this relay (set GROUPS=on in its environment to resume)";
+// both, exported so relay.ts handleJoin and nip86.ts say exactly what
+// authorizeGroupWrite says. It names no configuration: the person being
+// refused is not the operator, and the operator reads the README.
+export const GROUPS_PAUSED_MESSAGE = "restricted: groups are paused on this relay";
 
 // NIP-29 reserves 9000-9020 for moderation actions. bothy implements
 // three of them and REFUSES the rest by name rather than letting them

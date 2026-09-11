@@ -16,6 +16,7 @@ import { describe, expect, it } from "vitest";
 import { GROUP_METADATA_KIND, TOP_LEVEL_GROUP_ID } from "../src/groups";
 import { groupsEnabled } from "../src/limits";
 import { buildRelayInfo } from "../src/nip11";
+import { GROUP_METHODS, handleManagementCall, SUPPORTED_METHODS, supportedMethods } from "../src/nip86";
 import { authorizeGroupWrite, EDIT_METADATA_KIND, GROUPS_PAUSED_MESSAGE, PUT_USER_KIND } from "../src/nip29";
 import { addGroupMember } from "../src/storage";
 import { signEvent } from "./helpers/event";
@@ -122,6 +123,29 @@ describe("the write gate while paused", () => {
 });
 
 describe("what the relay advertises", () => {
+  it("names no configuration in the refusal", () => {
+    // The person refused is not the operator. The operator reads the
+    // README; a stranger learns only that groups are paused.
+    expect(GROUPS_PAUSED_MESSAGE).not.toMatch(/GROUPS|environment|=/);
+  });
+
+  it("leaves the group methods out of supportedmethods while paused, and refuses them", async () => {
+    expect(supportedMethods(PAUSED)).toEqual(SUPPORTED_METHODS.filter((m) => !GROUP_METHODS.includes(m)));
+    expect(supportedMethods(ON)).toEqual([...SUPPORTED_METHODS]);
+    for (const method of GROUP_METHODS) expect(supportedMethods(PAUSED)).not.toContain(method);
+    await runInDurableObject(stub(), async (_instance, state) => {
+      const sql = state.storage.sql;
+      for (const method of GROUP_METHODS) {
+        const reply = handleManagementCall(sql, PAUSED, method, [], "203.0.113.1", 1, OWNER_PUBKEY_HEX);
+        expect(reply.result).toBeUndefined();
+        expect(reply.error).toContain("paused");
+      }
+      // Non-group methods are untouched by the switch.
+      const listed = handleManagementCall(sql, PAUSED, "supportedmethods", [], "203.0.113.1", 1, OWNER_PUBKEY_HEX);
+      expect(listed.result).toEqual(supportedMethods(PAUSED));
+    });
+  });
+
   it("lists NIP-29 only while groups are on", () => {
     const paused = buildRelayInfo(PAUSED, NO_SETTINGS, null, null, RELAY_HEX) as { supported_nips: number[] };
     expect(paused.supported_nips).not.toContain(29);

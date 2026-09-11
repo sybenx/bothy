@@ -2585,7 +2585,7 @@ export class Relay extends DurableObject<Env> {
     // claim the owner's identity.
     const relayTag = event.tags.find((t) => t[0] === "relay")?.[1];
     if (!relayTag || !relayTagMatchesHost(relayTag, state.host)) {
-      ok(ws, event.id, false, "invalid: relay tag does not match this relay");
+      ok(ws, event.id, false, "invalid: relay tag does not name this relay");
       return;
     }
     state.authedPubkey = event.pubkey;

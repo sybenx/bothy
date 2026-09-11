@@ -72,7 +72,6 @@ The deploy button only asks for a project name. Everything else is an optional v
 | `MAX_EVENTS_PER_PUBKEY_PER_MINUTE` | How fast any one non-owner pubkey may publish. Defaults to `20`/minute — far above human posting rates, slow enough that a runaway follow takes hours rather than minutes to spend the daily write budget. You are never throttled. Raise it to a number, or set it to `off`. |
 | `NON_OWNER_STORAGE_BYTES` | Point at which writes from anyone but you are refused, reserving what's left of the 5GB free-tier ceiling for your own archive. Defaults to `2684354560` (half). Raise it to a number, or set it to `off`. |
 | `WRITE_POLICY` | Who can publish here: `owner`, `inbox`, `follows`, `mentions` or `all` (see "Who can write here" below). Set here it outranks the value set through the management API. Unset, the management API's value applies, then the default, `follows`. |
-| `GROUPS` | NIP-29 groups are paused unless this is `on`. See "What this is not". |
 | `UPDATE_CHECK` | On by default: the relay asks this repo what the current release is (one request, cached for six hours, made by the Worker rather than by your browser) so the admin page can say when a newer one exists. Set it to `off` and the relay never makes that request; the footer then simply shows no notice. |
 
 `ALLOW_FOLLOWS` is no longer read. If you had set it to `false`, set `WRITE_POLICY=owner` instead.
@@ -81,9 +80,9 @@ If your Worker is connected to a GitHub repo, Cloudflare may sync `wrangler.json
 
 This relay's read path is intentionally public, so it is worth adding a free Cloudflare rate-limiting rule against abusive traffic: in the Cloudflare dashboard, go to **Security → WAF → Rate limiting rules** for your zone and cap requests per IP to your Worker's route. The relay enforces its own per-connection and per-IP limits regardless, but an edge rule catches abuse before it reaches the Worker at all.
 
-## Inbox mode (gift-wrapped DMs)
+## Inbox mode (encrypted mail)
 
-This relay also accepts [NIP-59](https://github.com/nostr-protocol/nips/blob/master/59.md) gift wraps addressed to you, from anyone, regardless of who else is allowed to write here — see "Who can write here" below for that policy. It's the write path a client needs if you publish a `kind:10050` DM relay list naming this relay; bothy itself never publishes that list for you, so nothing changes unless you deliberately turn your relay into a DM inbox by signing one.
+This relay also accepts encrypted mail addressed to you, from anyone ([NIP-59](https://github.com/nostr-protocol/nips/blob/master/59.md) gift wraps, kind 1059), regardless of who else is allowed to write here — see "Who can write here" below for that policy. It's the write path a client needs if you publish a `kind:10050` DM relay list naming this relay; bothy itself never publishes that list for you, so nothing changes unless you deliberately turn your relay into a DM inbox by signing one.
 
 Reading them back is restricted to you. A query that names kind 1059 gets a [NIP-42](https://github.com/nostr-protocol/nips/blob/master/42.md) AUTH challenge instead of results; a query that doesn't name a kind is answered normally, with the gift wraps simply absent from what comes back. The second half matters as much as the first: refusing a query only when it would have matched a gift wrap makes the refusal itself the answer, and a stranger sliding a time window across your relay could count and time-correlate your incoming DMs from the refusals alone, without ever mentioning kind 1059. Leaving them out answers the same way whether your inbox is full or empty. You can delete a gift wrap the same way you'd delete any note ([NIP-09](https://github.com/nostr-protocol/nips/blob/master/09.md)), and [NIP-62](https://github.com/nostr-protocol/nips/blob/master/62.md) "Request to Vanish" support means either you or a message's sender can ask for it to be permanently purged.
 
@@ -96,7 +95,7 @@ Your relay has one write policy, and you choose it:
 | Policy | Who can publish |
 |---|---|
 | `owner` | Only you. |
-| `inbox` | You, and anyone sending you gift-wrapped mail (see "Inbox mode" above). |
+| `inbox` | You, and anyone sending you encrypted mail (see "Inbox mode" above). |
 | `follows` | Everything above, plus the people you follow. **The default.** |
 | `mentions` | Everything above, plus anyone whose event mentions or replies to you. An event from someone you don't follow may carry at most 32 indexed tags. |
 | `all` | Anyone, any event. |
@@ -136,7 +135,7 @@ Start there. `supportedmethods` returns exactly what this relay implements, whic
 
 What this relay implements: `banevent` and `allowevent` and `listbannedevents`; `banpubkey`, `unbanpubkey` and `listbannedpubkeys`; `allowpubkey`, `unallowpubkey` and `listallowedpubkeys`; `blockip` and `unblockip` and `listblockedips`; `changerelayname`, `changerelaydescription` and `changerelayicon`; and, bothy's own, `changewritepolicy` and `getwritepolicy` (see "Who can write here" above). What it does not: the kind allowlist, because bothy stores every kind on purpose; and the moderation queue, because bothy has nothing to report events into.
 
-The endpoint sends CORS headers and answers a preflight, so a client hosted somewhere other than the relay can call it from a browser. That weakens nothing: every call is a signed NIP-98 event, there is no cookie or session for a cross-origin request to borrow, and an unauthenticated preflight reveals only that the endpoint exists — which the NIP-11 document already advertises to anybody. Without it the API is reachable only from a page the relay itself served, which is not where most clients live.
+The endpoint answers cross-origin requests, so a client hosted somewhere other than the relay can call it from a browser.
 
 Banning an event tombstones its id, so the event is refused if it arrives again — including from a client re-sending it and from backfill pulling it out of another relay's history. You can ban an id you don't hold yet, and it will be refused on arrival. `allowevent` reverses this and is the only thing in bothy that lifts a tombstone.
 
@@ -157,7 +156,7 @@ When a name comes from your kind-0 profile it is derived rather than chosen, so 
 
 If an environment variable is set, a `change*` call still stores your value and tells you that the variable is currently winning. Nothing is silently discarded, and the stored value takes effect the moment you clear the variable.
 
-NIP-86 defines no way to unset a value, so bothy uses a convention: **passing an empty string clears the stored value**, falling through to your kind-0 profile and then to the built-in default. Every successful `change*` response says so, and points you at the NIP-11 document as the place to read back what is actually in effect:
+NIP-86 defines no way to unset a value, so bothy uses a convention: **passing an empty string clears the stored value**, falling through to your kind-0 profile and then to the built-in default. To read back what is in effect, request the NIP-11 document:
 
 ```bash
 curl -H "Accept: application/nostr+json" https://your-relay.workers.dev
@@ -169,7 +168,7 @@ The effective name also appears on the admin page, since NIP-86 has no `getrelay
 
 - `GET /api/stats` — relay stats for the admin page. Returns `{ version, claimed, ownerPubkey, totalEvents, events24h, ingested24h, rowsWrittenToday, storageBytes, storageBytesLimit, dailyRowsWrittenLimit, dailyRowsReadLimit, backfill, icon, relayName, writePolicy, writePolicySource, groupPolicy, chatPolicy, followCount, countAudit, followsListAt, vanishing, reads }`. `writePolicy` is the write policy in force by name and `writePolicySource` is where it was set (`env`, `stored` or `default`); `groupPolicy` is `on` or `paused`. `events24h` counts events by their own timestamp, which is what you posted; `ingested24h` counts what this relay actually took in, backfill included. During a backfill those differ by orders of magnitude. `vanishing` is a count, a progress total and an age — never the pubkeys that asked, since this endpoint is public and naming them would publish exactly the list a vanish request exists to remove someone from.
   Every figure here is a maintained counter, exact and current as of the request — nothing on this document is cached or dated. `events24h` and `ingested24h` are windowed in whole hours, so each spans 24–25 hours rather than exactly 24; `rowsWrittenToday` is exact, since a UTC day starts on a whole hour.
-  `rowsWrittenToday` means rows written, all of them: event rows and their index entries, tag rows, tombstones, counter updates, the follow-list rebuild, NIP-86 calls, backfill bookkeeping. It is measured rather than estimated, and it reads slightly high, because a removal is charged the pessimistic figure Cloudflare's cursor cannot confirm — see CLAUDE.md "The budget". There used to be two timestamps here, `snapshotAt` and `liveAt`, dating a six-hour cache over the counts that walked a table and a five-minute cache over these last two; both caches were removed as each figure became a counter.
+  `rowsWrittenToday` counts every row the relay wrote today: event rows and their index entries, tag rows, tombstones, counter updates, the follow-list rebuild, management calls and backfill bookkeeping. It is measured, and it reads slightly high because a removal is charged a pessimistic figure.
 - `POST /api/claim` — TOFU claim; body `{ pubkey }` (npub or hex). See "Ownership and lifecycle" above.
 - `GET /api/profile?pubkey=<hex>` — the claim form's courtesy profile preview: it looks your kind-0 up on a couple of well-known relays so you can see the name and avatar attached to a pubkey before binding the relay to it permanently. **This is a setup endpoint and it is only reachable during setup** — once the relay is claimed it returns 404, because it exists to guard one irreversible step and there is no reason to leave a path that opens outbound connections to third-party relays permanently open to anybody. Results are cached for five minutes.
 - `GET /live` — unauthenticated, push-only WebSocket for the admin page's live feed (max 5 connections, 10-minute lifetime); sends `{ kind, created_at, id }` per stored event, never gift wraps.
@@ -190,7 +189,7 @@ The NIPs leave some behavior unspecified. A few choices are worth knowing if you
 
 This project deliberately does not do: payments/zaps, multi-region scaling, NIP-05 hosting, media uploads, or community moderation tooling. The NIP-86 management API is the owner administering their own relay, not moderation tooling in the community sense. See `CLAUDE.md` for the full list — most feature requests are already ruled out there. The write policies in "Who can write here" follow the ladder described in [docs/rungs.md](docs/rungs.md).
 
-**Group support is paused.** There is code in this relay for a single NIP-29 group, with invites, private reads and ephemeral chat, and web push to go with it. It is not documented here because it does not yet work well enough to rely on, and it is off unless `GROUPS=on` is set (see "Configuration"): a paused relay refuses group writes and does not advertise NIP-29. The code and tests stay; the documentation comes back when it works.
+**Group support is paused.** There is code in this relay for a single NIP-29 group, with invites, private reads and ephemeral chat, and web push to go with it. It is not documented here because it does not yet work well enough to rely on, and it is off unless the `GROUPS` environment variable is set to `on`: a paused relay refuses group writes and does not advertise NIP-29. The code and tests stay; the documentation comes back when it works.
 
 ## Attribution
 

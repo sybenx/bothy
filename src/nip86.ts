@@ -35,13 +35,13 @@ import {
   unblockIp,
   upsertPushSubscription,
 } from "./storage";
-import { MAX_PUSH_SUBSCRIPTIONS_PER_PUBKEY } from "./limits";
+import { groupsEnabled, MAX_PUSH_SUBSCRIPTIONS_PER_PUBKEY } from "./limits";
+import { GROUPS_PAUSED_MESSAGE } from "./nip29";
 import { pushConfigured } from "./push";
 import { getOwnerPubkey } from "./ownership";
 import { normalizeIp } from "./ip";
 import { normalizePubkey } from "./pubkey";
 import {
-  DEFAULT_WRITE_POLICY,
   envOverridesPolicy,
   OPEN_POLICY_CONFIRMATION,
   parsePolicy,
@@ -133,6 +133,25 @@ export const SUPPORTED_METHODS = [
 // subscription row.
 export const MEMBER_CALLABLE_METHODS: readonly string[] = ["subscribepush", "unsubscribepush"];
 
+// The methods that belong to the group feature (limits.ts groupsEnabled).
+// While groups are paused they are left out of supportedmethods and
+// answer with the same refusal every other group path gives: the
+// discovery list is what a client trusts, and a listed method that
+// belongs to a feature the relay is not running is an advertisement for
+// something that does not work.
+export const GROUP_METHODS: readonly string[] = [
+  "listunusedinvites",
+  "revokeinvite",
+  "subscribepush",
+  "unsubscribepush",
+];
+
+export function supportedMethods(env: Env): string[] {
+  return groupsEnabled(env)
+    ? [...SUPPORTED_METHODS]
+    : SUPPORTED_METHODS.filter((method) => !GROUP_METHODS.includes(method));
+}
+
 // The exact string blockip demands back as its `reason` before it will
 // block the address the management request itself came from. Chosen to
 // be unmistakably deliberate and impossible to send by accident, and
@@ -166,39 +185,26 @@ function pubkeyParam(params: unknown[], index: number): string | null {
   return typeof value === "string" ? normalizePubkey(value) : null;
 }
 
-// The advisory note every successful change* call carries back in the
-// `error` field. Two things every operator needs and NIP-86 gives them no
-// other way to learn: that an empty string is the unset operation (the
-// spec defines none, so this is bothy's convention -- README.md "Relay
-// management API"), and that the value which actually takes effect is
-// whatever the NIP-11 document reports, not necessarily what was just
-// stored. When an environment variable outranks the stored value, that is
-// said plainly here too, because the alternative -- refusing the call, or
-// storing silently -- either loses the operator's input or lies about it.
+// The note a successful change* call carries back in the `error` field,
+// which is the one field NIP-86 offers for saying anything beside a
+// result. It states what happened, and adds one sentence only when an
+// environment variable is outranking the value just stored -- the case
+// where the call otherwise appears to have done nothing. How to clear a
+// value and where to read it back are in the README, once, rather than
+// repeated on every call.
 function identityNote(
   field: "name" | "description" | "icon",
-  method: string,
   envVarName: string,
   envValue: string | undefined,
   cleared: boolean,
 ): string {
-  const parts = [
-    cleared ? `Cleared the stored relay ${field}.` : `Stored the relay ${field}.`,
-  ];
+  const parts = [cleared ? `Cleared the stored relay ${field}.` : `Stored the relay ${field}.`];
   if (envValue) {
     parts.push(
       `Note: ${envVarName} is set in this deployment's environment and takes precedence over the stored value, ` +
         `so the stored value takes effect only once ${envVarName} is cleared in the Cloudflare dashboard.`,
     );
   }
-  parts.push(
-    `Calling ${method} with an empty string is what clears the stored value, falling back to the owner's ` +
-      `kind-0 profile and then to the built-in default.`,
-  );
-  parts.push(
-    `The value actually in effect is whatever this relay's NIP-11 document reports -- request it with an ` +
-      `Accept: application/nostr+json header.`,
-  );
   return parts.join(" ");
 }
 
@@ -220,11 +226,7 @@ function writePolicyNote(sql: SqlStorage, env: Env, headline: string): string {
     );
   }
   const resolved = resolveWritePolicy(env, getStoredWritePolicy(sql));
-  parts.push(
-    `The write policy now in force is "${resolved.policy}": ${POLICY_DESCRIPTIONS[resolved.policy]} ` +
-      `Calling changewritepolicy with an empty string clears the stored value and falls back to the ` +
-      `default, "${DEFAULT_WRITE_POLICY}".`,
-  );
+  parts.push(`The write policy now in force is "${resolved.policy}": ${POLICY_DESCRIPTIONS[resolved.policy]}`);
   return parts.join(" ");
 }
 
@@ -241,7 +243,7 @@ function changeIdentity(
   setRelaySetting(sql, field, value);
   // A successful call returns result true AND an error-field note -- see
   // identityNote. The note is advisory; the write already happened.
-  return { result: true, error: identityNote(field, method, envVarName, envValue, value === "") };
+  return { result: true, error: identityNote(field, envVarName, envValue, value === "") };
 }
 
 // The subscription object hearth sends as subscribepush's one parameter
@@ -335,9 +337,15 @@ export function handleManagementCall(
 ): ManagementResponse {
   if (typeof method !== "string") return err("request is missing a string 'method'");
 
+  // See GROUP_METHODS: a paused feature's methods answer the way every
+  // other group path answers, ahead of any parameter parsing.
+  if (GROUP_METHODS.includes(method) && !groupsEnabled(env)) {
+    return err(GROUPS_PAUSED_MESSAGE.replace(/^restricted: /, ""));
+  }
+
   switch (method) {
     case "supportedmethods":
-      return { result: [...SUPPORTED_METHODS] };
+      return { result: supportedMethods(env) };
 
     case "banevent": {
       const id = stringParam(params, 0);
@@ -567,7 +575,7 @@ export function handleManagementCall(
       // command that sets it is one word long.
       if (policy === "all" && params[1] !== OPEN_POLICY_CONFIRMATION) {
         return err(
-          `changewritepolicy: "all" lets ANYONE publish ANY event to this relay, bounded only by the ` +
+          `changewritepolicy: "all" lets anyone publish any event to this relay, bounded only by the ` +
             `per-event size cap, the per-pubkey rate cap and the storage share reserved for you. ` +
             `Every other policy is bounded by people you chose. To proceed, call changewritepolicy again ` +
             `with "all" and a second parameter set to exactly: ${OPEN_POLICY_CONFIRMATION}`,
