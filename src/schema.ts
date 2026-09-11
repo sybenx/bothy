@@ -3,7 +3,7 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import { generateRelayKeypair } from "./relay-identity";
 
 // Per-event write cost against the Workers Free plan's 100,000
-// rows-written/day ceiling — see CLAUDE.md "The budget". Rows written is
+// rows-written/day ceiling — see docs/budget.md. Rows written is
 // the binding constraint, not storage or requests, so this is the number
 // that decides how much headroom a single owner actually has.
 //
@@ -32,7 +32,7 @@ import { generateRelayKeypair } from "./relay-identity";
 // above is what they cost. Two of them were added in v0.7.2 after the
 // relay went down on rows READ, not rows written; the fourth,
 // idx_events_ingested, was added in v0.7.6 for the same reason -- see
-// CLAUDE.md "The budget".
+// docs/budget.md.
 //
 // This comment twice rejected an index on (kind, created_at), on the
 // grounds that the read-abuse guard rejected any filter lacking both
@@ -98,7 +98,7 @@ import { generateRelayKeypair } from "./relay-identity";
 // E into the size of the window. The price is one row per stored event:
 // the per-event cost above goes 5 -> 6, about 1,100 rows/day at the live
 // relay's ingest rate, against a 100,000/day ceiling. See
-// CLAUDE.md "The budget".
+// docs/budget.md.
 //
 // Existing deployments get NULL for rows written before the migration
 // below ran, and NULL never satisfies `> cutoff`. That undercounts for at
@@ -236,7 +236,7 @@ export const TABLES: readonly TableSpec[] = [
       // question about the ten rows in the 24h window. Called twice per
       // cron tick, that one query was ~288E rows/day of the 5,000,000
       // ceiling all by itself, and at E ~= 17,400 it was the entire
-      // ceiling with no client connected (CLAUDE.md "The budget"). Summing a
+      // ceiling with no client connected (docs/budget.md). Summing a
       // column reads E and touches `event_tags` not at all.
       //
       // Costs zero additional rows written as a column: this is one more
@@ -460,7 +460,7 @@ export const TABLES: readonly TableSpec[] = [
     // from the owner's kind-10002 relay list, tracking how far back this
     // relay has already fetched. Persisted rather than kept in memory
     // specifically so an hourly cron tick can resume a backfill that
-    // spans days -- see CLAUDE.md "The budget" on why a large history may
+    // spans days -- see docs/budget.md on why a large history may
     // genuinely take more than one day against the rows-written ceiling.
     name: "backfill_relays",
     columns: [
@@ -542,7 +542,7 @@ export const TABLES: readonly TableSpec[] = [
   },
   {
     // NIP-86 banpubkey/unbanpubkey/listbannedpubkeys (src/nip86.ts,
-    // "phase two" -- CLAUDE.md "The budget"). Unlike banned_events, this table IS
+    // "phase two" -- docs/budget.md). Unlike banned_events, this table IS
     // read on the per-event write path: ownership.ts isAllowedWriter
     // checks it for every non-owner write, before the follows lookup, so
     // a banned pubkey is refused even if it also appears in the owner's
@@ -842,7 +842,7 @@ export const TABLES: readonly TableSpec[] = [
       // one tick before it went. NOT published on /api/stats: that
       // endpoint is public and unauthenticated, and a count of the
       // group's chat is exactly the kind of group counter the partition
-      // keeps off it (CLAUDE.md "Threat model"). The owner reads it in
+      // keeps off it (docs/threat-model.md). The owner reads it in
       // the log line beside it.
       col("reported_at", "INTEGER NOT NULL DEFAULT 0"),
       col("reported_pending", "INTEGER NOT NULL DEFAULT 0"),
@@ -1298,7 +1298,7 @@ export const INDEXES: readonly IndexSpec[] = [
   // calls it twice per cron tick, so on an hourly cron that was 48E rows
   // read per day with no client connected, reaching the 5,000,000 ceiling
   // at E ~= 104,000. That was the documented cron floor in
-  // CLAUDE.md "The budget"; this index removes it, and what replaces it
+  // docs/budget.md; this index removes it, and what replaces it
   // scales with the day's ingest rather than with everything ever stored.
   //
   // `row_cost` is carried as a covering column, not a key. With it the
@@ -1887,7 +1887,7 @@ export function initSchema(sql: SqlStorage): void {
     sql.exec(createIndexSql(index));
   }
   dropUndeclaredIndexes(sql);
-  // NIP-51 mute list support was removed (see CLAUDE.md "The budget"); this drops
+  // NIP-51 mute list support was removed (see docs/budget.md); this drops
   // the now-orphaned table on deployed relays that still carry it from
   // before the removal. Idempotent and a no-op on a fresh database.
   sql.exec(`DROP TABLE IF EXISTS mutes`);

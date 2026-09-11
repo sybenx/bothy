@@ -392,7 +392,7 @@ describe("initSchema against historical table shapes", () => {
 // declaration on every wake from hibernation (src/schema.ts initSchema).
 // Measured live before this existed: 55 rows read per wake, ~94,000
 // rows/day at the relay's wake rate, to do nothing on the overwhelming
-// majority of wakes -- see CLAUDE.md "The budget". Two properties are
+// majority of wakes -- see docs/budget.md. Two properties are
 // load-bearing, per the header comment on initSchema, and each gets its
 // own describe block below: the hash must be a structural function of the
 // declaration (a hand-picked subset is a field that silently stops being
@@ -530,8 +530,8 @@ function measureRowsRead(sql: SqlStorage, fn: (sql: SqlStorage) => void): number
   return cursors.reduce((sum, c) => sum + c.rowsRead, 0);
 }
 
-// The before/after this whole file exists to prove -- see CLAUDE.md "The
-// budget"'s `initSchema` row in the reads table.
+// The before/after this whole file exists to prove -- see the
+// `initSchema` rows in docs/budget.md's reads table.
 // The group partition (src/groups.ts) is expressed entirely in the index
 // declaration, so these assert the declaration itself and the migration
 // that installs it. Both properties are load-bearing and neither is
@@ -647,7 +647,7 @@ describe("initSchema's rows-read cost", () => {
       // reconcileColumns' presence check reads one pragma_table_info row
       // per column TABLES already declares, so the full pass costs at
       // least the size of the declaration and grows automatically as
-      // TABLES does. CLAUDE.md "The budget" cites the one number that
+      // TABLES does. docs/budget.md cites the one number that
       // matters operationally -- 55 rows read/wake, measured live, before
       // this existed -- and this assertion only needs to show the full
       // pass is real work, dwarfing the O(1) steady-state cost above,

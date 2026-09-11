@@ -67,7 +67,7 @@ export function idMatchesContent(event: NostrEvent): boolean {
 //
 // Measured at ~1.11ms per verification, averaged over 5,000 calls to
 // @noble/curves' schnorr.verify(), against the 10ms of Worker CPU per
-// request that CLAUDE.md "The budget" records. Roughly nine verifies to
+// request that docs/budget.md records. Roughly nine verifies to
 // the ceiling.
 //
 // Read that with its caveat, which is why the number lives here rather

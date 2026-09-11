@@ -224,7 +224,7 @@ export function computeFollowsHash(follows: ReadonlySet<string>): string {
 // relays. This relay is in the owner's relay list by construction (it's
 // where they claimed it), so their client will have replicated their
 // contact list here; reading it locally avoids an outbound connection
-// (CLAUDE.md "The budget": an outbound connection keeps the DO in memory
+// (docs/budget.md: an outbound connection keeps the DO in memory
 // for up to 15 minutes). Called from the cron handler, and from
 // relay.ts acceptEvent the moment the owner publishes a kind-3 here.
 //

@@ -1,6 +1,6 @@
 // NIP-59 (nips/59.md) Gift Wrap: kind 1059, signed by a random one-time
 // key, `p`-tagged to its recipient. The one deliberate exception to
-// owner-only writes -- CLAUDE.md "Threat model" calls it
+// owner-only writes -- docs/threat-model.md calls it
 // "the only unauthenticated write path in the project" and "the only
 // unbounded write path", hence the extra abuse controls (limits.ts)
 // exercised here alongside the accept/reject rules. Recipient-authorized
@@ -390,7 +390,7 @@ describe("expired gift wraps are removed, not merely hidden", () => {
 });
 
 // What the sweep costs, measured on real cursors so a change that moves
-// either figure fails here rather than drifting -- CLAUDE.md "The budget".
+// either figure fails here rather than drifting -- docs/budget.md.
 describe("what the gift wrap sweep costs", () => {
   function measureRowsWritten(sql: SqlStorage, fn: (sql: SqlStorage) => void): number {
     let total = 0;

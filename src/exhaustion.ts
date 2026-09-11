@@ -81,7 +81,7 @@ export function logExhaustion(where: string, err: unknown): ExhaustionVerdict {
     console.error(
       `BUDGET EXHAUSTED (${verdict.resource}) at ${where}: ${verdict.message} -- ` +
         `Cloudflare free-tier allowances reset at 00:00 UTC. ` +
-        `See CLAUDE.md "The budget"; /api/stats reports the rows-read breakdown by code path.`,
+        `See docs/budget.md; /api/stats reports the rows-read breakdown by code path.`,
     );
   } else {
     console.error(`${where} failed:`, verdict.message, err instanceof Error ? err.stack : "");

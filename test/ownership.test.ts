@@ -1,4 +1,4 @@
-// Owner-gated writes (CLAUDE.md "Threat model": "Writes
+// Owner-gated writes (docs/threat-model.md: "Writes
 // are owner-only and signature-verified" for anyone not the owner or,
 // under the default write policy, one of the owner's follows).
 //
@@ -85,7 +85,7 @@ describe("ownership write gate", () => {
       "restricted: only the owner and people they follow can publish here",
     );
     // Schnorr verification is the most expensive per-event operation
-    // (CLAUDE.md "The budget") -- a non-owner write is rejected on the
+    // (docs/budget.md) -- a non-owner write is rejected on the
     // pubkey check alone, before it's ever paid for.
     expect(verifySignature).not.toHaveBeenCalled();
     conn.close();

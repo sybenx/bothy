@@ -1,4 +1,4 @@
-// Read-abuse mitigations (CLAUDE.md "Threat model"): reads are public by
+// Read-abuse mitigations (docs/threat-model.md): reads are public by
 // design, so these caps -- not authentication -- are what stands between
 // a normal deployment and a stranger burning the daily 5M rows-read /
 // 100k DO-requests ceiling.

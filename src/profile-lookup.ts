@@ -4,7 +4,7 @@
 // the lookup fails, allow the claim anyway; never block on it."). Runs
 // in the Worker (src/index.ts), not the Durable Object -- a short-lived
 // outbound WebSocket from the DO would pin it in memory for up to 15
-// minutes (CLAUDE.md "The budget"); the stateless Worker has no such
+// minutes (docs/budget.md); the stateless Worker has no such
 // cost.
 // Also reused by backfill-worker.ts to discover the owner's kind-10002
 // relay list -- same rationale, a courtesy discovery path from the
@@ -107,7 +107,7 @@ export async function lookupProfile(pubkey: string): Promise<Profile | null> {
 //
 // Isolate-scoped means it is lost on eviction and not shared across
 // colos, the same trade the in-memory throttles in relay.ts already make
-// (CLAUDE.md "Threat model": "In-memory limits across eviction"). It is
+// (docs/threat-model.md: "In-memory limits across eviction"). It is
 // the right shape against the threat regardless: a flood concentrates on
 // the isolates it is already talking to.
 // ---------------------------------------------------------------------

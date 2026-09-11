@@ -149,7 +149,7 @@ export function mentionsPubkey(event: Pick<NostrEvent, "tags">, pubkey: string):
 
 // The cap that keeps `mentions` bounded in ROWS and not only in authors.
 // A non-owner event costs 3 rows written per single-letter tag it carries
-// (CLAUDE.md "The budget"), and under `mentions` the author is anyone, so
+// (docs/budget.md), and under `mentions` the author is anyone, so
 // a stranger could otherwise mention the owner once inside a 64KB event
 // carrying two thousand `p` tags and spend six percent of the day's
 // ceiling on it -- twenty a minute, from as many pubkeys as they care to
