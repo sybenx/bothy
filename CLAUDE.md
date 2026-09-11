@@ -1131,6 +1131,11 @@ usefully — what it structurally cannot do.
   far has ended up either a stale leftover or a deploy that silently didn't
   happen. Cloudflare builds from `main`; work on any other branch does not
   reach the relay.
+- Plan mode before any change to `src/`, `public/`, README.md or CLAUDE.md:
+  questions batched before the plan, nothing written before the plan is
+  approved, and no push to `main` without the human saying so in that
+  session. Review by a fresh session against `docs/principles.md`. The full
+  method is [docs/workflow.md](docs/workflow.md).
 
 ## Commands
 
