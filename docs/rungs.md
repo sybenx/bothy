@@ -57,29 +57,3 @@ cuts across the rungs above:
 Tier 3 is expensive for architectural reasons as much as quota reasons:
 whether a relay can afford it depends on whether its write path is even
 able to make outbound connections.
-
-## What bothy implements
-
-bothy sits on one rung at a time and lets the owner choose which, with
-rung 5 refused by name. Each rung is cumulative — it admits everyone the
-rung below admits — so the policy is one integer:
-
-| Rung | Name in bothy | Set with |
-|---|---|---|
-| 1 | `owner` | `changewritepolicy owner` (NIP-86), or `WRITE_RUNG=1` |
-| 2 | `inbox` | `changewritepolicy inbox` — NIP-59 gift wraps p-tagged to the owner, from anyone |
-| 3 | `follows` | `changewritepolicy follows` — the owner's kind-3 contact list. The default. |
-| 4 | `mentions` | `changewritepolicy mentions` — any author, if the event p-tags the owner |
-| 5 | — | refused |
-
-Rung 4's "reference or address the owner" is decided from the event's own
-`p` tags, which puts it on the *cheap* tier of the filter ladder above:
-no storage read, no outbound connection. Because "anyone" is a number
-strangers choose, bothy adds one bound the ladder does not name — a cap
-on how many indexed tags a stranger's event may carry — so that opening
-rung 4 bounds rows written and not only authors.
-
-The explicit allowlist (`allowpubkey`) and blocklist (`banpubkey`) sit
-outside the ladder and apply at every rung: named individuals are what
-rung 1 already describes, and a ban is the owner closing the door on one
-person whatever the door's general setting is. See `src/write-policy.ts`.

@@ -8,17 +8,15 @@
 // flow at runtime. RELAY_NAME/RELAY_DESCRIPTION/RELAY_ICON are optional
 // advanced overrides anyone can add in the Cloudflare dashboard; read
 // them defensively with `env.X ?? fallback` everywhere they're used
-// (nip11.ts, ownership.ts) since they may be undefined. ALLOW_FOLLOWS is
-// an opt-OUT: writes from the owner's follows are enabled by default, and
-// setting it to the exact string "false" is the only way to turn them
-// off (write-policy.ts resolveWriteRung reads it as rung 2, below WRITE_RUNG).
+// (nip11.ts, ownership.ts) since they may be undefined. WRITE_POLICY is
+// the write policy by name (write-policy.ts); unset, the value stored
+// through NIP-86 applies, then the default.
 // MAX_EVENT_BYTES/MAX_EVENTS_PER_PUBKEY_PER_MINUTE/NON_OWNER_STORAGE_BYTES
 // are the three write-path abuse caps (limits.ts), raisable for anyone on
 // a paid plan where the free tier's ceilings don't apply. Each takes a
 // positive number, or the exact string "off" to disable that cap
-// entirely -- the same only-one-exact-value-disables-it shape as
-// ALLOW_FOLLOWS, so no truthy value can remove a safety limit by
-// accident (limits.ts resolveLimit).
+// entirely -- only that one exact value, so no truthy value can remove a
+// safety limit by accident (limits.ts resolveLimit).
 // The generated Env type (worker-configuration.d.ts) never declares any
 // of these, so this merges the optional fields onto the global `Env`.
 // RATE_LIMIT_API/RATE_LIMIT_PROFILE are the two Rate Limiting bindings
@@ -41,7 +39,6 @@ interface Env {
   RELAY_NAME?: string;
   RELAY_DESCRIPTION?: string;
   RELAY_ICON?: string;
-  ALLOW_FOLLOWS?: string;
   // Web push (src/push.ts). A SECRET, not a var -- set with
   // `wrangler secret put VAPID_PRIVATE_KEY`, never in wrangler.jsonc,
   // which declares no vars at all and which a git-connected Worker may
@@ -53,8 +50,8 @@ interface Env {
   VAPID_PRIVATE_KEY?: string;
   // The upstream update check (upstream-version.ts), which /api/stats
   // answers with and the admin page renders as a one-line notice. An
-  // opt-OUT, and the same only-one-exact-value-disables-it shape as
-  // ALLOW_FOLLOWS above: setting it to the exact string "off" is the only
+  // opt-OUT, and the same only-one-exact-value-disables-it shape as the
+  // write caps below: setting it to the exact string "off" is the only
   // way to stop the Worker asking githubusercontent what the current
   // release is. Unset means the check runs.
   UPDATE_CHECK?: string;
@@ -63,19 +60,18 @@ interface Env {
   // relay reports each hour what it WOULD delete and deletes nothing, the
   // exact string "on" lets it act, and the exact string "off" removes the
   // behaviour entirely. It inverts the only-one-exact-string-disables-it
-  // shape of ALLOW_FOLLOWS and UPDATE_CHECK above deliberately -- those
+  // shape of UPDATE_CHECK above deliberately -- those
   // guard a safety cap, where turning one off is the act that must be
   // spelled out, and here it is the deletion that must be.
   EPHEMERAL_CHAT?: string;
-  // The write ladder's rung (src/write-policy.ts): "1".."4" or a rung
-  // name (owner/inbox/follows/mentions). Set here it outranks the value
-  // stored through NIP-86 changewritepolicy, the same way RELAY_NAME
-  // outranks changerelayname. Unset means the stored value, then the
-  // default of 3 (follows). A malformed value is logged and ignored,
-  // never read as any particular rung. ALLOW_FOLLOWS=false above is the
-  // legacy way of saying rung 2 and is read as exactly that, below this
-  // variable in the chain.
-  WRITE_RUNG?: string;
+  // The write policy by name (src/write-policy.ts): owner, inbox,
+  // follows, mentions or all. Set here it outranks the value stored
+  // through NIP-86 changewritepolicy, the same way RELAY_NAME outranks
+  // changerelayname. Unset means the stored value, then the default
+  // (follows). A malformed value is logged and ignored, never read as
+  // any particular policy. ALLOW_FOLLOWS, which this replaces, is no
+  // longer read.
+  WRITE_POLICY?: string;
   // NIP-29 groups (limits.ts groupsEnabled). PAUSED unless this is the
   // exact string "on" -- the group code stays and stays tested, but no
   // group-scoped write, moderation event or join request is honoured

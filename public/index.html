@@ -358,54 +358,36 @@ function formatBytes(n) {
   return (n / 1024 ** 3).toFixed(2) + " GB";
 }
 
-// Write access policy: the write ladder's rung (src/write-policy.ts,
-// docs/rungs.md), reported by /api/stats as a number, a name and where
-// it came from. A bare follow count of 0 at rung 3 or above reads as
-// healthy at a glance -- it isn't, it means the allowlist is empty and
-// every follow is being silently rejected -- so that case gets its own
-// plain-language sentence instead of just a number.
+// Who can publish here, as one sentence (src/write-policy.ts, reported
+// by /api/stats as `writePolicy`). A follow count of 0 under a policy
+// that admits follows reads as healthy at a glance -- it isn't, it means
+// the follow list is empty and every follow is being silently rejected
+// -- so that case gets its own sentence instead of just a number.
 function renderWritePolicyStatus(stats) {
   const el = document.getElementById("write-policy-status");
-  const parts = ["Write policy: rung " + stats.writeRung + " (" + stats.writePolicy + ")."];
-  if (stats.writeRung === 1) {
-    parts.push("Only the owner can publish here.");
-  } else if (stats.writeRung === 2) {
-    parts.push("Only the owner can publish here, plus gift-wrapped mail addressed to them from anyone.");
-  } else if (stats.followCount === 0) {
-    parts.push("Follows are allowed to publish, but the follow list is empty -- no one but the owner can write until the owner's kind-3 contact list is stored on this relay.");
-  } else {
-    // No staleness note here any more. It used to warn when the follow
-    // cache had not been rebuilt in a few hours, which was a real signal
-    // only while the cron rebuilt it unconditionally on every tick.
-    // refreshFollows now writes only when the owner's contact list has
-    // actually changed (ownership.ts), so "not rebuilt in hours" is the
-    // healthy case and a warning on it would fire forever on a stable
-    // follow list. The failure this line exists to catch -- an empty
-    // allowlist silently rejecting every follow -- is the branch above,
-    // and it is a state rather than an age. The contact list's own
-    // timestamp is in the diagnostics panel below.
-    parts.push(
-      "Owner plus " + stats.followCount + (stats.followCount === 1 ? " follow" : " follows") +
-      (stats.writeRung >= 4 ? ", and anyone whose event mentions the owner," : "") +
-      " can publish here.",
-    );
+  const follows = stats.followCount + (stats.followCount === 1 ? " person you follow" : " people you follow");
+  let text;
+  switch (stats.writePolicy) {
+    case "owner":
+      text = "Only you can publish here.";
+      break;
+    case "inbox":
+      text = "Only you can publish here. Anyone can send you encrypted mail.";
+      break;
+    case "all":
+      text = "Anyone can publish here.";
+      break;
+    case "mentions":
+      text = stats.followCount === 0
+        ? "You, and anyone who mentions or replies to you, can publish here. Your follow list is empty, so nobody is admitted as a follow until your contact list is stored on this relay."
+        : "You, the " + follows + ", and anyone who mentions or replies to you can publish here.";
+      break;
+    default:
+      text = stats.followCount === 0
+        ? "You and the people you follow can publish here, but your follow list is empty -- nobody but you can write until your contact list is stored on this relay."
+        : "You and the " + follows + " can publish here.";
   }
-  // Where the rung is set decides how it gets changed, so say so:
-  // an environment variable has to be edited in the Cloudflare
-  // dashboard, everything else moves with one management call.
-  if (stats.writeRungSource === "env") {
-    parts.push("Set by WRITE_RUNG in the Cloudflare dashboard.");
-  } else if (stats.writeRungSource === "legacy-env") {
-    parts.push("Set by ALLOW_FOLLOWS=false in the Cloudflare dashboard.");
-  } else if (stats.writeRungSource === "stored") {
-    parts.push("Set through the management API (changewritepolicy).");
-  } else {
-    parts.push("The default; change it with the management API (changewritepolicy) or WRITE_RUNG.");
-  }
-  if (stats.groupPolicy === "paused") {
-    parts.push("NIP-29 groups are paused.");
-  }
-  el.textContent = parts.join(" ");
+  el.textContent = text;
 }
 
 // One-shot backfill progress (visible progress on
@@ -465,8 +447,8 @@ function renderDiagnostics(stats) {
   // the absence being reported is a missing kind-3, not a refresh that
   // has not run.
   document.getElementById("diag-follows-at").textContent =
-    stats.writeRung < 3
-      ? "n/a (follows cannot write at this rung)"
+    stats.writePolicy === "owner" || stats.writePolicy === "inbox"
+      ? "n/a (follows cannot publish under this policy)"
       : stats.followsListAt
         ? new Date(stats.followsListAt * 1000).toLocaleString()
         : "none stored";

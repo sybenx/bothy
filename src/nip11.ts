@@ -11,6 +11,7 @@ import {
 } from "./limits";
 import { pushPublicKey } from "./push";
 import type { RelaySettings } from "./storage";
+import { resolveWritePolicy } from "./write-policy";
 import { version } from "../package.json";
 
 // Hardcoded fallbacks (the last rung of the identity chain: fallbacks in code
@@ -165,8 +166,10 @@ export function buildRelayInfo(
     // is added below rather than left out, which is the same rule applied
     // in the other direction.
     limitation: {
-      // This relay is never fully open -- see ownership.ts isAllowedWriter.
-      restricted_writes: true,
+      // True under every write policy but `all` (write-policy.ts) --
+      // resolved from the same stored value the write gate reads, so the
+      // document cannot disagree with the gate.
+      restricted_writes: resolveWritePolicy(env, stored.writePolicy).policy !== "all",
       max_subscriptions: MAX_SUBSCRIPTIONS_PER_CONNECTION,
       max_limit: MAX_FILTER_LIMIT,
       // boundFilter (limits.ts) defaults a filter's limit to this

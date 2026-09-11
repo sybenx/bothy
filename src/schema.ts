@@ -361,7 +361,7 @@ export const TABLES: readonly TableSpec[] = [
     ],
   },
   {
-    // ALLOW_FOLLOWS cache (CLAUDE.md "Configuration"): the owner's own
+    // Follow cache (CLAUDE.md "Configuration"): the owner's own
     // kind-3 follow list, re-derived on a cron schedule rather than per
     // event -- see ownership.ts refreshFollows(). Replaced wholesale when
     // it is replaced at all, so no index beyond the primary key is
@@ -555,7 +555,7 @@ export const TABLES: readonly TableSpec[] = [
   {
     // NIP-86 allowpubkey/unallowpubkey/listallowedpubkeys (src/nip86.ts).
     // A manual allowlist, distinct from both banned_pubkeys and the
-    // ALLOW_FOLLOWS-derived `follows` table: it grants write access to a
+    // kind-3-derived `follows` table: it grants write access to a
     // specific pubkey the owner does not follow (or, with follows
     // disabled entirely, to anyone the owner names individually).
     // ownership.ts isAllowedWriter only consults this table on the path

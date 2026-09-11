@@ -32,8 +32,8 @@ export const MAX_EVENTS_PER_REQ = 500;
 // The original threat model had exactly one
 // untrusted write path: kind-1059 gift wraps, "the only unbounded write
 // path", since every other write was the owner's own and the owner is
-// trusted not to attack their own relay. v0.2.0 made ALLOW_FOLLOWS an
-// opt-OUT, which quietly turned "one trusted author" into "hundreds of
+// trusted not to attack their own relay. v0.2.0 opened writes to the
+// owner's follows by default, which quietly turned "one trusted author" into "hundreds of
 // pubkeys the owner has merely followed" -- without moving any of the
 // gift wrap caps across. A single compromised or malicious follow was
 // then bounded only by the per-IP message rate limit in relay.ts: at 300
@@ -52,8 +52,7 @@ export const MAX_EVENTS_PER_REQ = 500;
 // plan.
 // ---------------------------------------------------------------------
 
-// The exact string that turns a cap off. Same shape as ALLOW_FOLLOWS
-// (write-policy.ts resolveWriteRung reads it as rung 2) and for the same reason: removing a
+// The exact string that turns a cap off. Only this one value, because removing a
 // safety cap must be a deliberate, spelled-out act, never something any
 // truthy value does by accident. A malformed or empty value falls back
 // to the default rather than resolving to "no limit" -- a typo in the
@@ -1578,7 +1577,7 @@ export const CHAT_SWEEP_BATCH_SIZE = Math.max(
 //
 // Three states, and the default is the cautious one, which inverts this
 // file's usual only-one-exact-string-disables-it shape (DISABLE_VALUE
-// above, ALLOW_FOLLOWS, UPDATE_CHECK). Those guard a SAFETY limit, so the
+// above, UPDATE_CHECK). Those guard a SAFETY limit, so the
 // dangerous act is turning one off and that is what must be spelled out.
 // Here the dangerous act is deletion itself, so it is deletion that has to
 // be spelled out and everything else defaults to watching:
@@ -1619,15 +1618,15 @@ export function groupsEnabled(env: Env): boolean {
 }
 
 // ---------------------------------------------------------------------
-// The write ladder's rung 4 (src/write-policy.ts): anyone may write, if
-// the event p-tags the owner. The other three rungs are bounded by
+// The `mentions` write policy (src/write-policy.ts): anyone may write, if
+// the event p-tags the owner. The policies below it are bounded by
 // somebody the owner chose -- themselves, their correspondents, their
 // follows -- and this one is bounded by "how many people mention the
 // owner", which is a number strangers pick. Every non-owner write already
 // pays MAX_EVENT_BYTES, MAX_EVENTS_PER_PUBKEY_PER_WINDOW and the
 // non-owner storage share; what none of those bound is rows written PER
 // EVENT, which is 3 per single-letter tag (schema.ts TAG_ROW_COST). A
-// 64KB event can carry ~2,000 of them, so one stranger at rung 4 could
+// 64KB event can carry ~2,000 of them, so one stranger under `mentions` could
 // spend ~6,000 rows -- six percent of the day -- per event, twenty a
 // minute per pubkey, from as many pubkeys as they like.
 //

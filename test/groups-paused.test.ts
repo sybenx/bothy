@@ -27,7 +27,7 @@ isolateStorage();
 const PAUSED = { OWNER_PUBKEY: OWNER_PUBKEY_HEX } as unknown as Env;
 const ON = { OWNER_PUBKEY: OWNER_PUBKEY_HEX, GROUPS: "on" } as unknown as Env;
 const RELAY_HEX = "f".repeat(64);
-const NO_SETTINGS = { name: null, description: null, icon: null, writeRung: null };
+const NO_SETTINGS = { name: null, description: null, icon: null, writePolicy: null };
 
 function stub() {
   return env.RELAY.get(env.RELAY.idFromName("relay"));

@@ -1,9 +1,9 @@
-// ALLOW_FOLLOWS (CLAUDE.md "Configuration": "also accept writes from the
-// owner's kind-3 follow list"). Follows are re-derived from the owner's
+// The `follows` write policy (CLAUDE.md "Configuration": writes from the
+// owner's kind-3 follow list). Follows are re-derived from the owner's
 // own most recent kind-3 event already stored on this relay, not fetched
-// from elsewhere -- see ownership.ts refreshFollows(). ALLOW_FOLLOWS is an
-// opt-out (write-policy.ts resolveWriteRung, which reads ALLOW_FOLLOWS=false as rung 2), so both states are exercised
-// explicitly below with a hand-built env against real SqlStorage via
+// from elsewhere -- see ownership.ts refreshFollows(). Both the follows
+// and the owner-only policies are exercised explicitly below with a
+// hand-built env (WRITE_POLICY) against real SqlStorage via
 // runInDurableObject, rather than relying on whatever the global test env
 // happens to default to.
 import { env } from "cloudflare:workers";
@@ -41,10 +41,10 @@ function measureRowsWritten(sql: SqlStorage, fn: (sql: SqlStorage) => void): num
   return total;
 }
 
-const FOLLOWS_ENV = { OWNER_PUBKEY: OWNER_PUBKEY_HEX, ALLOW_FOLLOWS: "true" } as unknown as Env;
-const NO_FOLLOWS_ENV = { OWNER_PUBKEY: OWNER_PUBKEY_HEX, ALLOW_FOLLOWS: "false" } as unknown as Env;
+const FOLLOWS_ENV = { OWNER_PUBKEY: OWNER_PUBKEY_HEX, WRITE_POLICY: "follows" } as unknown as Env;
+const NO_FOLLOWS_ENV = { OWNER_PUBKEY: OWNER_PUBKEY_HEX, WRITE_POLICY: "owner" } as unknown as Env;
 
-describe("ALLOW_FOLLOWS write gate", () => {
+describe("follows write policy", () => {
   it("a friend in the owner's stored kind-3 contact list may write once follows are refreshed", async () => {
     const friend = randomKeypair();
     const contacts = signEvent(OWNER_SECRET_KEY_HEX, {
@@ -57,8 +57,7 @@ describe("ALLOW_FOLLOWS write gate", () => {
     await runInDurableObject(stub, async (_instance, state) => {
       // Stored directly via storeEvent rather than published over the
       // wire -- publishing would go through relay.ts's own handleEvent,
-      // which (now that ALLOW_FOLLOWS is an opt-out, see
-      // ownership.ts allowFollowsEnabled) immediately refreshes the
+      // which immediately refreshes the
       // follow cache on an owner kind-3, defeating the point of this
       // test's explicit before/after refreshFollows assertions.
       storeEvent(state.storage.sql, contacts, Math.floor(Date.now() / 1000));
@@ -71,7 +70,7 @@ describe("ALLOW_FOLLOWS write gate", () => {
     });
   });
 
-  it("does not allow a follow's writes when ALLOW_FOLLOWS is off", async () => {
+  it("does not allow a follow's writes under the owner policy", async () => {
     const friend = randomKeypair();
     const contacts = signEvent(OWNER_SECRET_KEY_HEX, {
       kind: 3,
@@ -98,7 +97,7 @@ describe("ALLOW_FOLLOWS write gate", () => {
     });
   });
 
-  it("the owner can always write regardless of ALLOW_FOLLOWS", async () => {
+  it("the owner can always write whatever the policy", async () => {
     const id = env.RELAY.idFromName("relay");
     const stub = env.RELAY.get(id);
     await runInDurableObject(stub, async (_instance, state) => {
@@ -342,7 +341,7 @@ describe("NIP-86 banpubkey/allowpubkey write gate (phase two)", () => {
     });
   });
 
-  it("an explicitly allowlisted pubkey can write even with ALLOW_FOLLOWS off", async () => {
+  it("an explicitly allowlisted pubkey can write even under the owner policy", async () => {
     const friend = randomKeypair().pubkeyHex;
     const id = env.RELAY.idFromName("relay");
     const stub = env.RELAY.get(id);

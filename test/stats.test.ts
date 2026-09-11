@@ -71,10 +71,9 @@ describe("GET /api/stats", () => {
       followsListAt: number | null;
     };
 
-    // The global test env leaves ALLOW_FOLLOWS unset (vitest.config.ts),
-    // and it's an opt-out (write-policy.ts resolveWriteRung, which reads ALLOW_FOLLOWS=false as rung 2), so this is
-    // "follows" here even with an empty follow list -- see
-    // follows.test.ts for the ALLOW_FOLLOWS=false owner-only case.
+    // The global test env sets no WRITE_POLICY (vitest.config.ts) and the
+    // default is "follows", so this is "follows" here even with an empty
+    // follow list -- see follows.test.ts for the owner-only case.
     expect(body.writePolicy).toBe("follows");
     expect(body.followCount).toBe(0);
     expect(body.followsListAt).toBeNull();
@@ -92,23 +91,22 @@ describe("GET /api/stats", () => {
     });
 
     const conn = await connectRelay();
-    // ALLOW_FOLLOWS is an opt-out (write-policy.ts resolveWriteRung, which reads ALLOW_FOLLOWS=false as rung 2) and
-    // the global test env leaves it unset, so relay.ts's immediate
-    // refresh on this owner kind-3 already populates `follows` for real.
+    // relay.ts's immediate refresh on this owner kind-3 already populates
+    // `follows` for real.
     await publish(conn, contacts);
     conn.close();
 
-    // Driven again directly with an explicit follows-enabled env (the
-    // same technique test/follows.test.ts uses for the write-gate itself)
-    // so this test doesn't depend on ALLOW_FOLLOWS's default staying what
-    // it is today -- what's under test here is that getStats'
+    // Driven again directly with an explicit follows env (the same
+    // technique test/follows.test.ts uses for the write-gate itself) so
+    // this test doesn't depend on the default policy staying what it is
+    // today -- what's under test here is that getStats'
     // followCount/followsListAt reflect whatever is actually in the
     // table, not relay.ts's refresh trigger (covered by
     // test/write-gate-refresh.test.ts instead).
     const id = env.RELAY.idFromName("relay");
     const stub = env.RELAY.get(id);
     await runInDurableObject(stub, async (_instance, state) => {
-      refreshFollows(state.storage.sql, { ...env, ALLOW_FOLLOWS: "true" } as unknown as Env);
+      refreshFollows(state.storage.sql, { ...env, WRITE_POLICY: "follows" } as unknown as Env);
     });
 
     const response = await exports.default.fetch("https://example.com/api/stats");

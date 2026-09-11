@@ -2089,11 +2089,11 @@ export interface RelaySettings {
   name: string | null;
   description: string | null;
   icon: string | null;
-  // The write ladder's stored rung (write-policy.ts resolveWriteRung),
-  // what NIP-86 changewritepolicy writes. Kept as the string the operator
+  // The stored write policy (write-policy.ts resolveWritePolicy), what
+  // NIP-86 changewritepolicy writes. Kept as the string the operator
   // supplied and parsed at resolution time, so an unparseable stored
   // value falls through to the default rather than refusing every write.
-  writeRung: string | null;
+  writePolicy: string | null;
 }
 
 export function getRelaySettings(sql: SqlStorage): RelaySettings {
@@ -2103,16 +2103,16 @@ export function getRelaySettings(sql: SqlStorage): RelaySettings {
     name: byKey.get("name") ?? null,
     description: byKey.get("description") ?? null,
     icon: byKey.get("icon") ?? null,
-    writeRung: byKey.get("write_rung") ?? null,
+    writePolicy: byKey.get("write_policy") ?? null,
   };
 }
 
-// Just the stored rung, for the write path. One indexed row read, paid
-// by relay.ts once per wake (it caches the resolved rung per instance
+// Just the stored policy, for the write path. One indexed row read, paid
+// by relay.ts once per wake (it caches the resolved policy per instance
 // and invalidates it on a management call) rather than per event.
-export function getStoredWriteRung(sql: SqlStorage): string | null {
+export function getStoredWritePolicy(sql: SqlStorage): string | null {
   const row = sql
-    .exec<{ value: string }>(`SELECT value FROM relay_settings WHERE key = ?`, "write_rung")
+    .exec<{ value: string }>(`SELECT value FROM relay_settings WHERE key = ?`, "write_policy")
     .toArray()[0];
   return row?.value ?? null;
 }
@@ -2122,7 +2122,7 @@ export function getStoredWriteRung(sql: SqlStorage): string | null {
 // falling back down the chain (README.md "Relay management API"). Storing
 // "" instead would be indistinguishable from a deliberate empty name and
 // would shadow the kind-0 and hardcoded rungs forever.
-export type RelaySettingKey = "name" | "description" | "icon" | "write_rung";
+export type RelaySettingKey = "name" | "description" | "icon" | "write_policy";
 
 export function setRelaySetting(sql: SqlStorage, key: RelaySettingKey, value: string): void {
   if (value === "") {

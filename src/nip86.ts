@@ -22,7 +22,7 @@ import {
   banPubkey,
   blockIp,
   deletePushSubscription,
-  getStoredWriteRung,
+  getStoredWritePolicy,
   listAllowedPubkeys,
   listBannedEvents,
   listBannedPubkeys,
@@ -41,15 +41,13 @@ import { getOwnerPubkey } from "./ownership";
 import { normalizeIp } from "./ip";
 import { normalizePubkey } from "./pubkey";
 import {
-  DEFAULT_WRITE_RUNG,
-  envOverridingRung,
-  MAX_WRITE_RUNG,
-  parseRung,
-  resolveWriteRung,
-  RUNG_DESCRIPTIONS,
-  RUNG_NAMES,
-  rungName,
-  type WriteRung,
+  DEFAULT_WRITE_POLICY,
+  envOverridesPolicy,
+  OPEN_POLICY_CONFIRMATION,
+  parsePolicy,
+  POLICY_DESCRIPTIONS,
+  resolveWritePolicy,
+  WRITE_POLICIES,
 } from "./write-policy";
 
 // nips/86.md: "a JSON-RPC-like request-response protocol over HTTP, on
@@ -90,13 +88,13 @@ export const SUPPORTED_METHODS = [
   "changerelayname",
   "changerelaydescription",
   "changerelayicon",
-  // bothy's own: the write ladder (src/write-policy.ts, docs/rungs.md).
-  // NIP-86 has no notion of a write policy beyond its per-pubkey lists,
-  // and the ladder is the thing those lists sit inside. changewritepolicy
-  // takes a rung number or name and follows the change* conventions
-  // (empty string clears, an environment variable outranks the stored
-  // value and the response says so); getwritepolicy reads back the rung
-  // in force and where it came from, which NIP-11 has no field for.
+  // bothy's own: the write policy (src/write-policy.ts). NIP-86 has no
+  // notion of a write policy beyond its per-pubkey lists, and the policy
+  // is the thing those lists sit inside. changewritepolicy takes a policy
+  // name and follows the change* conventions (empty string clears, an
+  // environment variable outranks the stored value and the response
+  // says so); getwritepolicy reads back the policy in force and where it
+  // came from, which NIP-11 has no field for.
   "changewritepolicy",
   "getwritepolicy",
   // bothy's own, not NIP-86's. The spec defines no invite methods at all,
@@ -207,27 +205,25 @@ function identityNote(
 // The advisory note every changewritepolicy response carries, in the
 // error field for the reason identityNote gives: it is the one field
 // NIP-86 offers for saying anything beside a result. It always ends by
-// stating the rung actually IN FORCE after the call, because that is the
-// question the operator has and there are two ways the answer differs
-// from what they just stored: WRITE_RUNG (or the legacy ALLOW_FOLLOWS)
-// in the environment outranks the stored value, and clearing the stored
-// value falls back to the default. Store and warn, never silently
-// discard -- the same rule as the name/description/icon methods.
+// stating the policy actually IN FORCE after the call, because that is
+// the question the operator has and there are two ways the answer
+// differs from what they just stored: WRITE_POLICY in the environment
+// outranks the stored value, and clearing the stored value falls back to
+// the default. Store and warn, never silently discard -- the same rule
+// as the name/description/icon methods.
 function writePolicyNote(sql: SqlStorage, env: Env, headline: string): string {
   const parts = [headline];
-  const overriding = envOverridingRung(env);
-  if (overriding) {
+  if (envOverridesPolicy(env)) {
     parts.push(
-      `Note: ${overriding} is set in this deployment's environment and takes precedence over the stored ` +
-        `value, so the stored value takes effect only once ${overriding} is cleared in the Cloudflare dashboard.`,
+      `Note: WRITE_POLICY is set in this deployment's environment and takes precedence over the stored ` +
+        `value, so the stored value takes effect only once WRITE_POLICY is cleared in the Cloudflare dashboard.`,
     );
   }
-  const resolved = resolveWriteRung(env, getStoredWriteRung(sql));
+  const resolved = resolveWritePolicy(env, getStoredWritePolicy(sql));
   parts.push(
-    `The write policy now in force is ${resolved.rung} (${rungName(resolved.rung)}): ` +
-      `${RUNG_DESCRIPTIONS[resolved.rung]} ` +
+    `The write policy now in force is "${resolved.policy}": ${POLICY_DESCRIPTIONS[resolved.policy]} ` +
       `Calling changewritepolicy with an empty string clears the stored value and falls back to the ` +
-      `default of ${DEFAULT_WRITE_RUNG} (${rungName(DEFAULT_WRITE_RUNG)}).`,
+      `default, "${DEFAULT_WRITE_POLICY}".`,
   );
   return parts.join(" ");
 }
@@ -389,7 +385,7 @@ export function handleManagementCall(
 
     // A manual allowlist, independent of banned_pubkeys -- see the header
     // comment above. Grants write access to a pubkey the owner doesn't
-    // follow (or, with ALLOW_FOLLOWS off, to anyone named individually)
+    // follow (or, under the owner/inbox policies, to anyone named individually)
     // without opening writes more broadly.
     case "allowpubkey": {
       const pubkey = pubkeyParam(params, 0);
@@ -548,60 +544,47 @@ export function handleManagementCall(
     case "changerelayicon":
       return changeIdentity(sql, params, "icon", method, "RELAY_ICON", env.RELAY_ICON);
 
-    // The write ladder (src/write-policy.ts). Stored as the operator gave
+    // The write policy (src/write-policy.ts). Stored as the operator gave
     // it, resolved on the write path through the same env-then-stored-
     // then-default chain the relay's name uses -- see writePolicyNote
     // for what the response has to tell them and why.
     case "changewritepolicy": {
       const raw = params[0];
       if (raw === "") {
-        setRelaySetting(sql, "write_rung", "");
+        setRelaySetting(sql, "write_policy", "");
         return { result: true, error: writePolicyNote(sql, env, "Cleared the stored write policy.") };
       }
-      const parsed = parseRung(raw);
-      if (!parsed.ok) {
-        // Rung 5 is refused BY NAME, with the reason, rather than as a
-        // malformed value: the ladder document is explicit that an open
-        // relay is a cliff and not a step, and an operator asking for it
-        // deserves the design answer -- the same call the kind allowlist
-        // methods below make.
-        if (parsed.reason === "open") {
-          return err(
-            "changewritepolicy: rung 5 (an open relay) is the one rung bothy refuses to implement. " +
-              "Rungs 1-4 are each bounded by something real -- the owner's posting rate, their " +
-              "correspondents, their follow list, the people who mention them -- and rung 5 is bounded " +
-              "by nothing, which is a difference in kind rather than degree (docs/rungs.md). The widest " +
-              `available policy is ${MAX_WRITE_RUNG} (${rungName(MAX_WRITE_RUNG)}).`,
-          );
-        }
+      const policy = parsePolicy(raw);
+      if (policy === null) {
         return err(
-          "changewritepolicy takes one parameter: a rung number from 1 to 4, or its name " +
-            `(${Object.values(RUNG_NAMES).join(", ")}). An empty string clears the stored policy.`,
+          `changewritepolicy takes one parameter, a policy name: ${WRITE_POLICIES.join(", ")}. ` +
+            `An empty string clears the stored policy.`,
         );
       }
-      setRelaySetting(sql, "write_rung", String(parsed.rung));
-      return {
-        result: true,
-        error: writePolicyNote(
-          sql,
-          env,
-          `Stored write policy ${parsed.rung} (${rungName(parsed.rung)}).`,
-        ),
-      };
+      // Opening the relay to everyone is allowed, but never on the first
+      // try -- the blockip self-block shape. It is the one policy whose
+      // consequence is unbounded by anything the owner chose, and the
+      // command that sets it is one word long.
+      if (policy === "all" && params[1] !== OPEN_POLICY_CONFIRMATION) {
+        return err(
+          `changewritepolicy: "all" lets ANYONE publish ANY event to this relay, bounded only by the ` +
+            `per-event size cap, the per-pubkey rate cap and the storage share reserved for you. ` +
+            `Every other policy is bounded by people you chose. To proceed, call changewritepolicy again ` +
+            `with "all" and a second parameter set to exactly: ${OPEN_POLICY_CONFIRMATION}`,
+        );
+      }
+      setRelaySetting(sql, "write_policy", policy);
+      return { result: true, error: writePolicyNote(sql, env, `Stored write policy "${policy}".`) };
     }
 
     case "getwritepolicy": {
-      const resolved = resolveWriteRung(env, getStoredWriteRung(sql));
+      const resolved = resolveWritePolicy(env, getStoredWritePolicy(sql));
       return {
         result: {
-          rung: resolved.rung,
-          name: rungName(resolved.rung),
+          policy: resolved.policy,
           source: resolved.source,
-          description: RUNG_DESCRIPTIONS[resolved.rung],
-          rungs: (Object.keys(RUNG_NAMES) as unknown as string[]).map((key) => {
-            const rung = Number(key) as WriteRung;
-            return { rung, name: RUNG_NAMES[rung], description: RUNG_DESCRIPTIONS[rung] };
-          }),
+          description: POLICY_DESCRIPTIONS[resolved.policy],
+          policies: WRITE_POLICIES.map((name) => ({ name, description: POLICY_DESCRIPTIONS[name] })),
         },
       };
     }

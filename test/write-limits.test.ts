@@ -3,7 +3,7 @@
 // test/follows.test.ts, which cover who may write at all, and from
 // test/read-limits.test.ts, which bounds the public read path.
 //
-// The gap these close: ALLOW_FOLLOWS became an opt-out in v0.2.0, so the
+// The gap these close: writes opened to the owner's follows in v0.2.0, so the
 // write path went from one trusted author to hundreds of followed
 // pubkeys while every abuse cap in the project was still scoped to
 // kind-1059 gift wraps. Each scenario below is named for the abuse it

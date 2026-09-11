@@ -4,14 +4,13 @@ import type { OwnerProfile } from "./nip11";
 import type { Profile } from "./profile-lookup";
 import { acrossScopes } from "./groups";
 import { normalizePubkey } from "./pubkey";
-import { getStoredWriteRung, isPubkeyAllowed, isPubkeyBanned, setFollowCount } from "./storage";
+import { getStoredWritePolicy, isPubkeyAllowed, isPubkeyBanned, setFollowCount } from "./storage";
 import {
+  admitsAtLeast,
   exceedsMentionTagCap,
-  FOLLOWS_RUNG,
-  MENTIONS_RUNG,
   mentionsPubkey,
-  resolveWriteRung,
-  type WriteRung,
+  resolveWritePolicy,
+  type WritePolicy,
 } from "./write-policy";
 
 // Kind-3 is NIP-01/NIP-02's contact list; its `p` tags are the follow set.
@@ -130,35 +129,35 @@ export type WriteAuthorization =
 
 // What the write gate needs beyond the pubkey, and why each is optional.
 //
-// `rung` is the effective write rung (write-policy.ts). relay.ts caches
-// it per instance and passes it in, so the gate pays no row for it per
-// event; a caller that omits it (the tests that drive this function
-// directly against real storage) gets it resolved from the environment
-// and the stored setting at one row read.
+// `policy` is the effective write policy (write-policy.ts). relay.ts
+// caches it per instance and passes it in, so the gate pays no row for
+// it per event; a caller that omits it (the tests that drive this
+// function directly against real storage) gets it resolved from the
+// environment and the stored setting at one row read.
 //
-// `tags` are the event's tags, consulted only at rung 4 and only on the
-// path already about to refuse -- rung 4's test is "does this event
-// p-tag the owner", which is answered from the event itself. Omitted,
-// rung 4 admits nobody it would not have admitted at rung 3, which is the
+// `tags` are the event's tags, consulted only under `mentions` and only
+// on the path already about to refuse -- that policy's test is "does
+// this event p-tag the owner", which is answered from the event itself.
+// Omitted, `mentions` admits nobody `follows` would not, which is the
 // safe direction for a caller that has no event in hand.
 export interface WriterContext {
-  rung?: WriteRung;
+  policy?: WritePolicy;
   tags?: string[][];
 }
 
-// The write ladder (write-policy.ts, docs/rungs.md), enforced.
+// The write policy (write-policy.ts), enforced.
 //
 // Owner writes are always allowed, and so is an explicitly allowlisted
-// pubkey (NIP-86 allowpubkey) at every rung -- docs/rungs.md places named
-// individuals inside rung 1, the owner deciding by hand who else may
-// write. banpubkey is the mirror image and refuses at every rung. The
-// rung then decides who ELSE gets in:
+// pubkey (NIP-86 allowpubkey) under every policy -- that is the owner
+// deciding by hand who else may write. banpubkey is the mirror image and
+// refuses under every policy. The policy then decides who ELSE gets in:
 //
-//   - rung 3 and above consult the follow cache (refreshFollows below);
-//   - rung 4 admits any author whose event p-tags the owner, provided
+//   - `follows` and above consult the follow cache (refreshFollows below);
+//   - `mentions` admits any author whose event p-tags the owner, provided
 //     the event carries no more indexed tags than
 //     MAX_MENTION_EVENT_INDEXED_TAGS -- see limits.ts for why a bound on
-//     WHO is not a bound on ROWS once "who" is anyone.
+//     WHO is not a bound on ROWS once "who" is anyone;
+//   - `all` admits everyone who is not banned.
 //
 // Ordering is by cost and by certainty, per CLAUDE.md "Conventions":
 //
@@ -168,15 +167,16 @@ export interface WriterContext {
 //     pubkey be banned, so there's no owner-lockout case to guard against
 //     here.
 //   - allowed_pubkeys is checked only on the path already about to
-//     reject a write (rung below 3, or "not a follow"), so it costs
-//     nothing on the common accept path.
-//   - the rung-4 mention test runs last, after both lookups, and costs
-//     no storage at all: it reads the event's own tags.
+//     reject a write (a policy below `follows`, or "not a follow"), so it
+//     costs nothing on the common accept path.
+//   - the mention test runs last, after both lookups, and costs no
+//     storage at all: it reads the event's own tags.
 //
-// The refusal names the rung's OWN boundary -- "not a follow" at rung 3,
-// "does not mention the owner" at rung 4 -- so the message a stranger
-// reads in their client tells them what this relay would have accepted,
-// which is the one thing a refused writer wants to know.
+// The refusal names the policy's OWN boundary -- "not a follow" under
+// `follows`, "does not mention the owner" under `mentions` -- so the
+// message a stranger reads in their client tells them what this relay
+// would have accepted, which is the one thing a refused writer wants to
+// know.
 export function isAllowedWriter(
   sql: SqlStorage,
   env: Env,
@@ -187,13 +187,14 @@ export function isAllowedWriter(
   if (owner === null) return { allowed: false, reason: "unclaimed" };
   if (pubkey === owner) return { allowed: true, isOwner: true };
   if (isPubkeyBanned(sql, pubkey)) return { allowed: false, reason: "banned" };
-  const rung = context.rung ?? resolveWriteRung(env, getStoredWriteRung(sql)).rung;
-  if (rung >= FOLLOWS_RUNG) {
+  const policy = context.policy ?? resolveWritePolicy(env, getStoredWritePolicy(sql)).policy;
+  if (policy === "all") return { allowed: true, isOwner: false };
+  if (admitsAtLeast(policy, "follows")) {
     const row = sql.exec(`SELECT 1 FROM follows WHERE pubkey = ?`, pubkey).toArray();
     if (row.length > 0) return { allowed: true, isOwner: false };
   }
   if (isPubkeyAllowed(sql, pubkey)) return { allowed: true, isOwner: false };
-  if (rung >= MENTIONS_RUNG && context.tags !== undefined) {
+  if (policy === "mentions" && context.tags !== undefined) {
     const event = { tags: context.tags };
     if (mentionsPubkey(event, owner)) {
       return exceedsMentionTagCap(event)
@@ -202,7 +203,7 @@ export function isAllowedWriter(
     }
     return { allowed: false, reason: "not-mention" };
   }
-  return { allowed: false, reason: rung >= FOLLOWS_RUNG ? "not-follow" : "owner-only" };
+  return { allowed: false, reason: admitsAtLeast(policy, "follows") ? "not-follow" : "owner-only" };
 }
 
 // Fingerprint of a follow set, in the style of schema.ts
@@ -302,15 +303,15 @@ export function computeFollowsHash(follows: ReadonlySet<string>): string {
 // to crowd the budget; not worth the refactor to shave a cost that
 // human-rate actions bound today.
 //
-// NOT gated on the write rung, deliberately. The cache is a fact about
-// the owner's contact list and the rung is a policy about who may write;
-// isAllowedWriter consults the cache only at rung 3 and above, so a
-// relay at rung 1 or 2 maintains a table nothing reads -- at the cost of
-// the hash comparison above, one row and a sha256, per tick. What that
-// buys is a rung change that takes effect the moment it is made: a
-// changewritepolicy call raising the relay to rung 3 finds the cache
-// already current, rather than admitting nobody until the next cron
-// tick rebuilt it.
+// NOT gated on the write policy, deliberately. The cache is a fact about
+// the owner's contact list and the policy is about who may write;
+// isAllowedWriter consults the cache only under `follows` and above, so
+// a relay under `owner` or `inbox` maintains a table nothing reads -- at
+// the cost of the hash comparison above, one row and a sha256, per tick.
+// What that buys is a policy change that takes effect the moment it is
+// made: a changewritepolicy call opening the relay to follows finds the
+// cache already current, rather than admitting nobody until the next
+// cron tick rebuilt it.
 export function refreshFollows(sql: SqlStorage, env: Env): void {
   const owner = getOwnerPubkey(sql, env);
   if (owner === null) return;

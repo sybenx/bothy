@@ -99,13 +99,7 @@ import {
   refreshProfile,
   type WriteRejection,
 } from "./ownership";
-import {
-  INBOX_RUNG,
-  resolveWriteRung,
-  rungName,
-  type ResolvedWriteRung,
-  type WriteRung,
-} from "./write-policy";
+import { admitsAtLeast, resolveWritePolicy, type ResolvedWritePolicy, type WritePolicy } from "./write-policy";
 import type { Profile } from "./profile-lookup";
 import { normalizePubkey } from "./pubkey";
 import {
@@ -153,7 +147,7 @@ import {
   expirationOf,
   fixMisclassifiedGroupEvents,
   getRelaySettings,
-  getStoredWriteRung,
+  getStoredWritePolicy,
   giftWrapCount,
   sweepExpiredGiftWraps,
   hasNonOwnerStorageHeadroom,
@@ -324,8 +318,9 @@ function writeRejectionMessage(reason: WriteRejection): string {
       return "restricted: writes are limited to the relay owner";
     case "banned":
       return "blocked: this pubkey is banned from writing here";
-    // The two rung-4 refusals (write-policy.ts). Each names the boundary
-    // it enforces, so a stranger learns what this relay WOULD accept.
+    // The two `mentions` refusals (write-policy.ts). Each names the
+    // boundary it enforces, so a stranger learns what this relay WOULD
+    // accept.
     case "not-mention":
       return "restricted: only the owner, people they follow, and events that mention the owner can publish here";
     case "too-many-tags":
@@ -401,20 +396,20 @@ export class Relay extends DurableObject<Env> {
   // backwards.
   private roomSampledAt = 0;
 
-  // The effective write rung (write-policy.ts resolveWriteRung), cached
-  // per instance so the write gate pays no row for it per event: the one
-  // stored-setting read happens on the first non-owner write after a
-  // wake and is then answered from memory until the next one. Cleared
-  // by manage() after every management call, because changewritepolicy
-  // is the only thing that can change the stored half and it arrives
-  // through that method on this same single-threaded object -- so a
-  // policy change takes effect on the very next event rather than on
-  // the next eviction.
-  private cachedWriteRung: ResolvedWriteRung | undefined;
+  // The effective write policy (write-policy.ts resolveWritePolicy),
+  // cached per instance so the write gate pays no row for it per event:
+  // the one stored-setting read happens on the first non-owner write
+  // after a wake and is then answered from memory until the next one.
+  // Cleared by manage() after every management call, because
+  // changewritepolicy is the only thing that can change the stored half
+  // and it arrives through that method on this same single-threaded
+  // object -- so a policy change takes effect on the very next event
+  // rather than on the next eviction.
+  private cachedWritePolicy: ResolvedWritePolicy | undefined;
 
-  private writeRung(): ResolvedWriteRung {
-    this.cachedWriteRung ??= resolveWriteRung(this.env, getStoredWriteRung(this.sql));
-    return this.cachedWriteRung;
+  private writePolicy(): ResolvedWritePolicy {
+    this.cachedWritePolicy ??= resolveWritePolicy(this.env, getStoredWritePolicy(this.sql));
+    return this.cachedWritePolicy;
   }
 
   // Set when this invocation queued something into `push_outbox`, and
@@ -634,11 +629,11 @@ export class Relay extends DurableObject<Env> {
         handleManagementCall(this.sql, this.env, method, params, callerIp, nowSeconds(), signer),
       ),
     );
-    // See cachedWriteRung. Cleared unconditionally rather than only for
+    // See cachedWritePolicy. Cleared unconditionally rather than only for
     // changewritepolicy: the cost is one row read on the next non-owner
     // write, and a cache that has to know which methods invalidate it is
     // a cache that will one day be wrong about one.
-    this.cachedWriteRung = undefined;
+    this.cachedWritePolicy = undefined;
     return response;
   }
 
@@ -725,20 +720,13 @@ export class Relay extends DurableObject<Env> {
     // NIP-86 has no getrelayname, so this is the read side for
     // changerelayname.
     relayName: string;
-    // Whether writes beyond the owner are currently possible at all
-    // (CLAUDE.md "What it is"), plus the numbers that
-    // back that state -- see the ALLOW_FOLLOWS-gate comment in
-    // ownership.ts isAllowedWriter. Surfaced so an owner who enabled
-    // ALLOW_FOLLOWS but never published a kind-3 here (an empty allowlist
-    // that silently blocks every follow) has a visible signal instead of
-    // a mystery.
-    writePolicy: string;
-    // The rung behind that name (write-policy.ts): the number, and
-    // where it came from -- the environment, the legacy ALLOW_FOLLOWS
-    // variable, a stored changewritepolicy, or the default -- so the
-    // admin page can say which one an owner would have to change.
-    writeRung: WriteRung;
-    writeRungSource: ResolvedWriteRung["source"];
+    // The write policy in force (write-policy.ts), by name, and where it
+    // came from -- the environment, a stored changewritepolicy, or the
+    // default. The admin page renders the policy as one sentence; the
+    // follow count beside it is what lets that sentence say "the follow
+    // list is empty" when it is, rather than reading as healthy.
+    writePolicy: WritePolicy;
+    writePolicySource: ResolvedWritePolicy["source"];
     // Whether NIP-29 groups are accepting anything (limits.ts
     // groupsEnabled): "on" or "paused". Configuration, like chatPolicy
     // below, and nothing about what the group holds.
@@ -927,9 +915,8 @@ export class Relay extends DurableObject<Env> {
       // to the static default favicon client-side.
       icon: resolveIcon(this.env, settings, profile),
       relayName: resolveName(this.env, settings, profile),
-      writePolicy: rungName(this.writeRung().rung),
-      writeRung: this.writeRung().rung,
-      writeRungSource: this.writeRung().source,
+      writePolicy: this.writePolicy().policy,
+      writePolicySource: this.writePolicy().source,
       groupPolicy: groupsEnabled(this.env) ? "on" : "paused",
       chatPolicy: chatMode(this.env),
       // Out of the same row as `totalEvents` above, at no additional read.
@@ -981,7 +968,7 @@ export class Relay extends DurableObject<Env> {
   }
 
   // Cron entry point (src/index.ts scheduled()) -- refreshes the
-  // ALLOW_FOLLOWS cache and, at most once/day, the cached NIP-11/favicon
+  // follow cache and, at most once/day, the cached NIP-11/favicon
   // icon from the owner's locally-stored kind-0 (ownership.ts
   // refreshProfile). Both are no-ops on their common paths (feature off;
   // empty list; already refreshed today), so this stays cheap on most
@@ -1308,7 +1295,7 @@ export class Relay extends DurableObject<Env> {
     // is fine: NIP-01 doesn't require checking id/sig before authorization.
     const sql = this.sql;
     const auth = isAllowedWriter(sql, this.env, event.pubkey, {
-      rung: this.writeRung().rung,
+      policy: this.writePolicy().policy,
       tags: event.tags,
     });
     if (!auth.allowed) {
@@ -1371,11 +1358,11 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
-    // The write ladder's rung 2 (write-policy.ts): a gift wrap is
-    // addressed mail, and a relay at rung 1 accepts only its owner's own
-    // events -- which a wrap, signed by a throwaway key, never is. Ahead
-    // of the owner lookup because it is answered from the cached rung.
-    if (this.writeRung().rung < INBOX_RUNG) {
+    // The `inbox` policy (write-policy.ts): a gift wrap is addressed
+    // mail, and a relay under `owner` accepts only its owner's own events
+    // -- which a wrap, signed by a throwaway key, never is. Ahead of the
+    // owner lookup because it is answered from the cached policy.
+    if (!admitsAtLeast(this.writePolicy().policy, "inbox")) {
       ok(ws, event.id, false, "restricted: writes are limited to the relay owner, and that includes mail");
       return;
     }
@@ -1811,7 +1798,7 @@ export class Relay extends DurableObject<Env> {
       // Refresh the follow cache the instant the owner publishes a new
       // kind-3, rather than waiting up to an hour for the next cron tick
       // (CLAUDE.md "What it is"). Gated on `event.pubkey === owner`,
-      // not just `event.kind` -- under ALLOW_FOLLOWS a follow can publish
+      // not just `event.kind` -- under the follows policy a follow can publish
       // their own kind-3 through this same accept path, and refreshFollows
       // always re-derives from the *owner's* most recent event regardless
       // of whose write triggered the call, so this only costs an extra
