@@ -33,6 +33,7 @@
         <li class="lvl-2"><a href="#setup">Setup</a></li>
         <li class="lvl-2"><a href="#keeping-it-updated">Keeping it updated</a></li>
         <li class="lvl-2"><a href="#ownership-and-lifecycle">Ownership and lifecycle</a></li>
+        <li class="lvl-2"><a href="#moving-to-a-new-bothy">Moving to a new bothy</a></li>
         <li class="lvl-2"><a href="#configuration">Configuration</a></li>
         <li class="lvl-2"><a href="#inbox-mode-encrypted-mail">Inbox mode (encrypted mail)</a></li>
         <li class="lvl-2"><a href="#who-can-write-here">Who can write here</a></li>
@@ -91,6 +92,40 @@ npx wrangler deploy
 <p>Claiming also starts a one-time backfill of your history: bothy looks up the relays your own kind-10002 list already names as ones you publish to, resolving that list via a couple of well-known relays, then pulls your past notes in from them automatically, a page at a time on each hourly cron tick, until it&#39;s caught up. This needs no action from you and stops once it&#39;s done; the admin page shows its progress.</p>
 <p>Redeploying does not reset ownership or storage. Running <code>wrangler deploy</code> again, or re-clicking the deploy button, ships new code against the same storage, so your events and your claim both survive. To actually reset a relay, delete the Worker from the Cloudflare dashboard (Workers &amp; Pages → your worker → Settings → Delete) and deploy a fresh one. There is no in-place &quot;unclaim,&quot; since Durable Object storage is tied to the Worker.</p>
 <p>To remove the relay entirely, delete two things: the Worker (Workers &amp; Pages → your project → Settings → Delete), which takes the relay offline, and the GitHub repo Cloudflare created (its Settings → Danger Zone → Delete this repository). Deleting only the repo leaves the relay running; deleting only the Worker leaves the repo behind.</p>
+<h2 id="moving-to-a-new-bothy">Moving to a new bothy<a class="anchor" href="#moving-to-a-new-bothy" aria-label="Link to this section">#</a></h2>
+<p>A bothy can&#39;t be moved to another Cloudflare account: its storage stays with the Worker. To move, deploy a fresh bothy, claim it with the same key, and copy events across with <a href="https://github.com/fiatjaf/nak">nak</a>. bothy doesn&#39;t speak negentropy (NIP-77), so <code>nak sync</code> won&#39;t work. Instead, you export with <code>nak req</code> and import with <code>nak event</code>.</p>
+<p>You don&#39;t strictly need to copy your own notes: claiming starts a backfill from the relays in your relay list. Copy them anyway if the old bothy is the only place some of them live. What only the old bothy holds is your follows&#39; notes, mentions of you and your encrypted mail.</p>
+<pre><code class="language-bash">OLD=wss://old-relay.workers.dev
+NEW=wss://new-relay.workers.dev
+ME=&lt;your hex pubkey&gt;
+export NOSTR_SECRET_KEY=&lt;your nsec&gt;   # nak signs the AUTH for your mail with it
+
+# 1. Export. Mail is read separately: a filter that doesn&#39;t name kind 1059
+#    is answered without your mail rather than asking you to log in.
+nak req --paginate -a $ME $OLD &gt; mine.jsonl
+nak req -a $ME -k 3 $OLD \
+  | jq -c &#39;[.tags[] | select(.[0] == &quot;p&quot;) | .[1]] | _nwise(100) | {authors: .}&#39; \
+  | nak req --paginate $OLD &gt; follows.jsonl
+nak req --paginate -p $ME $OLD | cat follows.jsonl - | awk &#39;!seen[$0]++&#39; &gt; others.jsonl
+nak req --paginate --auth -k 1059 -p $ME $OLD &gt; mail.jsonl
+
+# 2. Import, slowly enough to stay under bothy&#39;s limits:
+#    50 messages per 10 seconds from one address, 20 events a minute from
+#    anyone who isn&#39;t you, and 5 pieces of mail a minute.
+pace() { while IFS= read -r line; do printf &#39;%s\n&#39; &quot;$line&quot;; sleep &quot;$1&quot;; done; }
+pace 0.25 &lt; mine.jsonl   | nak event $NEW   # first: it carries your follow list
+pace 3    &lt; others.jsonl | nak event $NEW
+pace 12   &lt; mail.jsonl   | nak event $NEW
+</code></pre>
+<p>Things to know:</p>
+<ul>
+<li><strong>Order matters.</strong> Your own events go first because they include your follow list (kind 3). The new relay accepts your follows&#39; events only once it has that list.</li>
+<li><strong>Strangers are refused by default.</strong> Mentions from people you don&#39;t follow come back <code>restricted:</code> under the default <code>follows</code> policy. To keep them, switch the new relay to <code>mentions</code> for the import (see &quot;Who can write here&quot;) and back afterwards.</li>
+<li><strong>Spread it over days.</strong> Each event costs about 30 of the 100,000 rows the free plan lets you write per day. Past roughly 2,000 events, split the files (<code>split -l 2000 others.jsonl others-</code>) and import one part a day.</li>
+<li><strong>It&#39;s safe to re-run.</strong> An event the new relay already has is acknowledged and not stored twice, so you can simply run a step again.</li>
+<li><strong>Mail is slow.</strong> At 5 a minute, a full inbox takes hours.</li>
+<li><strong>Run it from a terminal.</strong> nak reads a filter from stdin when stdin isn&#39;t a terminal, so in a script, add <code>&lt; /dev/null</code> to the <code>nak req</code> lines that take no input.</li>
+</ul>
 <h2 id="configuration">Configuration<a class="anchor" href="#configuration" aria-label="Link to this section">#</a></h2>
 <p>The deploy button only asks for a project name. Everything else is an optional variable you can add later in the Cloudflare dashboard (<strong>Workers &amp; Pages → your worker → Settings → Variables</strong>) if you want it:</p>
 <div class="table-scroll"><table>
@@ -167,11 +202,20 @@ npx wrangler deploy
 </tr>
 </tbody></table></div>
 <p>Each policy includes everything the one above it allows. Whatever the policy, a pubkey you <code>allowpubkey</code> can always publish and a pubkey you <code>banpubkey</code> never can (see &quot;Relay management API&quot; below).</p>
-<p>To change it:</p>
-<pre><code class="language-bash">nak admin changewritepolicy --sec &lt;your nsec&gt; mentions your-relay.workers.dev
-nak admin getwritepolicy --sec &lt;your nsec&gt; your-relay.workers.dev
+<p>To change it you call <code>changewritepolicy</code>, one of bothy&#39;s own management methods. <a href="https://github.com/fiatjaf/nak">nak</a>&#39;s <code>nak admin</code> knows only the standard NIP-86 methods, so this shell function builds the same signed request by hand. It signs with the key in <code>NOSTR_SECRET_KEY</code>, which nak reads automatically:</p>
+<pre><code class="language-bash">export NOSTR_SECRET_KEY=&lt;your nsec&gt;
+bothy_rpc() {  # bothy_rpc &lt;relay-url&gt; &lt;method&gt; [params-json]
+  body=&quot;{\&quot;method\&quot;:\&quot;$2\&quot;,\&quot;params\&quot;:${3:-[]}}&quot;
+  auth=$(nak event -k 27235 -c &#39;&#39; -t u=&quot;$1&quot; -t method=POST \
+    -t payload=&quot;$(printf %s &quot;$body&quot; | shasum -a 256 | cut -d&#39; &#39; -f1)&quot; &lt; /dev/null | base64 | tr -d &#39;\n&#39;)
+  curl -s -X POST -H &#39;Content-Type: application/nostr+json+rpc&#39; \
+    -H &quot;Authorization: Nostr $auth&quot; -d &quot;$body&quot; &quot;$1&quot;; echo
+}
+
+bothy_rpc https://your-relay.workers.dev/ changewritepolicy &#39;[&quot;mentions&quot;]&#39;
+bothy_rpc https://your-relay.workers.dev/ getwritepolicy
 </code></pre>
-<p>It takes effect immediately. <code>getwritepolicy</code> reads back the policy in force and where it was set. An empty string clears the stored policy and returns to the default. <code>all</code> asks you to confirm: the first call refuses and tells you the exact confirmation string to pass as a second parameter. If <code>WRITE_POLICY</code> is set in the Cloudflare dashboard it outranks the management API, and <code>changewritepolicy</code> tells you so.</p>
+<p>The URL must be exactly the relay&#39;s, trailing slash included, because the signature covers it. It takes effect immediately. <code>getwritepolicy</code> reads back the policy in force and where it was set. An empty string clears the stored policy and returns to the default. <code>all</code> asks you to confirm: the first call refuses and tells you the exact confirmation string to pass as a second parameter. If <code>WRITE_POLICY</code> is set in the Cloudflare dashboard it outranks the management API, and <code>changewritepolicy</code> tells you so.</p>
 <p>Under <code>all</code>, NIP-11 advertises <code>restricted_writes: false</code>; under every other policy it is <code>true</code>.</p>
 <p>By default, then, bothy accepts events from two kinds of author: you (the owner), and the people you follow. Not strangers. It works by reading the follow list (kind 3) you&#39;ve already published — bothy doesn&#39;t ask you to maintain a separate allowlist, it just uses the one your nostr client already keeps.</p>
 <p>Why this is the default rather than a limitation: bothy is meant to be one of the 2-4 relays your NIP-65 relay list already tells clients to keep, not your only relay. Pair it with a permissive public relay and you get both — your own filtered archive of people you actually follow, plus a general-purpose inbox that already does the spam filtering you&#39;d otherwise have to build yourself. A reply from someone you don&#39;t follow isn&#39;t lost; it still lands on your other relay, and on the sender&#39;s own.</p>
