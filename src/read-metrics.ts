@@ -1,3 +1,5 @@
+import { clearReqCache } from "./req-cache";
+
 // ---------------------------------------------------------------------
 // TWO INSTRUMENTS OVER ONE WRAPPER. The rows-READ attribution below is a
 // diagnostic and is still expected to be removed; the rows-WRITTEN total
@@ -343,6 +345,30 @@ function trackCursor<T extends Record<string, SqlStorageValue>>(
   }) as SqlStorageCursor<T>;
 }
 
+// NOT PART OF THE DIAGNOSTIC: removing the rows-read attribution above
+// must keep this hook, or req-cache.ts serves stale answers.
+//
+// Whether a statement can change what a REQ query returns, for
+// req-cache.ts: a write naming `events` or `event_tags`, the only two
+// tables REQ SQL reads. Decided from the statement text rather than from
+// the cursor's rowsWritten, so it does not depend on how Cloudflare
+// reports a DELETE's writes, and narrowed to those two tables rather than
+// "any write" because two statements run on nearly every invocation and
+// write nothing a REQ can see: the constructor's
+// `CREATE TABLE IF NOT EXISTS schema_meta` and connect's
+// `UPDATE relay_meta`. Clearing on those would empty the cache on every
+// reconnect, which is exactly the traffic it exists for. `\b` treats `_`
+// as a word character, so `banned_events` and `event_hour_counts` do not
+// match.
+const WRITE_STATEMENT = /^\s*(INSERT|UPDATE|DELETE|REPLACE|DROP|ALTER)\b/i;
+// In table position, not anywhere: `maintained_counts` has a column
+// called `events`.
+const REQ_TABLES = /\b(INTO|UPDATE|FROM|TABLE)\s+(events|event_tags)\b/i;
+function changesReqResults(query: string): boolean {
+  return WRITE_STATEMENT.test(query) && REQ_TABLES.test(query);
+}
+
+
 // The single insertion point. Returns a SqlStorage that behaves exactly
 // like the one passed in, except that every cursor it hands out reports
 // its rows read into the active path.
@@ -358,8 +384,10 @@ export function instrumentSql(sql: SqlStorage): SqlStorage {
   return new Proxy(sql, {
     get(target, property) {
       if (property === "exec") {
-        return <T extends Record<string, SqlStorageValue>>(query: string, ...bindings: unknown[]) =>
-          trackCursor(target.exec<T>(query, ...bindings), currentPath);
+        return <T extends Record<string, SqlStorageValue>>(query: string, ...bindings: unknown[]) => {
+          if (changesReqResults(query)) clearReqCache();
+          return trackCursor(target.exec<T>(query, ...bindings), currentPath);
+        };
       }
       const value = Reflect.get(target, property, target);
       return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;

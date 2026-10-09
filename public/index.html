@@ -39,6 +39,9 @@
   .profile { display: flex; gap: 0.75rem; align-items: center; }
   .profile img { width: 2.5rem; height: 2.5rem; border-radius: 50%; }
   #error { color: #d94a4a; }
+  #signer-buttons { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+  #signer-buttons:not(:has(:not([hidden]))) { display: none; }
+  a.button { padding: 0.5rem 0.9rem; border: 1px solid #8888; border-radius: 0.25rem; text-decoration: none; color: inherit; }
   #reset-note { margin-top: 2rem; font-size: 0.9rem; opacity: 0.8; }
   h2 { font-size: 1rem; margin: 1.5rem 0 0.25rem; }
   .live-status { opacity: 0.7; font-size: 0.85rem; margin: 0 0 0.5rem; }
@@ -153,23 +156,33 @@
 <div id="unclaimed-view" hidden>
   <p>This relay hasn't been claimed yet.</p>
 
-  <!-- The QR/signed claim path (CLAUDE.md "What it is"): your phone signs
-       a NIP-42 proof rather than trusting whoever pastes a key first. The
-       nonce is only minted on this button's click, never on page load --
-       an unclaimed relay is public, and minting one per page view would
-       let a crawler write rows for free. -->
+  <!-- The QR claim (CLAUDE.md "What it is"): carries your npub from your
+       phone, where it lives, to this relay. The QR opens this same page on
+       the phone with a one-time code in the fragment (wireClaimQr,
+       claimLinkFromFragment). The code is only minted on this button's
+       click, never on page load -- an unclaimed relay is public, and
+       minting one per page view would let a crawler write rows for free. -->
   <div id="qr-section">
     <button type="button" id="show-qr-btn">Claim from your phone</button>
     <div id="qr-area" hidden>
-      <p>Scan this with a Nostr signer that supports claiming (or open <a id="qr-link" href="#" target="_blank" rel="noopener">this link</a> on your phone).</p>
+      <p>Scan this with your phone's camera. It opens this page there, where you can paste your <code>npub</code> or fetch it from your signer app. (Or open <a id="qr-link" href="#" target="_blank" rel="noopener">this link</a> on your phone.)</p>
       <div id="qr-code"></div>
       <p id="qr-status" class="live-status"></p>
     </div>
   </div>
 
-  <p>Or paste your <code>npub</code> or hex pubkey to claim it &mdash; this binds the relay to you, permanently.</p>
+  <p id="paste-intro">Or paste your <code>npub</code> or hex pubkey to claim it &mdash; this binds the relay to you, permanently.</p>
+  <p id="phone-intro" hidden>Paste your <code>npub</code> to claim this relay &mdash; every Nostr app has a &ldquo;copy npub&rdquo; button. This binds the relay to you, permanently.</p>
   <form id="claim-form">
     <input type="text" id="pubkey-input" placeholder="npub1... or hex pubkey" autocomplete="off" />
+    <div id="signer-buttons">
+      <!-- NIP-07: a browser extension or a Nostr browser that exposes
+           window.nostr. Shown only when it exists. -->
+      <button type="button" id="nip07-btn" hidden>Use my browser signer</button>
+      <!-- NIP-55: an Android signer app such as Amber, via a nostrsigner:
+           link. Shown on Android only, where that scheme can resolve. -->
+      <a id="nip55-link" class="button" hidden>Get it from my signer app</a>
+    </div>
     <div id="profile-preview"></div>
     <p id="claim-confirm" hidden></p>
     <button type="submit" id="claim-button">Claim this relay</button>
@@ -314,8 +327,18 @@ async function main() {
     wireLiveFeed();
   } else {
     document.getElementById("unclaimed-view").hidden = false;
-    wireClaimForm();
-    wireClaimQr(stats);
+    const claimLink = claimLinkFromFragment();
+    // A signer returning to this tab changes only the fragment, which does
+    // not reload the page; reload so the fragment is read afresh.
+    window.addEventListener("hashchange", () => {
+      if (claimLinkFromFragment()) location.reload();
+    });
+    wireClaimForm(claimLink);
+    if (claimLink) {
+      showPhoneView(claimLink);
+    } else {
+      wireClaimQr();
+    }
   }
 }
 
@@ -677,12 +700,13 @@ function wireLiveFeed() {
 // spending more of it.
 const CLAIM_STATUS_POLL_MS = 5000;
 
-// The QR/signed claim path (src/nip42.ts, CLAUDE.md "What it is"): mints a
-// nonce, builds the link the QR encodes, and polls until it's used or
-// expires. Deliberately does nothing until show-qr-btn is clicked --
-// this page is reachable by anyone while the relay is unclaimed, and
-// minting a nonce on page load would let a crawler write rows for free.
-function wireClaimQr(stats) {
+// The desktop half of the QR claim (CLAUDE.md "What it is"): mints a
+// code, shows a QR of this page's own URL carrying it, and polls until a
+// phone claims with it or it expires. Deliberately does nothing until
+// show-qr-btn is clicked -- this page is reachable by anyone while the
+// relay is unclaimed, and minting a code on page load would let a crawler
+// write rows for free.
+function wireClaimQr() {
   const btn = document.getElementById("show-qr-btn");
   const area = document.getElementById("qr-area");
   const codeEl = document.getElementById("qr-code");
@@ -691,9 +715,12 @@ function wireClaimQr(stats) {
   let pollTimer = null;
   let expiresAt = 0;
 
+  // This same page, on the phone, with the code in the fragment -- a
+  // fragment so it never reaches a server log. claimLinkFromFragment reads
+  // it back.
   function claimUrl(nonce, exp) {
-    const params = new URLSearchParams({ v: "1", mode: "claim", origin: location.host, nonce, exp: String(exp) });
-    return "https://" + stats.bounceHost + "/claim.html#" + params.toString();
+    const params = new URLSearchParams({ claim: nonce, exp: String(exp) });
+    return location.origin + "/#" + params.toString();
   }
 
   function renderQr(url) {
@@ -773,7 +800,37 @@ function wireClaimQr(stats) {
   btn.addEventListener("click", start);
 }
 
-function wireClaimForm() {
+// The phone half of the QR claim: `#claim=<code>&exp=<unix>`, plus
+// `&pubkey=<hex>` when an Android signer app has sent us back here with
+// the answer (NIP-55 appends its result to the callback URL, see
+// wireClaimForm). null when this page was opened any other way.
+function claimLinkFromFragment() {
+  const params = new URLSearchParams(location.hash.slice(1));
+  const nonce = params.get("claim");
+  if (!nonce) return null;
+  return { nonce, exp: Number(params.get("exp")) || 0, pubkey: params.get("pubkey") || "" };
+}
+
+// This page opened from the QR: it is the phone, so it shows no QR of
+// its own, and an expired code is said up front rather than discovered
+// on submit.
+function showPhoneView(claimLink) {
+  document.getElementById("qr-section").hidden = true;
+  document.getElementById("paste-intro").hidden = true;
+  document.getElementById("phone-intro").hidden = false;
+  if (claimLink.exp && Math.floor(Date.now() / 1000) >= claimLink.exp) {
+    document.getElementById("claim-form").hidden = true;
+    document.getElementById("phone-intro").hidden = true;
+    document.getElementById("error").textContent =
+      "This claim code has expired. Generate a new one on the relay's page and scan it again.";
+  }
+}
+
+// `claimLink` is claimLinkFromFragment's answer: when present, the claim
+// carries its code, so the desktop page polling /api/claim-status learns
+// that its QR is the one that landed. The claim itself is unsigned either
+// way -- the same trust as pasting on the desktop.
+function wireClaimForm(claimLink) {
   const input = document.getElementById("pubkey-input");
   const preview = document.getElementById("profile-preview");
   const errorEl = document.getElementById("error");
@@ -848,7 +905,7 @@ function wireClaimForm() {
     const res = await fetch("/api/claim", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pubkey: value }),
+      body: JSON.stringify(claimLink ? { pubkey: value, nonce: claimLink.nonce } : { pubkey: value }),
     });
     if (res.ok) {
       location.reload();
@@ -858,6 +915,50 @@ function wireClaimForm() {
     const body = await res.json().catch(() => ({}));
     errorEl.textContent = body.error || `claim failed (${res.status})`;
   });
+
+  // Fills the box as though it had been pasted, so the profile preview and
+  // the two-press confirm run exactly as they do for a paste.
+  function fill(pubkey) {
+    input.value = pubkey;
+    input.dispatchEvent(new Event("input"));
+  }
+
+  // NIP-07. Extensions can inject window.nostr after the page's own
+  // scripts run, so this looks once now and once shortly after.
+  const nip07 = document.getElementById("nip07-btn");
+  const showNip07 = () => {
+    if (window.nostr && typeof window.nostr.getPublicKey === "function") nip07.hidden = false;
+  };
+  showNip07();
+  setTimeout(showNip07, 500);
+  nip07.addEventListener("click", async () => {
+    errorEl.textContent = "";
+    try {
+      fill(await window.nostr.getPublicKey());
+    } catch {
+      errorEl.textContent = "your signer did not return a pubkey";
+    }
+  });
+
+  // NIP-55, for Android signer apps such as Amber: the signer appends its
+  // answer (a hex pubkey) to callbackUrl and opens it, which lands back on
+  // this page with `pubkey=` in the fragment. The claim code rides along
+  // in the same fragment, so the claim still reports to the desktop page.
+  if (/Android/i.test(navigator.userAgent)) {
+    const back = new URLSearchParams();
+    if (claimLink) {
+      back.set("claim", claimLink.nonce);
+      back.set("exp", String(claimLink.exp));
+    }
+    const callbackUrl = location.origin + "/#" + (back.toString() ? back.toString() + "&" : "") + "pubkey=";
+    const link = document.getElementById("nip55-link");
+    link.href =
+      "nostrsigner:?compressionType=none&returnType=signature&type=get_public_key&callbackUrl=" +
+      encodeURIComponent(callbackUrl);
+    link.hidden = false;
+  }
+
+  if (claimLink && claimLink.pubkey) fill(claimLink.pubkey);
 }
 
 main();

@@ -86,6 +86,11 @@ async function handleClaim(request: Request, env: Env): Promise<Response> {
     return json({ error: "malformed request body" }, 400);
   }
   const rawPubkey = (body as { pubkey?: unknown } | null)?.pubkey;
+  // Present when the phone that scanned the admin page's QR is the one
+  // claiming (public/index.html's phone view; ownership.ts claimWithNonce).
+  // It authenticates nothing -- this claim is unsigned either way -- and
+  // exists so /api/claim-status can tell the desktop page its QR landed.
+  const rawNonce = (body as { nonce?: unknown } | null)?.nonce;
   // Looked up here, in the stateless Worker, not inside the claim() RPC --
   // an outbound WebSocket from inside the DO would pin it in memory for
   // up to 15 minutes (CLAUDE.md "The budget"; profile-lookup.ts). This
@@ -108,18 +113,28 @@ async function handleClaim(request: Request, env: Env): Promise<Response> {
   // of whoever asked. Now a call that cannot possibly succeed costs at
   // most one indexed read and no outbound traffic at all.
   //
-  // These three checks mirror claim()'s own first three, in the same
-  // order, and none of them replaces it: claim() remains the authority.
+  // The pubkey and owner checks mirror claim()'s own, in the same order
+  // (the claim code's shape is checked here only; whether it is live is a
+  // storage question claim() answers), and none of them replaces it:
+  // claim() remains the authority.
   // The Durable Object is single-threaded, so the check-then-write inside
   // it is what actually makes TOFU atomic, and it still answers
   // "conflict" if it loses a race this pre-check could not have seen.
   if (env.OWNER_PUBKEY) return new Response("not found", { status: 404 });
   if (normalized === null) return json({ error: "invalid pubkey: expected npub1... or 64-char hex" }, 400);
+  if (rawNonce !== undefined && (typeof rawNonce !== "string" || rawNonce.length === 0 || rawNonce.length > 64)) {
+    return json({ error: "malformed claim code" }, 400);
+  }
   if ((await relayStub(env).getOwner()) !== null) return json({ error: "already claimed" }, 409);
 
   const profile = await lookupProfileCached(normalized);
 
-  const result = await relayStub(env).claim(rawPubkey, profile ?? undefined, new URL(request.url).host);
+  const result = await relayStub(env).claim(
+    rawPubkey,
+    profile ?? undefined,
+    new URL(request.url).host,
+    rawNonce,
+  );
   switch (result.status) {
     case "disabled":
       // CLAUDE.md "What it is": "If OWNER_PUBKEY is set in
@@ -129,12 +144,14 @@ async function handleClaim(request: Request, env: Env): Promise<Response> {
       return json({ error: "invalid pubkey: expected npub1... or 64-char hex" }, 400);
     case "conflict":
       return json({ error: "already claimed" }, 409);
+    case "invalid-nonce":
+      return json({ error: "this claim code has expired or was already used -- generate a new one" }, 410);
     case "claimed":
       return json({ pubkey: result.pubkey });
   }
 }
 
-// POST /api/claim-nonce -- the QR/signed claim path's setup step, always
+// POST /api/claim-nonce -- the QR claim's setup step, always
 // called by bothy's own admin page (same-origin, no CORS needed) right
 // before it renders a QR. Mints the nonce the QR embeds and the eventual
 // kind-22242 claim event must name -- see src/nip42.ts and CLAUDE.md

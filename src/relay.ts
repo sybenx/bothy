@@ -96,7 +96,7 @@ import {
   CONTACT_LIST_KIND,
   claimOwner,
   clearClaimNonces,
-  consumeClaimNonce,
+  claimWithNonce,
   getClaimStatus,
   getOwnerPubkey,
   getOwnerProfile,
@@ -120,6 +120,8 @@ import {
   type WriteMetricsSnapshot,
 } from "./read-metrics";
 import { getRelayPubkey } from "./relay-identity";
+import { connMetricsSnapshot, noteClose, noteRefusal, type ConnMetricsSnapshot } from "./conn-metrics";
+import { reqCacheSnapshot, type ReqCacheSnapshot } from "./req-cache";
 import { initSchema } from "./schema";
 import {
   groupHost,
@@ -234,6 +236,11 @@ interface ConnState {
   // attachment, so it survives hibernation like the rest of the state and
   // costs a handful of bytes against MAX_CONN_STATE_BYTES.
   groupReader?: boolean;
+  // conn-metrics.ts: when the connection was accepted and how many REQs it
+  // has had answered, read back once in webSocketClose. Optional because
+  // a connection accepted before these existed carries neither.
+  connectedAt?: number;
+  reqs?: number;
 }
 
 function getState(ws: WebSocket): ConnState {
@@ -517,6 +524,8 @@ export class Relay extends DurableObject<Env> {
       ip: request.headers.get("CF-Connecting-IP") ?? "unknown",
       host: new URL(request.url).host,
       subs: {},
+      connectedAt: Date.now(),
+      reqs: 0,
     });
 
     return new Response(null, { status: 101, webSocket: client });
@@ -542,11 +551,17 @@ export class Relay extends DurableObject<Env> {
   // so it exists whether or not this claim ever runs -- OWNER_PUBKEY
   // skips claim() entirely, and that deployment shape needs the identity
   // too.
+  //
+  // `nonce` is present when the claim came from a phone that scanned the
+  // admin page's QR (ownership.ts claimWithNonce): the claim is still
+  // unsigned and first-come-first-served, and the nonce is only what lets
+  // the desktop page learn that its own QR is the one that landed.
   async claim(
     rawPubkey: unknown,
     profile?: Profile,
     host?: string,
-  ): Promise<{ status: "claimed" | "conflict" | "disabled" | "invalid"; pubkey?: string }> {
+    nonce?: string,
+  ): Promise<{ status: "claimed" | "conflict" | "disabled" | "invalid" | "invalid-nonce"; pubkey?: string }> {
     if (this.env.OWNER_PUBKEY) return { status: "disabled" };
     if (typeof rawPubkey !== "string") return { status: "invalid" };
     const pubkey = normalizePubkey(rawPubkey);
@@ -556,7 +571,14 @@ export class Relay extends DurableObject<Env> {
       withReadPath("identity", () => {
         const sql = this.sql;
         if (host) recordHost(sql, host);
+        if (nonce !== undefined) {
+          const status = claimWithNonce(sql, pubkey, profile, nonce, nowSeconds());
+          return status === "claimed" ? { status, pubkey } : { status };
+        }
         if (!claimOwner(sql, pubkey, profile)) return { status: "conflict" as const };
+        // Every outstanding QR code is moot once the relay has an owner,
+        // whichever path claimed it.
+        clearClaimNonces(sql);
         return { status: "claimed" as const, pubkey };
       }),
     );
@@ -603,10 +625,8 @@ export class Relay extends DurableObject<Env> {
       withReadPath("identity", () => {
         const sql = this.sql;
         if (host) recordHost(sql, host);
-        if (!consumeClaimNonce(sql, nonce, nowSeconds())) return { status: "invalid-nonce" as const };
-        if (!claimOwner(sql, pubkey, undefined, nonce)) return { status: "conflict" as const };
-        clearClaimNonces(sql);
-        return { status: "claimed" as const, pubkey };
+        const status = claimWithNonce(sql, pubkey, undefined, nonce, nowSeconds());
+        return status === "claimed" ? { status, pubkey } : { status };
       }),
     );
   }
@@ -835,13 +855,6 @@ export class Relay extends DurableObject<Env> {
     // it, and the exposure it described is bounded by the write gate and
     // the storage cap rather than by knowing the number.
     vanishing: VanishSummary;
-    // The host the QR/signed claim flow's link should point at
-    // (src/nip42.ts, public/index.html's claim button) -- `BOUNCE_HOST` if
-    // set, else this relay's own host, so a clean deploy needs no external
-    // service to show a working QR. Always present, claimed or not, the
-    // same way `relayPubkey` is: the unclaimed page is the one place that
-    // actually reads it.
-    bounceHost: string;
     // Whether the owner's own resolved kind-10002 already names this
     // relay (ownership.ts ownerListsThisRelay) -- what the claimed view
     // uses to decide whether the wss:// copy box still has a job to do.
@@ -863,6 +876,13 @@ export class Relay extends DurableObject<Env> {
     // stays the authoritative, durable figure -- this is a diagnostic
     // breakdown of it, with the same reset-on-eviction caveat as `reads`.
     writes: WriteMetricsSnapshot;
+    // DIAGNOSTIC, memory only, same reset-on-eviction caveat. Hits on
+    // src/req-cache.ts are REQ queries that read zero rows; a hit count
+    // far below the miss count means the client varies its filters (a
+    // sliding `since`, most likely) and the cache is not the answer.
+    reqCache: ReqCacheSnapshot;
+    // DIAGNOSTIC: why connections end -- src/conn-metrics.ts.
+    connections: ConnMetricsSnapshot;
   }> {
     // Scoped to "getStats" rather than measured per query: the nested
     // estimateRowsWrittenSince declares its own scope and so reports
@@ -876,11 +896,19 @@ export class Relay extends DurableObject<Env> {
       // Snapshotted after the scope closes so this call's own reads/writes
       // are included in what it reports -- a breakdown that excluded the
       // request producing it would understate getStats by exactly one call.
-      return { ...stats, reads: readMetricsSnapshot(), writes: writeMetricsSnapshot() };
+      return {
+        ...stats,
+        reads: readMetricsSnapshot(),
+        writes: writeMetricsSnapshot(),
+        reqCache: reqCacheSnapshot(),
+        connections: connMetricsSnapshot(),
+      };
     });
   }
 
-  private collectStats(host?: string): Omit<Awaited<ReturnType<Relay["getStats"]>>, "reads" | "writes"> {
+  private collectStats(
+    host?: string,
+  ): Omit<Awaited<ReturnType<Relay["getStats"]>>, "reads" | "writes" | "reqCache" | "connections"> {
     // recordHost is a write, and it is a no-op once the host is already
     // known (src/host.ts), so it costs nothing to keep honest.
     if (host) recordHost(this.sql, host);
@@ -985,11 +1013,6 @@ export class Relay extends DurableObject<Env> {
       countAudit: { lastRanAt: counts.lastRanAt, drift: counts.drift },
       followsListAt: followsListAt(sql),
       vanishing: vanishSummary(sql),
-      // Falls back to the stored own-host (src/host.ts getOwnHost) rather
-      // than an empty string when this call carries no live host -- the
-      // unit tests that call getStats() with no argument are the only
-      // callers that hit this, and every real request passes one.
-      bounceHost: this.env.BOUNCE_HOST ?? host ?? getOwnHost(sql) ?? "",
       ownerListsThisRelay: owner !== null && ownerListsThisRelay(sql, this.env, host ?? getOwnHost(sql) ?? ""),
     };
   }
@@ -2345,6 +2368,14 @@ export class Relay extends DurableObject<Env> {
     withReadPath("req", () => this.handleReqInner(ws, frame));
   }
 
+  // Every CLOSED a REQ is refused with goes through here, so
+  // conn-metrics.ts can say which refusals a reconnecting client is
+  // getting -- see that file for why it matters.
+  private refuse(ws: WebSocket, subId: string, reason: string): void {
+    noteRefusal(reason);
+    send(ws, ["CLOSED", subId, reason]);
+  }
+
   private handleReqInner(ws: WebSocket, frame: unknown[]): void {
     const subId = frame[1];
     if (typeof subId !== "string") {
@@ -2354,7 +2385,7 @@ export class Relay extends DurableObject<Env> {
 
     const state = getState(ws);
     if (!(subId in state.subs) && Object.keys(state.subs).length >= MAX_SUBSCRIPTIONS_PER_CONNECTION) {
-      send(ws, ["CLOSED", subId, "rate-limited: too many open subscriptions"]);
+      this.refuse(ws, subId, "rate-limited: too many open subscriptions");
       return;
     }
 
@@ -2378,11 +2409,11 @@ export class Relay extends DurableObject<Env> {
     // it is bounded here.
     const rawFilters = frame.slice(2);
     if (rawFilters.length > MAX_FILTERS_PER_REQ) {
-      send(ws, [
-        "CLOSED",
+      this.refuse(
+        ws,
         subId,
         `invalid: too many filters in one REQ (${rawFilters.length}), at most ${MAX_FILTERS_PER_REQ}`,
-      ]);
+      );
       return;
     }
 
@@ -2465,11 +2496,11 @@ export class Relay extends DurableObject<Env> {
     // Refused with a message that says what to do about it, rather than
     // silently reading fewer groups than the reader is entitled to.
     if (readableGroups !== undefined && readableGroups.length > MAX_SCOPED_GROUPS) {
-      send(ws, [
-        "CLOSED",
+      this.refuse(
+        ws,
         subId,
         `restricted: you are in more than ${MAX_SCOPED_GROUPS} groups -- name the one you want with "#h"`,
-      ]);
+      );
       return;
     }
     // Which partitions this read covers. Passed into boundFilter because
@@ -2482,12 +2513,12 @@ export class Relay extends DurableObject<Env> {
     for (const raw of rawFilters) {
       const filter = parseFilter(raw);
       if (!filter) {
-        send(ws, ["CLOSED", subId, "error: malformed filter"]);
+        this.refuse(ws, subId, "error: malformed filter");
         return;
       }
       const bound = boundFilter(filter, perFilterBudget, scopes.length);
       if (!bound.ok) {
-        send(ws, ["CLOSED", subId, bound.reason]);
+        this.refuse(ws, subId, bound.reason);
         return;
       }
       filters.push(bound.filter);
@@ -2544,9 +2575,9 @@ export class Relay extends DurableObject<Env> {
           setState(ws, state);
         }
         send(ws, ["AUTH", state.challenge]);
-        send(ws, ["CLOSED", subId, "auth-required: authentication required to read group events"]);
+        this.refuse(ws, subId, "auth-required: authentication required to read group events");
       } else {
-        send(ws, ["CLOSED", subId, "restricted: not allowed to read group events"]);
+        this.refuse(ws, subId, "restricted: not allowed to read group events");
       }
       return;
     }
@@ -2557,9 +2588,9 @@ export class Relay extends DurableObject<Env> {
           setState(ws, state);
         }
         send(ws, ["AUTH", state.challenge]);
-        send(ws, ["CLOSED", subId, "auth-required: authentication required to read gift wraps"]);
+        this.refuse(ws, subId, "auth-required: authentication required to read gift wraps");
       } else {
-        send(ws, ["CLOSED", subId, "restricted: not allowed to read gift wraps"]);
+        this.refuse(ws, subId, "restricted: not allowed to read gift wraps");
       }
       return;
     }
@@ -2579,6 +2610,7 @@ export class Relay extends DurableObject<Env> {
     const next: ConnState = {
       ...state,
       subs: { ...state.subs, [subId]: filters },
+      reqs: (state.reqs ?? 0) + 1,
       // Recorded once the read gate above has admitted this connection to
       // the group partition: this is what "in the room" means, and
       // groupOccupants counts it. Written here rather than beside
@@ -2588,12 +2620,12 @@ export class Relay extends DurableObject<Env> {
       ...(mayReadGroups ? { groupReader: true } : {}),
     };
     if (!stateFits(next)) {
-      send(ws, [
-        "CLOSED",
+      this.refuse(
+        ws,
         subId,
         "invalid: filters are too large to hold open; name fewer authors or ids, " +
           "and split the request across several REQs",
-      ]);
+      );
       return;
     }
     setState(ws, next);
@@ -2888,6 +2920,12 @@ export class Relay extends DurableObject<Env> {
     // disconnect, which on a WebSocket relay is routine rather than
     // exceptional. Mapped to 1000 (normal closure): this side is closing
     // deliberately and cleanly in response, whatever happened to the peer.
+    if (this.ctx.getTags(ws).includes(LIVE_FEED_TAG)) {
+      noteClose("live", code, undefined, undefined);
+    } else {
+      const state = getState(ws);
+      noteClose("nostr", code, state.connectedAt, state.reqs);
+    }
     ws.close(RESERVED_CLOSE_CODES.has(code) ? NORMAL_CLOSURE : code, reason);
   }
 

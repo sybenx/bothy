@@ -25,6 +25,7 @@ import {
 } from "./schema";
 import { addRowsWritten, takeRowsWritten, unlandedRowsWritten, withReadPath } from "./read-metrics";
 import { normalizeIp } from "./ip";
+import { clearReqCache, readReqCache, reqCacheKey, writeReqCache } from "./req-cache";
 import { getRelayPubkey } from "./relay-identity";
 import {
   dTagValue,
@@ -86,6 +87,9 @@ function insertEventRow(
   expiration: number | null,
   ingestedAt: number,
 ): void {
+  // req-cache.ts. The instrumented handle already clears it on this
+  // INSERT; this covers a caller holding a raw ctx.storage.sql.
+  clearReqCache();
   const indexedTags = event.tags.filter(isIndexedTag);
   // Which partition this event lands in, decided once here from the
   // event's own tags (groups.ts scopeOf) and then copied onto every row
@@ -262,6 +266,8 @@ export function groupHost(sql: SqlStorage): (id: string) => boolean {
 // amplifier.
 // ---------------------------------------------------------------------
 function deleteEventRow(sql: SqlStorage, id: string): void {
+  // req-cache.ts, for the same reason as insertEventRow's.
+  clearReqCache();
   // Read before the delete, and read HERE rather than taken from the
   // caller. Four of the five callers already hold the row's `created_at`
   // (the replaceable and addressable replacement paths, applyDeletion,
@@ -2015,10 +2021,21 @@ function runFilterQuery(
 ): NostrEvent[] {
   const query = buildFilterQuery(filter, nowSec, options);
   if (query === null) return [];
-  return sql
+  // req-cache.ts: a repeated query against unchanged data reads nothing.
+  const key = reqCacheKey(query.sql, query.params);
+  const cached = readReqCache(key, nowSec);
+  if (cached !== undefined) return cached;
+  const events = sql
     .exec<EventRow>(query.sql, ...query.params)
     .toArray()
     .map(rowToEvent);
+  let minExpiration: number | null = null;
+  for (const event of events) {
+    const expiration = expirationOf(event);
+    if (expiration !== null && (minExpiration === null || expiration < minExpiration)) minExpiration = expiration;
+  }
+  writeReqCache(key, events, minExpiration);
+  return [...events];
 }
 
 // Rows written in the last 24h, summed from the per-event `row_cost`

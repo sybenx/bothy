@@ -78,7 +78,7 @@ export function getOwnerPubkey(sql: SqlStorage, env: Env): string | null {
 // undefined fields are stored as null and nip11.ts falls back to
 // hardcoded defaults.
 //
-// `nonce` is set only by the QR/signed claim path (relay.ts claimSigned)
+// `nonce` is set only by a QR claim (ownership.ts claimWithNonce, below)
 // -- the claim nonce that won, so getClaimStatus below can answer "was
 // *this* QR the one that worked" rather than just "is the relay claimed by
 // someone, somehow". The paste path passes nothing and the column stays
@@ -100,15 +100,15 @@ export function claimOwner(sql: SqlStorage, pubkey: string, profile?: Profile, n
 }
 
 // ---------------------------------------------------------------------
-// QR/signed claim (src/nip42.ts, src/relay.ts issueClaimNonce/claimSigned,
-// src/index.ts POST /api/claim-nonce, /api/claim-signed, GET
+// QR claim (src/relay.ts issueClaimNonce/claim/claimSigned, src/index.ts
+// POST /api/claim-nonce, /api/claim with a nonce, /api/claim-signed, GET
 // /api/claim-status). See CLAUDE.md "The budget" for the row-cost
 // reasoning behind the sweep-on-issue below.
 // ---------------------------------------------------------------------
 
 export type IssueClaimNonceResult = { nonce: string; expiresAt: number } | "capped";
 
-// Mints a short-lived, single-use nonce for the QR/signed claim flow.
+// Mints a short-lived, single-use nonce for the QR claim flow.
 // Sweeps expired rows FIRST, not just excludes them from the count --
 // unlike group_invites, which only the owner can grow, this table can be
 // grown by anyone loading a public, unclaimed relay's admin page, so
@@ -126,7 +126,7 @@ export function issueClaimNonce(sql: SqlStorage, nowSec: number): IssueClaimNonc
   return { nonce, expiresAt };
 }
 
-// The "nonce freshness" check the QR/signed claim flow needs: does this
+// The "nonce freshness" check the QR claim flow needs: does this
 // nonce exist and hasn't it expired. Deletes it either way it matters --
 // a nonce that's about to become the winning claim has no further use,
 // and clearClaimNonces below wipes whatever's left the moment the claim
@@ -149,6 +149,28 @@ export function consumeClaimNonce(sql: SqlStorage, nonce: string, nowSec: number
 // is refused regardless of what it names.
 export function clearClaimNonces(sql: SqlStorage): void {
   sql.exec(`DELETE FROM claim_nonces`);
+}
+
+// A claim that names a nonce from the QR: both claim endpoints end here
+// (relay.ts claim with a nonce, the phone pasting or fetching an npub;
+// relay.ts claimSigned, a signer proving possession). The nonce does not
+// authenticate anything on the unsigned path -- that claim is
+// first-come-first-served exactly like the paste form -- it is what lets
+// GET /api/claim-status tell the desktop page that THIS QR is the one
+// that landed. An unknown, used or expired one is refused rather than
+// ignored, so a phone holding a stale page is told to fetch a new code
+// instead of claiming as though it had scanned a live one.
+export function claimWithNonce(
+  sql: SqlStorage,
+  pubkey: string,
+  profile: Profile | undefined,
+  nonce: string,
+  nowSec: number,
+): "invalid-nonce" | "conflict" | "claimed" {
+  if (!consumeClaimNonce(sql, nonce, nowSec)) return "invalid-nonce";
+  if (!claimOwner(sql, pubkey, profile, nonce)) return "conflict";
+  clearClaimNonces(sql);
+  return "claimed";
 }
 
 export type ClaimStatus = "pending" | "claimed" | "claimed-elsewhere";

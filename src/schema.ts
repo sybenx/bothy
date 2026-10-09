@@ -404,7 +404,7 @@ export const TABLES: readonly TableSpec[] = [
     ],
   },
   {
-    // Short-lived, single-use claim nonces for the QR/signed claim path
+    // Short-lived, single-use claim nonces for the QR claim
     // (src/nip42.ts, src/index.ts POST /api/claim-nonce and
     // /api/claim-signed). Unlike group_invites, which only the owner can
     // grow, this table can be grown by anyone who loads a public,

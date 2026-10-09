@@ -1,5 +1,6 @@
 import { reset } from "cloudflare:test";
 import { afterEach } from "vitest";
+import { clearReqCache } from "../../src/req-cache";
 
 // Storage isolation in this vitest plugin is per test FILE, not per test
 // (https://developers.cloudflare.com/workers/testing/vitest-integration/isolation-and-concurrency/).
@@ -25,8 +26,14 @@ import { afterEach } from "vitest";
 // counters behind -- correct behaviour, and what
 // storage.ts auditMaintainedCounts would log. Assert counts against
 // events you published, not against rows you seeded.
+//
+// The second step is back, for a different cache: src/req-cache.ts holds
+// REQ answers in module memory and is cleared by writes that pass the
+// instrumented SQL handle, which reset() does not. Cleared here so a test
+// is never answered from the database the previous one discarded.
 export function isolateStorage(): void {
   afterEach(async () => {
     await reset();
+    clearReqCache();
   });
 }

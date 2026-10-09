@@ -1,5 +1,7 @@
-// The QR/signed claim path (CLAUDE.md "What it is"): proof of possession
-// via a signed NIP-42 AUTH event, additive to the paste-based TOFU flow
+// The QR claim (CLAUDE.md "What it is"): a one-time code the admin page
+// shows as a QR, redeemed either by the phone pasting an npub (/api/claim
+// with a nonce, unsigned) or by a signer proving possession with a NIP-42
+// AUTH event (/api/claim-signed). Additive to the paste-based TOFU flow
 // test/claim.test.ts covers.
 //
 // Same harness limitation as claim.test.ts, and for the same reason: the
@@ -26,6 +28,7 @@ import { CLAIM_NONCE_TTL_SECONDS, MAX_OUTSTANDING_CLAIM_NONCES } from "../src/li
 import { AUTH_KIND, verifyClaimAuthEvent } from "../src/nip42";
 import {
   claimOwner,
+  claimWithNonce,
   clearClaimNonces,
   consumeClaimNonce,
   getClaimStatus,
@@ -216,6 +219,74 @@ describe("claim_nonce on the owner row / getClaimStatus (env.OWNER_PUBKEY unset)
       // No nonce param -- the plain paste path.
       expect(claimOwner(sql, claimant)).toBe(true);
       expect(getClaimStatus(sql, "any-nonce-at-all")).toBe("claimed-elsewhere");
+    });
+  });
+});
+
+// The step both claim endpoints end in: /api/claim with a code (the
+// phone that scanned the QR, unsigned) and /api/claim-signed.
+describe("claimWithNonce (env.OWNER_PUBKEY unset)", () => {
+  const stub = () => env.RELAY.get(env.RELAY.idFromName("relay"));
+  const now = () => Math.floor(Date.now() / 1000);
+  const issue = (sql: SqlStorage, nowSec: number): string => {
+    const issued = issueClaimNonce(sql, nowSec);
+    if (issued === "capped") throw new Error("unreachable");
+    return issued.nonce;
+  };
+  const owner = (sql: SqlStorage): string | undefined =>
+    sql.exec<{ pubkey: string }>(`SELECT pubkey FROM owner LIMIT 1`).toArray()[0]?.pubkey;
+  const outstanding = (sql: SqlStorage): number =>
+    sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM claim_nonces`).toArray()[0]?.n ?? -1;
+
+  it("claims with a live code and reports that code as the winner", async () => {
+    const claimant = randomKeypair().pubkeyHex;
+    await runInDurableObject(stub(), async (_instance, state) => {
+      const sql = state.storage.sql;
+      const nonce = issue(sql, now());
+      expect(claimWithNonce(sql, claimant, { name: "phone" }, nonce, now())).toBe("claimed");
+      expect(owner(sql)).toBe(claimant);
+      expect(getClaimStatus(sql, nonce)).toBe("claimed");
+    });
+  });
+
+  it("wipes every other outstanding code once it lands", async () => {
+    await runInDurableObject(stub(), async (_instance, state) => {
+      const sql = state.storage.sql;
+      const winner = issue(sql, now());
+      issue(sql, now());
+      issue(sql, now());
+      expect(claimWithNonce(sql, randomKeypair().pubkeyHex, undefined, winner, now())).toBe("claimed");
+      expect(outstanding(sql)).toBe(0);
+    });
+  });
+
+  it("refuses an unknown, expired or already-used code without claiming", async () => {
+    await runInDurableObject(stub(), async (_instance, state) => {
+      const sql = state.storage.sql;
+      const pubkey = randomKeypair().pubkeyHex;
+      expect(claimWithNonce(sql, pubkey, undefined, "never-issued", now())).toBe("invalid-nonce");
+
+      const expiring = issue(sql, now());
+      expect(claimWithNonce(sql, pubkey, undefined, expiring, now() + CLAIM_NONCE_TTL_SECONDS + 1)).toBe(
+        "invalid-nonce",
+      );
+
+      const used = issue(sql, now());
+      expect(consumeClaimNonce(sql, used, now())).toBe(true);
+      expect(claimWithNonce(sql, pubkey, undefined, used, now())).toBe("invalid-nonce");
+
+      expect(owner(sql)).toBeUndefined();
+    });
+  });
+
+  it("answers conflict on a relay already claimed, and leaves the owner alone", async () => {
+    const first = randomKeypair().pubkeyHex;
+    await runInDurableObject(stub(), async (_instance, state) => {
+      const sql = state.storage.sql;
+      expect(claimOwner(sql, first)).toBe(true);
+      const late = issue(sql, now());
+      expect(claimWithNonce(sql, randomKeypair().pubkeyHex, undefined, late, now())).toBe("conflict");
+      expect(owner(sql)).toBe(first);
     });
   });
 });

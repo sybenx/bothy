@@ -178,7 +178,7 @@ export const MAX_INVITE_CODE_LENGTH = 128;
 export const MAX_OUTSTANDING_INVITES = 64;
 
 // ---------------------------------------------------------------------
-// QR/signed claim nonces (src/nip42.ts, src/ownership.ts issueClaimNonce).
+// QR claim nonces (src/ownership.ts issueClaimNonce, claimWithNonce).
 // Not the same shape as the invite cap just above: an invite can only be
 // grown by the owner, who is already trusted with everything else this
 // relay does, while a claim nonce can be minted by anyone who loads a
@@ -401,6 +401,16 @@ export const DAILY_ROWS_READ_LIMIT = 5_000_000;
 // address. Nothing here closes that; it would take a per-connection
 // rows-read budget, which this relay does not have.
 export const MAX_FILTER_ROWS_READ = DAILY_ROWS_READ_LIMIT / 500;
+
+// How many events req-cache.ts may hold across all its entries -- the
+// memory bound on the one thing that does close the gap above for the
+// traffic that actually hit it: a client reconnecting every few seconds
+// and re-sending the same REQs against a table that had not changed
+// (2026-10-09, ~236 rows per REQ, projected 6.26M/day). Ten thousand is
+// about twice the whole of a personal relay's `events` table at the time
+// (4,954), and a few MB of isolate memory against the DO's 128MB. It
+// bounds memory, not correctness: a full cache evicts and re-reads.
+export const REQ_CACHE_MAX_EVENTS = 10_000;
 
 // Filters one REQ frame may carry.
 //

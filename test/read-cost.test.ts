@@ -47,6 +47,7 @@ import {
 import type { Filter } from "../src/nostr";
 import { queryFilter, readMaintainedCounts } from "../src/storage";
 import { readMetricsSnapshot, resetReadMetrics } from "../src/read-metrics";
+import { clearReqCache } from "../src/req-cache";
 import type { Relay } from "../src/relay";
 import { signEvent } from "./helpers/event";
 import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX } from "./helpers/keys";
@@ -621,6 +622,10 @@ describe("the read-cost guard", () => {
 describe("read attribution", () => {
   it("bills a REQ, the stats endpoint and the rows-written estimate to separate paths", async () => {
     await runInDurableObject(stub(), async () => resetReadMetrics());
+    // An earlier test sent this same REQ against this same data, so it
+    // would otherwise be answered from src/req-cache.ts and read nothing
+    // -- which is the cache working, and not what this test measures.
+    clearReqCache();
 
     const conn = await connectRelay();
     conn.send(["REQ", "sub", { kinds: [1], limit: 20 }]);
