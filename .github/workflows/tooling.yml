@@ -1,0 +1,91 @@
+name: Update tooling
+
+# Keeps the build and test tooling current without anybody remembering to.
+# What it moves, what it deliberately does not, and why are at the top of
+# scripts/update-tooling.mjs. In short: devDependencies within their major
+# version, after a week's cooldown, and only if the typecheck, the whole test
+# suite and a build all pass on the result.
+#
+# It commits straight to main, because this repository has no pull requests
+# (CLAUDE.md "Conventions"). A push to main is a deploy, so a green run
+# rebuilds the relay with the new wrangler. A red run commits nothing, and
+# GitHub emails the owner about the failure, which is the signal that an
+# update needs a person.
+
+on:
+  # Tuesday, the day after sync.yml's Monday run. A bump committed here
+  # reaches downstream copies the following Monday, by which time this
+  # repository's own relay has been running on it for six days.
+  schedule:
+    - cron: "41 5 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    # Upstream only. A downstream copy gets its dependencies from sync.yml,
+    # already tested here, and must not drift from upstream's lockfile.
+    if: github.repository == 'sybenx/bothy'
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Install what is committed
+        run: npm ci
+
+      - name: Move the tooling forward
+        run: node scripts/update-tooling.mjs | tee "$RUNNER_TEMP/changes.txt"
+
+      - name: Stop here if nothing moved
+        id: diff
+        run: |
+          if git diff --quiet; then
+            echo "Tooling is already current."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # From a clean install of the new lockfile, so what is tested is what
+      # Cloudflare's build and every downstream copy will install.
+      - name: Reinstall from the new lockfile
+        if: steps.diff.outputs.changed == 'true'
+        run: npm ci
+
+      - name: Typecheck
+        if: steps.diff.outputs.changed == 'true'
+        run: npm run typecheck
+
+      - name: Test
+        if: steps.diff.outputs.changed == 'true'
+        run: npm run test
+
+      - name: Build without deploying
+        if: steps.diff.outputs.changed == 'true'
+        run: npx wrangler deploy --dry-run --outdir "$RUNNER_TEMP/build"
+
+      - name: Audit
+        if: steps.diff.outputs.changed == 'true'
+        run: npm audit
+
+      - name: Commit and push
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Only these two. Anything else the run touched is not this
+          # workflow's to commit.
+          git add package.json package-lock.json
+          {
+            echo "Update build and test tooling"
+            echo
+            cat "$RUNNER_TEMP/changes.txt"
+          } > "$RUNNER_TEMP/message.txt"
+          git commit -F "$RUNNER_TEMP/message.txt"
+          git push origin HEAD:main

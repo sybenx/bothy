@@ -1,6 +1,6 @@
 {
   "name": "bothy",
-  "version": "0.17.0",
+  "version": "0.17.1",
   "private": true,
   "type": "module",
   "description": "A single-user nostr relay that runs on the Cloudflare free tier and deploys in one click.",
@@ -11,22 +11,22 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "cf-typegen": "wrangler types",
-    "sync-badge": "node scripts/sync-badge.mjs"
+    "sync-badge": "node scripts/sync-badge.mjs",
+    "update-tooling": "node scripts/update-tooling.mjs"
   },
   "dependencies": {
-    "@noble/curves": "2.3.0",
-    "@noble/hashes": "2.3.0"
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "1.0.0",
+    "@cloudflare/vitest-plugin": "1.8.5",
     "typescript": "7.0.2",
-    "vitest": "4.1.11",
-    "wrangler": "4.125.0"
+    "vitest": "4.1.12",
+    "wrangler": "4.165.0"
   },
   "allowScripts": {
-    "esbuild@0.28.1": true,
     "fsevents@2.3.3": true,
-    "workerd@1.20260815.1": true,
-    "workerd@1.20260820.1": true
+    "esbuild@0.28.2": true,
+    "workerd@1.20261118.1": true
   }
 }
