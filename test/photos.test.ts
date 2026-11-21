@@ -128,6 +128,12 @@ describe("uploading and fetching a photo", () => {
     expect((await upload(OWNER, jpeg())).status).toBe(200);
   });
 
+  it("takes an admin's photo, since an admin is a member", async () => {
+    const admin = randomKeypair();
+    expect((await callManagement("addadmin", [admin.pubkeyHex])).result).toBe(true);
+    expect((await upload(admin, jpeg())).status).toBe(200);
+  });
+
   it("refuses anyone who is not a member", async () => {
     const response = await upload(randomKeypair(), jpeg());
     expect(response.status).toBe(403);
