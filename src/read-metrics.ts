@@ -74,6 +74,8 @@ export const READ_PATHS = [
   "identity",
   // NIP-86 management calls (relay.ts manage).
   "management",
+  // Profile photos (src/photos.ts): serving, uploading and deleting one.
+  "photos",
   // schema.ts initSchema, which runs in the Durable Object constructor,
   // so on every wake from hibernation.
   "schema",

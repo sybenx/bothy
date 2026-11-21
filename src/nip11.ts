@@ -7,7 +7,10 @@ import {
   MAX_FILTER_LIMIT,
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
   maxEventBytes,
+  photoMaxBytes,
+  photoStorageBytes,
 } from "./limits";
+import { PHOTO_TYPES } from "./photos";
 import { pushPublicKey } from "./push";
 import type { RelaySettings } from "./storage";
 import { resolveWritePolicy } from "./write-policy";
@@ -91,6 +94,7 @@ export function buildRelayInfo(
   ownerPubkey: string | null,
   relayPubkey: string,
   memberCount?: number,
+  photos?: { url: string; usedBytes: number },
 ): Record<string, unknown> {
   const info: Record<string, unknown> = {
     name: resolveName(env, stored, profile),
@@ -166,6 +170,20 @@ export function buildRelayInfo(
   if (ownerPubkey && memberCount !== undefined) {
     info.member_count = memberCount;
   }
+  // The profile photo server (src/photos.ts), bothy's own field. A
+  // Blossom server for members' photos only: where it is, what it takes,
+  // and how full it is. Omitted while unclaimed or with
+  // PHOTO_STORAGE_BYTES=off.
+  const photoCap = photoStorageBytes(env);
+  if (ownerPubkey && photos !== undefined && photoCap !== null) {
+    info.blossom = {
+      url: photos.url,
+      types: [...PHOTO_TYPES],
+      max_blob_bytes: photoMaxBytes(env),
+      used_bytes: photos.usedBytes,
+      max_bytes: photoCap,
+    };
+  }
   const contact = resolveContact(profile);
   if (contact) {
     info.contact = contact;
@@ -180,12 +198,16 @@ export function nip11Response(
   ownerPubkey: string | null,
   relayPubkey: string,
   memberCount?: number,
+  photos?: { url: string; usedBytes: number },
 ): Response {
-  return new Response(JSON.stringify(buildRelayInfo(env, stored, profile, ownerPubkey, relayPubkey, memberCount)), {
-    headers: {
-      "Content-Type": "application/nostr+json",
-      // Web clients fetch NIP-11 cross-origin.
-      "Access-Control-Allow-Origin": "*",
+  return new Response(
+    JSON.stringify(buildRelayInfo(env, stored, profile, ownerPubkey, relayPubkey, memberCount, photos)),
+    {
+      headers: {
+        "Content-Type": "application/nostr+json",
+        // Web clients fetch NIP-11 cross-origin.
+        "Access-Control-Allow-Origin": "*",
+      },
     },
-  });
+  );
 }

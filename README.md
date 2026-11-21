@@ -118,6 +118,8 @@ The deploy button only asks for a project name. Everything else is an optional v
 | `MAX_EVENTS_PER_PUBKEY_PER_MINUTE` | How fast any one non-owner pubkey may publish. Defaults to `20`/minute — far above human posting rates, slow enough that a runaway follow takes hours rather than minutes to spend the daily write budget. You are never throttled. Raise it to a number, or set it to `off`. |
 | `NON_OWNER_STORAGE_BYTES` | Point at which writes from anyone but you are refused, reserving what's left of the 5GB free-tier ceiling for your own archive. Defaults to `2684354560` (half). Raise it to a number, or set it to `off`. |
 | `WRITE_POLICY` | Who can publish here: `owner`, `inbox`, `follows`, `mentions` or `all` (see "Who can write here" below). Set here it outranks the value set through the management API. Unset, the management API's value applies, then the default, `follows`. |
+| `PHOTO_STORAGE_BYTES` | How much all profile photos together may take, in bytes. Defaults to `262144000` (250 MB). Set it to `off` to store no photos at all. |
+| `PHOTO_MAX_BYTES` | The largest one photo may be, in bytes. Defaults to `102400` (100 KB), and can be raised to at most `1048576` (1 MB). |
 | `UPDATE_CHECK` | On by default: the relay asks this repo what the current release is (one request, cached for six hours, made by the Worker rather than by your browser) so the admin page can say when a newer one exists. Set it to `off` and the relay never makes that request; the footer then simply shows no notice. |
 
 `ALLOW_FOLLOWS` is no longer read. If you had set it to `false`, set `WRITE_POLICY=owner` instead.
@@ -177,6 +179,12 @@ npx wrangler secret put VAPID_PRIVATE_KEY
 ```
 
 Without it everything above still works, with no notifications. A notification says only that there is a new message: not who sent it, not what it says, and not which conversation it belongs to. It passes through Apple's or Google's push service, and none of that is theirs to see. The relay could not add it anyway, because the mail is sealed.
+
+### Profile photos
+
+Members, and you, can keep a profile photo here, so the people in your home load each other's faces from it. It is a [Blossom](https://github.com/hzrd149/blossom) server for that one thing: JPEG, PNG or WebP, up to 100 KB, one photo each (a new one replaces the old), a few uploads a day. Anyone can fetch a stored photo by its hash; nothing lists them. A removed member's photo goes with their mail, after 14 days.
+
+Photos are kept in the relay's own storage, beside your events, so they need no setup and no extra Cloudflare product. All of them together are capped at 250 MB; at the cap new uploads are refused and nothing else is affected. The admin page shows how much is used. The apps also put each photo on a public Blossom server, so nothing breaks if this one is full.
 
 ## Who can write here
 

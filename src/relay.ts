@@ -25,6 +25,8 @@ import {
   boundFilter,
   MAX_PUSHES_PER_TICK,
   MAX_WRAP_RECIPIENTS_CHECKED,
+  PHOTO_UPLOADS_PER_DAY,
+  photoStorageBytes,
   MAX_REQUEST_JOINS_PER_IP_PER_WINDOW,
   REQUEST_JOIN_RATE_LIMIT_WINDOW_MS,
   MEMBER_REMOVAL_GRACE_SECONDS,
@@ -127,6 +129,7 @@ import {
   type WriteMetricsSnapshot,
 } from "./read-metrics";
 import { getRelayPubkey } from "./relay-identity";
+import { type PhotoType, sqlitePhotoStore, takeUploadAllowance } from "./photos";
 import { normalizeIp } from "./ip";
 import { connMetricsSnapshot, noteClose, noteRefusal, type ConnMetricsSnapshot } from "./conn-metrics";
 import { reqCacheSnapshot, type ReqCacheSnapshot } from "./req-cache";
@@ -577,6 +580,7 @@ export class Relay extends DurableObject<Env> {
     ownerPubkey: string | null;
     relayPubkey: string;
     memberCount: number;
+    photoBytes: number;
   }> {
     return this.metered(() =>
       withReadPath("identity", () => {
@@ -592,6 +596,7 @@ export class Relay extends DurableObject<Env> {
           relayPubkey: getRelayPubkey(sql),
           // M rows, M the size of a friend group (storage.ts memberCount).
           memberCount: memberCount(sql),
+          photoBytes: sqlitePhotoStore(sql).usedBytes(),
         };
       }),
     );
@@ -675,6 +680,64 @@ export class Relay extends DurableObject<Env> {
     );
   }
 
+  // ------------------------------------------------------------------
+  // Profile photos (src/photos.ts). The Worker has already checked the
+  // auth event, the size and the type; these decide who and how much.
+  // ------------------------------------------------------------------
+
+  async getPhoto(sha256: string): Promise<{ type: PhotoType; data: ArrayBuffer } | null> {
+    return this.metered(() =>
+      withReadPath("photos", () => {
+        const photo = sqlitePhotoStore(this.sql).get(sha256);
+        return photo === null ? null : { type: photo.type, data: photo.data };
+      }),
+    );
+  }
+
+  // The status is the HTTP status the Worker answers with; `reason` goes
+  // in X-Reason (BUD-01). An upload of the photo already current is
+  // answered as a success without spending an upload.
+  async uploadPhoto(
+    pubkey: string,
+    sha256: string,
+    type: PhotoType,
+    data: Uint8Array,
+  ): Promise<{ status: 200; uploadedAt: number } | { status: 403 | 429 | 507; reason: string }> {
+    return this.metered(() =>
+      withReadPath("photos", () => {
+        const sql = this.sql;
+        const owner = getOwnerPubkey(sql, this.env);
+        if (pubkey !== owner && !isMember(sql, pubkey)) {
+          return { status: 403 as const, reason: "only this relay's members can store a photo here" };
+        }
+        const store = sqlitePhotoStore(sql);
+        const current = store.currentFor(pubkey);
+        if (current !== null && current.sha256 === sha256) return { status: 200 as const, uploadedAt: current.uploadedAt };
+        const cap = photoStorageBytes(this.env) ?? 0;
+        if (store.usedBytes() - (current?.size ?? 0) + data.byteLength > cap) {
+          return { status: 507 as const, reason: "this relay has no room for more photos" };
+        }
+        const now = nowSeconds();
+        if (!takeUploadAllowance(sql, pubkey, Math.floor(now / 86400), PHOTO_UPLOADS_PER_DAY)) {
+          return {
+            status: 429 as const,
+            reason: `at most ${PHOTO_UPLOADS_PER_DAY} photo uploads a day; try again tomorrow`,
+          };
+        }
+        store.put(pubkey, { sha256, type, size: data.byteLength, uploadedAt: now }, data);
+        return { status: 200 as const, uploadedAt: now };
+      }),
+    );
+  }
+
+  // Only the uploader's current photo, and from anyone who uploaded it,
+  // member or not: a removed member may still take their own photo down.
+  async deletePhoto(pubkey: string, sha256: string): Promise<boolean> {
+    return this.metered(() =>
+      withReadPath("photos", () => sqlitePhotoStore(this.sql).deleteIfCurrent(pubkey, sha256)),
+    );
+  }
+
   // Backs GET /api/stats (src/index.ts), which is public and
   // unauthenticated: every figure here is maintained or bounded, so no
   // request walks a table.
@@ -751,6 +814,10 @@ export class Relay extends DurableObject<Env> {
     // pushConfigured): "on" or "off". Configuration, like groupPolicy;
     // NIP-11 says the same thing by carrying `push_key` or not.
     pushPolicy: "on" | "off";
+    // Profile photos (src/photos.ts): bytes stored, against the cap.
+    // `photoStorageLimit` is null when PHOTO_STORAGE_BYTES=off.
+    photoBytes: number;
+    photoStorageLimit: number | null;
     // Whether the daily counter audit (storage.ts auditMaintainedCounts)
     // has run and what it last found, from the same row. `lastRanAt: null`
     // means it has never run and must NOT be rendered as "no drift found".
@@ -866,6 +933,8 @@ export class Relay extends DurableObject<Env> {
       followCount: counts.follows,
       memberCount: memberCount(sql),
       pushPolicy: pushConfigured(this.env) ? "on" : "off",
+      photoBytes: sqlitePhotoStore(sql).usedBytes(),
+      photoStorageLimit: photoStorageBytes(this.env),
       countAudit: { lastRanAt: counts.lastRanAt, drift: counts.drift },
       followsListAt: followsListAt(sql),
       vanishing: vanishSummary(sql),

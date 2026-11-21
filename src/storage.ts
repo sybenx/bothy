@@ -2571,6 +2571,9 @@ export function sweepFormerMembers(
     // this member's mail now.
     if (targets.length < budget) {
       sql.exec(`DELETE FROM former_members WHERE pubkey = ?`, pubkey);
+      // Their profile photo goes with their mail (src/photos.ts).
+      sql.exec(`DELETE FROM photos WHERE pubkey = ?`, pubkey);
+      sql.exec(`DELETE FROM photo_uploads WHERE pubkey = ?`, pubkey);
       finished++;
     }
   }

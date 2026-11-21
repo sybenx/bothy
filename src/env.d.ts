@@ -60,4 +60,14 @@ interface Env {
   MAX_EVENT_BYTES?: string;
   MAX_EVENTS_PER_PUBKEY_PER_MINUTE?: string;
   NON_OWNER_STORAGE_BYTES?: string;
+  // Profile photos (src/photos.ts). PHOTO_STORAGE_BYTES is the total they
+  // may occupy, or exactly "off" to turn photo storage off. PHOTO_MAX_BYTES
+  // is the largest one photo may be, never above limits.ts
+  // PHOTO_MAX_BYTES_CEILING; it cannot be turned off.
+  PHOTO_STORAGE_BYTES?: string;
+  PHOTO_MAX_BYTES?: string;
+  // Rate limit for serving photos (wrangler.jsonc), separate from
+  // RATE_LIMIT_API because an app showing a list of friends loads many
+  // at once.
+  RATE_LIMIT_PHOTOS?: RateLimit;
 }

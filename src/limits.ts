@@ -674,6 +674,47 @@ export const FORMER_MEMBER_SWEEP_BATCH_SIZE = GIFT_WRAP_SWEEP_BATCH_SIZE;
 // only bounds the lookups a malformed wrap can make a stranger cost.
 export const MAX_WRAP_RECIPIENTS_CHECKED = 4;
 
+// ---------------------------------------------------------------------
+// Profile photos (src/photos.ts, a Blossom server for exactly one thing).
+// Held in this Durable Object's own SQLite, so they share the 5GB with
+// everything else; every number below exists to keep that share small and
+// visible. docs/principles.md "Restraint" is the rule they follow.
+// ---------------------------------------------------------------------
+
+// The largest one photo may be. The apps send a 512px JPEG, which is
+// 30-80KB; 100KB leaves room without inviting anything that is not a
+// profile photo. PHOTO_MAX_BYTES may raise it, never past the ceiling,
+// which is half SQLite's 2MB value limit in a Durable Object
+// (developers.cloudflare.com/durable-objects/platform/limits, checked
+// 2026-11-21), so a photo is always one row.
+export const PHOTO_MAX_BYTES_DEFAULT = 100 * 1024;
+export const PHOTO_MAX_BYTES_CEILING = 1024 * 1024;
+
+export function photoMaxBytes(env: Env): number {
+  const raw = env.PHOTO_MAX_BYTES === undefined ? NaN : Number(env.PHOTO_MAX_BYTES);
+  if (!Number.isFinite(raw) || raw <= 0) return PHOTO_MAX_BYTES_DEFAULT;
+  return Math.min(Math.floor(raw), PHOTO_MAX_BYTES_CEILING);
+}
+
+// All photos together: 250MB, 5% of the storage ceiling. At the cap new
+// uploads are refused and nothing else changes. "off" turns photos off:
+// no uploads, nothing served, and no `blossom` on NIP-11.
+export const PHOTO_STORAGE_BYTES_DEFAULT = 250 * 1024 * 1024;
+
+export function photoStorageBytes(env: Env): number | null {
+  return resolveLimit(env.PHOTO_STORAGE_BYTES, PHOTO_STORAGE_BYTES_DEFAULT);
+}
+
+// Uploads one pubkey may make in a UTC day. Each replaces their one photo,
+// so this bounds rows written (2 per upload), not storage. Five is
+// someone changing their mind, not a script.
+export const PHOTO_UPLOADS_PER_DAY = 5;
+
+// How far ahead of now a kind-24242 auth event's `created_at` may be,
+// matching nip98.ts HTTP_AUTH_MAX_DRIFT_SECONDS. Its expiry is its own
+// `expiration` tag (BUD-01).
+export const PHOTO_AUTH_MAX_FUTURE_SECONDS = 60;
+
 // Join requests (nip86.ts requestjoin): somebody with a "Message me" link
 // and no code asks to become a member, and the owner approves or declines.
 //

@@ -638,6 +638,34 @@ export const TABLES: readonly TableSpec[] = [
     ],
   },
   {
+    // Profile photos (src/photos.ts): ONE per pubkey, the member's or the
+    // owner's current photo, so a new upload replaces the row. The bytes
+    // are in `data`, one row each: limits.ts PHOTO_MAX_BYTES_CEILING keeps
+    // a photo under SQLite's per-value limit. Served publicly by `sha256`
+    // (idx_photos_sha256); there is no listing. A removed member's photo
+    // goes when their grace period ends (storage.ts sweepFormerMembers).
+    name: "photos",
+    columns: [
+      col("pubkey", "TEXT PRIMARY KEY"),
+      col("sha256", "TEXT NOT NULL"),
+      col("type", "TEXT NOT NULL"),
+      col("size", "INTEGER NOT NULL"),
+      col("data", "BLOB NOT NULL"),
+      col("uploaded_at", "INTEGER NOT NULL"),
+    ],
+  },
+  {
+    // The per-pubkey daily upload count (limits.ts PHOTO_UPLOADS_PER_DAY).
+    // `day` is the UTC day number; a new day resets `count`. Durable, not
+    // in memory, because an evicted object would otherwise forget it.
+    name: "photo_uploads",
+    columns: [
+      col("pubkey", "TEXT PRIMARY KEY"),
+      col("day", "INTEGER NOT NULL"),
+      col("count", "INTEGER NOT NULL"),
+    ],
+  },
+  {
     // Members the owner removed (nip86.ts unallowpubkey), kept for
     // limits.ts MEMBER_REMOVAL_GRACE_SECONDS so the mail already stored for
     // them stays readable while their app moves house. After that the cron
@@ -976,6 +1004,12 @@ export const INDEXES: readonly IndexSpec[] = [
   // member's mail goes to (relay.ts drainInboxPushes, storage.ts
   // hasPushSubscription), and dropping a removed member's devices. One row
   // written per subscribe.
+  // Serves GET /<sha256> (src/photos.ts): a photo is found by its hash.
+  {
+    name: "idx_photos_sha256",
+    table: "photos",
+    keyColumns: ["sha256"],
+  },
   {
     name: "idx_push_subscriptions_pubkey",
     table: "push_subscriptions",

@@ -136,6 +136,32 @@ comes from the kind-3 the owner's client already publishes; nobody
 maintains a second list. Backfill starts from the relay list the owner
 already has. Nothing asks for information the network already holds.
 
+### Restraint
+
+A home should give its group what it needs, and it runs on someone's free
+Cloudflare account, so every feature that holds things for members is
+held to four rules. They came out of profile photos (src/photos.ts), the
+first time bothy stored something that was not an event.
+
+**Bounded.** It has a hard cap in bytes, and a per-person bound on top
+(one photo each, a few uploads a day). At the cap it refuses, and nothing
+else on the relay notices. The cap is an environment variable with a
+default chosen to be a small share of the storage ceiling.
+
+**Members only.** Writing is for the owner and members. Reading is no
+wider than it needs to be: a photo is served by its hash, and nothing
+lists what is stored.
+
+**Visible.** The admin page and NIP-11 say how much is used against the
+cap. Nothing fills quietly.
+
+**Never required.** A deploy needs no new binding, account feature or
+paid service, and the feature can be turned off. If a bigger store (R2)
+ever makes sense, it is opt-in behind the same interface. And the
+feature is never the only copy: the apps keep their own (photos also go
+to a public Blossom server), so the relay may refuse, fill up or lose
+something without breaking anyone.
+
 ## Writing
 
 ### Plain language, second person, verbs
@@ -249,6 +275,8 @@ answer to every one is no.
 9. Is anything claimed that does not yet work?
 10. Does anything an existing relay relies on change without a migration
     line?
+11. Does it hold something for members without a cap, a way to see it,
+    and a way to turn it off, or does a deploy now need something new?
 
 ## Sources
 

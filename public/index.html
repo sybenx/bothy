@@ -145,6 +145,7 @@
 
   <p id="write-policy-status">-</p>
   <p id="members-status">-</p>
+  <p id="photos-status" hidden></p>
 
   <p id="backfill-status" hidden></p>
   <p id="backfill-refusal" class="refusal" hidden></p>
@@ -326,6 +327,7 @@ async function main() {
 
     renderWritePolicyStatus(stats);
     renderMembersStatus(stats);
+    renderPhotosStatus(stats);
     renderBackfillStatus(stats.backfill);
     renderDiagnostics(stats);
     wireLiveFeed();
@@ -426,6 +428,16 @@ function renderMembersStatus(stats) {
     : n === 0 ? " Notifications are on."
     : " New mail notifies their phones.";
   el.textContent = who + push;
+}
+
+// Members' profile photos (/api/stats `photoBytes` against
+// `photoStorageLimit`), hidden when photo storage is off.
+function renderPhotosStatus(stats) {
+  const el = document.getElementById("photos-status");
+  el.hidden = stats.photoStorageLimit === null || stats.photoStorageLimit === undefined;
+  if (el.hidden) return;
+  el.textContent = "Profile photos use " + formatBytes(stats.photoBytes) + " of " +
+    formatBytes(stats.photoStorageLimit) + ".";
 }
 
 // One-shot backfill progress (visible progress on
