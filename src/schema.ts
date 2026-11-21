@@ -395,11 +395,19 @@ export const TABLES: readonly TableSpec[] = [
       // whatever its source (storage.ts isMember); the source only says
       // how they got in.
       //
+      // 'request': the owner approved a join request (nip86.ts approvejoin).
+      //
       // allowpubkey on an existing row promotes it to 'owner'; nothing
       // demotes an 'owner' row (allowPubkeyForGroup does nothing on
       // conflict). DEFAULT 'owner' because allowpubkey was the only writer
       // before this column existed.
       col("source", "TEXT NOT NULL DEFAULT 'owner'"),
+      // Who let them in, as a hex pubkey: the owner, for every way in that
+      // exists today (only the owner makes invites, approves requests and
+      // calls allowpubkey). A column rather than an assumption so members
+      // inviting members can be added without a migration. NULL on rows
+      // written before it existed, and on rows a NIP-29 group wrote.
+      col("invited_by", "TEXT"),
     ],
   },
   // The groups this relay hosts, one row each. NIP-29 leaves creation to the
@@ -575,6 +583,24 @@ export const TABLES: readonly TableSpec[] = [
       col("uses_allowed", "INTEGER NOT NULL DEFAULT 1"),
       col("uses", "INTEGER NOT NULL DEFAULT 0"),
       col("revoked_at", "INTEGER"),
+    ],
+  },
+  {
+    // Join requests (nip86.ts requestjoin): one row per pubkey that asked
+    // to become a member without a code. Pending while `declined_at` is
+    // NULL; either way the row goes at `expires_at` (limits.ts
+    // JOIN_REQUEST_TTL_SECONDS after the request, or after the decline),
+    // swept by the cron tick. Approval deletes the row and writes the
+    // `allowed_pubkeys` row. `name` and `note` are what the requester typed,
+    // bounded by limits.ts and shown only to the owner.
+    name: "join_requests",
+    columns: [
+      col("pubkey", "TEXT PRIMARY KEY"),
+      col("name", "TEXT"),
+      col("note", "TEXT"),
+      col("requested_at", "INTEGER NOT NULL"),
+      col("expires_at", "INTEGER NOT NULL"),
+      col("declined_at", "INTEGER"),
     ],
   },
   {

@@ -1701,14 +1701,25 @@ export interface AllowedPubkey {
 // NIP-86 allowpubkey: the only writer of `source = 'owner'`. An existing
 // row is PROMOTED to 'owner' (one-way), so a later kind-9001 remove-user,
 // which deletes only 'invite' rows, cannot revoke a deliberate grant.
-export function allowPubkey(sql: SqlStorage, pubkey: string, reason: string | null, nowSec: number): void {
+//
+// `invitedBy` is the caller (the owner); a promotion keeps an earlier
+// inviter when none is given.
+export function allowPubkey(
+  sql: SqlStorage,
+  pubkey: string,
+  reason: string | null,
+  nowSec: number,
+  invitedBy: string | null = null,
+): void {
   sql.exec(
-    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source) VALUES (?, ?, ?, 'owner')
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, invited_by) VALUES (?, ?, ?, 'owner', ?)
        ON CONFLICT(pubkey) DO UPDATE SET reason = excluded.reason, allowed_at = excluded.allowed_at,
-                                         source = 'owner'`,
+                                         source = 'owner',
+                                         invited_by = COALESCE(excluded.invited_by, invited_by)`,
     pubkey,
     reason,
     nowSec,
+    invitedBy,
   );
   readmitFormerMember(sql, pubkey);
 }
@@ -2035,9 +2046,11 @@ export function memberCount(sql: SqlStorage): number {
 }
 
 // Called wherever a pubkey is (re)admitted: a returning member's mail is
-// theirs again, so the grace clock stops.
+// theirs again, so the grace clock stops, and a request they had waiting
+// is answered.
 function readmitFormerMember(sql: SqlStorage, pubkey: string): void {
   sql.exec(`DELETE FROM former_members WHERE pubkey = ?`, pubkey);
+  sql.exec(`DELETE FROM join_requests WHERE pubkey = ?`, pubkey);
 }
 
 export interface MemberInvite {
@@ -2137,6 +2150,7 @@ export function redeemMemberInvite(
   code: string,
   pubkey: string,
   nowSec: number,
+  invitedBy: string | null = null,
 ): MemberInviteOutcome {
   if (isPubkeyAllowed(sql, pubkey)) return "already-member";
   const invite = lookupMemberInvite(sql, code);
@@ -2151,11 +2165,12 @@ export function redeemMemberInvite(
     nowSec,
   );
   sql.exec(
-    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source)
-       VALUES (?, 'joined with an invite', ?, 'member')
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, invited_by)
+       VALUES (?, 'joined with an invite', ?, 'member', ?)
        ON CONFLICT(pubkey) DO NOTHING`,
     pubkey,
     nowSec,
+    invitedBy,
   );
   readmitFormerMember(sql, pubkey);
   return "joined";
@@ -2173,6 +2188,171 @@ export function revokeMemberInvite(sql: SqlStorage, code: string, nowSec: number
   if (invite.uses >= invite.uses_allowed) return "used-up";
   sql.exec(`UPDATE member_invites SET revoked_at = ? WHERE code = ?`, nowSec, code);
   return "revoked";
+}
+
+// ---------------------------------------------------------------------
+// Join requests (schema.ts `join_requests`, nip86.ts requestjoin).
+// ---------------------------------------------------------------------
+
+// What asking did. "created" is the only outcome that sends the owner a
+// message: asking again while a request waits changes nothing, so a
+// requester's app can call requestjoin on every open to learn where it
+// stands without the owner hearing about it twice.
+export type JoinRequestOutcome =
+  | { status: "created"; expiresAt: number }
+  | { status: "pending"; expiresAt: number }
+  | { status: "declined" }
+  | { status: "full" };
+
+export function recordJoinRequest(
+  sql: SqlStorage,
+  pubkey: string,
+  name: string | null,
+  note: string | null,
+  nowSec: number,
+  ttlSec: number,
+  maxPending: number,
+): JoinRequestOutcome {
+  const existing = sql
+    .exec<{ expires_at: number; declined_at: number | null }>(
+      `SELECT expires_at, declined_at FROM join_requests WHERE pubkey = ?`,
+      pubkey,
+    )
+    .toArray()[0];
+  if (existing !== undefined && existing.expires_at > nowSec) {
+    return existing.declined_at === null ? { status: "pending", expiresAt: existing.expires_at } : { status: "declined" };
+  }
+  const pending =
+    sql
+      .exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM join_requests WHERE declined_at IS NULL AND expires_at > ?`,
+        nowSec,
+      )
+      .toArray()[0]?.n ?? 0;
+  if (pending >= maxPending) return { status: "full" };
+  const expiresAt = nowSec + ttlSec;
+  sql.exec(
+    `INSERT INTO join_requests (pubkey, name, note, requested_at, expires_at, declined_at)
+       VALUES (?, ?, ?, ?, ?, NULL)
+       ON CONFLICT(pubkey) DO UPDATE SET name = excluded.name, note = excluded.note,
+         requested_at = excluded.requested_at, expires_at = excluded.expires_at, declined_at = NULL`,
+    pubkey,
+    name,
+    note,
+    nowSec,
+    expiresAt,
+  );
+  return { status: "created", expiresAt };
+}
+
+export interface JoinRequest {
+  pubkey: string;
+  name: string | null;
+  note: string | null;
+  requestedAt: number;
+  expiresAt: number;
+}
+
+// Waiting ones only, newest first: a declined request is the owner's own
+// decision and needs no second look.
+export function listJoinRequests(sql: SqlStorage, nowSec: number): JoinRequest[] {
+  return sql
+    .exec<{ pubkey: string; name: string | null; note: string | null; requested_at: number; expires_at: number }>(
+      `SELECT pubkey, name, note, requested_at, expires_at FROM join_requests
+        WHERE declined_at IS NULL AND expires_at > ? ORDER BY requested_at DESC`,
+      nowSec,
+    )
+    .toArray()
+    .map((r) => ({ pubkey: r.pubkey, name: r.name, note: r.note, requestedAt: r.requested_at, expiresAt: r.expires_at }));
+}
+
+function hasPendingJoinRequest(sql: SqlStorage, pubkey: string, nowSec: number): boolean {
+  return (
+    sql
+      .exec(
+        `SELECT 1 FROM join_requests WHERE pubkey = ? AND declined_at IS NULL AND expires_at > ?`,
+        pubkey,
+        nowSec,
+      )
+      .toArray().length > 0
+  );
+}
+
+// False when nothing from that pubkey is waiting. Makes them a member the
+// way an invite does, with `invitedBy` (the owner) as the inviter, and
+// deletes the request (readmitFormerMember).
+export function approveJoinRequest(sql: SqlStorage, pubkey: string, invitedBy: string, nowSec: number): boolean {
+  if (!hasPendingJoinRequest(sql, pubkey, nowSec)) return false;
+  sql.exec(
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, invited_by)
+       VALUES (?, 'asked to join', ?, 'request', ?)
+       ON CONFLICT(pubkey) DO NOTHING`,
+    pubkey,
+    nowSec,
+    invitedBy,
+  );
+  readmitFormerMember(sql, pubkey);
+  return true;
+}
+
+// False when nothing from that pubkey is waiting. The row stays, declined,
+// for `ttlSec`, so asking again inside that time gets "declined" and sends
+// the owner nothing.
+export function declineJoinRequest(sql: SqlStorage, pubkey: string, nowSec: number, ttlSec: number): boolean {
+  if (!hasPendingJoinRequest(sql, pubkey, nowSec)) return false;
+  sql.exec(
+    `UPDATE join_requests SET declined_at = ?, expires_at = ? WHERE pubkey = ?`,
+    nowSec,
+    nowSec + ttlSec,
+    pubkey,
+  );
+  return true;
+}
+
+// Cron tick. Rows are bounded by MAX_PENDING_JOIN_REQUESTS plus the
+// declined ones, so one statement.
+export function sweepExpiredJoinRequests(sql: SqlStorage, nowSec: number): void {
+  sql.exec(`DELETE FROM join_requests WHERE expires_at <= ?`, nowSec);
+}
+
+// ---------------------------------------------------------------------
+// The member list for the owner's management screen (nip86.ts
+// listmembers): everyone with a home here, and everyone removed whose mail
+// is still waiting to be deleted.
+// ---------------------------------------------------------------------
+
+export interface MemberDetails {
+  pubkey: string;
+  invitedBy: string | null;
+  joinedAt: number;
+  source: string;
+}
+
+export interface RemovedMember {
+  pubkey: string;
+  removedAt: number;
+  // When their stored mail is deleted (removedAt + grace). The sweep
+  // runs hourly, so the deletion lands within the hour after this.
+  deletesAt: number;
+}
+
+export function listMembers(
+  sql: SqlStorage,
+  graceSec: number,
+): { members: MemberDetails[]; removed: RemovedMember[] } {
+  const members = sql
+    .exec<{ pubkey: string; invited_by: string | null; allowed_at: number; source: string }>(
+      `SELECT pubkey, invited_by, allowed_at, source FROM allowed_pubkeys ORDER BY allowed_at DESC`,
+    )
+    .toArray()
+    .map((r) => ({ pubkey: r.pubkey, invitedBy: r.invited_by, joinedAt: r.allowed_at, source: r.source }));
+  const removed = sql
+    .exec<{ pubkey: string; removed_at: number }>(
+      `SELECT pubkey, removed_at FROM former_members ORDER BY removed_at DESC`,
+    )
+    .toArray()
+    .map((r) => ({ pubkey: r.pubkey, removedAt: r.removed_at, deletesAt: r.removed_at + graceSec }));
+  return { members, removed };
 }
 
 export interface FormerMemberSweep {

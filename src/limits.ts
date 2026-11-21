@@ -674,6 +674,31 @@ export const FORMER_MEMBER_SWEEP_BATCH_SIZE = GIFT_WRAP_SWEEP_BATCH_SIZE;
 // only bounds the lookups a malformed wrap can make a stranger cost.
 export const MAX_WRAP_RECIPIENTS_CHECKED = 4;
 
+// Join requests (nip86.ts requestjoin): somebody with a "Message me" link
+// and no code asks to become a member, and the owner approves or declines.
+//
+// A request waits this long, and a declined one is remembered this long
+// after the decline, so the same person cannot ask again at once.
+export const JOIN_REQUEST_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+// Requests waiting at once. Each one also costs a message to the owner
+// (12 rows written, the gift wrap's cost), and anyone can ask, from any
+// number of fresh keys; this is what bounds the owner's inbox against
+// that. Past it, requestjoin says to try again later.
+export const MAX_PENDING_JOIN_REQUESTS = 50;
+
+// Per address: how often requestjoin may be called (relay.ts, in memory,
+// like the NIP-29 join throttle). Three in ten minutes is a person
+// retrying, not a script.
+export const REQUEST_JOIN_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
+export const MAX_REQUEST_JOINS_PER_IP_PER_WINDOW = 3;
+
+// What a requester may say about themselves, in characters. The name goes
+// into the owner's message as "<name> wants to join your home.", so it is
+// kept to a name's length; the note is a sentence or two.
+export const JOIN_REQUEST_NAME_MAX_LENGTH = 64;
+export const JOIN_REQUEST_NOTE_MAX_LENGTH = 280;
+
 // ---------------------------------------------------------------------
 // Call presence (push.ts CALL_PRESENCE_KIND; hearth's reference/push.md).
 // hearth beats every five seconds during a call and treats a pubkey as

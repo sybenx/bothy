@@ -19,7 +19,16 @@ import {
   banEvent,
   banPubkey,
   blockIp,
+  approveJoinRequest,
   countOutstandingMemberInvites,
+  declineJoinRequest,
+  giftWrapCount,
+  isMember,
+  isPubkeyBanned,
+  listJoinRequests,
+  listMembers,
+  recordJoinRequest,
+  storeEvent,
   createMemberInvite,
   deletePushSubscription,
   getStoredWritePolicy,
@@ -48,9 +57,17 @@ import {
   MEMBER_INVITE_CODE_BYTES,
   MEMBER_INVITE_DEFAULT_USES,
   MEMBER_INVITE_MAX_USES,
+  JOIN_REQUEST_NAME_MAX_LENGTH,
+  JOIN_REQUEST_NOTE_MAX_LENGTH,
+  JOIN_REQUEST_TTL_SECONDS,
+  MAX_PENDING_JOIN_REQUESTS,
+  maxGiftWraps,
+  MEMBER_REMOVAL_GRACE_SECONDS,
 } from "./limits";
 import { GROUPS_PAUSED_MESSAGE } from "./nip29";
 import { pushConfigured } from "./push";
+import { joinRequestMessage, oneLine } from "./join-requests";
+import type { NostrEvent } from "./nostr";
 import { getOwnerPubkey } from "./ownership";
 import { normalizeIp } from "./ip";
 import { normalizePubkey } from "./pubkey";
@@ -77,6 +94,10 @@ export const MANAGEMENT_CONTENT_TYPE = "application/nostr+json+rpc";
 export interface ManagementResponse {
   result?: unknown;
   error?: string;
+  // Not part of the response: events this call stored that relay.ts
+  // manage() must also deliver (live subscriptions, push) and then strip
+  // before answering. Today only requestjoin's message to the owner.
+  outbox?: NostrEvent[];
 }
 
 // Exactly the methods implemented below, and the value supportedmethods
@@ -120,6 +141,15 @@ export const SUPPORTED_METHODS = [
   "redeeminvite",
   "listunusedinvites",
   "revokeinvite",
+  // bothy's own. requestjoin is how someone without a code asks to become
+  // a member; the owner answers with approvejoin or declinejoin.
+  // listmembers is the owner's member screen: more than
+  // listallowedpubkeys says, and the removed members still in their grace.
+  "requestjoin",
+  "listjoinrequests",
+  "approvejoin",
+  "declinejoin",
+  "listmembers",
   // bothy's own; the one pair a member may call, not only the owner
   // (MEMBER_CALLABLE_METHODS below).
   "subscribepush",
@@ -143,7 +173,10 @@ export const MEMBER_CALLABLE_METHODS: readonly string[] = ["subscribepush", "uns
 // by definition not a member yet. The code is the authority, and the
 // signature only says who is joining (the pubkey stored is the signer's,
 // never one from the body).
-export const ANYONE_CALLABLE_METHODS: readonly string[] = ["redeeminvite"];
+//
+// requestjoin likewise: the requester is not a member, and asking is the
+// point. relay.ts throttles it per address before dispatch.
+export const ANYONE_CALLABLE_METHODS: readonly string[] = ["redeeminvite", "requestjoin"];
 
 // The 401 a non-member gets for a MEMBER_CALLABLE_METHODS call (index.ts).
 // Stable on purpose: an app that sees it knows its user is not, or is no
@@ -183,6 +216,29 @@ const HEX_ID_RE = /^[0-9a-f]{64}$/;
 // the distinction through revokeinvite.
 export const REDEEM_REFUSAL_MESSAGE =
   "redeeminvite: this invite cannot be used. Ask whoever sent it for a new one.";
+
+// requestjoin's one optional parameter, {"name", "note"}: each an optional
+// string, squeezed onto one line and length-bounded. Null with a message
+// when it is not that shape.
+function parseJoinDetails(value: unknown): { name: string | null; note: string | null } | string {
+  if (value === undefined || value === null) return { name: null, note: null };
+  if (typeof value !== "object" || Array.isArray(value)) {
+    return 'requestjoin takes one optional object, {"name": "...", "note": "..."}';
+  }
+  const raw = value as { name?: unknown; note?: unknown };
+  const field = (v: unknown, label: string, max: number): string | null | { error: string } => {
+    if (v === undefined || v === null) return null;
+    if (typeof v !== "string") return { error: `requestjoin: ${label} must be a string` };
+    const text = oneLine(v);
+    if (text.length > max) return { error: `requestjoin: ${label} can be at most ${max} characters` };
+    return text === "" ? null : text;
+  };
+  const name = field(raw.name, "name", JOIN_REQUEST_NAME_MAX_LENGTH);
+  if (typeof name === "object" && name !== null) return name.error;
+  const note = field(raw.note, "note", JOIN_REQUEST_NOTE_MAX_LENGTH);
+  if (typeof note === "object" && note !== null) return note.error;
+  return { name, note };
+}
 
 // An optional positive integer parameter, or the default when absent.
 // Null when present but not a whole number in [1, max].
@@ -415,7 +471,7 @@ export function handleManagementCall(
     case "allowpubkey": {
       const pubkey = pubkeyParam(params, 0);
       if (pubkey === null) return err("allowpubkey takes a pubkey, as npub or 64-character hex");
-      allowPubkey(sql, pubkey, optionalReason(params, 1), nowSec);
+      allowPubkey(sql, pubkey, optionalReason(params, 1), nowSec, signer);
       return { result: true };
     }
 
@@ -520,10 +576,82 @@ export function handleManagementCall(
       const code = stringParam(params, 0);
       if (code === null || code === "") return err("redeeminvite takes the invite code as a string");
       if (getOwnerPubkey(sql, env) === signer) return { result: true };
-      const outcome = redeemMemberInvite(sql, code, signer, nowSec);
+      const outcome = redeemMemberInvite(sql, code, signer, nowSec, getOwnerPubkey(sql, env));
       if (outcome === "joined" || outcome === "already-member") return { result: true };
       return err(REDEEM_REFUSAL_MESSAGE);
     }
+
+    // Anyone may call this (ANYONE_CALLABLE_METHODS); the signer is who
+    // asks. The result says where they stand, so their app can call it
+    // again on every open: {"status": "pending", "expires_at"} while it
+    // waits, "member" once approved (or if they already were), "declined"
+    // for JOIN_REQUEST_TTL_SECONDS after a decline. Only a new request
+    // messages the owner.
+    case "requestjoin": {
+      const owner = getOwnerPubkey(sql, env);
+      if (owner === null) return err("requestjoin: this relay has no owner yet, so there is nobody to ask");
+      if (signer === owner || isMember(sql, signer)) return { result: { status: "member" } };
+      if (isPubkeyBanned(sql, signer)) return err("requestjoin: this relay does not accept requests from you");
+      const details = parseJoinDetails(params[0]);
+      if (typeof details === "string") return err(details);
+      const outcome = recordJoinRequest(
+        sql,
+        signer,
+        details.name,
+        details.note,
+        nowSec,
+        JOIN_REQUEST_TTL_SECONDS,
+        MAX_PENDING_JOIN_REQUESTS,
+      );
+      switch (outcome.status) {
+        case "full":
+          return err("requestjoin: too many requests are waiting for an answer here. Try again later.");
+        case "declined":
+          return { result: { status: "declined" } };
+        case "pending":
+          return { result: { status: "pending", expires_at: outcome.expiresAt } };
+        case "created": {
+          const result = { status: "pending", expires_at: outcome.expiresAt };
+          // The request stands even if the owner's inbox is full; they
+          // still see it in listjoinrequests.
+          if (giftWrapCount(sql) >= maxGiftWraps(env)) return { result };
+          const { wrap } = joinRequestMessage(sql, owner, signer, details.name, details.note, nowSec);
+          const stored = storeEvent(sql, wrap, nowSec);
+          return { result, ...(stored.stored ? { outbox: [stored.stored] } : {}) };
+        }
+      }
+    }
+
+    case "listjoinrequests":
+      return { result: listJoinRequests(sql, nowSec) };
+
+    // Makes the requester a member with the owner as inviter. Nothing is
+    // sent to them: their app learns it on its next requestjoin,
+    // subscribepush or unsubscribepush.
+    case "approvejoin": {
+      const pubkey = pubkeyParam(params, 0);
+      if (pubkey === null) return err("approvejoin takes a pubkey, as npub or 64-character hex");
+      if (!approveJoinRequest(sql, pubkey, signer, nowSec)) {
+        return err(
+          "approvejoin: no request from that pubkey is waiting. To let someone in without one, use allowpubkey.",
+        );
+      }
+      return { result: true };
+    }
+
+    case "declinejoin": {
+      const pubkey = pubkeyParam(params, 0);
+      if (pubkey === null) return err("declinejoin takes a pubkey, as npub or 64-character hex");
+      if (!declineJoinRequest(sql, pubkey, nowSec, JOIN_REQUEST_TTL_SECONDS)) {
+        return err("declinejoin: no request from that pubkey is waiting");
+      }
+      return { result: true };
+    }
+
+    // Members, and the removed ones whose mail has not been deleted yet.
+    // Letting a removed one back in is allowpubkey, which stops the clock.
+    case "listmembers":
+      return { result: listMembers(sql, MEMBER_REMOVAL_GRACE_SECONDS) };
 
     // bothy's own; the client half is hearth's subscribeToPush. The pubkey
     // stored is `signer` and nothing else -- the parameters carry a

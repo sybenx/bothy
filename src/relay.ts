@@ -25,6 +25,8 @@ import {
   boundFilter,
   MAX_PUSHES_PER_TICK,
   MAX_WRAP_RECIPIENTS_CHECKED,
+  MAX_REQUEST_JOINS_PER_IP_PER_WINDOW,
+  REQUEST_JOIN_RATE_LIMIT_WINDOW_MS,
   MEMBER_REMOVAL_GRACE_SECONDS,
   FORMER_MEMBER_SWEEP_PUBKEYS,
   FORMER_MEMBER_SWEEP_BATCH_SIZE,
@@ -124,6 +126,7 @@ import {
   type WriteMetricsSnapshot,
 } from "./read-metrics";
 import { getRelayPubkey } from "./relay-identity";
+import { normalizeIp } from "./ip";
 import { connMetricsSnapshot, noteClose, noteRefusal, type ConnMetricsSnapshot } from "./conn-metrics";
 import { reqCacheSnapshot, type ReqCacheSnapshot } from "./req-cache";
 import { initSchema } from "./schema";
@@ -179,6 +182,7 @@ import {
   pushSubscriptionsFor,
   queueInboxPush,
   sweepFormerMembers,
+  sweepExpiredJoinRequests,
   isIpBlocked,
   queryFilters,
   type RelaySettings,
@@ -607,16 +611,52 @@ export class Relay extends DurableObject<Env> {
     callerIp: string,
     signer: string,
   ): Promise<ManagementResponse> {
-    const response = await this.metered(() =>
-      withReadPath("management", () =>
-        handleManagementCall(this.sql, this.env, method, params, callerIp, nowSeconds(), signer),
-      ),
-    );
+    // requestjoin is the one method anyone may call that writes on the
+    // owner's behalf (a message to them), so it is throttled per address
+    // here, before it reads anything.
+    if (method === "requestjoin" && this.isRequestJoinRateLimited(callerIp)) {
+      return { error: "requestjoin: too many requests from this address. Try again in a few minutes." };
+    }
+    const response = await this.metered(async () => {
+      const answer = withReadPath("management", () => {
+        const sql = this.sql;
+        const reply = handleManagementCall(sql, this.env, method, params, callerIp, nowSeconds(), signer);
+        // What the call stored, delivered like any accepted event: to the
+        // owner's open subscriptions, and to their devices.
+        const owner = getOwnerPubkey(sql, this.env);
+        for (const event of reply.outbox ?? []) {
+          this.notePush(sql, event, owner === null ? [] : [owner]);
+          this.broadcast(event);
+        }
+        const { outbox: _delivered, ...rest } = reply;
+        return rest;
+      });
+      await this.settlePushAlarm();
+      return answer;
+    });
     // Cleared after every method, not only changewritepolicy: it costs one
     // row on the next non-owner write, and a cache that has to know which
     // methods invalidate it will eventually be wrong about one.
     this.cachedWritePolicy = undefined;
     return response;
+  }
+
+  // See limits.ts REQUEST_JOIN_RATE_LIMIT_WINDOW_MS. In memory, like the
+  // other per-address throttles: an evicted object forgets, which costs at
+  // most one more window's worth of requests.
+  private requestJoinRateLimits = new Map<string, { windowStart: number; count: number }>();
+
+  private isRequestJoinRateLimited(ip: string): boolean {
+    const now = Date.now();
+    const key = normalizeIp(ip);
+    const entry = this.requestJoinRateLimits.get(key);
+    if (!entry || now - entry.windowStart >= REQUEST_JOIN_RATE_LIMIT_WINDOW_MS) {
+      if (this.requestJoinRateLimits.size >= 1024) this.requestJoinRateLimits.clear();
+      this.requestJoinRateLimits.set(key, { windowStart: now, count: 1 });
+      return false;
+    }
+    entry.count++;
+    return entry.count > MAX_REQUEST_JOINS_PER_IP_PER_WINDOW;
   }
 
   // For the Worker's management gate (src/index.ts), deciding whether a
@@ -915,6 +955,8 @@ export class Relay extends DurableObject<Env> {
         // Removed members' mail, once their grace period is over
         // (storage.ts sweepFormerMembers). Free while nobody is waiting.
         withReadPath("giftWrapSweep", () => this.sweepFormerMemberMail(sql, now));
+        // Join requests past their 30 days, answered or not.
+        sweepExpiredJoinRequests(sql, now);
         // Last: see the comment on runCron.
         this.drainPendingVanishes(sql);
       });

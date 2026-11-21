@@ -1,7 +1,8 @@
-// Minimal bech32 decoder (BIP-173) -- just enough to turn an `npub1...`
-// string into its 32-byte payload. No encoder: the relay only ever needs
-// to accept npubs a client pastes in, never mint its own. Not a
-// general-purpose bech32/bech32m library.
+// Minimal bech32 (BIP-173): enough to turn an `npub1...` string into its
+// 32-byte payload, and to write one back. The encoder exists for one
+// reader, the message the relay sends its owner about a join request
+// (join-requests.ts), which names the requester as a `nostr:npub1...`
+// link their app can open. Not a general-purpose bech32/bech32m library.
 const CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 const GENERATOR = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
 
@@ -67,4 +68,36 @@ export function bech32Decode(input: string): { hrp: string; bytes: Uint8Array } 
   const bytes = convertBits(payload, 5, 8);
   if (bytes === null) return null;
   return { hrp, bytes: Uint8Array.from(bytes) };
+}
+
+function createChecksum(hrp: string, data: number[]): number[] {
+  const mod = polymod([...hrpExpand(hrp), ...data, 0, 0, 0, 0, 0, 0]) ^ 1;
+  const out: number[] = [];
+  for (let i = 0; i < 6; i++) out.push((mod >>> (5 * (5 - i))) & 31);
+  return out;
+}
+
+// 8-bit to 5-bit with the final group zero-padded, which is what encoding
+// needs and decoding (convertBits above) must refuse.
+function toWords(bytes: Uint8Array): number[] {
+  let acc = 0;
+  let bits = 0;
+  const out: number[] = [];
+  for (const value of bytes) {
+    acc = (acc << 8) | value;
+    bits += 8;
+    while (bits >= 5) {
+      bits -= 5;
+      out.push((acc >>> bits) & 31);
+    }
+  }
+  if (bits > 0) out.push((acc << (5 - bits)) & 31);
+  return out;
+}
+
+// A 64-character hex pubkey as `npub1...` (NIP-19).
+export function npubEncode(pubkeyHex: string): string {
+  const bytes = Uint8Array.from(pubkeyHex.match(/../g) ?? [], (h) => parseInt(h, 16));
+  const words = toWords(bytes);
+  return "npub1" + [...words, ...createChecksum("npub", words)].map((w) => CHARSET[w]).join("");
 }
