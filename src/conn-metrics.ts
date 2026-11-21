@@ -1,20 +1,16 @@
 // ---------------------------------------------------------------------
-// DIAGNOSTIC, memory only, like read-metrics.ts and for the same reasons:
-// a counter that cost a row write would spend the budget it is helping to
-// explain, and these are for proportions rather than daily totals.
+// DIAGNOSTIC, memory only, like read-metrics.ts and for the same reasons
+// (a stored counter would spend the budget it explains; proportions, not
+// daily totals).
 //
-// The question it answers: why does a client reconnect every ~13 seconds?
-// On 2026-10-09 one did, re-sending ~4 REQs per connection, and that was
-// 99.4% of the relay's rows read. req-cache.ts makes the repeats cheap;
-// this says whether the relay is what is sending the client away. If REQs
-// are refused (a client asking for kind 1059 without AUTH, say, then
-// reconnecting to try again), the fix is that interaction rather than a
-// cache. If connections end with 1000 after a few REQs and no refusals,
-// the client is polling, and the cache is the whole answer.
+// Answers whether the relay is what sends a rapidly reconnecting client
+// away (see req-cache.ts). Refused REQs (say, kind 1059 without AUTH)
+// followed by reconnects point at that interaction; clean 1000 closes
+// after a few REQs with no refusals mean the client is polling.
 //
-// Published on /api/stats, which is public, so it holds counts only:
-// refusal reasons are the relay's own constant strings with numbers
-// masked, and nothing here names an IP, a pubkey, or a filter.
+// Published on /api/stats, which is public, so counts only: refusal
+// reasons are the relay's own constant strings with digits masked, and
+// nothing names an IP, a pubkey or a filter.
 // ---------------------------------------------------------------------
 
 const refusals = new Map<string, number>();
@@ -35,10 +31,10 @@ export function noteRefusal(reason: string): void {
   bump(refusals, category);
 }
 
-// `channel` separates the admin page's /live feed, which the server
-// itself closes every ten minutes, from nostr protocol connections.
-// `connectedAt`/`reqs` are undefined for a connection accepted before
-// this was deployed, and for a live feed socket's REQ count.
+// `channel` separates the admin page's /live feed, which the server closes
+// after LIVE_FEED_MAX_LIFETIME_MS, from nostr connections.
+// `connectedAt`/`reqs` are undefined for a live feed socket and for a
+// hibernated socket whose attachment predates those fields.
 export function noteClose(
   channel: "nostr" | "live",
   code: number,

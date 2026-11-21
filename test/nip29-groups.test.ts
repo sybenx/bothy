@@ -772,9 +772,8 @@ describe("regeneration", () => {
 });
 
 // ITEM 3, second half: what a membership change actually costs against the
-// 100,000 rows-written/day ceiling (CLAUDE.md "The budget"). Measured on a
-// real SqlStorageCursor, like every other figure in that section, so a
-// change that moves it fails here rather than drifting.
+// 100,000 rows-written/day ceiling. Measured on a real SqlStorageCursor,
+// so a change that moves it fails here rather than drifting.
 describe("rows written per membership change", () => {
   // Sums SqlStorageCursor.rowsWritten across every statement `fn` issues --
   // the same proxy test/hibernation.test.ts uses, for the same reason.

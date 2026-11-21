@@ -1,13 +1,9 @@
-// One-shot backfill, Worker-side half. Every
-// outbound WebSocket this feature ever opens lives here, in the
-// stateless Worker's scheduled() handler -- never inside the Relay
-// Durable Object. CLAUDE.md "The budget": "an outbound connection keeps
-// the DO in memory for up to 15 minutes even with no traffic," which is
-// exactly the cost hibernation exists to avoid. The DO's role is limited
-// to answering "what's the state" (getBackfillState) and "here's a page
-// I already fetched, please store it" (discoverBackfillRelays,
-// ingestBackfillPage) -- both plain RPC calls, the same mechanism
-// src/index.ts already uses for claim()/getStats(), not fetch().
+// One-shot backfill, Worker-side half. Every outbound WebSocket backfill
+// opens lives here, in the Worker's scheduled() handler, never in the
+// Relay Durable Object: an outbound WebSocket keeps the DO in memory for
+// up to 15 minutes, defeating hibernation. The DO only answers RPCs:
+// getBackfillState, and discoverBackfillRelays/ingestBackfillPage to
+// store what was fetched here.
 import { BACKFILL_FETCH_TIMEOUT_MS, BACKFILL_PAGE_SIZE } from "./limits";
 import { RELAY_LIST_KIND, writeRelaysFrom } from "./nostr";
 import { WELL_KNOWN_RELAYS } from "./profile-lookup";
@@ -15,36 +11,25 @@ import { relayStub } from "./relay-stub";
 
 export interface FetchPageResult {
   events: unknown[];
-  // True only when an actual EOSE frame arrived for this subscription --
-  // false for a timeout, a socket error, a socket close, and the
-  // WebSocket constructor throwing. backfill.ts applyBackfillPage's
-  // exhaustion rule depends on this distinction: a timed-out or failed
-  // fetch can look exactly like a short page (few or zero events
-  // collected before termination), but only a real EOSE means the relay
-  // actually told us it has nothing more.
+  // True only when a real EOSE arrived for this subscription; false for
+  // a timeout, socket error, close, or constructor throw. A failed fetch
+  // can look like a short page, and backfill.ts applyBackfillPage's
+  // exhaustion rule depends on telling them apart.
   eose: boolean;
-  // Every frame that was neither an EVENT nor an EOSE for this
-  // subscription. NIP-01 gives a relay three ways to refuse a REQ --
-  // CLOSED, NOTICE, and AUTH -- and this function used to drop all three
-  // on the floor. That turned "the relay told us auth-required" into a
-  // result indistinguishable from "the relay said nothing at all": both
-  // arrived as zero events and no EOSE, and the caller had no way to tell
-  // a refusal from a timeout. Keeping them is a correctness fix, not
-  // instrumentation; a refusal is information the relay actually sent us.
+  // Every frame that was neither EVENT nor EOSE for this subscription
+  // (CLOSED, NOTICE, AUTH, ...), so a refusal such as auth-required is
+  // distinguishable from a relay that said nothing.
   refusals: string[];
 }
 
-// Bounds what a hostile or broken relay can push into storage through the
-// refusal channel -- these strings are persisted (backfill.ts) and shown
-// on the admin page, so they are capped on both count and length rather
-// than trusted.
+// These strings come from a remote relay and are persisted (backfill.ts)
+// and shown on the admin page, so count and length are capped.
 const MAX_REFUSAL_FRAMES = 5;
 const MAX_REFUSAL_LENGTH = 300;
 
-// Collects every EVENT payload a relay sends for one REQ until EOSE or a
-// timeout, then closes the socket -- same short-lived-connection shape as
-// profile-lookup.ts's queryOne, just collecting many results instead of
-// resolving on the first one, since a backfill page is the whole point.
+// Collects every EVENT for one REQ until EOSE, CLOSED, an error or the
+// timeout, then closes the socket. Same shape as profile-lookup.ts
+// queryOne, but collecting a page rather than the first result.
 function fetchPage(relayUrl: string, filter: Record<string, unknown>, timeoutMs: number): Promise<FetchPageResult> {
   return new Promise((resolve) => {
     const events: unknown[] = [];
@@ -72,8 +57,7 @@ function fetchPage(relayUrl: string, filter: Record<string, unknown>, timeoutMs:
     try {
       socket = new WebSocket(relayUrl);
     } catch (err) {
-      // Even the constructor throwing is something the caller can act on,
-      // and it is not the same as a silent timeout.
+      // Reported as a refusal so it is distinguishable from a timeout.
       resolve({
         events: [],
         eose: false,
@@ -98,20 +82,15 @@ function fetchPage(relayUrl: string, filter: Record<string, unknown>, timeoutMs:
           eose = true;
           done();
         } else if (frame[0] === "CLOSED" && frame[1] === subId) {
-          // NIP-01: CLOSED ends the subscription. Nothing more is coming,
-          // so waiting out the full timeout buys nothing but delay -- and
-          // resolving now, with the reason recorded, is the difference
-          // between "the relay refused, here is what it said" and "the
-          // relay went quiet for eight seconds". Deliberately does NOT set
-          // eose: a refusal is not "no more history", and must never
-          // retire the relay (see backfill.ts applyBackfillPage).
+          // CLOSED ends the subscription, so resolve now instead of
+          // waiting out the timeout. Does NOT set eose: a refusal is not
+          // "no more history" and must never retire the relay.
           recordRefusal(frame);
           done();
         } else {
           // NOTICE, AUTH, OK, and anything for another subscription id.
-          // Recorded rather than dropped -- an AUTH challenge is the most
-          // likely reason a relay serves history to one client and not
-          // another.
+          // An AUTH challenge is the likeliest reason a relay withholds
+          // history.
           recordRefusal(frame);
         }
       } catch {
@@ -123,14 +102,11 @@ function fetchPage(relayUrl: string, filter: Record<string, unknown>, timeoutMs:
   });
 }
 
-// Resolves the owner's write relays from their most recent kind-10002
-// across the well-known relays (same courtesy-discovery relays
-// profile-lookup.ts already uses for the claim-time kind-0 lookup) --
-// bothy itself starts empty, so it cannot be the source of its own
-// backfill relay list. Picks whichever response has the highest
-// created_at, in case the well-known relays disagree. Returns an empty
-// array on total failure, which the caller treats as "try again next
-// tick," not "give up."
+// Resolves the owner's write relays from their newest kind-10002 on the
+// well-known relays (profile-lookup.ts WELL_KNOWN_RELAYS); bothy starts
+// empty, so it cannot be its own source. The highest created_at wins if
+// they disagree. Empty on total failure, which the caller retries next
+// tick.
 async function discoverWriteRelays(ownerPubkey: string): Promise<string[]> {
   const pages = await Promise.all(
     WELL_KNOWN_RELAYS.map((url) =>
@@ -150,20 +126,15 @@ async function discoverWriteRelays(ownerPubkey: string): Promise<string[]> {
   return best ? writeRelaysFrom(best.tags) : [];
 }
 
-// Called once per cron tick (src/index.ts scheduled()), alongside the
-// existing follow-cache refresh. A cheap no-op once backfill is done or
-// the relay is unclaimed -- getBackfillState's single RPC call covers
-// both checks so this function only ever opens an outbound socket when
-// there's real work to do.
+// Called once per cron tick (index.ts scheduled()). One RPC decides
+// whether there is work, so a done or unclaimed relay opens no socket.
 export async function runBackfillTick(env: Env): Promise<void> {
   const stub = relayStub(env);
   const state = await stub.getBackfillState();
   if (state === null || state.status === "done" || state.status === "paused-budget") {
-    // paused-budget resolves itself: the next successful ingest call
-    // (once the daily quota resets) flips status back via
-    // applyBackfillPage, not this function -- but there is nothing to
-    // fetch until then, so skip opening a socket for a page that would
-    // just fail to store again before 00:00 UTC.
+    // Only applyBackfillPage moves status out of "paused-budget", and it
+    // is reached only past this return, so as written nothing lifts the
+    // pause after the 00:00 UTC reset.
     return;
   }
 
@@ -177,12 +148,8 @@ export async function runBackfillTick(env: Env): Promise<void> {
 
   if (state.nextRelay === null || state.nextUntil === null) return;
 
-  // Yield to the owner's own live traffic (backfill.ts hasBackfillHeadroom)
-  // -- skip opening an outbound socket at all when today's rows-written
-  // estimate already leaves backfill no reserved room. ingestBackfillPage
-  // checks this same condition again, authoritatively, right before
-  // writing -- this earlier check only saves a wasted outbound connection
-  // on a day backfill isn't going to be allowed to write anyway.
+  // Saves a wasted fetch on a day with no headroom; the authoritative
+  // check is in applyBackfillPage (backfill.ts hasBackfillHeadroom).
   if (!state.canIngestNow) return;
 
   const filter = { authors: [state.ownerPubkey], until: state.nextUntil, limit: BACKFILL_PAGE_SIZE };

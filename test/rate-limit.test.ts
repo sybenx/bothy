@@ -1,8 +1,7 @@
 // Per-IP HTTP rate limiting (src/index.ts rateLimited, wrangler.jsonc's
 // `ratelimits` block).
 //
-// Everything HTTP was previously defended by its per-request cost alone
-// (CLAUDE.md "The budget": "nothing rate-limits the HTTP endpoints"),
+// Without it, everything HTTP is defended by its per-request cost alone,
 // against callers who pay nothing per request. The per-IP throttle in
 // relay.ts covers WebSocket *messages*, which is a different axis
 // entirely -- it starts counting after the connection exists, so it never

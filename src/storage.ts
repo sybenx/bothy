@@ -69,18 +69,17 @@ export function expirationOf(event: NostrEvent): number | null {
   return Number.isInteger(value) ? value : null;
 }
 
-// `ingestedAt` is wall-clock now, not event.created_at -- see schema.ts's
-// `ingested_at` comment for why the two must never be conflated. It is
-// one more column on an INSERT this function already performs, so it adds
-// zero rows written per event.
+// One of the only two functions that add or remove `events` rows (the
+// other is deleteEventRow). The maintained counters move inside these two,
+// so they cannot drift from the table; nothing else may insert an event
+// row. (The one-time migrations below move rows between partitions in
+// place and adjust the group counters themselves.)
 //
-// `row_cost` is stamped here for the same reason and at the same price:
-// this INSERT is the only place that knows both how many indexed tag rows
-// are about to follow and what the schema charges for each, and
-// estimateRowsWrittenSince below then reads a column instead of rebuilding
-// the figure from a table-wide join. eventRowCost is derived from
-// schema.ts INDEXES, so the number stamped here tracks the real index set
-// rather than a constant somebody has to remember to update.
+// `ingestedAt` is wall-clock now, never event.created_at (schema.ts
+// `ingested_at` explains why the two must not be conflated). `row_cost` is
+// stamped here because only this INSERT knows the indexed tag count;
+// estimateRowsWrittenSince sums that column. Both are extra columns on an
+// INSERT that runs anyway, so they cost no rows written.
 function insertEventRow(
   sql: SqlStorage,
   event: NostrEvent,
@@ -91,18 +90,12 @@ function insertEventRow(
   // INSERT; this covers a caller holding a raw ctx.storage.sql.
   clearReqCache();
   const indexedTags = event.tags.filter(isIndexedTag);
-  // Which partition this event lands in, decided once here from the
-  // event's own tags (groups.ts scopeOf) and then copied onto every row
-  // that describes it -- the event row, its tag rows, and the counters.
-  // Decided at the choke point rather than by the caller for the same
-  // reason `deleteEventRow` reads `created_at` itself: this is one of the
-  // two functions in the codebase that write to `events`, so "what an
-  // event is" and "what gets stored about it" are the same lines of code.
+  // The partition is decided here, at the choke point, from the event
+  // itself (groups.ts scopeOf), and copied onto the event row, its tag rows
+  // and the counters, so no caller can file an event inconsistently.
   const scope = scopeOf(event, groupHost(sql));
-  // WHICH group, decided in the same breath as whether. Null for a public
-  // row, and null for the two 39000-series kinds that are public -- those
-  // name their group in `d` and are readable by anybody, so scoping them
-  // would be scoping a row nothing scopes reads.
+  // NULL exactly when the row is public, including kinds 39000/39001,
+  // which are public group state (groups.ts isPubliclyReadableGroupKind).
   const groupId = scope === GROUP_SCOPE ? groupIdOf(event) : null;
   sql.exec(
     `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost, is_group, group_id)
@@ -120,27 +113,14 @@ function insertEventRow(
     scope,
     groupId,
   );
-  // Immediately after the row exists and before anything else can fail.
+  // After the INSERT, so a duplicate id (which throws, and which
+  // backfill.ts applyBackfillPage catches and continues past) leaves the
+  // counters untouched. Before the tag loop, so if a tag insert throws, the
+  // stored event row is still counted.
   //
-  // Not a separate step a caller could skip: this is one of the two
-  // statements in the codebase that touch `events` (the other is
-  // deleteEventRow), so "an event was stored" and "the counters moved" are
-  // the same three lines of code. Placed after the INSERT rather than
-  // before so a duplicate id -- which throws, and which backfill.ts
-  // applyBackfillPage catches and continues past -- leaves the counters
-  // untouched rather than counting an event that was never stored. Placed
-  // before the tag loop for the same reason in the other direction: if a
-  // tag insert throws, the event row is real and the counters must say so.
-  //
-  // Rows written: 2 per stored event (the third counter row is the ingest
-  // bucket at the end of this function), on top of the 6 + 3T the row
-  // itself costs -- see schema.ts eventRowCostMeasured, and
-  // eventRowCost beside it for the figure the guards deliberately
-  // over-charge. The UPDATE is one row in a one-row table with no index;
-  // the upsert is one row in a rowid-aliased table with no index. Both
-  // now carry the group half in a second column, which is free: a column
-  // added to a statement that already runs is not a row.
-  // CLAUDE.md "The budget" carries the arithmetic.
+  // Rows written: 2 (the third counter row is the ingest bucket below), on
+  // top of the event row's own cost (schema.ts eventRowCostMeasured; the
+  // guards use the deliberately higher eventRowCost).
   bumpEventCounters(sql, event.created_at, 1, scope);
   for (const tag of indexedTags) {
     sql.exec(
@@ -154,38 +134,24 @@ function insertEventRow(
       groupId,
     );
   }
-  // LAST, and after the tag rows rather than beside the counters above,
-  // because this statement carries two things at once: the ingest-hour
-  // bucket behind `ingested24h`, and the write meter's running total
-  // (read-metrics.ts) landing in the same UPDATE. Everything this event
-  // cost has to have happened before the total is taken, or the tag rows
-  // would be attributed to the next event instead of this one.
-  //
-  // This is why the write meter is free on the event path: the bucket row
-  // is being written anyway, and `rows_written` is one more column on it.
-  // Only paths with no bucket of their own -- cron ticks, the follow
-  // rebuild, NIP-86 calls -- pay a write to land their total, and there
-  // are on the order of thirty of those a day (settleRowsWritten below).
-  //
-  // The total taken here includes whatever a removal in the same
-  // execution context put there: a replaceable replacement deletes the
-  // superseded version before reaching this line, and deleteEventRow
-  // accounts for that removal into the same accumulator.
+  // Must run LAST. This one upsert is both the ingest-hour bucket behind
+  // `ingested24h` and where the write meter's running total
+  // (read-metrics.ts) lands, so everything this event cost, tag rows
+  // included, has to have happened before takeRowsWritten() or it is
+  // attributed to the next event. Landing the meter here makes it free on
+  // the event path; paths with no bucket of their own use settleRowsWritten.
+  // The total also includes a superseded version deleted just before this
+  // by a replaceable replacement (deleteEventRow adds to the same
+  // accumulator).
   bumpIngestCounters(sql, hourBucket(ingestedAt), 1, scope === GROUP_SCOPE ? 1 : 0, takeRowsWritten());
 }
 
-// Whether this relay hosts a group with this id -- which is what makes an
-// `h` tag a group tag rather than a stranger's, now that no constant does.
+// Whether this relay hosts a group with this id: what makes an `h` tag a
+// group tag here rather than a reference to someone else's group.
 //
-// Memoised in instance memory, not because the read is expensive (one row
-// off a primary key on a table with as many rows as the owner has made
-// groups) but because it sits on the broadcast path, which runs per event
-// per open socket. Groups are created by the owner and never by anybody
-// else, so the set changes at owner pace and a cache invalidated on that
-// one write is exact rather than eventually-consistent. Instance memory,
-// so an eviction reloads it -- the same trade the presence and rate-limit
-// maps already make, and safe the same way: losing it costs a read, never
-// a wrong answer.
+// Memoised in module memory because it sits on the broadcast path (per
+// event per open socket). Only createGroup changes the set, and it
+// invalidates, so the memo is exact. Eviction just reloads it.
 let hostedGroups: Set<string> | null = null;
 
 export function invalidateHostedGroups(): void {
@@ -206,80 +172,30 @@ export function groupHost(sql: SqlStorage): (id: string) => boolean {
   return (id) => hostsGroup(sql, id);
 }
 
-// ---------------------------------------------------------------------
-// `DELETE FROM event_tags WHERE event_id = ?` is served by
-// idx_event_tags_event (schema.ts), added in v0.7.3. Before it, this was
-// a full scan of `event_tags` -- T rows, about 5E, to remove a handful --
-// and it was the most expensive read in the codebase.
+// The only function that removes an event row (see insertEventRow).
 //
-// It was deferred once on a budget argument, and the budget argument was
-// the wrong frame. It priced the index (a row write per TAG row:
-// TAG_ROW_COST 2 -> 3, about five more rows per real note, ~15,000
-// rows/day here, moving the meter from ~44,000 to ~59,000 of 100,000)
-// against the reads it saved, concluded that a fixed daily flow was
-// expensive, and treated the path as a performance question to revisit
-// when a counter said it was worth it.
+// `DELETE FROM event_tags WHERE event_id = ?` must stay served by
+// idx_event_tags_event (schema.ts); without it each removal scans all of
+// `event_tags` (~5E rows). That index is not optional, because NIP-62
+// vanish reaches this path and cannot be gated, throttled below "eventually
+// completes", or revoked: NIP-62 binds even write-restricted relays to
+// honour it "regardless of the user's status", so relay.ts handleVanish
+// runs before ownership.ts isAllowedWriter, and banpubkey/unfollowing never
+// touch it. Cost is the only control. Unindexed, one vanish of N events
+// read N x 5E rows, so N x E > 1,000,000 used the whole day's read ceiling
+// in one request. test/read-cost.test.ts asserts the seek cost.
 //
-// WHY IT IS NOT A BUDGET QUESTION
-//
-// This DELETE is reached by NIP-62 vanish, and NIP-62 says a relay
-// honours a vanish request "regardless of the user's status" -- it binds
-// write-restricted relays explicitly. relay.ts handleVanish is therefore
-// dispatched BEFORE ownership.ts isAllowedWriter and pays none of
-// acceptEvent's abuse caps. That is not an oversight; it is what the spec
-// requires. The consequences are:
-//
-//   - It cannot be gated. Any pubkey with a valid signature reaches it.
-//   - It cannot be throttled below "eventually completes", because the
-//     spec requires completion.
-//   - It cannot be revoked. banpubkey and unfollowing both go through
-//     isAllowedWriter, which this path never calls -- so neither of the
-//     owner's two revocation tools touches it, and an EX-follow keeps
-//     both their stored events and the ability to trigger this.
-//
-// Cost is therefore the only control available. Not the preferred one,
-// the only one. An unindexed DELETE here meant a single request from one
-// ex-follow holding N stored events read N x 5E rows: at E = 4,000 and
-// N = 500 that is 10,000,000 rows, two days of the read ceiling, from one
-// message the relay is obliged to accept. The threshold for a single
-// request to consume an entire day was N x E > 1,000,000 -- N = 250 at
-// today's table size, which is not a large number of events for one
-// pubkey to have accumulated.
-//
-// So the index is what makes an operation the relay cannot refuse
-// affordable to perform. ~15,000 rows/day written is the price of not
-// having an unrefusable, unrevocable read amplifier in the write path.
-//
-// The reads are fixed; the WRITES are not, and the index does nothing for
-// them. Removing an event still costs its row, its index entries and a
-// tombstone -- see schema.ts eventRemovalRowsWritten, and
-// eventRemovalBudget for the figure the drain is paced against -- so a
-// large vanish can still
-// exceed a single request's budget partway through. That is why
-// beginVanish/drainVanish below checkpoint the work across cron ticks
-// rather than attempting it all inside the request: NIP-62 requires full
-// deletion, and a vanish that stopped wherever the ceiling fell while
-// reporting success would be a compliance failure, not a slow query.
-//
-// test/read-cost.test.ts asserts the seek cost, so a regression that
-// dropped the index would fail rather than quietly restore the
-// amplifier.
-// ---------------------------------------------------------------------
+// The index fixes reads, not writes: each removal still costs its rows,
+// index entries and a tombstone (schema.ts eventRemovalRowsWritten /
+// eventRemovalBudget), which is why beginVanish/drainVanish checkpoint the
+// work across cron ticks rather than doing it inside the request.
 function deleteEventRow(sql: SqlStorage, id: string): void {
   // req-cache.ts, for the same reason as insertEventRow's.
   clearReqCache();
-  // Read before the delete, and read HERE rather than taken from the
-  // caller. Four of the five callers already hold the row's `created_at`
-  // (the replaceable and addressable replacement paths, applyDeletion,
-  // applyAddressDeletion) and could pass it, but banEvent does not: it
-  // tombstones an id that may never have been stored at all, and a caller
-  // that guessed would decrement a bucket for an event that does not
-  // exist. One PK seek at the choke point is what makes the decrement
-  // correct for every caller including that one -- and `undefined` here is
-  // the honest answer to "there was nothing to remove", not an error.
-  //
-  // Rows read: 1. Removals are rare next to insertions, and this is the
-  // same index seek the DELETE below performs anyway.
+  // Read here rather than taken from the caller, because banEvent passes
+  // ids that may never have been stored: the counters must move only for a
+  // row that existed, by its own `created_at`. `undefined` means nothing
+  // to remove. Rows read: 1 (the same PK seek the DELETE does).
   const row = sql
     .exec<{
       created_at: number;
@@ -290,30 +206,19 @@ function deleteEventRow(sql: SqlStorage, id: string): void {
     .toArray()[0];
   sql.exec(`DELETE FROM event_tags WHERE event_id = ?`, id);
   sql.exec(`DELETE FROM events WHERE id = ?`, id);
-  // After the DELETE, mirroring insertEventRow: a decrement that ran ahead
-  // of a statement that then threw would leave the counters describing
-  // fewer events than are stored.
+  // After the DELETEs, so a statement that throws cannot leave the
+  // counters describing fewer events than are stored.
   if (row === undefined) return;
-  // `is_group` read from the row rather than recomputed from the event,
-  // for the reason `created_at` beside it is: banEvent reaches here with
-  // an id that may never have been stored, and the counters must move for
-  // the partition the row was actually IN, not the one a caller guessed.
+  // The partition the row was actually in, read from the row.
   const scope: GroupScope = row.is_group === 1 ? GROUP_SCOPE : PUBLIC_SCOPE;
   bumpEventCounters(sql, row.created_at, -1, scope);
-  // The ingest-hour bucket behind `ingested24h`, which counts events this
-  // relay took in and STILL HOLDS -- so a removal has to come back out of
-  // the hour it arrived in, not the hour it was removed in. A plain
-  // UPDATE rather than an upsert, for the reason bumpEventCounters gives:
-  // a decrement can only be for an event that was counted, so its bucket
-  // exists, and an upsert would quietly manufacture a -1 bucket if that
-  // ever stopped being true instead of leaving the audit something to
-  // find. `rows_written` on the same row is deliberately untouched -- a
-  // row that was written and then deleted was still written, and the
-  // allowance does not come back.
+  // `ingested24h` counts events taken in and still held, so a removal comes
+  // out of the hour the event ARRIVED in. Plain UPDATE, not upsert, for the
+  // reason bumpEventCounters gives. `rows_written` is left alone: a row
+  // written and then deleted was still written.
   //
-  // Skipped for a NULL `ingested_at`, which only rows written before that
-  // column existed carry: they were never bucketed (schema.ts
-  // seedIngestCounts skips them too), so there is nothing to decrement.
+  // A NULL `ingested_at` (rows from before the column existed) was never
+  // bucketed (schema.ts seedIngestCounts), so there is nothing to decrement.
   if (row.ingested_at !== null) {
     sql.exec(
       `UPDATE ingest_hour_counts SET n = n - 1, group_n = group_n - ? WHERE hour = ?`,
@@ -321,89 +226,55 @@ function deleteEventRow(sql: SqlStorage, id: string): void {
       hourBucket(row.ingested_at),
     );
   }
-  // ------------------------------------------------------------------
-  // THE ONE PLACE ROWS WRITTEN ARE ACCOUNTED BY HAND rather than
-  // measured, and it is here because the instrument is blind on this
-  // path. SqlStorageCursor reports index maintenance on INSERT and not on
-  // DELETE (schema.ts eventRemovalRowsWritten), so the wrapper in
-  // read-metrics.ts sees the base rows a removal retires and none of the
-  // index entries -- an undercount, on a budget meter, of the one
-  // operation this relay is not allowed to refuse (NIP-62 vanish).
+  // The one place rows written are accounted by hand. SqlStorageCursor
+  // reports index maintenance on INSERT but not on DELETE (schema.ts
+  // eventRemovalRowsWritten), so the read-metrics.ts wrapper undercounts
+  // every removal. This adds the pessimistic figure on top: stamped
+  // `row_cost` plus TOMBSTONE_ROW_COST, which is exactly schema.ts
+  // eventRemovalBudget, the figure the vanish drain is paced against. A
+  // budget meter should err high.
   //
-  // So the pessimistic figure is added on top: `row_cost` is what the
-  // INSERT actually cost, stamped at insert time, and adding
-  // TOMBSTONE_ROW_COST makes it exactly schema.ts eventRemovalBudget --
-  // the same number the vanish drain is already paced against, chosen
-  // there for the same reason and in the same direction. If Cloudflare
-  // bills what the cursor reports, this reads high; if it bills index
-  // maintenance both ways, this reads right. High is the safe way for a
-  // meter to be wrong.
+  // It double-counts the base rows the cursor did report, deliberately:
+  // tracking only the difference would need a second hand-maintained model
+  // of what the cursor can see. A NULL `row_cost` (pre-migration row) falls
+  // back to a bare note's cost.
   //
-  // DOUBLE-COUNTS DELIBERATELY. The cursor already reported the base rows
-  // this DELETE retired, and they are in the accumulator; this adds the
-  // full estimate over the top rather than the difference. Tracking the
-  // difference would mean the meter carrying a second model of what the
-  // cursor can and cannot see -- a hand-maintained derivation of exactly
-  // the kind this project has got wrong before -- to shave a handful of
-  // rows off a figure that is intentionally pessimistic anyway.
-  //
-  // A NULL `row_cost` (a row written before that column existed) falls
-  // back to the cost of a bare note. It is a floor, like every other
-  // pre-migration figure in this file, and it is wrong for at most as
-  // long as those rows survive.
-  //
-  // Not landed here: this goes into the in-memory accumulator and is
-  // written by whichever landing comes next in the same execution context
-  // -- insertEventRow's bucket bump on a replacement, settleRowsWritten
-  // at the entry point otherwise. A landing of its own would be a row
-  // written per row removed, to record rows written.
+  // Not landed here: the next landing in the same execution context
+  // (insertEventRow's bucket bump, or settleRowsWritten at the entry point)
+  // writes it, so recording it costs no extra row.
   addRowsWritten((row.row_cost ?? eventRowCost(0)) + TOMBSTONE_ROW_COST);
 }
 
-// One hour, as both bucket tables key themselves: `event_hour_counts` by
-// `created_at` and `ingest_hour_counts` by `ingested_at`. One function
-// because the arithmetic is identical and must stay so; WHICH timestamp
-// is handed to it is the distinction that matters, and it is made at each
-// call site rather than hidden in here (see schema.ts on why those two
-// clocks must never be conflated).
+// The hour key for both bucket tables: `event_hour_counts` is keyed by
+// `created_at`, `ingest_hour_counts` by `ingested_at`. Which timestamp is
+// passed is decided at each call site, and must not be mixed up.
 //
-// Math.trunc, not Math.floor, because SQLite's integer `/` truncates
-// toward zero and the seed migrations (schema.ts seedMaintainedCounts,
-// seedIngestCounts) and the daily audit below all bucket in SQL. They differ only for negative
-// created_at, which nothing rejects -- validate.ts
-// isCreatedAtTooFarInFuture is deliberately one-sided -- so matching the
-// SQL is what keeps an event from being seeded into one bucket and
-// decremented out of another.
+// Math.trunc, not Math.floor, to match SQLite's integer `/` (toward zero),
+// which the seed migrations (schema.ts seedMaintainedCounts,
+// seedIngestCounts) and auditMaintainedCounts use. They differ for negative
+// created_at, which nothing rejects, and a mismatch would seed an event
+// into one bucket and decrement it from another.
 export function hourBucket(createdAt: number): number {
   return Math.trunc(createdAt / 3600);
 }
 
-// The maintained counters behind /api/stats' `totalEvents` and
-// `events24h`, moved by `delta` (+1 on insert, -1 on removal).
+// The counters behind /api/stats' `totalEvents` and `events24h`.
 //
-// Private on purpose, and called from exactly two places: insertEventRow
-// and deleteEventRow, the only two functions in the codebase that write to
-// `events`. Nothing else may call it -- a second caller would be a way for
-// the counters to move without the table moving, which is the one failure
-// mode the daily audit exists to catch and the one this arrangement exists
-// to prevent.
+// Called only from insertEventRow and deleteEventRow. A second caller
+// would let the counters move without the table moving.
 //
-// The bucket row is upserted on the way up and plain-UPDATEd on the way
-// down: a decrement can only ever be for an event that was counted, so its
-// bucket necessarily exists, and an upsert there would silently create a
-// -1 bucket if that ever stopped being true rather than leaving the audit
-// something to find.
+// Upsert on the way up, plain UPDATE on the way down: a decrement is
+// always for a counted event whose bucket exists, and an upsert would
+// silently create a -1 bucket if that ever stopped being true instead of
+// leaving auditMaintainedCounts something to find.
 function bumpEventCounters(
   sql: SqlStorage,
   createdAt: number,
   delta: 1 | -1,
   scope: GroupScope,
 ): void {
-  // The group half moves in the same statements as the total, never in
-  // statements of its own -- which is what makes the split free. A column
-  // added to an UPDATE that already runs costs no additional rows written
-  // (measured: 1 row either way), where a second counter row per hour
-  // would have cost one per event.
+  // The group half is a second column in the same statements, which costs
+  // no extra rows written (measured: 1 row either way).
   const group = scope === GROUP_SCOPE ? 1 : 0;
   sql.exec(
     `UPDATE maintained_counts SET events = events + ?, group_events = group_events + ?`,
@@ -430,9 +301,8 @@ function bumpEventCounters(
 // (schema.ts `ingest_hour_counts`), moved by `events` (1 when an event
 // arrives, 0 when only rows-written is landing) and `rowsWritten`.
 //
-// One upsert, one row, no index entry: `hour` is a rowid alias. The
-// decrement side lives in deleteEventRow as a plain UPDATE, for the same
-// reason bumpEventCounters' does.
+// One row written, no index entry (`hour` is a rowid alias). The decrement
+// is a plain UPDATE in deleteEventRow, as in bumpEventCounters.
 function bumpIngestCounters(
   sql: SqlStorage,
   hour: number,
@@ -459,51 +329,34 @@ function bumpIngestCounters(
 // own row, lost only if the object is evicted before the next one).
 const MIN_ROWS_WRITTEN_LANDING = 2;
 
-// Lands the write meter's running total into the CURRENT ingest hour.
+// Lands the write meter's running total into the current ingest hour.
 //
-// Called at every Durable Object entry point (relay.ts `metered`), inside
-// the same execution context as the writes it describes and before that
-// context returns. That timing is the correctness property, not a
-// nicety: the accumulator is instance memory, this object hibernates
-// between messages, and it wakes on the order of seventy times per cron
-// interval -- so a flush on a timer, or one deferred to the next cron
-// tick, would lose almost everything it measured, and lose more of it the
-// quieter the relay is.
+// Must be called at every Durable Object entry point (relay.ts `metered`),
+// before that execution context returns. The accumulator is instance
+// memory and the object hibernates between messages (~70 wakes per cron
+// interval), so a timed or deferred flush would lose most of the count,
+// and lose more the quieter the relay is.
 //
-// Almost always a no-op. An event write has already landed its own total
-// through insertEventRow's bucket bump, and a read-only request has
-// nothing pending; what reaches here is the cron tick, the follow
-// rebuild, a NIP-86 call, backfill's bookkeeping and the vanish drain --
-// on the order of thirty writes a day.
-//
-// Rows read: 1 for the upsert's conflict check, and only when something
-// actually lands. Scoped to "meter" so that trickle is named rather than
-// swelling `unattributed`, which is the instrument's gap detector.
+// Usually a no-op: event writes land their own total in insertEventRow.
+// What reaches here is cron, the follow rebuild, NIP-86 calls, backfill
+// bookkeeping and the vanish drain. Rows read: 1, only when something
+// lands. Scoped to "meter" so it does not swell `unattributed`, which is
+// read-metrics.ts's gap detector.
 export function settleRowsWritten(sql: SqlStorage, nowSec: number): void {
   if (unlandedRowsWritten() < MIN_ROWS_WRITTEN_LANDING) return;
   withReadPath("meter", () => bumpIngestCounters(sql, hourBucket(nowSec), 0, 0, takeRowsWritten()));
 }
 
-// /api/stats `ingested24h` and `rowsWrittenToday`, out of the ingest-hour
-// buckets in ONE statement.
+// /api/stats `ingested24h` and `rowsWrittenToday`, from the ingest-hour
+// buckets in one statement.
 //
-// Both windows are suffixes of the same key range, which is why one seek
-// answers both: `budgetSince` is the last 00:00 UTC and therefore always
-// inside the last 24 hours, so its bucket is at or after the rolling
-// window's first bucket. The range runs from there to the current hour --
-// `ingested_at` is wall-clock write time, so nothing can be bucketed
-// ahead of now.
+// One range answers both because `budgetSince` (the last 00:00 UTC) is
+// always inside the last 24 hours, and nothing is bucketed ahead of now
+// (`ingested_at` is wall-clock). Rows read: at most 25, independent of E
+// and request rate; /api/stats is unauthenticated, so this must not grow.
 //
-// Rows read: at most 25, whatever E is, however busy the relay is and
-// however many requests arrive. This replaced two window scans behind a
-// five-minute cache row (`live_stats`), which cost ~1,200 rows every time
-// the cache missed and made an unauthenticated GET worth rationing.
-//
-// `rowsWrittenToday` is exact at the boundary rather than approximate:
-// 00:00 UTC is a whole number of hours, so the day's buckets are exactly
-// the day's writes. `ingested24h` is whole hours and so spans 24-25h --
-// the same fidelity trade countEvents24h makes, against a number that
-// used to be up to five minutes stale.
+// `rowsWrittenToday` is exact, since 00:00 UTC falls on an hour boundary.
+// `ingested24h` covers whole hours, so 24-25h (as countEvents24h).
 export function readIngestCounts(
   sql: SqlStorage,
   nowSec: number,
@@ -521,9 +374,8 @@ export function readIngestCounts(
     .toArray()[0];
   return {
     ingested24h: row?.ingested ?? 0,
-    // Read out of the same bucket rows at no additional cost, and
-    // subtracted before /api/stats reports anything -- see relay.ts
-    // collectStats. The audit uses both halves.
+    // relay.ts collectStats subtracts this before publishing, so a public
+    // poller cannot time group arrivals. The audit uses both halves.
     ingestedGroup24h: row?.grouped ?? 0,
     rowsWrittenToday: row?.written ?? 0,
   };
@@ -539,10 +391,8 @@ export interface CountAuditStatus {
   drift: string[] | null;
 }
 
-// /api/stats `totalEvents`, `followCount` and the audit's own status, all
-// from the one `maintained_counts` row. Rows read: 1 for the trio, whatever
-// E and F are. Read together rather than separately because they live in
-// one row and collectStats wants all of them.
+// /api/stats `totalEvents`, `followCount` and the audit status, from the
+// one `maintained_counts` row. Rows read: 1, whatever E and F are.
 export function readMaintainedCounts(
   sql: SqlStorage,
 ): { events: number; groupEvents: number; follows: number } & CountAuditStatus {
@@ -557,9 +407,8 @@ export function readMaintainedCounts(
     .toArray()[0];
   return {
     events: row?.events ?? 0,
-    // One more column off the row already being read: /api/stats reports
-    // `events - groupEvents`, so a public poller cannot time group
-    // arrivals off the total (schema.ts `group_events`).
+    // /api/stats reports `events - groupEvents`, so a public poller cannot
+    // time group arrivals off the total (schema.ts `group_events`).
     groupEvents: row?.group_events ?? 0,
     follows: row?.follows ?? 0,
     lastRanAt: row?.audited_at ?? null,
@@ -567,27 +416,17 @@ export function readMaintainedCounts(
   };
 }
 
-// The number of follows the write gate currently admits, maintained by
-// ownership.ts refreshFollows. Rows written: 1, and only when the owner's
-// contact list actually changes.
-//
-// Exported for refreshFollows and for nothing else. It lives here beside
-// the counter it moves rather than in ownership.ts so the read and the
-// write of this column sit in one file, the way the event counters do --
-// but it is CALLED from inside refreshFollows' own write branches, not
-// from its caller, which is the property that matters.
+// The follow count, for ownership.ts refreshFollows only. It must be called
+// inside refreshFollows' own write branches (rebuild and clear), since
+// refreshFollows is the only writer of `follows` and its early returns
+// would otherwise skip it. Rows written: 1, only when the list changes.
 export function setFollowCount(sql: SqlStorage, follows: number): void {
   sql.exec(`UPDATE maintained_counts SET follows = ?`, follows);
 }
 
-// The `created_at` of the contact list the follow cache reflects -- not
-// when that cache was last rebuilt, which is no longer a thing that
-// happens on a schedule (ownership.ts refreshFollows).
-//
-// Rows read: 1. Every row in `follows` carries the same value (see
-// schema.ts `follows`), so `LIMIT 1` is not a sample of the column, it IS
-// the column -- which is why this needs no counter of its own. It was
-// `MAX(fetched_at)` and cost F rows to pick one of F identical numbers.
+// The `created_at` of the contact list the follow cache reflects, not when
+// the cache was rebuilt. Rows read: 1: every row in `follows` carries the
+// same value (schema.ts `follows`), so `LIMIT 1` is exact.
 export function followsListAt(sql: SqlStorage): number | null {
   return (
     sql.exec<{ fetched_at: number }>(`SELECT fetched_at FROM follows LIMIT 1`).toArray()[0]
@@ -595,21 +434,14 @@ export function followsListAt(sql: SqlStorage): number | null {
   );
 }
 
-// /api/stats `events24h`: stored events whose own `created_at` falls in the
-// last 24 hours -- what the owner has been posting, not what this relay
-// took in (readIngestCounts' `ingested24h` answers that one).
+// /api/stats `events24h`: stored events whose own `created_at` is in the
+// last 24 hours (what was posted, not what was ingested; that is
+// readIngestCounts).
 //
-// Rows read: at most 26, whatever E is and however busy the relay is. The
-// range starts at the bucket containing (now - 86400) and cannot extend
-// past the bucket an hour ahead of now, since limits.ts
-// MAX_CREATED_AT_FUTURE_SECONDS refuses anything further ahead.
-//
-// The window is whole hours, so it covers between 24 and 25 hours rather
-// than exactly 24 -- an event signed 24h40m ago still counts until the
-// clock leaves its bucket. That is the one fidelity cost of the bucket
-// table, and it replaces a figure that was exact to the second and up to
-// SIX HOURS stale (it came from `stats_snapshot`), so the number on the
-// page got considerably closer to the truth rather than further from it.
+// Rows read: at most 26, independent of E: from the bucket containing
+// now - 86400 to at most one hour ahead, since limits.ts
+// MAX_CREATED_AT_FUTURE_SECONDS refuses anything further ahead. Whole
+// hours, so the window is 24-25h.
 export function countEvents24h(
   sql: SqlStorage,
   nowSec: number,
@@ -620,40 +452,24 @@ export function countEvents24h(
       hourBucket(nowSec - 86400),
     )
     .toArray()[0];
-  // Both halves, from one statement over the same bucket rows: /api/stats
-  // reports the difference, the audit checks each against the table.
+  // /api/stats reports the difference; the audit checks each half.
   return { total: row?.n ?? 0, group: row?.grouped ?? 0 };
 }
 
-// Once-a-day proof that every maintained counter still matches the table
-// it counts, called from relay.ts runCron.
+// Daily check that every maintained counter still matches the table it
+// counts, called from relay.ts runCron.
 //
-// DETECT ONLY. It logs and returns; it never writes a corrected figure.
-// A counter that repairs itself is a counter that erases the evidence of
-// whatever broke it -- the drift would come back on the next occurrence of
-// the same bug and be silently swallowed again, and the only symptom would
-// be a number that is quietly wrong between repairs. A loud log line once
-// a day and a figure that stays wrong until somebody looks is the strictly
-// more useful failure.
+// DETECT ONLY: it logs and records, and never writes a corrected figure.
+// A self-repairing counter erases the evidence of whatever broke it, so the
+// bug recurs silently and the number is quietly wrong between repairs.
 //
-// Rows read: E + F, once a day. One scan of `events` produces all FOUR
-// event figures -- the total, the `created_at` window, the `ingested_at`
-// window and the stamped cost in that window -- deliberately one
-// statement rather than four, since each extra pass would be another E
-// for an answer this one already has in hand; plus at most 26 + 25 bucket
-// rows, plus a count over `follows`. Against the ~12E a day the stats snapshot used to spend
-// recomputing these same numbers four times over, this is a quarter of the
-// cost and it verifies rather than assumes.
+// Rows read, once a day: E (one scan of `events` yields all the event
+// figures; keep it one statement, as each extra pass costs another E), +
+// at most 26 + 25 bucket rows, + F (`follows`, which has its own writer in
+// ownership.ts refreshFollows and so gets checked too), + M for the
+// membership check.
 //
-// `follows` is audited here rather than trusted because it is maintained
-// by a different function in a different file (ownership.ts
-// refreshFollows) with its own two write branches. A counter's safety
-// argument is about its choke point, and a second choke point is a second
-// thing that can be wrong -- so it gets the same daily check, at F rows,
-// which is the cost this whole change removed from the per-request path.
-//
-// Paced by `maintained_counts.audited_at` rather than by the cron's own
-// frequency, so it stays daily whatever the cron schedule becomes.
+// Paced by `maintained_counts.audited_at`, not by the cron schedule.
 export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   const state = sql
     .exec<{ events: number; groupEvents: number; follows: number; audited_at: number | null }>(
@@ -664,10 +480,7 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   if (state.audited_at !== null && nowSec - state.audited_at < 86400) return;
 
   const cutoff = hourBucket(nowSec - 86400);
-  // One scan of `events`, four figures. Two more than it produced before
-  // the ingest buckets existed, and deliberately in the same statement:
-  // a second scan would be a second E for numbers the first pass already
-  // has in hand.
+  // One scan of `events` for every figure; see the header on why.
   const actual = sql
     .exec<{
       total: number;
@@ -706,28 +519,19 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
     ingestedCosted: 0,
   };
   const counted24h = countEvents24h(sql, nowSec);
-  // The rolling half of the ingest buckets, on the same cutoff the scan
-  // above used. `budgetSince` is passed as the rolling cutoff too, so
-  // `rowsWrittenToday` here is a 24h figure rather than a since-midnight
-  // one -- which is what the floor check below wants: it is comparing
-  // against the cost of events ingested in the same 24 hours.
+  // `budgetSince` is passed as now - 86400 too, so `rowsWrittenToday` here
+  // is a rolling 24h figure, matching the window of the floor check below.
   const ingestBuckets = readIngestCounts(sql, nowSec, nowSec - 86400);
   const actualFollows =
     sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM follows`).toArray()[0]?.n ?? 0;
 
-  // Collected alongside the console.error this function already made,
-  // rather than replacing it: the console line is for whoever is
-  // tailing logs at the moment this runs, and `driftMessages` is what
-  // survives past that moment for /api/stats to read back tomorrow.
+  // Stored in `last_drift` for /api/stats to read back after the log line
+  // has scrolled away.
   const driftMessages: string[] = [];
-  // `message` is what survives into `maintained_counts.last_drift`, which
-  // /api/stats reads back -- and that endpoint is PUBLIC and
-  // unauthenticated. `detail` is the part that goes only to the log line.
-  // The split exists for the group membership check below, whose useful
-  // detail is a list of pubkeys: naming them in `last_drift` would publish
-  // part of this group's membership on the one document anybody can fetch,
-  // which is the disclosure the whole partition exists to prevent. The
-  // stored half therefore counts; the logged half names.
+  // `message` is stored in `last_drift`, which the PUBLIC, unauthenticated
+  // /api/stats reads back; `detail` goes only to the log. The membership
+  // check below puts pubkeys in `detail` only, since storing them would
+  // publish group membership. The stored half counts; the logged half names.
   const report = (message: string, where: string, detail = "") => {
     driftMessages.push(message);
     console.error(
@@ -743,11 +547,9 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   if (actual.total !== state.events) {
     drift("maintained_counts.events", state.events, actual.total, "insertEventRow/deleteEventRow");
   }
-  // The group halves are audited separately rather than folded into the
-  // totals above, because they are what /api/stats SUBTRACTS: a group
-  // counter that drifted low would put group events back on a public,
-  // unauthenticated document one at a time, and a total that still
-  // matched would say nothing was wrong.
+  // The group halves are checked on their own because /api/stats subtracts
+  // them: one that drifted low would leak group events onto a public
+  // document while the total still matched.
   if (actual.groupTotal !== state.groupEvents) {
     drift(
       "maintained_counts.group_events",
@@ -791,39 +593,24 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
       "insertEventRow/deleteEventRow",
     );
   }
-  // A FLOOR, not an equality, and that asymmetry is the whole check.
-  // `rows_written` counts every row this relay wrote in the hour --
-  // deletions, tombstones, follow rebuilds, NIP-86 calls, backfill
-  // bookkeeping -- so it is expected to EXCEED the cost of the events
-  // still standing from that hour, often by a lot. What it can never
-  // legitimately do is fall below it: every one of those events was
-  // stored, and storing it cost the `row_cost` stamped on it. Below the
-  // floor means the meter lost writes, which is the one failure mode that
-  // matters here -- an entry point that landed nothing before returning,
-  // or a write reaching SQLite outside the wrapper.
+  // A FLOOR, not an equality. `rows_written` includes deletions,
+  // tombstones, follow rebuilds, NIP-86 calls and backfill bookkeeping, so
+  // it normally exceeds the cost of the events still standing from those
+  // hours. It can never legitimately fall below it; if it does, the meter
+  // lost writes (an entry point that landed nothing, or a write that
+  // bypassed the read-metrics.ts wrapper).
   //
-  // Detect only, like everything else in this function.
+  // Compared against the MEASURED cost, not the stamped one. `row_cost`
+  // is schema.ts eventRowCost, a deliberate over-estimate (12 + 4T charged
+  // against 9 + 3T spent; see EVENT_BASE_ROW_COST). Over-charging makes
+  // every other consumer stricter, but here it would put the floor above
+  // what the meter can report and log drift every day. So the tag rows are
+  // recovered from the stamped total and re-priced at the measured
+  // figures. If eventRowCost is ever made exact, this collapses to
+  // `ingestedCost` and should be removed.
   //
-  // AND IT IS COMPARED AGAINST THE MEASURED COST, NOT THE STAMPED ONE.
-  // `row_cost` carries schema.ts eventRowCost, which is deliberately an
-  // over-estimate: it counts each partial index PAIR twice where a row
-  // pays one half (12 + 4T charged against 9 + 3T spent -- see
-  // EVENT_BASE_ROW_COST for why that is left wrong). Every other consumer
-  // of that number is a guard made stricter by over-charging; this one is
-  // not. A floor set above what the meter can ever report is not a floor,
-  // it is a drift line logged every single day, on the one check whose
-  // value is that it fires rarely.
-  //
-  // So the stamped sum is converted back to what those events actually
-  // cost, using the same two declarations it was built from: the tag rows
-  // in the window are recovered from the stamped total, then re-priced at
-  // the measured per-row figures. When the derivation is one day fixed,
-  // measured and stamped become equal, this arithmetic collapses to
-  // `ingestedCost`, and it should be deleted.
-  //
-  // Rows written before `row_cost` existed are excluded from both sides
-  // (`ingestedCosted` counts only stamped rows), the same way they have
-  // always been absent from the sum.
+  // Rows with NULL `row_cost` are excluded from both sides
+  // (`ingestedCosted` counts only stamped rows).
   const stampedPerEvent = EVENT_BASE_ROW_COST + EVENT_COUNTER_ROW_COST;
   const measuredPerEvent = EVENT_BASE_ROW_COST_MEASURED + EVENT_COUNTER_ROW_COST;
   const tagRowsInWindow = Math.max(
@@ -842,30 +629,16 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
     );
   }
 
-  // NOT a counter, and the one check here that is about an invariant
-  // between two tables rather than between a table and a number kept
-  // alongside it. It lives in this function anyway because this is where
-  // the daily pace is (schema.ts `maintained_counts`: "a single
-  // `audited_at` is then what paces one daily audit over everything this
-  // relay maintains, rather than two gates that could drift apart").
+  // Not a counter: an invariant between two tables, checked here because
+  // this is where the daily pacing lives. Every NIP-29 group member must
+  // have an `allowed_pubkeys` row, because that outer list is what
+  // ownership.ts isAllowedWriter consults; a member without one is refused
+  // with a message about follows that never mentions groups. nip29.ts
+  // applyModeration writes both, so they diverge only through a bug or a
+  // hand-edit.
   //
-  // What it checks: every NIP-29 group member has an `allowed_pubkeys`
-  // row. Membership is the inner of two nested lists and the outer one is
-  // what the write gate actually consults (src/nip29.ts), so a member
-  // missing from it is a member who silently cannot write -- their events
-  // are refused by ownership.ts isAllowedWriter with a message about
-  // follows that says nothing about groups, and nothing anywhere connects
-  // the cause to the effect. The two tables are written together by
-  // nip29.ts applyModeration and can only come apart through a bug or a
-  // hand-edit, which is exactly the class of thing a daily check is for.
-  //
-  // Detect only, like everything above it. Repairing the containment would
-  // mean this function granting relay write access to a pubkey on the
-  // strength of a row it has just decided it cannot trust -- the loudest
-  // possible version of the objection schema.ts already makes to
-  // self-healing counters.
-  //
-  // Rows read: M plus an indexed seek each, where M is the member count.
+  // Detect only: repairing it would grant relay write access on the
+  // strength of a row just found untrustworthy.
   const unallowedMembers = groupMembersWithoutAllowance(sql);
   if (unallowedMembers.length > 0) {
     report(
@@ -876,17 +649,10 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
     );
   }
 
-  // Written whether or not anything disagreed: this records that the audit
-  // RAN, which is what paces the next one. Recording it only on success
-  // would make a drifting relay recount E rows on every cron tick.
-  //
-  // `last_drift` is stamped in the same statement as `audited_at` so the
-  // two can never describe different runs -- a reader must never be able
-  // to see this run's timestamp paired with a previous run's findings.
-  // NULL, not an empty array, when nothing disagreed: schema.ts's
-  // `last_drift` comment is why that distinction (never audited vs.
-  // audited-and-clean) has to survive into what gets stored, not just
-  // what gets displayed.
+  // Written even when something drifted: `audited_at` paces the next run,
+  // and skipping it would rescan E rows every cron tick. `last_drift` goes
+  // in the same statement so the timestamp and findings always describe
+  // the same run; NULL when clean (schema.ts `last_drift`).
   sql.exec(
     `UPDATE maintained_counts SET audited_at = ?, last_drift = ?`,
     nowSec,
@@ -894,125 +660,48 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   );
 }
 
-// One-time correction for events that were flagged is_group = 1 for two
-// reasons that turned out to be the same shape: groups.ts isGroupEvent
-// used to accept ANY `h` tag as this relay's group, and separately used to
-// accept ANY 39000-series event as this relay's group metadata regardless
-// of who signed it. Two populations, one partition, one migration:
+// One-time correction of rows wrongly stored with is_group = 1:
 //
-//   1. An ordinary `h`-tagged event backfilled from the owner's own
-//      history that names some OTHER relay's NIP-29 group -- reached here
-//      because backfill fetches wherever the owner's events were
-//      published, not only what was written to this relay.
-//   2. A 39000-series event NOT signed by this relay's own identity
-//      (relay-identity.ts) -- reached the same way, and refused at the
-//      source now (storeEvent below); this migration is what cleans up
-//      any that got in before that refusal existed. Checked by SIGNER,
-//      not by `d`, for the reason storeEvent's own comment gives: a
-//      forged `d` reading TOP_LEVEL_GROUP_ID would defeat a `d`-tag check.
+//   1. An `h`-tagged event naming a group this relay does not host
+//      (typically backfilled from the owner's history elsewhere). It is
+//      someone else's ordinary content, so it is moved to the PUBLIC
+//      partition.
+//   2. A 39000-series event not signed by this relay's own key
+//      (relay-identity.ts). storeEvent now refuses these; this removes any
+//      stored earlier. It is DELETED, not moved: a group reader's REQ
+//      merges both partitions (relay.ts handleReqInner), so a public copy
+//      would still sit beside the genuine member list, and an ordinary
+//      unauthenticated `{"authors":[owner]}` would start returning it
+//      (filterNamesGroup does not refuse an authors-only filter). Deletion
+//      is safe because storeEvent's signer check keeps it from returning.
+//      Matched by signer, not `d`, since a forged `d` is trivial.
 //
-// Both make an event unreadable to anyone who is not a member of the one
-// group this relay actually hosts -- population 1 hides a stranger's
-// unrelated content behind a membership list that has nothing to do with
-// it, population 2 sits in the partition as a second, indistinguishable
-// candidate for "this group's member list" alongside the relay's genuine
-// one, which is worse than hidden: it is ambiguous.
+// Batched by `limit` with no cursor (VANISH_BATCH_SIZE at the call site in
+// relay.ts runCronInner, because moving a row between partitions or
+// deleting it has the index-maintenance cost that constant is paced
+// against). Guarded by relay_meta.group_scope_fixed, set to 1 once a call
+// finds no candidates.
 //
-// THE TWO POPULATIONS ARE FIXED DIFFERENTLY, and that is deliberate.
-// Population 1 is de-flagged into the PUBLIC partition -- it is somebody
-// else's ordinary content, wrongly gated, and belongs there once ungated.
-// Population 2 is DELETED outright, not de-flagged, because de-flagging
-// alone does not close the ambiguity it exists to fix: an owner-or-member
-// reader is the one actually entitled to ask `{"kinds":[39002]}`, and that
-// reader's REQ merges BOTH partitions (relay.ts handleReqInner: `scopes =
-// mayReadGroups ? ALL_SCOPES : [PUBLIC_SCOPE]`), so a de-flagged copy
-// would still turn up alongside this relay's genuine member list -- the
-// exact ambiguity this migration exists to end, surviving for the one
-// audience it matters to. De-flagging population 2 would also be a NEW
-// disclosure: an entirely ordinary, group-unrelated `{"authors":[owner]}`
-// from an unauthenticated client would start returning it once it sat in
-// the public partition, since filterNamesGroup only refuses a filter that
-// NAMES a group or a metadata kind, and an authors-only filter does
-// neither. Deletion is safe unconditionally because storeEvent's own
-// signer check (below) means no event shaped like this can ever be
-// re-admitted -- there is nothing left to preserve and nothing this purge
-// could need to run twice for.
+// Each candidate's fix runs in storage.transactionSync. DO SQLite commits
+// each exec() separately, and raw BEGIN/SAVEPOINT is refused by the
+// runtime; transactionSync rolls back every write made in its closure,
+// including writes through read-metrics.ts instrumentSql's proxy.
+// Without it, a crash between the `events` and `event_tags` flips would
+// leave a stale `event_tags.is_group`, which filters.ts buildFilterQuery's
+// tag subquery reads directly to decide which partition an event is
+// served from.
 //
-// BATCHED, and deliberately without a separate cursor. Every call asks the
-// group partition's own indexes for up to `limit` candidates -- the same
-// bounded-request shape hasVanishTargets/drainVanish already use to make a
-// cost this relay cannot avoid a fixed one instead of a table scan. `limit`
-// is VANISH_BATCH_SIZE at the one call site (relay.ts runCronInner) --
-// reused rather than a constant invented for this, because both fixes
-// share its cost shape: population 1's UPDATE moves a row's `is_group`
-// between partitions, retiring its old partial-index entries and writing
-// new ones, and population 2's DELETE removes them outright -- the same
-// index-maintenance cost schema.ts eventRemovalBudget prices for a
-// removal, which is exactly what VANISH_BATCH_SIZE is paced against.
+// Population 1 is re-checked with isGroupEvent before writing, because an
+// event can carry several `h` tags and groupIdOf reads only the first.
+// Population 2 needs no recheck: `pubkey` is one column.
 //
-// EACH CANDIDATE'S FIX RUNS INSIDE storage.transactionSync, which is what
-// makes a crash mid-fix leave NO residue at all, rather than merely a
-// SAFE one.
-//
-// Cloudflare's SQLite-backed Durable Object storage commits each
-// `SqlStorage.exec()` call independently; there is no cross-statement
-// atomicity without asking for it, and asking for it with raw SQL is
-// refused outright ("please use the state.storage.transaction() or
-// state.storage.transactionSync() APIs instead of the SQL BEGIN
-// TRANSACTION or SAVEPOINT statements", confirmed against the real
-// runtime). transactionSync's actual contract, also confirmed directly:
-// an exception thrown inside its closure rolls back every write the
-// closure made, including writes issued through instrumentSql's Proxy
-// wrapper around the same underlying connection (relay.ts's `this.sql`
-// is never the raw object). That is exactly what an interrupted cron
-// tick needs: either the whole read-check-fix sequence for one candidate
-// happened, or none of it did. A crash between population 1's `events`
-// flip and its `event_tags` flip therefore cannot leave the two columns
-// disagreeing -- the transaction that would have produced that
-// disagreement never committed anything, and the SAME candidate query
-// rediscovers the row on the next call exactly as it was before this
-// call started. Same for population 2's deleteEventRow: either the row
-// and its counters are gone, or nothing happened.
-//
-// This replaces an earlier version of this migration that relied on
-// STATEMENT ORDERING instead -- candidacy keyed to whichever field the
-// fix touched first, so a re-run could not double-decrement a counter.
-// That version could still leave a stale `event_tags.is_group` behind on
-// a crash between the two flips, reasoned about at the time as a safe,
-// bounded, one-row residue. It was not: filters.ts buildFilterQuery's
-// tag-filter subquery (`SELECT event_id FROM event_tags WHERE is_group =
-// ? AND tag_name = ? AND tag_value IN (...)`) reads event_tags.is_group
-// DIRECTLY to decide which ids a `#<letter>`-tag-filtered REQ returns, in
-// whichever partition the reader is scoped to -- an access decision, not
-// a cosmetic one, and "safe direction" was the wrong standard to hold it
-// to. transactionSync removes the crash window the residue depended on,
-// rather than reasoning about what it would have left behind.
-//
-// Guarded by relay_meta.group_scope_fixed exactly the way
-// backfill_meta.exhaust_reset_applied guards backfill.ts
-// resetWronglyExhaustedRelays: 0 until a call finds nothing left to fix,
-// then permanently 1, so a relay with nothing wrong -- and every relay
-// going forward, once this has run -- pays one bounded, index-seeked
-// query and never asks again.
-//
-// Population 1's candidate id is still re-checked against the real,
-// corrected isGroupEvent before anything is written -- an event can carry
-// more than one `h` tag, and groupIdOf reads only the FIRST one, so a
-// second, mismatched tag on an event that is genuinely ours must not be
-// reclassified. Population 2 needs no such recheck: `pubkey` is a single
-// column, not a repeatable tag, so the SQL condition IS the authoritative
-// answer.
-//
-// A NOTE ON WHAT "BOUNDED" DOES NOT PROMISE, for population 1: an event
-// with a genuinely matching FIRST `h` tag and an extra, different one
-// after it is a false positive every single call re-selects and
-// re-skips, so a relay holding one never sees group_scope_fixed flip to
-// 1 -- every future cron tick pays this one bounded, index-seeked query
-// forever rather than zero. That is still bounded (the same cost every
-// time, never a scan that grows with E), just not self-terminating. No
-// real NIP-29 client emits two `h` tags with different values, so this is
-// a cost this relay accepts rather than a case worth a second piece of
-// state to track.
+// Known limit, relevant only while the flag is still 0: the candidate
+// query treats any `h` value other than TOP_LEVEL_GROUP_ID as suspect, so
+// events with a mismatched second `h` tag, and events in any other group
+// this relay hosts, are re-selected and skipped on every call. The flag
+// then never flips and every tick pays one bounded query; and if such
+// false positives fill `limit`, real candidates behind them are never
+// reached.
 export function fixMisclassifiedGroupEvents(
   sql: SqlStorage,
   storage: DurableObjectStorage,
@@ -1047,12 +736,8 @@ export function fixMisclassifiedGroupEvents(
 
   let fixed = 0;
   for (const { event_id } of candidates) {
-    // The whole read-check-fix sequence for ONE candidate, atomically --
-    // see the header comment above for why this is a transaction rather
-    // than an ordering argument. Returns whether this candidate was
-    // actually corrected, so a false positive (population 1's recheck) or
-    // a row already gone (a previous call's completed fix) costs nothing
-    // and changes nothing.
+    // Read, check and fix one candidate atomically (see the header).
+    // Returns false for a false positive or a row already gone.
     const wasFixed = storage.transactionSync((): boolean => {
       const row = sql
         .exec<EventRow & { ingested_at: number | null }>(
@@ -1065,48 +750,18 @@ export function fixMisclassifiedGroupEvents(
       const event = rowToEvent(row);
 
       if (isGroupMetadataKind(event.kind)) {
-        // Population 2 is PURGED, not reclassified -- de-flagging it
-        // into the public partition would leave it exactly as ambiguous
-        // as it was in the group partition, just for a different
-        // audience. The owner-or-member reader who is actually entitled
-        // to ask `{"kinds":[39002]}` reads BOTH partitions merged
-        // (relay.ts handleReqInner: `scopes = mayReadGroups ?
-        // ALL_SCOPES : [PUBLIC_SCOPE]`), so a de-flagged copy would still
-        // turn up alongside this relay's genuine member list -- the
-        // exact ambiguity the partition-only fix was supposed to end,
-        // just surviving for the one audience it matters to. Worse, an
-        // unauthenticated `{"authors":[owner]}` (an entirely ordinary
-        // query, unrelated to groups) would start returning it once it
-        // sat in the public partition, since filterNamesGroup only
-        // refuses a filter that NAMES a group or a metadata kind -- an
-        // authors-only filter does neither. Deletion is what
-        // storeEvent's refusal made safe to do unconditionally: no
-        // signer-mismatched event in this kind range can ever be
-        // re-admitted, so there is nothing to preserve and nothing this
-        // purge could need to run again for.
-        //
-        // deleteEventRow is the existing single removal choke point
-        // (defined above in this file) -- reusing it means this pays
-        // exactly the event_tags cleanup and counter decrements a live
-        // NIP-09 deletion would, through the one place that keeps "what
-        // an event is" and "what gets stored about it" in the same
-        // lines of code.
+        // Population 2: deleted, not moved (see the header).
         deleteEventRow(sql, event_id);
         return true;
       }
 
-      // Population 1: the false-positive guard the header comment
-      // describes. An event can carry more than one `h` tag, and
-      // groupIdOf reads only the FIRST one, so a second, mismatched tag
-      // on an event that is genuinely ours must not be reclassified.
+      // Population 1: skip anything that really is ours (see the header).
       if (isGroupEvent(event, groupHost(sql))) return false;
 
       sql.exec(`UPDATE events SET is_group = 0 WHERE id = ?`, event_id);
       sql.exec(`UPDATE event_tags SET is_group = 0 WHERE event_id = ?`, event_id);
-      // Mirrors bumpEventCounters'/deleteEventRow's decrement exactly,
-      // minus the `events`/`n` halves -- this is a reclassification, not
-      // a removal, so the total event count does not move, only which
-      // half of it is "group".
+      // A reclassification, not a removal: only the group halves of the
+      // counters move, mirroring deleteEventRow's decrement.
       sql.exec(`UPDATE maintained_counts SET group_events = group_events - 1`);
       sql.exec(
         `UPDATE event_hour_counts SET group_n = group_n - 1 WHERE hour = ?`,
@@ -1125,38 +780,23 @@ export function fixMisclassifiedGroupEvents(
   return fixed;
 }
 
-// The one-time migration to groups-as-rows, for a relay that already
-// holds group history.
+// One-time migration of stored rows to multiple groups. New writes are
+// already correct (insertEventRow derives both from the event); this fixes
+// rows that predate the change:
 //
-// Two things changed underneath the stored rows and neither rewrites
-// itself. The partition stopped meaning "is this group traffic" and
-// started meaning "does reading this need a membership check", which put
-// kind 39000 and kind 39001 on the public side of it (groups.ts); and an
-// event gained a `group_id`, which nothing before this wrote. New writes
-// are already correct -- storeEvent computes both from the event -- so
-// this is only ever about rows that predate the change.
+//   - kinds 39000/39001 are now public group state (groups.ts
+//     isPubliclyReadableGroupKind) and must leave the group partition, or
+//     an unauthenticated NIP-29 client sees no groups on this relay;
+//   - group-partition rows need `group_id`;
+//   - legacy `group_members` rows move to `group_membership`.
 //
-// UNTIL IT RUNS, THE FIX DOES NOTHING VISIBLE. A relay's existing 39000
-// sits in the group partition where an unauthenticated read cannot reach
-// it, which is precisely the state that made a NIP-29 client show "no
-// channels on this server yet". That is the whole reason this is paced
-// across cron ticks rather than deferred to a redeploy: nobody redeploys
-// to finish a migration they cannot see is pending.
+// Run from cron in VANISH_BATCH_SIZE batches, like
+// fixMisclassifiedGroupEvents and for the same index-maintenance reason.
+// The membership copy is unbatched; it is bounded by group size.
 //
-// Batched and checkpointed exactly as fixMisclassifiedGroupEvents above,
-// against the same VANISH_BATCH_SIZE and for the same reason: every write
-// here is an UPDATE moving a row between partial-index partitions, which
-// is the shape that constant is already paced against. The membership
-// copy is not batched -- it is bounded by the number of people in the
-// group, which is bounded by the owner having added them one at a time.
-//
-// Ordered so that a tick which dies partway leaves a state the next tick
-// finishes rather than one it double-counts: membership first (idempotent
-// by primary key), then the partition move (idempotent because it selects
-// only rows still on the wrong side), then the stamping (idempotent
-// because it selects only rows still missing it). The flag is set last
-// and only when a pass finds nothing left, so an interrupted run simply
-// repeats.
+// Each step is idempotent (membership by primary key, the moves and stamps
+// by selecting only rows still needing them), so an interrupted tick just
+// repeats. The flag is set only when a pass changes nothing.
 export function migrateToMultiGroup(
   sql: SqlStorage,
   storage: DurableObjectStorage,
@@ -1170,16 +810,11 @@ export function migrateToMultiGroup(
 
   let changed = 0;
 
-  // 1. Membership, from the table keyed by pubkey alone into the one keyed
-  //    by (group_id, pubkey). Everyone who was a member was a member of the
-  //    id the relay used to force, because there was no other.
-  //
-  //    `source` is 'owner' for all of them: the column distinguishes a
-  //    grant the owner made from one the group's own invite bookkeeping
-  //    made, and the old table did not record which. Calling them all
-  //    owner-granted is the conservative reading -- a remove-user reclaims
-  //    only `invite` rows, so this preserves access rather than silently
-  //    revoking it, and the owner can still remove anybody by hand.
+  // 1. Membership: every legacy member belonged to TOP_LEVEL_GROUP_ID, the
+  //    only group there was. `source` is set to 'owner' because the old
+  //    table did not record it, and 'owner' is the conservative choice:
+  //    remove-user reclaims only 'invite' rows, so no access is silently
+  //    revoked.
   const legacy = sql
     .exec<{ n: number }>(
       `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'group_members'`,
@@ -1195,11 +830,9 @@ export function migrateToMultiGroup(
     changed += 1;
   }
 
-  // 2. The 39000/39001 rows that are on the wrong side of the partition.
-  //    Moved one at a time inside a transaction, with the same counter
-  //    adjustment fixMisclassifiedGroupEvents makes for the same move: a
-  //    reclassification does not change how many events exist, only how
-  //    many of them are group events.
+  // 2. 39000/39001 rows still in the group partition, moved to public one
+  //    per transaction with the same group-half counter adjustment as
+  //    fixMisclassifiedGroupEvents.
   const misfiled = sql
     .exec<{ id: string; created_at: number; ingested_at: number | null }>(
       `SELECT id, created_at, ingested_at FROM events
@@ -1228,13 +861,10 @@ export function migrateToMultiGroup(
     changed += 1;
   }
 
-  // 3. `group_id`, on every row that is in the group partition and has
-  //    none. Read from the event rather than assumed to be the forced id:
-  //    a relay that has already been running under this change may hold
-  //    rows for a group the owner created, and stamping those with `_`
-  //    would file them into the wrong group -- which, since membership is
-  //    what the column will eventually scope, is the one error here that
-  //    would disclose something.
+  // 3. `group_id` on group-partition rows that lack it. Read from the event,
+  //    not assumed to be TOP_LEVEL_GROUP_ID: rows may belong to a group the
+  //    owner has since created, and filing them under the wrong group would
+  //    expose them to that group's members.
   const unstamped = sql
     .exec<EventRow>(
       `SELECT id, pubkey, created_at, kind, tags, content, sig FROM events
@@ -1244,10 +874,8 @@ export function migrateToMultiGroup(
     .toArray();
   for (const row of unstamped) {
     const id = groupIdOf(rowToEvent(row));
-    // A group-partition row that names no group cannot happen through
-    // storeEvent, which is what put it there. Left alone and counted, so
-    // the pass does not spin on it forever: the flag below is set when a
-    // pass finds nothing it CAN do, and this row is not one of those.
+    // Cannot happen via storeEvent. Skipped without counting it as a
+    // change, so it does not keep the flag below from being set.
     if (id === null) continue;
     storage.transactionSync(() => {
       sql.exec(`UPDATE events SET group_id = ? WHERE id = ?`, id, row.id);
@@ -1264,71 +892,57 @@ export function migrateToMultiGroup(
 }
 
 // ---------------------------------------------------------------------
-// THE PARTITION RULE, stated once and obeyed by every query below.
+// THE PARTITION RULE, obeyed by every query below.
 //
-// Every stored event lives in exactly one partition of `events` --
-// `is_group` 0 or 1 (src/groups.ts) -- and schema.ts declares the three
-// REQ-serving indexes as partial PAIRS keyed on it. SQLite uses a partial
-// index only for a query whose WHERE clause implies the index's own
-// predicate, so:
+// Every event is in exactly one partition (`is_group` 0 or 1, groups.ts),
+// and schema.ts declares the REQ-serving indexes on `events` and
+// `event_tags` as partial PAIRS on it. SQLite uses a partial index only
+// when the WHERE clause implies its predicate, so a query that pins
+// `is_group` to neither value reads the whole table. Measured at 50,000
+// group events, `SELECT id FROM events WHERE pubkey = ? AND kind = ?`:
+// 2 rows read pinned, 51,500 unpinned.
 //
-//   pinned to one partition   the same plan, and the same cost, as before
-//                             this column existed
-//   pinned to neither         no index qualifies; SCAN events
-//
-// Measured at 50,000 group events, `SELECT id FROM events WHERE pubkey = ?
-// AND kind = ?`: 2 rows read pinned, 51,500 unpinned.
-//
-// A lookup that is not about one partition in particular therefore runs
-// once per partition and concatenates, which costs one extra seek and
-// keeps every one of them index-served. Reads that ARE about one
-// partition -- everything a REQ produces -- pin it directly instead.
-//
-// Primary-key lookups (`WHERE id = ?`) are exempt and always were:
-// `sqlite_autoindex_events_1` is not partial, so an id seek needs no pin.
+// A lookup not about one partition runs once per partition
+// (groups.ts acrossScopes). Primary-key lookups (`WHERE id = ?`) need no
+// pin: the PK index is not partial.
 // ---------------------------------------------------------------------
 export function eventExists(sql: SqlStorage, id: string): boolean {
   return sql.exec(`SELECT 1 FROM events WHERE id = ?`, id).toArray().length > 0;
 }
 
-// Tombstone check for the write path (relay.ts handleEvent) -- a plain
-// `eventExists` can't tell a genuinely new id from one that was deleted
-// and is being replayed, since deletion removes the row. See schema.ts's
-// `deleted_ids` comment.
+// Tombstone check for the write path: deletion removes the row, so
+// eventExists cannot tell a new id from a replayed deleted one (schema.ts
+// `deleted_ids`).
 export function isDeleted(sql: SqlStorage, id: string): boolean {
   return sql.exec(`SELECT 1 FROM deleted_ids WHERE id = ?`, id).toArray().length > 0;
 }
 
-// Deletes an event and permanently blocks its id from ever being stored
-// again -- the durability NIP-09/NIP-62 require. Only for genuine
-// deletion requests (applyDeletion, applyAddressDeletion, applyVanish);
-// `storeEvent`'s replaceable/addressable replacement path must keep using
-// the untombstoned `deleteEventRow` -- see schema.ts.
+// Deletes an event and permanently refuses its id, so a sender holding a
+// signed copy cannot replay it. For deletion requests and bans only
+// (NIP-09, NIP-62 drainVanish, banEvent). A replaceable/addressable
+// replacement is not a deletion and uses deleteEventRow; so do the chat and
+// expired-gift-wrap sweeps, for the reasons given on them.
 function deleteAndTombstone(sql: SqlStorage, id: string): void {
   deleteEventRow(sql, id);
   sql.exec(`INSERT OR IGNORE INTO deleted_ids (id) VALUES (?)`, id);
 }
 
-// True while the database is still small enough to accept writes from
-// someone other than the owner -- see limits.ts NON_OWNER_STORAGE_SHARE_LIMIT
-// for why the threshold is measured against total size and what that
-// reserves. `limit` is passed in because it is env-overridable and the
-// caller (relay.ts acceptEvent) has already resolved it. `databaseSize`
-// is a property read, not a query -- getStats reads the same one.
+// True while the database is small enough to accept non-owner writes
+// (limits.ts NON_OWNER_STORAGE_SHARE_LIMIT). `limit` is env-overridable and
+// resolved by the caller. `databaseSize` is a property read, not a query.
 export function hasNonOwnerStorageHeadroom(sql: SqlStorage, limit: number): boolean {
   return sql.databaseSize < limit;
 }
 
-// Current count of stored gift wraps -- backs the maxGiftWraps cap
-// (limits.ts) on the write path. A read against the 5,000,000/day
-// rows-read ceiling, not the rows-written one -- see CLAUDE.md "The
-// budget".
+// Stored gift wraps, for the maxGiftWraps cap (limits.ts), run on every
+// accepted wrap. Answered from idx_events_kind_created_* without touching
+// the table; do not add a condition on a column those indexes lack (see
+// sweepExpiredGiftWraps).
 export function giftWrapCount(sql: SqlStorage): number {
-  // Both partitions: nothing stops a sender putting an `h` tag on a gift
-  // wrap, and a storage cap that only counted half of what it is capping
-  // would be a cap with a hole in it. Two index counts rather than one --
-  // measured at the same 500 rows the single count cost (the partial pair
-  // holds between them exactly the rows the whole index held).
+  // Both partitions: wraps stored before relay.ts handleGiftWrap refused
+  // group-tagged ones may sit in the group partition, and the cap must
+  // count them. Two index counts cost what one did (measured: 500 rows
+  // either way).
   return acrossScopes((scope) =>
     sql
       .exec<{ n: number }>(
@@ -1348,61 +962,26 @@ export interface GiftWrapSweep {
   done: boolean;
 }
 
-// Removes gift wraps whose NIP-40 `expiration` has passed.
+// Deletes gift wraps whose NIP-40 `expiration` has passed. Every other
+// kind is only hidden when expired (filters.ts); kind 1059 is the one kind
+// capped by COUNT, so an expired wrap would hold a `maxGiftWraps` slot
+// forever and eventually get the owner's real mail refused as "inbox
+// full". Dead rows also cost `excludeGiftWraps` the same skip live ones do.
 //
-// WHY THIS EXISTS AT ALL, since nothing else in this file deletes an
-// event for being expired. `filters.ts` hides an expired event from every
-// query -- NIP-40's "SHOULD NOT send expired events to clients, even if
-// they are stored" -- and for every other kind that is the whole of what
-// expiry means here: the row costs storage bytes, which
-// NON_OWNER_STORAGE_SHARE_LIMIT already bounds, and nothing else.
+// Teaching giftWrapCount about expiry instead would be wrong: `expiration`
+// is on no index, so the count would fetch every row and double a read paid
+// on every accepted wrap, and the dead rows would still cost the skip.
 //
-// Kind 1059 is the exception, because it is the one kind with a cap on
-// how many of it may exist. `giftWrapCount` above counts rows and not
-// mail, so an expired wrap occupies a slot in `maxGiftWraps` that no
-// query will ever serve from, permanently. Left alone, a relay carrying
-// expiring wraps fills its inbox with rows it is hiding and then answers
-// "blocked: gift wrap inbox storage is full" to the owner's real mail --
-// worse at the job it already had, in exchange for nothing.
+// No tombstone: relay.ts acceptEvent refuses any event whose signed
+// `expiration` has passed, so the event refuses its own replay.
 //
-// The count is deliberately NOT taught about expiry instead, which is the
-// smaller-looking fix. `SELECT COUNT(*) ... WHERE kind = ? AND is_group =
-// ?` is answered from idx_events_kind_created_* without touching the
-// table; adding `expiration` to it -- a column no index carries -- would
-// fetch every row behind those index entries, doubling a read that
-// relay.ts handleGiftWrap pays on every accepted wrap. And it would fix
-// only half the problem: `maxGiftWraps` is bounded by
-// MAX_FILTER_ROWS_READ as well as by the storage share, because
-// `excludeGiftWraps` skips past every stored wrap to reach the rows it
-// may return, and a dead row costs that skip exactly as a live one does.
-// The rows have to go, not just stop being counted.
+// Oldest first via the index, stopping when the batch fills, so "run again
+// next tick" is the whole checkpoint. A tick with nothing to do walks the
+// kind-1059 range once per partition: bounded by `maxGiftWraps` (~2,048
+// rows at defaults, ~1% of the daily read ceiling if run hourly on a
+// permanently full inbox), and free on a relay holding no wraps.
 //
-// NO TOMBSTONE, and the argument is stronger here than the one sweepChat
-// makes for the same choice. That path needs `swept_through` to stand in
-// for the tombstones it does not write; this one needs nothing, because
-// the event refuses its own replay: relay.ts acceptEvent drops any event
-// whose `expiration` has passed, the tag is covered by the signature, and
-// so a re-send of the same signed copy is refused forever and for free. A
-// `deleted_ids` row would be a permanent row bought to duplicate a check
-// the event already carries.
-//
-// COST. Oldest first, so a batch that runs out leaves a contiguous
-// remainder and the checkpoint is just "run again next tick" -- the same
-// shape sweepChat and drainVanish use. `ORDER BY created_at ASC` is
-// served by the index rather than sorted, and the walk stops the moment
-// the batch fills, so a tick with work to do reads roughly what it
-// removes. A tick with nothing to do walks the whole kind-1059 range
-// once per partition to establish that, which is bounded by
-// `maxGiftWraps` -- ~2,048 rows at the defaults, ~49,000 a day, about 1%
-// of the rows-read ceiling, and only on a relay whose inbox is
-// permanently full. An ordinary personal inbox of a few dozen wraps pays
-// a few dozen rows an hour, and a relay that has never received one pays
-// nothing at all: there are no index entries to walk.
-//
-// Both partitions. `handleGiftWrap` now refuses a wrap carrying a group
-// tag, but rows stored before it did are still there, and `giftWrapCount`
-// counts both -- so a sweep that cleaned only one would leave the other
-// half of the cap silting up exactly as before.
+// Both partitions, matching giftWrapCount.
 export function sweepExpiredGiftWraps(
   sql: SqlStorage,
   nowSec: number,
@@ -1422,12 +1001,9 @@ export function sweepExpiredGiftWraps(
       .toArray(),
   );
 
-  // Fewer than asked for across both partitions means neither partition
-  // filled its own limit, so the range is exhausted -- checked against
-  // the limit rather than by re-running the query, the same call
-  // drainVanish and sweepChat both make. Equality counts as not done: two
-  // partitions summing to exactly the limit could still each be holding
-  // more, and re-checking next tick is cheaper than being wrong.
+  // Fewer than `limit` in total means neither partition filled its own
+  // limit, so nothing is left. Exactly `limit` counts as not done, since
+  // either partition might hold more.
   const done = targets.length < limit;
   for (const target of targets.slice(0, limit)) deleteEventRow(sql, target.id);
   return { removed: Math.min(targets.length, limit), done };
@@ -1440,25 +1016,22 @@ interface StoreResult {
 }
 
 // NIP-01 "Kinds" storage rules: regular kinds keep every event;
-// replaceable/addressable kinds keep only the newest per key, with
-// equal-`created_at` ties broken by the lowest id; ephemeral kinds are
-// never written to a row at all -- `stored` is still set to the event so
-// relay.ts's caller broadcasts it live, but nothing here inserts a row
-// for it. Duplicate and already-expired checks happen before this is
-// called (relay.ts).
+// replaceable/addressable kinds keep only the newest per key (ties: lowest
+// id); ephemeral kinds are never stored, but `stored` is still the event so
+// the caller broadcasts it. `stored: null` with `ok: true` means "accepted,
+// not stored". Duplicate and tombstone checks are the caller's (relay.ts
+// acceptEvent, which also refuses expired events; backfill.ts
+// applyBackfillPage). Every event row, relay-generated ones included, must
+// go through here.
 export function storeEvent(sql: SqlStorage, event: NostrEvent, ingestedAt: number): StoreResult {
   if (isEphemeralKind(event.kind)) {
     return { ok: true, message: "", stored: event };
   }
 
   if (isReplaceableKind(event.kind)) {
-    // Both partitions, because NIP-01 keys a replaceable event by
-    // (pubkey, kind) and says nothing about groups: the newest one wins
-    // whether or not either copy carries an `h` tag. Pinning only the
-    // incoming event's own partition would have let one author hold two
-    // "current" kind-10002s, one public and one group-scoped, which is a
-    // protocol divergence bought for nothing -- see the partition rule
-    // above for why the alternative (no pin at all) is a table scan.
+    // Both partitions: NIP-01 keys a replaceable event by (pubkey, kind)
+    // alone, so pinning only the incoming event's partition would let one
+    // author keep a public and a group-scoped "current" version.
     const existing = acrossScopes((scope) =>
       sql
         .exec<{ id: string; created_at: number }>(
@@ -1480,40 +1053,16 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent, ingestedAt: numbe
   }
 
   if (isAddressableKind(event.kind)) {
-    // NIP-29: 39000-series group metadata events "MUST be created by the
-    // relay master key only... Relays shouldn't accept these events if
-    // they're signed by anyone else." nip29.ts authorizeGroupWrite already
-    // refuses every client-submitted one of these outright, unconditionally
-    // -- but that gate sits ABOVE storeEvent, on the live write path only.
-    // backfill.ts applyBackfillPage is the other caller of storeEvent, and
-    // it bypasses that gate entirely: it can pull in anything the owner
-    // ever personally signed, including a kind in this range signed under
-    // their OWN key rather than the relay's, if they (or some client bug)
-    // ever published one elsewhere.
+    // NIP-29: 39000-series events "MUST be created by the relay master key
+    // only". nip29.ts authorizeGroupWrite refuses client-submitted ones,
+    // but backfill.ts applyBackfillPage calls storeEvent without that gate
+    // and could import one the owner signed elsewhere. Checked by SIGNER,
+    // not by `d`: a forged event can carry any `d`, and would then be
+    // indistinguishable from this relay's real member list. Only
+    // relay-identity.ts signAsRelay produces an accepted signature.
     //
-    // Checked by SIGNER, not by the `d` tag it carries. groups.ts
-    // isGroupEvent used to accept a metadata-kind event with a missing or
-    // empty `d` as "ours" on the reasoning that hiding is safer than
-    // disclosing -- which protected against disclosure but not against
-    // AMBIGUITY: a bare `{"kinds":[39002]}` still can't tell that
-    // malformed row apart from this relay's own genuine member list, both
-    // landing in the same partition. Checking the `d` value instead of the
-    // signer would not have fixed that either -- a forged kind-39002
-    // signed by the owner's own key with `d` set to read TOP_LEVEL_GROUP_ID
-    // would pass a `d`-tag check and be genuinely indistinguishable from
-    // this relay's real member list to any `#d`-scoped filter too. The
-    // signer is the one thing a forgery cannot fake: only
-    // relay-identity.ts signAsRelay ever produces a signature this check
-    // accepts, and every event it signs (nip29.ts applyModeration) always
-    // stamps `d` as TOP_LEVEL_GROUP_ID correctly -- so a metadata-kind
-    // event that reaches insertEventRow below is guaranteed well-formed,
-    // and groups.ts isGroupEvent no longer needs a malformed case at all.
-    //
-    // Refused the same way a superseded replacement is (ok: true, nothing
-    // stored) rather than as a protocol-level error: the only caller that
-    // reaches this branch with such an event is backfill, which reads
-    // `stored` and nothing else (CLAUDE.md storage-semantics: "dropped
-    // rather than stored" is the same rule ephemeral kinds follow above).
+    // Dropped as "accepted, not stored" rather than as an error: the only
+    // caller that reaches this is backfill, which reads `stored` only.
     if (isGroupMetadataKind(event.kind) && event.pubkey !== getRelayPubkey(sql)) {
       return { ok: true, message: "", stored: null };
     }
@@ -1540,11 +1089,10 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent, ingestedAt: numbe
     return { ok: true, message: "", stored: event };
   }
 
-  // Regular kinds, and the spec-undefined 45-999/>=40000 ranges, land
-  // here and are stored like regular events: 45-999 holds live assigned
-  // kinds, writes are owner-only so permissiveness costs nothing, and
-  // storing too much is recoverable while rejecting the owner's own
-  // events is not.
+  // Regular kinds, and the spec-undefined 45-999/>=40000 ranges, are stored
+  // as regular events: 45-999 holds live assigned kinds, writes are already
+  // gated by the write policy, and storing too much is recoverable while
+  // rejecting the owner's own events is not.
   insertEventRow(sql, event, expirationOf(event), ingestedAt);
   return { ok: true, message: "", stored: event };
 }
@@ -1565,31 +1113,15 @@ function isSupersededBy(
 // request has no effect", line 53); an `a` tag removes replaceable/
 // addressable versions at or before the deletion's created_at.
 //
-// Authorization on the `e`-tag path branches on the target's kind
-//:
-//   - target is a gift wrap (kind 1059): authorized iff the deletion's
-//     pubkey appears in the target's `p` tags. NIP-59 gift wraps are
-//     signed by a random one-time key, so the ordinary "same pubkey"
-//     NIP-09 rule can never fire for them -- NIP-59's carve-out is that
-//     the tagged recipient may delete instead.
-//   - everything else: authorized iff `deletion.pubkey === target.pubkey`,
-//     the standard NIP-09 same-author rule. This used to be true for
-//     every row in `events` purely because the write gate
-//     (ownership.ts isAllowedWriter) only ever let the owner (or a
-//     follow) write anything -- so any deletion request the relay would
-//     even accept already shared its pubkey with every existing row, and
-//     this function didn't need to check. Gift wraps break that: kind
-//     1059 is the one write-gate exception, so the table can now hold
-//     rows whose pubkey has nothing to do with the deleter. This check
-//     is made explicit rather than left resting on that invariant, since
-//     it now only holds per-kind, not relay-wide -- getting it backwards
-//     is exactly the permissive-direction mistake CLAUDE.md warns about:
-//     a stranger deleting the owner's posts, or the owner's kind-5
-//     deleting a stranger's gift wrap to someone else. (In practice
-//     `deletion.pubkey` is always the owner here too, since kind-5 still
-//     goes through the write gate -- but that's the accept-path's
-//     promise, not this function's, and this function shouldn't depend
-//     on a promise made elsewhere.)
+// Authorization on the `e`-tag path depends on the target's kind:
+//   - gift wrap (kind 1059): the deleter must be in the target's `p` tags.
+//     Wraps are signed by a one-time key, so the same-author rule could
+//     never match; NIP-59 lets the recipient delete instead.
+//   - everything else: the deleter must be the target's author (NIP-09).
+// Checked here rather than relying on the write gate, because the table
+// holds events from many authors (gift wraps, follows, group members,
+// other write policies), and the failure would be one author deleting
+// another's events.
 export function applyDeletion(sql: SqlStorage, deletion: NostrEvent): void {
   for (const tag of deletion.tags) {
     if (tag[0] === "e" && tag[1]) {
@@ -1611,34 +1143,19 @@ export function applyDeletion(sql: SqlStorage, deletion: NostrEvent): void {
   }
 }
 
-// NIP-09 `a` tags address replaceable and addressable events only --
-// "<kind>:<pubkey>:<d-identifier>" names a coordinate that exists solely
-// for kinds that have one. Regular events have no coordinate and are
-// deleted by `e` tag, one id at a time.
-//
-// Accepting a regular kind here was a conformance bug with a sharp edge.
-// `1:<pubkey>:` names no single event, so the branch below treated it as
-// "every kind-1 event by that pubkey at or before the cutoff" and
-// tombstoned all of them. One tag, unbounded N. That made
-// MAX_EVENT_BYTES a bound on nothing for bulk deletion: the size cap
-// limits a kind-5 to roughly 870 `e` tags, but a single `a` tag reached
-// the same N with none of the effort, and each removal pays the DELETE
-// above.
-//
-// Restricted to the kinds NIP-09 actually addresses, N per `a` tag is at
-// most one stored event -- replaceable kinds keep one version per
-// (pubkey, kind), addressable ones keep one per (pubkey, kind, d) -- so
-// the byte cap becomes a real bound on what one deletion request can
-// cost.
+// NIP-09 `a` tags address replaceable and addressable kinds only; regular
+// events are deleted by `e` tag. The kind check is a cost bound, not just
+// conformance: for a regular kind, `1:<pubkey>:` would match every kind-1
+// by that author, so one tag could delete unboundedly many events. Limited
+// to these kinds, each `a` tag matches at most one stored event, and
+// MAX_EVENT_BYTES (roughly 870 `e` tags at 64 KiB) bounds a request's cost.
 function applyAddressDeletion(sql: SqlStorage, address: string, deletion: NostrEvent): void {
   const [kindStr, pubkey, d = ""] = address.split(":");
   const kind = Number(kindStr);
   if (!Number.isInteger(kind) || pubkey !== deletion.pubkey) return;
   if (!isReplaceableKind(kind) && !isAddressableKind(kind)) return;
 
-  // Both partitions on both branches: a NIP-09 deletion names an address,
-  // and an author deleting their own address means all of it. See the
-  // partition rule above.
+  // Both partitions: an address names the event wherever it is stored.
   if (isAddressableKind(kind)) {
     const candidates = acrossScopes((scope) =>
       sql
@@ -1670,50 +1187,31 @@ function applyAddressDeletion(sql: SqlStorage, address: string, deletion: NostrE
   }
 }
 
-// NIP-62 (nips/62.md) Request to Vanish, in two halves: this one records
-// the request, and drainVanish below does the work.
+// NIP-62 Request to Vanish, in two halves: this records the request and
+// drainVanish does the work across cron ticks.
 //
-// It is split because a vanish is the one request whose size is chosen by
-// the sender and bounded by nothing this relay controls. Removing an
-// event costs its tag rows, its own row and a tombstone (schema.ts
-// eventRemovalRowsWritten), and the drain is paced against the
-// pessimistic eventRemovalBudget -- so a pubkey with thousands of stored
-// events cannot be vanished inside one request without exceeding the
-// daily write budget partway through. Doing it inline anyway would leave the pubkey
-// half-vanished while the OK frame said it had succeeded, and "fully
-// delete" is the spec's word, so that is a compliance failure rather than
-// a slow query.
+// Split because the sender chooses the size: a pubkey with thousands of
+// events cannot be removed inside one request without overrunning the
+// write budget (schema.ts eventRemovalBudget), and NIP-62 says "fully
+// delete", so stopping partway while reporting success is not an option.
+// Once recorded, the drain resumes on the next tick whatever happens to the
+// socket or the object.
 //
-// Recording first also makes the request durable: once this row exists,
-// the drain resumes on the next cron tick whether or not the socket, the
-// request or the Durable Object survived.
+// Applies to any requester, not only the owner, and is not routed through
+// ownership.ts isAllowedWriter: NIP-62 binds write-restricted relays to
+// honour it "regardless of the user's status". See deleteEventRow for what
+// that costs.
 //
-// Applied unconditionally against `requester` (the vanish event's own
-// pubkey), matching the spec text rather than special-casing "if
-// requester is the owner": "Relays MUST fully delete any events from the
-// .pubkey" and "Relays SHOULD delete all NIP-59 Gift Wraps that p-tagged
-// the .pubkey". Both clauses naturally do nothing for a requester who has
-// no matching rows. Deliberately NOT routed through ownership.ts's
-// isAllowedWriter -- unlike every other write path, a vanish request's
-// authority comes from the requester vanishing their *own* data, not from
-// relay-write permission, and the spec is explicit that write-restricted
-// relays "MUST also follow the request to vanish regardless of the user's
-// status." See deleteEventRow above for what that costs and why the index
-// exists.
-//
-// `cutoffCreatedAt` is stored rather than recomputed on resume: it is the
-// original request's created_at, and re-deriving it later would silently
-// change which events the requester actually asked to remove.
+// `cutoffCreatedAt` (the request's created_at) is stored, not recomputed
+// on resume, so the set of events covered never changes.
 export function beginVanish(
   sql: SqlStorage,
   requester: string,
   cutoffCreatedAt: number,
   nowSec: number,
 ): void {
-  // ON CONFLICT keeps the WIDEST request rather than the newest. Two
-  // vanish requests from one pubkey are unusual, but if the second names
-  // an earlier cutoff, honouring it would narrow a deletion already
-  // promised -- so the cutoff only ever moves outward.
+  // The cutoff only moves outward: a second request with an earlier cutoff
+  // must not narrow a deletion already promised.
   sql.exec(
     `INSERT INTO vanishing (pubkey, cutoff_created_at, requested_at) VALUES (?, ?, ?)
        ON CONFLICT(pubkey) DO UPDATE SET
@@ -1725,32 +1223,20 @@ export function beginVanish(
   );
 }
 
-// The set of events one vanish request covers, as one query, so
-// drainVanish (which removes them) and hasVanishTargets (which asks
-// whether there are any) cannot disagree about what a vanish means.
-//
-// Both NIP-62 clauses in one statement: events the requester authored,
-// and (nips/62.md: "Relays SHOULD delete all NIP-59 Gift Wraps that
-// p-tagged the .pubkey") gift wraps addressed to them. UNION rather than
-// two queries so a single `limit` bounds the whole operation, and so a
-// caller cannot finish the first clause, report done, and leave the
-// second.
+// The one definition of what a vanish covers, shared by drainVanish and
+// hasVanishTargets so they cannot disagree: events the requester authored,
+// and gift wraps p-tagged to them (NIP-62 "SHOULD delete all NIP-59 Gift
+// Wraps that p-tagged the .pubkey"). One UNION so a single `limit` bounds
+// both clauses and neither can be reported done while the other remains.
 function vanishTargets(
   sql: SqlStorage,
   requester: string,
   cutoffCreatedAt: number,
   limit: number,
 ): { id: string }[] {
-  // Once per partition, and the partition pin reaches the tag subquery too
-  // -- see the partition rule above, and filters.ts for why a tag lookup
-  // that names no partition cannot use the pair either. A vanish covers
-  // everything the requester has here, group events included: NIP-62 binds
-  // the relay to erase, and an erasure that skipped the partition the
-  // requester happened to post in would be a compliance failure rather
-  // than a saving.
-  //
-  // `limit` is applied per partition and again by the caller's slice, so
-  // one drain batch stays bounded by the figure limits.ts paces it at.
+  // Both partitions (a vanish covers group events too), with the pin on
+  // the tag subquery as well, per the partition rule. `limit` applies per
+  // partition and again in the slice, so a batch never exceeds it.
   return acrossScopes((scope) =>
     sql
       .exec<{ id: string }>(
@@ -1773,25 +1259,12 @@ function vanishTargets(
   ).slice(0, limit);
 }
 
-// Whether this relay holds anything a vanish request would remove.
-//
-// A READ standing in front of a WRITE, and that is the whole point.
-// beginVanish below used to be called unconditionally, so a vanish from
-// a pubkey with nothing stored still wrote a checkpoint row -- which
-// drainVanish then deleted again on finding no targets, having deleted
-// nothing. Measured over the wire: 4 rows written per request, from a
-// path that runs before every write gate the relay has (NIP-62 binds
-// write-restricted relays to honour a vanish "regardless of the user's
-// status", so that ordering is correct and cannot change) and needs no
-// prior relationship with the relay at all. At the ~20 requests/second
-// the per-IP message throttle permits, that is ~1,730,000 rows/day
-// against a 100,000/day ceiling: the owner stops being able to publish
-// about ninety minutes in.
-//
-// NIP-62 requires the relay to honour the request. It does not require
-// paying rows to remember a request with nothing to do -- a vanish over
-// an empty set is complete the moment it is asked, and the honest answer
-// costs one seek.
+// Whether a vanish request has anything to remove: a read in front of
+// beginVanish's write. A vanish over an empty set is already complete, and
+// recording it anyway costs 4 rows written (measured) on a path any
+// signer can reach before every write gate. At the 5 messages/second the
+// per-IP throttle (relay.ts RATE_LIMIT_MAX_MESSAGES) permits, that is
+// ~1,730,000 rows/day against the 100,000/day ceiling. This costs one seek.
 export function hasVanishTargets(sql: SqlStorage, requester: string, cutoffCreatedAt: number): boolean {
   return vanishTargets(sql, requester, cutoffCreatedAt, 1).length > 0;
 }
@@ -1799,15 +1272,11 @@ export function hasVanishTargets(sql: SqlStorage, requester: string, cutoffCreat
 // The cutoff of a vanish already checkpointed for this pubkey, or null if
 // none is pending.
 //
-// Backs handleVanish's dedupe: a signed vanish event is replayable by
-// anyone who has ever seen it, forever, and each replay re-ran
-// beginVanish (a write) and a fresh drain batch (up to VANISH_BATCH_SIZE
-// removals) for a request already in progress. Read back and compared
-// against the incoming request's own cutoff, a replay is recognised for
-// what it is and costs one row read. Only a request that would WIDEN the
-// pending one gets to write, which is the same rule beginVanish's
-// ON CONFLICT already applies -- stated as a read in front of the write
-// rather than as a write that happens to change nothing.
+// Backs relay.ts handleVanish's dedupe. A signed vanish event can be
+// replayed by anyone who has seen it, and without this each replay would
+// rewrite the checkpoint and run another drain batch. Compared against the
+// incoming cutoff, a replay costs one row read; only a request that would
+// widen the pending one writes.
 export function pendingVanishCutoff(sql: SqlStorage, requester: string): number | null {
   const row = sql
     .exec<{ cutoff_created_at: number }>(
@@ -1825,13 +1294,9 @@ export interface VanishProgress {
   done: boolean;
 }
 
-// Removes up to `limit` of one pubkey's events, newest first, and clears
-// the checkpoint once nothing is left. Safe to call repeatedly; calling
-// it for a pubkey with no `vanishing` row is a no-op.
-//
-// Both NIP-62 clauses drain through one query (vanishTargets above) so a
-// single limit bounds the whole operation, and so "what a vanish covers"
-// has one definition that hasVanishTargets asks the same question of.
+// Removes up to `limit` of one pubkey's vanish targets (vanishTargets) and
+// clears the checkpoint once nothing is left. Safe to call repeatedly; a
+// no-op for a pubkey with no `vanishing` row.
 export function drainVanish(sql: SqlStorage, requester: string, limit: number): VanishProgress {
   const row = sql
     .exec<{ cutoff_created_at: number; deleted_so_far: number }>(
@@ -1845,9 +1310,7 @@ export function drainVanish(sql: SqlStorage, requester: string, limit: number): 
 
   for (const target of targets) deleteAndTombstone(sql, target.id);
 
-  // Fewer than asked for means the set is exhausted. Checked against the
-  // limit rather than by re-running the query, which would cost a second
-  // pass over the same index for an answer this already implies.
+  // Fewer than `limit` means the set is exhausted; no second query needed.
   const done = targets.length < limit;
   if (done) {
     sql.exec(`DELETE FROM vanishing WHERE pubkey = ?`, requester);
@@ -1861,39 +1324,17 @@ export function drainVanish(sql: SqlStorage, requester: string, limit: number): 
   return { deleted: targets.length, done };
 }
 
-// ---------------------------------------------------------------------
-// `ingested24h` and `rowsWrittenToday` used to live here, in a cache row
-// (`live_stats`) on a five-minute clock, with readLiveStats/
-// computeLiveStats/writeLiveStats around it and a `liveAt` field on
-// /api/stats to state how stale they were.
-//
-// All of it is gone. Both figures are bucket counters now
-// (readIngestCounts above, schema.ts `ingest_hour_counts`), read at at
-// most 25 rows in one statement, so there is no expensive read left for a
-// clock to ration -- the same ending `stats_snapshot` came to when
-// `events24h` was bucketed, one release earlier. That is twice now, and
-// it is the lesson limits.ts records where costs get priced: a TTL over
-// an expensive read bounds how often you pay it, not what it costs, and
-// it survives only until somebody makes the read cheap. Reach for the
-// counter first and the clock second.
-//
-// Nothing on /api/stats answers to a clock any more, and `liveAt` went
-// with the last one that did.
-// ---------------------------------------------------------------------
-
 export interface PendingVanish {
   pubkey: string;
   deletedSoFar: number;
   requestedAt: number;
 }
 
-// Vanish requests still draining -- read by relay.ts runCron to resume
-// them. Oldest first, so a request cannot be starved by newer ones
-// arriving.
+// Vanish requests still draining, for relay.ts runCron. Oldest first, so
+// newer requests cannot starve older ones.
 //
-// INTERNAL ONLY: these rows name pubkeys, and pubkeys are what a vanish
-// request exists to disassociate from this relay. /api/stats takes
-// vanishSummary below instead.
+// INTERNAL ONLY: these rows name the pubkeys that asked to be erased.
+// /api/stats uses vanishSummary.
 export function pendingVanishes(sql: SqlStorage): PendingVanish[] {
   return sql
     .exec<{ pubkey: string; deleted_so_far: number; requested_at: number }>(
@@ -1913,18 +1354,9 @@ export interface VanishSummary {
   oldestRequestedAt: number | null;
 }
 
-// What /api/stats publishes about vanish requests, and deliberately not
-// pendingVanishes above.
-//
-// /api/stats is unauthenticated and public, and it used to carry the
-// `vanishing` rows verbatim, pubkey included -- so anyone could read off
-// which identities had asked this relay to erase them, which is close to
-// the opposite of what asking bought them. The operational question the
-// admin page asks ("is a drain stuck?") is answered by a count, a
-// progress total and an age; none of those name anyone.
-//
-// One row read: three aggregates over a table that is empty except while
-// a vanish is draining.
+// What the public, unauthenticated /api/stats may say about vanish
+// requests: a count, a progress total and an age, enough to see a stuck
+// drain without naming who asked to be erased. One row read.
 export function vanishSummary(sql: SqlStorage): VanishSummary {
   const row = sql
     .exec<{ pending: number; deleted: number; oldest: number | null }>(
@@ -1940,29 +1372,23 @@ export function vanishSummary(sql: SqlStorage): VanishSummary {
   };
 }
 
-// What a READER is allowed to see, as opposed to what one query asks for.
+// What a READER may see, set by relay.ts handleReqInner.
 //
-// `scopes` is the partitions of `events` this read covers: the public rows
-// alone for every unauthenticated client, both for a reader the relay has
-// authorised (relay.ts handleReqInner). It is a list rather than a boolean
-// because it is not a filter condition -- each partition is a separate
-// query, for the reason filters.ts FilterQueryOptions.scope gives.
+// `scopes` is the partitions this read covers: public only for an
+// unauthenticated client, both for an authorised reader. A list, not a
+// boolean, because each partition is a separate query (filters.ts
+// FilterQueryOptions.scope).
 export interface ReadOptions {
   excludeGiftWraps?: boolean;
-  // Owner-only, and NOT implied by `scopes` covering the group partition:
-  // a member reads the group and does not read the invite codes in it
-  // (groups.ts CREATE_INVITE_KIND). Two separate permissions, so two
-  // separate options.
+  // Owner-only, and NOT implied by `scopes` including the group
+  // partition: members read the group but not its invite codes (groups.ts
+  // CREATE_INVITE_KIND).
   excludeInvites?: boolean;
   scopes?: readonly GroupScope[];
-  // The oldest `created_at` a kind-9 chat message may be returned at --
-  // see filters.ts FilterQueryOptions.chatHorizon, which is where it is
-  // turned into SQL, and storage.ts chatHorizon, which is where it comes
-  // from. Undefined means no clamp, which is both the reporting mode and
-  // every deployment with EPHEMERAL_CHAT unset.
-  //
-  // Not a permission, unlike the three fields above it: it does not
-  // depend on who is asking, and the owner gets it too.
+  // Oldest `created_at` a kind-9 chat message may be returned at (from
+  // chatHorizon below; turned into SQL by filters.ts
+  // FilterQueryOptions.chatHorizon). Undefined means no clamp, as when
+  // EPHEMERAL_CHAT is unset. Not a permission: it applies to the owner too.
   chatHorizon?: number;
   // See FilterQueryOptions.groupIds. `undefined` is the owner, who reads
   // every group; an empty array is a reader who may read none.
@@ -1981,19 +1407,14 @@ export function queryFilter(
     ...(options.excludeGiftWraps === undefined ? {} : { excludeGiftWraps: options.excludeGiftWraps }),
     ...(options.excludeInvites === undefined ? {} : { excludeInvites: options.excludeInvites }),
     ...(options.chatHorizon === undefined ? {} : { chatHorizon: options.chatHorizon }),
-    // Which groups the reader may see. Forwarded here and not merged with
-    // a spread, like everything above it, because this object is an
-    // explicit allowlist of what reaches the query builder -- which is the
-    // right shape for a security boundary and is also exactly how this
-    // option came to be dropped the first time: the gate computed it, the
-    // builder supported it, and nothing carried it between them, so a
-    // member of one group read every group through a filter that named
-    // none. test/nip29-groups.test.ts is what said so.
+    // This object is an explicit allowlist of what reaches the query
+    // builder, so a new ReadOptions field must be forwarded here by hand.
+    // Dropping `groupIds` lets a member of one group read every group
+    // (test/nip29-groups.test.ts).
     ...(options.groupIds === undefined ? {} : { groupIds: options.groupIds }),
     scope,
-    // The tag scan budget is shared across the partitions this read
-    // covers, so an authorised read costs what limits.ts prices a tag
-    // filter at rather than twice it -- see FilterQueryOptions.
+    // Split the tag scan budget across partitions, so an authorised read
+    // costs what limits.ts priced, not twice it.
     tagScanDivisor: scopes.length,
   });
 
@@ -2038,127 +1459,34 @@ function runFilterQuery(
   return [...events];
 }
 
-// Rows written in the last 24h, summed from the per-event `row_cost`
-// column each INSERT stamps (schema.ts eventRowCost, storage.ts
-// insertEventRow). A read-only estimate, not a tracked counter -- see
-// limits.ts/relay.ts comments on why this relay avoids extra writes just
-// to measure itself. Backs /api/stats's `rowsWrittenToday`
-// (relay.ts getStats) and backfill's own headroom check (backfill.ts
-// hasBackfillHeadroom: backfill must yield to the owner's live traffic
-// rather than compete with it for the same daily ceiling) -- both need
-// the same number, so it lives here once rather
-// than being computed twice and risking drift between what the admin page
-// displays and what backfill actually throttles against.
+// Estimated rows written storing events ingested after `sinceCutoff`,
+// summed from the `row_cost` each insert stamps. Sole caller: backfill.ts
+// hasBackfillHeadroom (since 00:00 UTC), which keeps backfill inside its
+// BACKFILL_ROWS_SHARE_LIMIT so it never competes with live traffic.
 //
-// Measured by `ingested_at` -- when this relay actually wrote the row --
-// and never by `created_at`, which is when the author says they signed
-// it. Filtering on created_at made this function report rows
-// attributable to events *timestamped* in the window, so backfill's
-// writes (carrying years-old timestamps) were invisible to it: 729
-// reported against 33,000 actually written. See schema.ts's
-// `ingested_at` comment for the full account.
+// Keyed on `ingested_at`, never `created_at`: backfilled events carry
+// years-old timestamps, and filtering on created_at hid backfill's own
+// writes from the guard restraining it (schema.ts `ingested_at`).
 //
-// Rows read: E, where E is every row in `events`. It was E + T until
-// v0.7.2, and that join is the single change in this file that mattered
-// most to the read budget. The old query derived each event's tag count
-// live:
+// Rows read: the events ingested in the window, as a range seek on the
+// covering idx_events_ingested (ingested_at, row_cost). Without that index
+// it reads all of `events` on every check, a cost that grows with E. Never
+// join `event_tags` here to count tags; that read the whole tag table.
 //
-//   SELECT COUNT(t.event_id) FROM events e
-//   LEFT JOIN event_tags t ON t.event_id = e.id
-//   WHERE e.ingested_at > ? GROUP BY e.id
-//
-// `idx_event_tags_lookup` is (tag_name, tag_value, created_at) and
-// `event_id` appears nowhere in it, so SQLite resolved that join by
-// building an automatic index over the whole of `event_tags` -- reading
-// every tag row in the table to answer a question about the handful of
-// events in the 24h window. The cost tracked the TABLE, not the window.
-// backfill.ts hasBackfillHeadroom calls this twice per cron tick, so on
-// an hourly cron that one query was ~288E rows read per day, and at
-// E ~= 17,400 it was the entire 5,000,000/day ceiling on its own with no
-// client connected (CLAUDE.md "The budget").
-//
-// Summing a stamped column removed the join outright and never touches
-// `event_tags` at all. What remained was a scan of `events` itself,
-// because `ingested_at` led no index: E rows read to add up the rows in
-// a 24h window. That was left in place deliberately, on the grounds that
-// indexing `ingested_at` would cost a row write per event -- the exact
-// cost stamping the column had been chosen to avoid -- and that cutting
-// the floor from ~288E to ~48E was enough.
-//
-// It was not enough, and the reason is that E is not a constant. A cost
-// proportional to everything ever stored, paid twice per cron tick
-// forever, gets worse as the relay fills whether or not anything else
-// changes; it was the last remaining line in CLAUDE.md "The budget"'s
-// cron floor, binding at E ~= 104,000. Measured live at E = 4,232:
-// 4,224 rows read per call, which is to say it read the entire table to
-// answer a question about roughly a thousand rows.
-//
-// idx_events_ingested (schema.ts, v0.7.6) is (ingested_at, row_cost),
-// covering, so this is now a range seek answered from the index without
-// visiting the table: the size of the WINDOW, not the size of E, and it
-// scales with the day's ingest instead of with the accumulated history.
-// The price is one row written per stored event, ~1,100/day here against
-// 100,000. The reasoning that finally justified paying it is on the
-// index itself.
-//
-// Still an estimate, and still named one. It sums the cost of rows
-// currently standing for events ingested in the window, which is not
-// quite the same as every row written in it: a row written and then
-// deleted inside the same window drops out. Rows written before
-// `row_cost` existed carry NULL and are absent from the SUM entirely,
-// which undercounts for at most the one 24h window straddling an
-// upgrade. Both make this a floor rather than a ceiling, which is the
-// safe direction for the budget guard in backfill.ts
-// hasBackfillHeadroom -- it will never believe there is less headroom
-// than there is, only more, and the reserved-half rule
-// (BACKFILL_ROWS_SHARE_LIMIT) is what absorbs the difference.
-//
-// IT COUNTS INSERTIONS ONLY, AND IT IS NO LONGER THE WRITE-BUDGET
-// METER. `row_cost` is stamped by insertEventRow and nothing else, so no
-// deletion this relay performs appears in this number -- not the delete
-// half of a replaceable replacement, not NIP-09, not NIP-62 vanish, not
-// NIP-86 banevent, and not the tombstone any of them writes. Nor does
-// anything this relay writes that is not an event row: the follow cache
-// rebuild (ownership.ts refreshFollows, 900 rows at 300 follows), the
-// NIP-86 ban and settings tables, backfill's cursor bookkeeping. Every
-// one of those is a real write against the same 100,000/day ceiling.
-//
-// This comment used to end by saying to read the number as "rows written
-// STORING events, not rows written", because /api/stats displayed it as
-// the write-budget meter and the understatement was on the page. That is
-// no longer where the meter comes from. `rowsWrittenToday` is now
-// MEASURED -- every cursor's rowsWritten, accumulated by the wrapper in
-// read-metrics.ts and landed in an ingest-hour bucket by
-// settleRowsWritten above -- so the display counts everything and this
-// function has exactly one caller left.
-//
-// That caller is backfill.ts hasBackfillHeadroom, and the omission is
-// correct for it, which is why the function survives rather than being
-// replaced by the measured figure. The guard asks "may backfill write
-// more" and compares against BACKFILL_ROWS_SHARE_LIMIT, half the
-// ceiling; deletion traffic is bounded by its own reserved share
-// (limits.ts VANISH_ROWS_SHARE_LIMIT, a quarter) and cannot eat into
-// backfill's half however busy it gets. A guard protecting one share does
-// not need to see writes already bounded away from it.
-//
-// So the two numbers are deliberately different and neither feeds the
-// other: this one is a projection over stamped per-event costs, sized to
-// a reservation, and the meter is a measurement of what was actually
-// spent. Wiring the meter into this guard would make backfill yield to
-// traffic it is already insulated from; wiring this into the meter would
-// put the old understatement back on the admin page.
+// Insertions only, and an underestimate: deletions, tombstones and
+// non-event writes are absent, events deleted since are dropped, and NULL
+// `row_cost` rows are skipped. That is correct for this guard, because
+// deletion traffic has its own reserved share (limits.ts
+// VANISH_ROWS_SHARE_LIMIT). It is NOT the write-budget meter: /api/stats
+// `rowsWrittenToday` is measured (read-metrics.ts, landed by
+// settleRowsWritten). Keep the two separate; feeding the meter into this
+// guard would make backfill yield to traffic it is already insulated from.
 export function estimateRowsWrittenSince(sql: SqlStorage, sinceCutoff: number): number {
   return withReadPath("estimateRowsWrittenSince", () => estimateRowsWrittenSinceInner(sql, sinceCutoff));
 }
 
-// Scoped separately from whichever path called it (read-metrics.ts):
-// getStats displays this number once per admin page load, but
-// backfill.ts hasBackfillHeadroom calls it twice per cron tick, and
-// nothing in the /api/stats breakdown would distinguish those if this
-// inherited its caller's bucket. It was for a long time the single most
-// expensive line in the fixed daily floor, which is reason enough to
-// keep its own line in the report now that it is not -- a path that
-// stops being expensive is worth being able to see stay that way.
+// Reported under its own read-metrics.ts path rather than its caller's, so
+// its cost stays visible on /api/stats `reads` wherever it is called from.
 function estimateRowsWrittenSinceInner(sql: SqlStorage, sinceCutoff: number): number {
   return (
     sql
@@ -2190,11 +1518,9 @@ export function queryFilters(
 }
 
 // ---------------------------------------------------------------------
-// NIP-86 relay management (src/nip86.ts) storage. None of the queries
-// below run on the per-event write path or the REQ read path -- bans and
-// settings are written at operator pace, and the only one that runs on a
-// client-facing path at all is isIpBlocked, called exactly once per
-// WebSocket connection in Relay.fetch(). See schema.ts for the tables.
+// NIP-86 relay management (src/nip86.ts) storage, written at operator
+// pace. Of this section, only isIpBlocked runs on a client-facing path
+// (once per WebSocket connection).
 // ---------------------------------------------------------------------
 
 export interface BannedEvent {
@@ -2202,14 +1528,10 @@ export interface BannedEvent {
   reason: string | null;
 }
 
-// Records the ban AND tombstones the id. Both are needed and they do
-// different jobs: `banned_events` is the operator-visible record that
-// listbannedevents reads back, while the `deleted_ids` tombstone is what
-// actually stops the event from coming back -- a re-send from a client or
-// a replay from backfill (backfill.ts applyBackfillPage checks isDeleted)
-// would otherwise restore an event the operator just banned. Banning an
-// id that isn't stored is meaningful for exactly that reason: the
-// tombstone refuses it on arrival.
+// Records the ban AND tombstones the id. `banned_events` is what
+// listbannedevents reads back; the `deleted_ids` tombstone is what refuses
+// a client re-send or a backfill replay. Banning an id that is not stored
+// is meaningful for that reason.
 export function banEvent(sql: SqlStorage, id: string, reason: string | null, nowSec: number): void {
   deleteAndTombstone(sql, id);
   sql.exec(
@@ -2221,26 +1543,18 @@ export function banEvent(sql: SqlStorage, id: string, reason: string | null, now
   );
 }
 
-// The ONLY place in this codebase that deletes a row from `deleted_ids`,
-// deliberately and by NIP-86's definition of allowevent. Everywhere else
-// a tombstone is permanent on purpose: `deleted_ids` exists so a NIP-09
-// or NIP-62 deletion sticks even though the sender still holds a signed
-// copy they could replay (see schema.ts). Lifting it here is safe only
-// because the operator is the relay owner and is explicitly asking for
-// this id to become storable again -- which also means allowevent will
-// un-delete an id that was tombstoned by a NIP-09 deletion rather than by
-// banevent, if the owner passes one. That is the operator's call to make;
-// do not "fix" it by restricting the delete to ids present in
-// banned_events, since an id banned before it ever arrived has no other
-// way back.
+// The ONLY place that deletes a tombstone; everywhere else they are
+// permanent. The owner explicitly asking for an id to be storable again is
+// the one justification. This also lifts tombstones from NIP-09/NIP-62
+// deletions, which is the owner's call. Do not restrict it to ids in
+// `banned_events`; that would leave some tombstoned ids with no way back.
 export function allowEvent(sql: SqlStorage, id: string): void {
   sql.exec(`DELETE FROM banned_events WHERE id = ?`, id);
   sql.exec(`DELETE FROM deleted_ids WHERE id = ?`, id);
 }
 
-// Reads `banned_events`, never `deleted_ids` -- listing every tombstone
-// would report the owner's own NIP-09 deletions and NIP-62 vanish
-// requests as "banned events", which they are not.
+// Reads `banned_events`, never `deleted_ids`, which also holds NIP-09 and
+// NIP-62 deletions that are not bans.
 export function listBannedEvents(sql: SqlStorage): BannedEvent[] {
   return sql
     .exec<{ id: string; reason: string | null }>(
@@ -2254,15 +1568,11 @@ export interface BlockedIp {
   reason: string | null;
 }
 
-// ip is canonicalized (ip.ts normalizeIp) before it ever reaches storage
-// or a comparison, at all three call sites here plus the self-block check
-// in nip86.ts -- the same address written two different ways (an
-// operator's hand-typed, expanded IPv6 vs. Cloudflare's own compressed
-// CF-Connecting-IP) must resolve to the same key, or a block stored under
-// one spelling silently fails to match connections presenting the other:
-// listblockedips would read the row back as "blocked" while the
-// connection-time check below never fires. See ip.ts for the full
-// reasoning.
+// Every IP is canonicalized (ip.ts normalizeIp) before storage or
+// comparison, here and in nip86.ts's self-block check. Otherwise an
+// expanded IPv6 typed by the operator would never match Cloudflare's
+// compressed CF-Connecting-IP, and the block would list as active while
+// never firing.
 export function blockIp(sql: SqlStorage, ip: string, reason: string | null, nowSec: number): void {
   sql.exec(
     `INSERT INTO blocked_ips (ip, reason, blocked_at) VALUES (?, ?, ?)
@@ -2283,26 +1593,24 @@ export function listBlockedIps(sql: SqlStorage): BlockedIp[] {
     .toArray();
 }
 
-// One indexed lookup, run once per WebSocket connection in Relay.fetch()
-// -- never per message and never per event, so an IP block costs nothing
-// on the hot path. The management endpoint never calls this: see
-// src/nip86.ts.
+// Once per WebSocket connection in Relay.fetch(), never per message. Never
+// called for the management endpoint, so blocking your own address cannot
+// lock you out of the API that unblocks it.
 export function isIpBlocked(sql: SqlStorage, ip: string): boolean {
   return sql.exec(`SELECT 1 FROM blocked_ips WHERE ip = ?`, normalizeIp(ip)).toArray().length > 0;
 }
 
-// The stored rung of the relay identity chain (nip11.ts) -- what
-// changerelayname/changerelaydescription/changerelayicon write. Absent
-// keys read back as null; there is no "" value, because clearing deletes
-// the row (see setRelaySetting).
+// The stored rung of the relay identity chain (nip11.ts), written by
+// changerelayname/description/icon. Absent keys read as null; there is no
+// stored "" (see setRelaySetting).
 export interface RelaySettings {
   name: string | null;
   description: string | null;
   icon: string | null;
-  // The stored write policy (write-policy.ts resolveWritePolicy), what
-  // NIP-86 changewritepolicy writes. Kept as the string the operator
-  // supplied and parsed at resolution time, so an unparseable stored
-  // value falls through to the default rather than refusing every write.
+  // Written by NIP-86 changewritepolicy. Stored as the operator's string
+  // and parsed at resolution (write-policy.ts resolveWritePolicy), so an
+  // unparseable value falls through to the default instead of refusing
+  // every write.
   writePolicy: string | null;
 }
 
@@ -2317,9 +1625,9 @@ export function getRelaySettings(sql: SqlStorage): RelaySettings {
   };
 }
 
-// Just the stored policy, for the write path. One indexed row read, paid
-// by relay.ts once per wake (it caches the resolved policy per instance
-// and invalidates it on a management call) rather than per event.
+// The stored policy alone, for the write path. One row read per wake, not
+// per event: relay.ts caches the resolved policy per instance and clears it
+// after every management call.
 export function getStoredWritePolicy(sql: SqlStorage): string | null {
   const row = sql
     .exec<{ value: string }>(`SELECT value FROM relay_settings WHERE key = ?`, "write_policy")
@@ -2327,11 +1635,9 @@ export function getStoredWritePolicy(sql: SqlStorage): string | null {
   return row?.value ?? null;
 }
 
-// An empty string clears the stored value rather than storing one --
-// NIP-86 defines no unset operation, so this is bothy's convention for
-// falling back down the chain (README.md "Relay management API"). Storing
-// "" instead would be indistinguishable from a deliberate empty name and
-// would shadow the kind-0 and hardcoded rungs forever.
+// An empty string clears the stored value: NIP-86 has no unset operation,
+// so this is bothy's convention (README.md "Relay management API"). A
+// stored "" would shadow the kind-0 and default rungs forever.
 export type RelaySettingKey = "name" | "description" | "icon" | "write_policy";
 
 export function setRelaySetting(sql: SqlStorage, key: RelaySettingKey, value: string): void {
@@ -2348,11 +1654,10 @@ export function setRelaySetting(sql: SqlStorage, key: RelaySettingKey, value: st
 }
 
 // ---------------------------------------------------------------------
-// NIP-86 phase two (src/nip86.ts): banpubkey/unbanpubkey/listbannedpubkeys
-// and allowpubkey/unallowpubkey/listallowedpubkeys. Unlike everything else
-// in this section, isPubkeyBanned and isPubkeyAllowed below DO run on the
-// per-event write path (ownership.ts isAllowedWriter) -- see schema.ts for
-// the cost accounting.
+// NIP-86 pubkey lists: banpubkey/unbanpubkey/listbannedpubkeys and
+// allowpubkey/unallowpubkey/listallowedpubkeys. Two independent lists, not
+// two ends of one. isPubkeyBanned and isPubkeyAllowed DO run on the
+// per-event write path (ownership.ts isAllowedWriter).
 // ---------------------------------------------------------------------
 
 export interface BannedPubkey {
@@ -2382,9 +1687,8 @@ export function listBannedPubkeys(sql: SqlStorage): BannedPubkey[] {
     .toArray();
 }
 
-// The write-path check -- one indexed lookup per non-owner write, run
-// before the follows check (ownership.ts isAllowedWriter) so a banned
-// pubkey is refused even if it is also a follow.
+// One PK lookup per non-owner write, run before the follows check
+// (ownership.ts isAllowedWriter) so a banned follow is still refused.
 export function isPubkeyBanned(sql: SqlStorage, pubkey: string): boolean {
   return sql.exec(`SELECT 1 FROM banned_pubkeys WHERE pubkey = ?`, pubkey).toArray().length > 0;
 }
@@ -2394,11 +1698,9 @@ export interface AllowedPubkey {
   reason: string | null;
 }
 
-// The NIP-86 allowpubkey path, and the only one that writes
-// `source = 'owner'`. An existing row is PROMOTED rather than left alone:
-// an operator typing this command means the grant to outlive whatever the
-// group does next, and a kind-9001 remove-user must not be able to revoke
-// it afterwards. See schema.ts `allowed_pubkeys.source`.
+// NIP-86 allowpubkey: the only writer of `source = 'owner'`. An existing
+// row is PROMOTED to 'owner' (one-way), so a later kind-9001 remove-user,
+// which deletes only 'invite' rows, cannot revoke a deliberate grant.
 export function allowPubkey(sql: SqlStorage, pubkey: string, reason: string | null, nowSec: number): void {
   sql.exec(
     `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source) VALUES (?, ?, ?, 'owner')
@@ -2411,22 +1713,17 @@ export function allowPubkey(sql: SqlStorage, pubkey: string, reason: string | nu
 }
 
 // ---------------------------------------------------------------------
-// NIP-29 group membership (src/nip29.ts), and the group's half of the
-// allowlist beside it. Two nested lists: a row in `group_members` says a
-// pubkey may write `h`-tagged events, a row in `allowed_pubkeys` says it
-// may write here at all, and a member needs both -- see schema.ts
-// `allowed_pubkeys.source` for why the second one has to remember who
-// created it.
+// NIP-29 group membership (src/nip29.ts). Two nested lists: a
+// `group_membership` row lets a pubkey write to that group, an
+// `allowed_pubkeys` row lets it write here at all, and a member needs both.
+// `allowed_pubkeys.source` records who granted the outer row, so
+// remove-user can reclaim only what the group granted.
 // ---------------------------------------------------------------------
 
-// The row a new member needs in order to reach the relay at all -- written
-// by kind-9000 put-user and by a redeemed kind-9021 join request, which is
-// why the reason is the caller's to supply rather than a constant here.
-// DO NOTHING on conflict rather than an upsert. A pubkey already carrying
-// an owner-granted allowance keeps it as owner-granted: put-user must
-// never demote a deliberate grant into one remove-user can reclaim, which
-// an upsert writing `source = 'invite'` would do silently. And a pubkey
-// already carrying an invite-granted one needs nothing changed.
+// The outer-list row a new member needs, written by kind-9000 put-user and
+// a redeemed kind-9021 join. DO NOTHING on conflict, never an upsert: an
+// upsert writing 'invite' would silently demote an owner grant into one
+// remove-user can reclaim.
 export function allowPubkeyForGroup(
   sql: SqlStorage,
   pubkey: string,
@@ -2443,20 +1740,17 @@ export function allowPubkeyForGroup(
   );
 }
 
-// The inverse, and deliberately narrower than "delete the row": only what
-// the group itself granted comes back out. `AND source = 'invite'` is the
-// whole point of that column.
+// The inverse: removes only a group-granted ('invite') row, never an owner
+// grant.
 export function revokeGroupAllowance(sql: SqlStorage, pubkey: string): void {
   sql.exec(`DELETE FROM allowed_pubkeys WHERE pubkey = ? AND source = 'invite'`, pubkey);
 }
 
-// `groupId` defaults to the id the relay used to force, which is what
-// keeps every existing caller correct while there is still exactly one
-// group to be a member of. The default goes when the callers learn to
-// pass the id off the event they are gating -- it is an intermediate
-// state, not the destination, and it is a default rather than a
-// hard-coded constant inside the query so that removing it is a
-// signature change the compiler finds every caller of.
+// `groupId` here and in the next two functions defaults to
+// TOP_LEVEL_GROUP_ID for callers that do not yet pass the event's group
+// (nip29.ts authorizeGroupWrite and handleJoinRequest still rely on it).
+// A default parameter rather than a constant in the query, so removing it
+// makes the compiler find every such caller.
 export function addGroupMember(
   sql: SqlStorage,
   pubkey: string,
@@ -2478,9 +1772,8 @@ export function removeGroupMember(
   sql.exec(`DELETE FROM group_membership WHERE group_id = ? AND pubkey = ?`, groupId, pubkey);
 }
 
-// The write-path check (nip29.ts authorizeGroupWrite). Reached only for an
-// event carrying an `h` tag whose author is not the owner, so ordinary
-// traffic never pays it.
+// The group write check (nip29.ts authorizeGroupWrite), reached only for a
+// non-owner's group event, so ordinary traffic never pays it.
 export function isGroupMember(
   sql: SqlStorage,
   pubkey: string,
@@ -2492,31 +1785,9 @@ export function isGroupMember(
   );
 }
 
-// Ordered by pubkey, which makes the regenerated kind-39002 member list a
-// function of the member SET alone. That is what lets nip29.ts decide
-// whether to write a new one by comparing tags: ordered by `added_at`
-// instead, removing a member and adding them back would move them to the
-// end and rewrite an event whose membership had not changed.
-// Which groups this pubkey may READ, which is the same list it may write
-// to: a pubkey admitted to write to a group is by construction admitted to
-// read it back, and keeping the two answers one query is what stops them
-// drifting into a group somebody can post to and not see.
-//
-// One indexed seek on the (group_id, pubkey) primary key's second column
-// -- which is why `group_membership` is keyed that way round rather than
-// (pubkey, group_id): the far commoner question is "is THIS pubkey in
-// THIS group", asked once per group write and once per REQ, and it wants
-// the composite key's prefix. This question is asked once per REQ by a
-// non-owner and reads one row per group they are in.
-// Brings a group into being -- the row that makes an id one this relay
-// hosts, and therefore the whole of what NIP-29 means by a relay creating
-// "rules around some specific ids".
-//
-// Invalidates the hosted-group memo, which is the one write that changes
-// it: everything downstream of `hostsGroup` -- which partition a row lands
-// in, whether a moderation event names something real -- is wrong until it
-// does, and wrong in the direction of filing a new group's traffic into
-// the public partition.
+// Brings a group into being: the row that makes an id one this relay hosts.
+// Must invalidate the hostsGroup memo, or the new group's events would be
+// filed in the public partition.
 export function createGroup(sql: SqlStorage, id: string, nowSec: number): void {
   sql.exec(
     `INSERT INTO groups (id, created_at, is_closed) VALUES (?, ?, 1) ON CONFLICT(id) DO NOTHING`,
@@ -2526,6 +1797,14 @@ export function createGroup(sql: SqlStorage, id: string, nowSec: number): void {
   invalidateHostedGroups();
 }
 
+// The groups this pubkey may READ, which is the same list it may write to;
+// one query for both keeps them from diverging. Asked once per REQ by an
+// authenticated non-owner.
+//
+// Not an index seek: no index leads with `pubkey`, so this reads every
+// `group_membership` row. The primary key is (group_id, pubkey) because the
+// commoner question, "is THIS pubkey in THIS group" (isGroupMember), wants
+// that prefix.
 export function listMemberGroups(sql: SqlStorage, pubkey: string): string[] {
   return sql
     .exec<{ group_id: string }>(
@@ -2536,6 +1815,10 @@ export function listMemberGroups(sql: SqlStorage, pubkey: string): string[] {
     .map((r) => r.group_id);
 }
 
+// Ordered by pubkey so the regenerated kind-39002 member list depends only
+// on the member SET: nip29.ts skips the rewrite when the tags are equal,
+// and ordering by `added_at` would make a remove-and-re-add rewrite an
+// unchanged list.
 export function listGroupMembers(sql: SqlStorage, groupId: string = TOP_LEVEL_GROUP_ID): string[] {
   return sql
     .exec<{ pubkey: string }>(
@@ -2546,10 +1829,8 @@ export function listGroupMembers(sql: SqlStorage, groupId: string = TOP_LEVEL_GR
     .map((r) => r.pubkey);
 }
 
-// Group members with no `allowed_pubkeys` row: the containment the two
-// nested lists are supposed to have, checked once a day by
-// auditMaintainedCounts above. M rows plus an indexed seek each, where M
-// is the member count.
+// Members (of any group) with no `allowed_pubkeys` row, for the daily
+// check in auditMaintainedCounts. Rows read: M plus a PK seek each.
 export function groupMembersWithoutAllowance(sql: SqlStorage): string[] {
   return sql
     .exec<{ pubkey: string }>(
@@ -2564,8 +1845,8 @@ export function groupMembersWithoutAllowance(sql: SqlStorage): string[] {
 
 // ---------------------------------------------------------------------
 // NIP-29 invite codes (src/nip29.ts). One row per kind-9009 the owner
-// publishes; the row, not the event, is what a kind-9021 join request is
-// checked against -- see schema.ts `group_invites`.
+// publishes; a kind-9021 join is checked against the row, not the event
+// (schema.ts `group_invites`).
 // ---------------------------------------------------------------------
 
 export interface GroupInvite {
@@ -2577,10 +1858,9 @@ export interface GroupInvite {
   revoked_at: number | null;
 }
 
-// What a presented code turned out to be. Four of the five are refusals,
-// and nip29.ts collapses all of them into ONE message on the wire -- this
-// distinction exists for the owner's log line and for the NIP-86 methods,
-// never for the person who presented the code. See handleJoinRequest.
+// What a presented code turned out to be. nip29.ts handleJoinRequest sends
+// the same refusal for all four failures, so the code cannot be used as an
+// oracle; the distinction is for the owner's log and NIP-86 only.
 export type InviteOutcome = "redeemed" | "unknown" | "revoked" | "spent" | "expired";
 
 export function lookupInvite(sql: SqlStorage, code: string): GroupInvite | null {
@@ -2611,12 +1891,9 @@ export function createInvite(sql: SqlStorage, code: string, createdAt: number, e
   );
 }
 
-// Outstanding means redeemable right now: unspent, unrevoked, unexpired.
-// The same three conditions as listUnusedInvites below and as the
-// redeemable branch of redeemInvite -- stated three times because they
-// are three different statements, and kept identical because a row this
-// count admits and a redemption refuses would be a cap the owner cannot
-// clear by using the invites it is counting.
+// Outstanding = redeemable now: unspent, unrevoked, unexpired. Keep these
+// conditions identical to listUnusedInvites and redeemInvite, or the
+// MAX_OUTSTANDING_INVITES cap could count invites that can never be used.
 export function countOutstandingInvites(sql: SqlStorage, nowSec: number): number {
   return (
     sql
@@ -2648,22 +1925,14 @@ export function listUnusedInvites(sql: SqlStorage, nowSec: number): UnusedInvite
     .toArray();
 }
 
-// Classify, then spend -- both here, so SINGLE USE is a property of one
-// statement rather than of a caller's ordering.
+// Classify, then spend, both here so single use does not depend on a
+// caller's ordering. The UPDATE repeats the SELECT's conditions on
+// purpose: the SELECT decides what to report, the UPDATE what to write, and
+// only the UPDATE must be safe against a double redemption if anything is
+// ever put between the two.
 //
-// The UPDATE repeats every condition the SELECT above just checked, which
-// looks redundant and is not the same claim: the SELECT decides what to
-// TELL the owner, the UPDATE decides what to WRITE, and only the second
-// one has to be safe against two redemptions of the same code. A Durable
-// Object is single-threaded and nothing awaits between these two
-// statements, so today they cannot disagree; the guard is what keeps that
-// true if a future caller ever puts something between them.
-//
-// The classification order is revoked, then spent, then expired, because
-// a row can be more than one at once and the owner wants the most
-// decisive reason: an invite that was revoked and has since also lapsed
-// was revoked, and saying "expired" would describe the clock instead of
-// the act.
+// Order revoked, spent, expired: a row can be several at once, and the
+// owner should see the act (revoked) rather than the clock (expired).
 export function redeemInvite(
   sql: SqlStorage,
   code: string,
@@ -2686,23 +1955,16 @@ export function redeemInvite(
   return "redeemed";
 }
 
-// What a revoke did. A separate type from InviteOutcome above, which
-// describes a REDEMPTION -- reusing it would have made "revoked" mean
-// "this revoke succeeded" in one function and "this code was already dead
-// when you presented it" in the other.
+// What a revoke did. Separate from InviteOutcome so "revoked" does not mean
+// both "this revoke succeeded" and "the code was already dead".
 export type RevokeOutcome = "revoked" | "unknown" | "spent" | "already-revoked";
 
-// NIP-86 revokeinvite (src/nip86.ts). Says exactly why a revoke did
-// nothing -- here the caller IS the owner, so there is nobody to keep the
-// distinction from, which is the opposite of the join path's rule.
+// NIP-86 revokeinvite. The caller is the authenticated owner, so unlike
+// the join path it says exactly why nothing happened.
 //
-// A spent invite is left alone rather than marked revoked: it is already
-// unusable, and overwriting its history would lose `redeemed_by`, which
-// is the only record of who the code let in.
-//
-// An EXPIRED but unspent invite is revoked normally rather than reported
-// as already-dead. The owner saying they meant it dead outlives the clock
-// having made it so, and the row is what an admin reads back later.
+// A spent invite is left alone: it is already unusable, and `redeemed_by`
+// is the only record of who it let in. An expired but unspent invite is
+// revoked normally, so the row records the owner's act, not just the clock.
 export function revokeInvite(sql: SqlStorage, code: string, nowSec: number): RevokeOutcome {
   const invite = lookupInvite(sql, code);
   if (invite === null) return "unknown";
@@ -2724,9 +1986,8 @@ export function listAllowedPubkeys(sql: SqlStorage): AllowedPubkey[] {
     .toArray();
 }
 
-// The write-path check -- ownership.ts isAllowedWriter only calls this on
-// the path already about to reject a write (owner-only mode, or "not a
-// follow"), so it costs nothing on the common accept path.
+// ownership.ts isAllowedWriter calls this only on a path already about to
+// reject the write, so the common accept path never pays it.
 export function isPubkeyAllowed(sql: SqlStorage, pubkey: string): boolean {
   return sql.exec(`SELECT 1 FROM allowed_pubkeys WHERE pubkey = ?`, pubkey).toArray().length > 0;
 }
@@ -2734,10 +1995,9 @@ export function isPubkeyAllowed(sql: SqlStorage, pubkey: string): boolean {
 // ---------------------------------------------------------------------
 // Web push subscriptions (src/push.ts, src/nip86.ts subscribepush).
 //
-// The pubkey on every row here is the one the NIP-98 signature proved,
-// never one a request body offered -- see schema.ts `push_subscriptions`.
-// These functions take it as a parameter and never derive it, so there is
-// no path through this file where a body could reach that column.
+// The pubkey on every row is the one the NIP-98 signature proved, never one
+// from a request body (schema.ts `push_subscriptions`); these functions
+// take it as a parameter and never derive it.
 // ---------------------------------------------------------------------
 
 export interface PushSubscriptionRow {
@@ -2747,24 +2007,19 @@ export interface PushSubscriptionRow {
   auth: string;
 }
 
-// The same row plus the only column the fan-out reads and does not send:
-// when this endpoint last worked, which decides whether a success is
-// worth a row write at all (limits.ts PUSH_LAST_OK_INTERVAL_SECONDS).
+// Plus `last_ok_at`, which decides whether a successful send is worth a
+// row write (limits.ts PUSH_LAST_OK_INTERVAL_SECONDS).
 export interface PushFanoutRow extends PushSubscriptionRow {
   last_ok_at: number | null;
 }
 
-// Registers or refreshes one endpoint, evicting this pubkey's oldest if
-// they are already at the cap.
+// Registers or refreshes one endpoint, evicting this pubkey's oldest beyond
+// the cap.
 //
-// An upsert rather than an insert, because a browser hands the same
-// endpoint back on every load once it has one (hearth's subscribeToPush
-// reuses `getSubscription()`), and because the keys behind an endpoint
-// can legitimately change. Rebinding an endpoint to a DIFFERENT pubkey is
-// allowed for the same reason: an endpoint belongs to a browser profile,
-// and a household laptop signed into one npub and then another is one
-// endpoint that genuinely changed hands. The row moving means the old
-// pubkey stops receiving on it, which is the correct outcome.
+// An upsert: browsers re-send the same endpoint on every load, and its keys
+// can change. Rebinding to a DIFFERENT pubkey is allowed because an
+// endpoint belongs to a browser profile, which can switch npubs; the old
+// pubkey then stops receiving on it, which is correct.
 export function upsertPushSubscription(
   sql: SqlStorage,
   row: PushSubscriptionRow,
@@ -2785,20 +2040,13 @@ export function upsertPushSubscription(
     row.auth,
     nowSec,
   );
-  // Oldest out, not newest refused. A browser that rotates its endpoint
-  // -- which they do, on their own schedule and without telling anyone --
-  // would otherwise fill a member's four slots with dead rows and lock
-  // them out of their own notifications, with the newest registration,
-  // the only live one, being the one turned away.
+  // Evict the oldest rather than refuse the newest: browsers rotate
+  // endpoints silently, and refusing would fill the slots with dead rows
+  // and turn away the one live registration.
   //
-  // `rowid DESC` breaks the tie, and it is load-bearing rather than
-  // tidy: `created_at` is a whole second, and four devices registered by
-  // one person setting up their phone and laptop land inside one. Ordered
-  // by endpoint instead, the survivor would be whichever string sorted
-  // first -- which is to say arbitrary, and specifically NOT the
-  // registration that just arrived. `endpoint` is a TEXT primary key and
-  // so not a rowid alias, which is what leaves the implicit rowid free to
-  // carry insertion order.
+  // `rowid DESC` is a load-bearing tie-break: several registrations often
+  // share one `created_at` second, and the implicit rowid (free because the
+  // TEXT primary key is not a rowid alias) keeps the newest.
   sql.exec(
     `DELETE FROM push_subscriptions
        WHERE pubkey = ?
@@ -2812,12 +2060,9 @@ export function upsertPushSubscription(
   );
 }
 
-// Scoped to the pubkey that signed the call, not to the endpoint alone.
-// Without the `AND pubkey = ?` any member holding a valid NIP-98 key
-// could unsubscribe anybody else's device by naming its endpoint --
-// endpoints are not secrets to the people who have seen a fan-out fail,
-// and silently turning somebody's notifications off is a quieter kind of
-// damage than turning them on.
+// Scoped to the signing pubkey, not the endpoint alone. Endpoints are not
+// secret, so without `AND pubkey = ?` any member could silently turn off
+// someone else's notifications.
 export function deletePushSubscription(sql: SqlStorage, pubkey: string, endpoint: string): boolean {
   const before = sql
     .exec(`SELECT 1 FROM push_subscriptions WHERE endpoint = ? AND pubkey = ?`, endpoint, pubkey)
@@ -2827,17 +2072,15 @@ export function deletePushSubscription(sql: SqlStorage, pubkey: string, endpoint
   return true;
 }
 
-// Deletes by endpoint alone -- the disposal path, for an endpoint the
-// push service itself reported gone (404/410). No pubkey to scope it to:
-// the authority here is the push service, not a caller.
+// Deletes by endpoint alone, for an endpoint the push service reported
+// gone (404/410). The authority is the push service, not a caller.
 export function forgetPushEndpoint(sql: SqlStorage, endpoint: string): void {
   sql.exec(`DELETE FROM push_subscriptions WHERE endpoint = ?`, endpoint);
 }
 
-// One page of the fan-out. Ordered by endpoint and resumed by endpoint
-// (schema.ts `push_outbox.cursor`) so a subscription added or removed
-// mid-fan-out cannot shift the page boundary underneath the cursor, which
-// a rowid offset would.
+// One page of the fan-out, ordered and resumed by endpoint
+// (schema.ts `push_outbox.cursor`), so subscriptions added or removed
+// mid-fan-out cannot shift the page boundary as a rowid offset would.
 export function pushSubscriptionsAfter(
   sql: SqlStorage,
   after: string | null,
@@ -2869,9 +2112,9 @@ export function countPushSubscriptions(sql: SqlStorage): number {
 }
 
 // ---------------------------------------------------------------------
-// The push outbox (schema.ts `push_outbox`, relay.ts drainPushOutbox).
-// At most two rows -- one per notification reason -- because messages
-// arriving in the same few seconds are one notification.
+// The push outbox (schema.ts `push_outbox`, relay.ts drainPushOutbox):
+// one row per notification reason, so messages arriving close together
+// become one notification.
 // ---------------------------------------------------------------------
 
 export interface PushOutboxRow {
@@ -2885,12 +2128,9 @@ export interface PushOutboxRow {
 // Queues a notification, or folds this occurrence into the one already
 // queued for the same reason.
 //
-// Folding does NOT reset `cursor` or `sent`: a fan-out already halfway
-// through its endpoints keeps going rather than starting again, so a busy
-// room cannot make the drain restart forever and never reach the last
-// member. It does add the new actor, so somebody who has just posted is
-// not pushed about their own message even when it arrived after the row
-// did.
+// Folding does NOT reset `cursor` or `sent`, so a busy room cannot keep
+// restarting a fan-out that never reaches the last member. It does add the
+// actor, so nobody is pushed about their own message.
 export function queuePush(sql: SqlStorage, reason: string, actor: string, nowSec: number): void {
   const existing = sql
     .exec<{ actors: string }>(`SELECT actors FROM push_outbox WHERE reason = ?`, reason)
@@ -2910,9 +2150,8 @@ export function queuePush(sql: SqlStorage, reason: string, actor: string, nowSec
   sql.exec(`UPDATE push_outbox SET actors = ? WHERE reason = ?`, JSON.stringify(actors), reason);
 }
 
-// A stored column parsed back, so a row written by some future version --
-// or corrupted -- degrades into "exclude nobody" rather than throwing
-// inside the alarm and stalling every pending notification.
+// A malformed `actors` value degrades to "exclude nobody" rather than
+// throwing inside the alarm and stalling every pending notification.
 function parseActors(raw: string): string[] {
   try {
     const parsed = JSON.parse(raw) as unknown;
@@ -2942,9 +2181,8 @@ export function clearPush(sql: SqlStorage, reason: string): void {
 // ---------------------------------------------------------------------
 // Call presence (schema.ts `presence`, limits.ts's presence block).
 //
-// Read and written at most once per PRESENCE_WRITE_INTERVAL_SECONDS per
-// pubkey -- relay.ts's in-memory tier is what keeps the seven beats in
-// between from reaching this file at all.
+// Reached at most once per PRESENCE_WRITE_INTERVAL_SECONDS per pubkey;
+// relay.ts's in-memory tier answers the beats in between.
 // ---------------------------------------------------------------------
 
 export function lastPresenceAt(sql: SqlStorage, pubkey: string): number | null {
@@ -2963,12 +2201,9 @@ export function recordPresence(sql: SqlStorage, pubkey: string, nowSec: number):
   );
 }
 
-// A deliberate departure: hearth publishes a kind-25051 with
-// `{"status":"leave"}` when somebody closes the call, and honouring it
-// means their next arrival is announced however soon it comes. Without
-// this, leaving and coming back inside PRESENCE_STALE_SECONDS would be
-// silent -- which is the right default for a dropped connection and the
-// wrong one for somebody who said they were going.
+// For hearth's kind-25051 `{"status":"leave"}`: clearing the row means the
+// next arrival is announced even within PRESENCE_STALE_SECONDS, which is
+// silent by default so that a dropped connection is not announced.
 export function clearPresence(sql: SqlStorage, pubkey: string): void {
   sql.exec(`DELETE FROM presence WHERE pubkey = ?`, pubkey);
 }
@@ -2976,20 +2211,15 @@ export function clearPresence(sql: SqlStorage, pubkey: string): void {
 // ---------------------------------------------------------------------
 // Ephemeral group chat (schema.ts `chat_state`, limits.ts's chat block).
 //
-// One row of state and one index seek. Everything here reads or writes
-// that row except sweepChat's own DELETEs, which go through
-// deleteEventRow like every other removal in this file.
+// State is the single `chat_state` row these functions read and update
+// without a group_id filter (schema.ts seeds exactly one); the sweep is a
+// range over idx_events_kind_created_grp.
 //
-// ONE KIND, and the scope is stated as a kind rather than as a partition
-// on purpose. The group partition holds far more than talk -- reactions,
-// the relay-generated 39000-series, the moderation events that produced
-// it, invite codes -- and none of that is a conversation. Kind 9 is what
-// NIP-29 calls a chat message and what push.ts already raises a
-// notification for, so it is the one kind that expires. A kind-7 reaction
-// to a swept message therefore outlives the message it points at, which
-// is a wart and is left alone deliberately: widening the scope past what
-// was asked for is a worse mistake than a dangling reaction, and this
-// constant is the single place to widen it if that changes.
+// Only kind 9 (groups.ts GROUP_CHAT_KIND) expires. The group partition
+// also holds reactions, moderation events, relay-generated state and
+// invite codes, none of which is conversation. A kind-7 reaction to a
+// swept message outlives it; that is accepted, and GROUP_CHAT_KIND is the
+// one place to widen the scope.
 // ---------------------------------------------------------------------
 
 export interface ChatState {
@@ -3000,9 +2230,7 @@ export interface ChatState {
   reportedPending: number;
 }
 
-// One row read. The row is seeded by initSchema, so the fallback below is
-// for the one wake between an upgrade and that seed and never for normal
-// operation.
+// One row read. initSchema seeds the row; the fallback is defensive only.
 export function readChatState(sql: SqlStorage): ChatState {
   const row = sql
     .exec<{
@@ -3025,84 +2253,54 @@ export function readChatState(sql: SqlStorage): ChatState {
   };
 }
 
-// The room was not empty at `nowSec`. One row updated in place, and the
-// caller is expected to have decided both that the room is occupied
-// (relay.ts groupOccupants, against MIN_ROOM_OCCUPANTS) and that the
-// stored value is stale enough to be worth moving (relay.ts's in-memory
-// tier, against CHAT_OCCUPANCY_WRITE_INTERVAL_SECONDS) -- the same
-// two-tier shape recordPresence sits behind, and for the same reason.
+// Records that the room was occupied at `nowSec`. The caller decides that
+// it is (relay.ts groupOccupants, MIN_ROOM_OCCUPANTS) and that the stored
+// value is stale enough to rewrite (CHAT_OCCUPANCY_WRITE_INTERVAL_SECONDS).
 //
-// MAX rather than a plain assignment: an evicted object's in-memory tier
-// is empty, so two entry points in the same second can both decide to
-// write, and a clock that can move backwards is a cutoff that can delete
-// less than the previous sweep already did.
+// MAX, not assignment: after an eviction the in-memory tier is empty and
+// writes can arrive out of order, and the watermark must never move back.
 export function noteRoomOccupied(sql: SqlStorage, nowSec: number): void {
   sql.exec(`UPDATE chat_state SET last_occupied_at = MAX(last_occupied_at, ?)`, nowSec);
 }
 
-// The oldest `created_at` a read of the group's chat may return.
+// The oldest `created_at` a read of the group's chat may return:
 //
-// Two rules in one expression, and the MIN is what joins them:
+//   room occupied  watermark is near now, so the horizon is
+//                  now - CHAT_BACKLOG_SECONDS: a late arrival sees the
+//                  last few minutes.
+//   room empty     the horizon is the watermark: a reader sees only the
+//                  notes left since the room emptied.
 //
-//   while the room is occupied  last_occupied_at is close to now, so the horizon
-//                               is now - CHAT_BACKLOG_SECONDS: somebody
-//                               arriving partway through sees the last
-//                               few minutes.
-//   while the room is empty     last_occupied_at is older than the
-//                               backlog window, so the horizon is
-//                               last_occupied_at: what a reader sees is
-//                               exactly the notes left since the room
-//                               emptied, and none of the conversation
-//                               before them.
-//
-// The transition between the two is a fade rather than a step, since the
-// backlog window catches up with the watermark over
-// CHAT_BACKLOG_SECONDS after the last person leaves.
-//
-// Not a second expiry. Everyone who was in the room already holds these
-// messages from their own live subscription; this is what a REQ is
-// clamped to, and it is where the rows-read saving comes from between one
-// sweep and the next.
+// The MIN makes the change gradual over CHAT_BACKLOG_SECONDS. Not a second
+// expiry: it clamps REQs, which is where the rows-read saving between
+// sweeps comes from.
 export function chatHorizon(state: ChatState, nowSec: number): number {
   return Math.min(nowSec - CHAT_BACKLOG_SECONDS, state.lastOccupiedAt);
 }
 
-// The cutoff one sweep would remove up to: every kind-9 in the group at or
-// before this second is over.
+// The cutoff a sweep removes up to (inclusive). Once the room has been
+// empty for CONVERSATION_IDLE_SECONDS, everything at or before the
+// watermark (said while somebody was present) goes. The watermark both
+// ends the conversation and separates speech from notes, so no
+// per-message bookkeeping is needed.
 //
-// ONE RULE, and `last_occupied_at` is the whole of it. Once the room has
-// been empty for CONVERSATION_IDLE_SECONDS, everything said while
-// somebody was still in it goes -- and everything said while somebody was
-// still in it is exactly everything at or before the moment the room was
-// last not-empty. So the watermark that decides when the conversation
-// ended is also the line between what belongs to it and what does not,
-// and the speech/note distinction needs no per-message bookkeeping at
-// all.
-//
-// Nothing bounds a note. A message sent to an empty room sits after this
-// cutoff and keeps sitting there until somebody comes and the watermark
-// moves past it, however long that takes -- see limits.ts, where the
-// ceiling that used to be here is argued out of existence.
-//
-// Returns 0 while the room is in use, which is the ordinary case: a
-// conversation in progress sweeps nothing.
+// A note (a message sent to an empty room) is after the cutoff and waits,
+// with no time limit, until the watermark passes it (see limits.ts on why
+// there is no ceiling). Returns 0 while the room is in use.
 export function chatSweepCutoff(state: ChatState, nowSec: number): number {
   return nowSec - state.lastOccupiedAt >= CONVERSATION_IDLE_SECONDS ? state.lastOccupiedAt : 0;
 }
 
-// How many messages that cutoff covers, for the report.
-//
-// A COUNT over idx_events_kind_created_grp, which carries `kind` and
-// `created_at` as its key columns and is partial on `is_group = 1` -- so
-// this is an index range scan and reads one entry per eligible message
-// without touching the table or a single tag row. Bounded by what the
-// group holds rather than by anything this function chooses, which is why
-// the sweep calls it once per cron tick and never per request.
+// How many messages that cutoff covers, for the report. A range over
+// idx_events_kind_created_grp; `group_id` is not in that index, so it also
+// reads the table row of every kind-9 in the group partition up to the
+// cutoff. Bounded by what the group holds, so call it once per cron tick,
+// never per request.
 export function countChatBefore(sql: SqlStorage, cutoff: number): number {
   const row = sql
     .exec<{ n: number }>(
-      // Same scope as the delete below, or the reporting mode would name a
-      // number larger than deleting mode would ever remove.
+      // Same scope as sweepChat's delete, so reporting mode reports what
+      // deleting mode would remove.
       `SELECT COUNT(*) AS n FROM events
         WHERE kind = ? AND is_group = ? AND group_id = ? AND created_at <= ?`,
       GROUP_CHAT_KIND,
@@ -3115,8 +2313,7 @@ export function countChatBefore(sql: SqlStorage, cutoff: number): number {
 }
 
 export interface ChatSweep {
-  // What the cutoff was, so the log line can say what it acted on rather
-  // than only how much.
+  // For the log line.
   cutoff: number;
   // How many messages the cutoff covered when the sweep began.
   pending: number;
@@ -3127,28 +2324,23 @@ export interface ChatSweep {
   done: boolean;
 }
 
-// One tick's worth of the sweep.
+// One cron tick of the sweep. `remove` (decided by the caller from
+// EPHEMERAL_CHAT) separates deleting from reporting; both modes compute and
+// store the same report.
 //
-// `remove` is what separates reporting from deleting, and it is a
-// parameter rather than an env read so this function has one behaviour to
-// test and the mode is decided once, by the caller. In both modes the
-// report is computed and stored: reporting mode is meant to produce
-// exactly the numbers deleting mode would have acted on.
+// No tombstones (deleteEventRow, not deleteAndTombstone): a `deleted_ids`
+// row per message would keep a permanent record of every conversation,
+// which is what this exists to remove. Replay is refused instead by
+// `swept_through`, which nip29.ts authorizeGroupWrite compares an incoming
+// chat message's `created_at` against.
 //
-// NO TOMBSTONES, which is the one place this departs from every other
-// removal in this file. deleteEventRow rather than deleteAndTombstone:
-// a `deleted_ids` row per message would leave two permanent rows behind
-// for every message deleted, so the relay would accumulate a record of
-// the conversation for as long as it accumulated conversations -- the
-// exact thing being removed, kept in a smaller box. The replay that
-// tombstones exist to refuse is refused instead by `swept_through`, which
-// nip29.ts authorizeGroupWrite compares an incoming chat message's
-// `created_at` against: one integer, refusing every message of every
-// swept conversation at once.
+// Oldest first, so a partial batch leaves a contiguous remainder.
 //
-// Oldest first, so a batch that runs out leaves a contiguous remainder
-// for the next tick, and so the checkpoint below can advance on
-// "returned fewer than asked for" the way drainVanish does.
+// The sweep and the read horizon measure the client-signed `created_at`,
+// the column idx_events_kind_created_grp is keyed on. A member can date a
+// message forward to outlive its conversation (by at most
+// MAX_CREATED_AT_FUTURE_SECONDS) or backward to have it swept early.
+// Accepted: writers are members, and the next cutoff collects it.
 export function sweepChat(
   sql: SqlStorage,
   state: ChatState,
@@ -3158,12 +2350,10 @@ export function sweepChat(
 ): ChatSweep {
   const cutoff = chatSweepCutoff(state, nowSec);
 
-  // Nothing new is covered: either the room is in use, or the last sweep
-  // already drained everything this cutoff names. Returns before the
-  // COUNT and before any write, which is what keeps a room standing empty
-  // with an undelivered note in it costing one row read per tick forever
-  // rather than a row written per tick forever. With no ceiling on a note
-  // that is not a rare state -- it is where an unread note lives.
+  // Nothing new to cover (room in use, or already drained). Return before
+  // the COUNT and any write: an empty room holding an unread note is a
+  // normal long-lived state and must cost nothing per tick beyond the state
+  // read.
   if (cutoff <= state.sweptThrough) {
     return { cutoff, pending: 0, removed: 0, done: true };
   }
@@ -3171,27 +2361,15 @@ export function sweepChat(
   const pending = countChatBefore(sql, cutoff);
 
   if (!remove) {
-    // Reporting mode writes the report and nothing else. One row per cron
-    // tick, 24 a day, which is what buys an owner a state to read back
-    // instead of a log line they had to be watching for.
+    // Reporting mode writes only the report: one row per tick.
     sql.exec(`UPDATE chat_state SET reported_at = ?, reported_pending = ?`, nowSec, pending);
     return { cutoff, pending, removed: 0, done: pending === 0 };
   }
 
-  // Scoped to the group whose watermark this cutoff came from.
-  //
-  // `chat_state` is still one row, so the occupancy watermark and the
-  // swept-through checkpoint both describe the group that row is for. The
-  // sweep therefore has to delete that group's chat and nothing else: a
-  // relay hosting two groups would otherwise decide when group B's
-  // conversation ended by watching who was in group A, and delete B's
-  // messages on A's schedule. Bounded here rather than by making the whole
-  // sweep per-group, which is the correct shape and a larger change --
-  // this is the part that must not be wrong in the meantime, because it is
-  // the part that deletes.
-  //
-  // The consequence, stated so it is a known limit rather than a surprise:
-  // chat in a group other than this one does not expire at all.
+  // Limited to TOP_LEVEL_GROUP_ID, the group the single `chat_state` row
+  // describes. Without this, a relay hosting several groups would delete
+  // one group's chat on another group's schedule. Known limit until the
+  // sweep is made per-group: chat in any other group never expires.
   const targets = sql
     .exec<{ id: string }>(
       `SELECT id FROM events WHERE kind = ? AND is_group = ? AND group_id = ? AND created_at <= ?
@@ -3205,15 +2383,10 @@ export function sweepChat(
     .toArray();
   for (const target of targets) deleteEventRow(sql, target.id);
 
-  // Fewer than asked for means the range is exhausted, checked against
-  // the limit rather than by re-running the query -- the same call
-  // drainVanish makes, for the same reason.
+  // Fewer than `limit` means the range is exhausted.
   const done = targets.length < limit;
-  // `swept_through` advances only on a completed range. A partial sweep
-  // leaves it where it was: nothing depends on it being current, and a
-  // watermark that ran ahead of the deletion would refuse a replay of a
-  // message still sitting in the table, which is a state with no reader
-  // and no reason to exist.
+  // `swept_through` advances only when the range is complete, so it never
+  // runs ahead of messages still stored.
   sql.exec(
     `UPDATE chat_state
         SET swept_through = MAX(swept_through, ?),

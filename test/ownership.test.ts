@@ -1,6 +1,6 @@
-// Owner-gated writes (CLAUDE.md "Threat model": "Writes
-// are owner-only and signature-verified" for anyone not the owner or,
-// under the default write policy, one of the owner's follows).
+// Owner-gated writes (src/ownership.ts isAllowedWriter): every event is
+// signature-verified, and only the owner or, under the default write
+// policy, one of the owner's follows may write.
 //
 // The global test env sets no WRITE_POLICY (vitest.config.ts), and the
 // default policy is "follows" -- a non-owner stranger here is rejected
@@ -8,10 +8,10 @@
 // test/follows.test.ts for the owner-only case.
 //
 // The OWNER_PUBKEY fixture here is injected as a miniflare binding in
-// vitest.config.ts, matching CLAUDE.md's documented env-override path:
-// "If OWNER_PUBKEY is set in env, skip storage entirely, use the env
-// value." The TOFU claim flow itself is test/claim.test.ts's job, not
-// this suite's.
+// vitest.config.ts, exercising the env-override path in
+// src/ownership.ts getOwnerPubkey: with OWNER_PUBKEY set, the stored
+// owner row is never consulted. The TOFU claim flow itself is
+// test/claim.test.ts's job, not this suite's.
 import { describe, expect, it, vi } from "vitest";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
@@ -84,8 +84,8 @@ describe("ownership write gate", () => {
     expect(message).toBe(
       "restricted: only the owner and people they follow can publish here",
     );
-    // Schnorr verification is the most expensive per-event operation
-    // (CLAUDE.md "The budget") -- a non-owner write is rejected on the
+    // Schnorr verification (src/validate.ts verifySignature) is the most
+    // expensive per-event operation -- a non-owner write is rejected on the
     // pubkey check alone, before it's ever paid for.
     expect(verifySignature).not.toHaveBeenCalled();
     conn.close();

@@ -1,9 +1,7 @@
-// Immediate follow cache refresh on an owner-authored kind-3
-// (CLAUDE.md "The budget" "immediate write-gate refresh"; CLAUDE.md "Owner-only
-// writes"). Before this, refreshFollows only ran on the hourly cron
-// (Relay.runCron), so a follow added moments ago couldn't write for up to
-// an hour, and a relay whose owner had never published a kind-3 here had a
-// silently empty allowlist.
+// Immediate follow cache refresh on an owner-authored kind-3 (relay.ts
+// acceptEvent calls ownership.ts refreshFollows). Without it the cache
+// would refresh only on the hourly cron (Relay.runCron), so a follow added
+// moments ago could not write for up to an hour.
 //
 // isAllowedWriter is mocked to always accept so a non-owner kind-3 can
 // reach relay.ts's acceptEvent path at all -- with the real gate,

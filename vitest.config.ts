@@ -9,7 +9,7 @@ export default defineConfig({
       // OWNER_PUBKEY fixture for the ownership write-gate tests (see
       // test/ownership.test.ts and test/helpers/keys.ts). Set here rather
       // than in wrangler.jsonc so a real deploy stays unclaimed (TOFU) by
-      // default -- see CLAUDE.md "Ownership".
+      // default.
       miniflare: {
         bindings: {
           OWNER_PUBKEY: OWNER_PUBKEY_HEX,

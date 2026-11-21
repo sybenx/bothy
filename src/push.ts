@@ -2,27 +2,23 @@
 // authorization, written against the platform's own WebCrypto rather than
 // against a library.
 //
-// WHY NO LIBRARY. The npm packages that do this -- `web-push` and the
-// wrappers around it -- are written for Node: they `require("crypto")`
-// for ECDH and AES-GCM, `require("https")` to make the request, and
-// `crypto.createECDH()` in particular has no Workers equivalent at all.
-// None of it runs here, and the parts that do would drag a second crypto
-// stack in beside @noble, which CLAUDE.md "Conventions" rules out. The
-// alternative was checked rather than assumed: everything RFC 8291 needs
-// -- P-256 ECDH, HKDF-SHA256, AES-128-GCM -- and everything RFC 8292
-// needs -- ECDSA P-256 over SHA-256, emitting the raw r||s form JWS calls
-// ES256 -- is native `crypto.subtle` on workerd, and native is also
-// faster than any JS implementation on a 10ms CPU budget.
+// WHY NO LIBRARY. `web-push` and its wrappers are written for Node
+// (`require("crypto")`, `require("https")`, `crypto.createECDH()`, which
+// has no Workers equivalent), so they do not run on workerd, and would add
+// a second crypto stack beside @noble, which this project avoids.
+// Everything RFC 8291 needs (P-256 ECDH, HKDF-SHA256, AES-128-GCM) and RFC
+// 8292 needs (ECDSA P-256/SHA-256 in the raw r||s form JWS calls ES256) is
+// native `crypto.subtle` on workerd, which is also faster than JS on a
+// 10ms CPU budget.
 //
-// The ONE thing WebCrypto cannot do is derive a public key from a bare
-// private scalar: `importKey` wants a JWK carrying x and y, which is the
-// thing being derived. That is one point multiplication, and @noble is
-// already a dependency, so `p256.getPublicKey` does it -- once per key,
-// memoised below -- and everything else is `crypto.subtle`.
+// The ONE exception: WebCrypto cannot derive a public key from a bare
+// private scalar (`importKey` wants a JWK carrying the x and y being
+// derived), so @noble's `p256.getPublicKey` does that, once per key,
+// memoised below.
 //
-// The client half of this contract is hearth's reference/push.md: it
-// reads `push_key` off the NIP-11 document (nip11.ts), subscribes with
-// it, and hands the subscription over as the NIP-86 call in nip86.ts.
+// The client half of this contract is hearth's reference/push.md: it reads
+// `push_key` off the NIP-11 document (nip11.ts), subscribes with it, and
+// hands the subscription over through nip86.ts subscribepush.
 import { p256 } from "@noble/curves/nist.js";
 import {
   PUSH_PAYLOAD_MAX_BYTES,
@@ -31,16 +27,8 @@ import {
   VAPID_JWT_LIFETIME_SECONDS,
 } from "./limits";
 
-// NIP-29's own chat kind ("kind 9 is a chat message"), and the kind a
-// message notification is raised for.
-//
-// Declared in groups.ts and re-exported here, the same arrangement
-// CREATE_INVITE_KIND has and for the identical reason: filters.ts needs
-// it to clamp a read of the group's chat to the horizon (limits.ts
-// CHAT_BACKLOG_SECONDS), and filters.ts -> push.ts -> limits.ts ->
-// filters.ts is a cycle. groups.ts is the read side of NIP-29, so a kind
-// the read path has to recognise belongs there; this file goes on naming
-// it from one place.
+// NIP-29's chat kind, the kind a message notification is raised for.
+// Declared in groups.ts to avoid an import cycle (see the comment there).
 export { GROUP_CHAT_KIND } from "./groups";
 
 // hearth's call presence beat -- its own kind, in the ephemeral range, no
@@ -55,12 +43,17 @@ export const CALL_PRESENCE_KIND = 25051;
 // fire", anything else as "there's a message".
 export type PushReason = "message" | "voice";
 
-// What a push carries, and deliberately all it carries. reference/push.md
-// "What it must not do": no message content and no name -- the payload
-// travels through Apple's or Google's push service to reach the phone,
-// and neither the contents of the room nor who is in it are theirs to
-// hold. The room name is already public: it is the NIP-11 `name` any
-// client can fetch unauthenticated.
+// What a push carries, and deliberately all it carries: no message content
+// and no sender. The payload travels through Apple's or Google's push
+// service, and neither the room's contents nor who is in it are theirs to
+// hold. The room name is admissible because it is already public (the
+// NIP-11 `name`). That rule is about what is put in, independent of the
+// RFC 8291 encryption.
+//
+// What encryption cannot hide: the push service still learns which devices
+// this deployment pushes to, and when. That is why push is something a
+// person turns on, and a relay with no VAPID key (no `push_key`) never
+// learns any of it.
 export interface PushPayload {
   room: string;
   kind: PushReason;
@@ -73,10 +66,10 @@ export interface PushTarget {
   auth: string;
 }
 
-// What a send resolved to, and what the caller does about it.
-// reference/push.md "Cleanup": 404 or 410 means the endpoint is gone for
-// good and the row should go; anything else is worth a retry and is not
-// worth a deletion.
+// What a send resolved to. 404 or 410 means the endpoint is gone for good
+// and the row should be deleted (reference/push.md "Cleanup"); any other
+// failure is not evidence of that. There is no retry queue: a retried
+// notification is stale by the time it lands.
 export type PushOutcome = "sent" | "gone" | "failed";
 
 // ---------------------------------------------------------------------
@@ -123,26 +116,18 @@ const utf8 = new TextEncoder();
 // The VAPID keypair (RFC 8292).
 //
 // ONE SECRET, NOT TWO. `VAPID_PRIVATE_KEY` is the 32-byte P-256 scalar in
-// base64url -- the same form every web push tool calls "the private key"
-// -- and the public half is DERIVED from it here rather than configured
-// beside it. Two configured halves can disagree; a derived one cannot,
-// and a relay advertising a `push_key` that does not match the key it
-// signs with would produce subscriptions that can never be pushed to and
-// no error anywhere saying why.
+// base64url, and the public half is DERIVED from it rather than configured
+// beside it. Two configured halves could disagree, and a `push_key` that
+// does not match the signing key yields subscriptions that can never be
+// pushed to, with no error anywhere.
 //
-// It is a SECRET, never a var: wrangler.jsonc declares no `vars` block at
-// all (see the comment there), and a git-connected Worker may sync vars
-// from that config on deploy and overwrite what was set in the dashboard
-// -- which for a private key would mean the repository silently deciding
-// what it is. `wrangler secret put VAPID_PRIVATE_KEY` is the only way in,
-// secrets are never read back out of the config, and env.d.ts declares it
-// optional like every other variable in this project.
+// A SECRET, never a var (`wrangler secret put VAPID_PRIVATE_KEY`): a
+// git-connected Worker may sync vars from wrangler.jsonc on deploy and
+// overwrite the dashboard value (see the comment there), and secrets are
+// never synced from config.
 //
-// Unset is a first-class state and not an error. No key means no
-// `push_key` on the NIP-11 document, which means hearth never subscribes,
-// which means no subscription rows, no outbox rows and no alarm -- see
-// reference/push.md: "A relay that never advertises a `push_key` never
-// learns any of it, and hearth works."
+// Unset is a supported state, not an error: no `push_key` on NIP-11, so no
+// client subscribes, so no subscription rows, outbox rows or alarms.
 // ---------------------------------------------------------------------
 
 export interface VapidKeys {
@@ -151,17 +136,14 @@ export interface VapidKeys {
   // string a browser wants as `applicationServerKey` and the exact string
   // that goes on the NIP-11 document as `push_key`.
   publicKey: string;
-  // JWK form of the private half, ready for crypto.subtle.importKey. Held
-  // rather than rebuilt because it is derived from the point multiply
-  // above and neither half ever changes for a given secret.
+  // JWK form of the private half, for crypto.subtle.importKey. Held because
+  // building it needs the point multiplication.
   jwk: JsonWebKey;
 }
 
-// Memoised on the raw environment string, the same shape and for the same
-// reason as ownership.ts getOwnerPubkey: this is read on the NIP-11 path
-// and once per push fan-out, and the derivation is an elliptic curve
-// point multiplication. A Map rather than a single slot so a test that
-// swaps the variable is not answered from the previous value.
+// Memoised on the raw environment string: read on the NIP-11 path and per
+// fan-out, and the derivation is a point multiplication. A Map rather than
+// a single slot so a test that swaps the variable gets a fresh answer.
 const vapidCache = new Map<string, VapidKeys | null>();
 
 export function vapidKeys(env: Env): VapidKeys | null {
@@ -171,11 +153,9 @@ export function vapidKeys(env: Env): VapidKeys | null {
   if (cached !== undefined) return cached;
   const resolved = deriveVapidKeys(raw);
   if (resolved === null) {
-    // Logged, not thrown. A malformed key is an operator mistake on an
-    // optional feature, and the honest failure is the one push.md already
-    // describes for an absent key -- no push_key, no subscriptions, no
-    // errors anywhere a client can see. Silence would leave an operator
-    // who set the variable wondering why nothing happened.
+    // Logged, not thrown: a malformed key behaves exactly like an absent
+    // one, and the log line is the only way the operator learns why push
+    // never came on.
     console.warn(
       "push: VAPID_PRIVATE_KEY is not a base64url-encoded 32-byte P-256 secret key, so push is disabled. " +
         "Generate one with any web-push tool and set it with `wrangler secret put VAPID_PRIVATE_KEY`.",
@@ -209,11 +189,9 @@ function deriveVapidKeys(raw: string): VapidKeys | null {
   }
 }
 
-// Whether this deployment can push at all. Read by nip86.ts, which
-// refuses a subscription rather than storing one it can never use, and by
-// relay.ts, which queues nothing when this is false -- so an unconfigured
-// relay writes no rows and schedules no alarms for a feature it does not
-// have.
+// Whether this deployment can push at all. nip86.ts refuses subscriptions
+// and relay.ts queues nothing when false, so an unconfigured relay writes
+// no rows and schedules no alarms for push.
 export function pushConfigured(env: Env): boolean {
   return vapidKeys(env) !== null;
 }
@@ -228,11 +206,9 @@ export function pushPublicKey(env: Env): string | null {
 // ---------------------------------------------------------------------
 // RFC 8292: the Authorization header.
 //
-// One JWT per push service ORIGIN, not per endpoint -- the `aud` claim is
-// the origin and nothing else in the token varies, so twenty phones
-// behind one FCM origin share one signature. That matters: signing is the
-// only per-send cost here that is not native, and a fan-out that signed
-// once per endpoint would pay it forty times for one answer.
+// The token depends only on the push service ORIGIN (`aud`), the subject
+// and the expiry, so one signature could serve every endpoint behind one
+// origin. sendPush currently signs once per send, not per origin.
 // ---------------------------------------------------------------------
 
 async function signVapid(keys: VapidKeys, origin: string, subject: string, nowSec: number): Promise<string> {
@@ -254,10 +230,9 @@ async function signVapid(keys: VapidKeys, origin: string, subject: string, nowSe
     false,
     ["sign"],
   );
-  // WebCrypto emits the raw r||s pair (IEEE P1363), which is exactly what
-  // JWS ES256 wants. Node's crypto emits DER instead, which is the one
-  // place a port of a Node implementation would silently produce a token
-  // every push service rejects.
+  // WebCrypto emits the raw r||s pair (IEEE P1363), which is what JWS ES256
+  // wants. Node's crypto emits DER, so code ported from Node would produce
+  // a token every push service rejects.
   const signature = new Uint8Array(
     await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, utf8.encode(signingInput)),
   );
@@ -286,26 +261,21 @@ async function signVapid(keys: VapidKeys, origin: string, subject: string, nowSe
 async function encryptPayload(target: PushTarget, payload: PushPayload): Promise<Uint8Array | null> {
   const uaPublic = base64UrlDecode(target.p256dh);
   const authSecret = base64UrlDecode(target.auth);
-  // Validated again here even though nip86.ts validates on the way in: a
-  // row stored by an older, laxer version of that check would otherwise
-  // reach `importKey` and throw inside the fan-out, where one bad row
-  // would take out the whole batch.
+  // Re-validated although nip86.ts validates on the way in: a row that
+  // slipped past that check would otherwise throw in `importKey` and take
+  // out the whole fan-out batch.
   if (uaPublic === null || uaPublic.length !== 65 || uaPublic[0] !== 0x04) return null;
   if (authSecret === null || authSecret.length !== 16) return null;
 
   const plaintext = utf8.encode(JSON.stringify(payload));
-  // The record has to hold the plaintext, the 0x02 delimiter and the
-  // 16-byte GCM tag. Refused rather than truncated: a truncated payload
-  // decrypts to broken JSON, and hearth's service worker would raise a
-  // notification with the wrong room name on it.
+  // The record must hold the plaintext, the 0x02 delimiter and the 16-byte
+  // GCM tag. Refused rather than truncated: truncation yields broken JSON
+  // on the device.
   if (plaintext.length > PUSH_PAYLOAD_MAX_BYTES) return null;
 
-  // Casts, twice, and both are workerd's generated types rather than
-  // anything unusual at runtime. `generateKey` is typed as returning
-  // `CryptoKey | CryptoKeyPair` because one signature covers symmetric
-  // and asymmetric algorithms; ECDH always yields a pair. `exportKey` is
-  // typed as returning `ArrayBuffer | JsonWebKey` for the same reason;
-  // "raw" always yields the buffer.
+  // Two casts, both for workerd's generated types: `generateKey` returns
+  // `CryptoKey | CryptoKeyPair` (ECDH always yields a pair) and `exportKey`
+  // returns `ArrayBuffer | JsonWebKey` ("raw" always yields the buffer).
   const ephemeral = (await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, [
     "deriveBits",
   ])) as CryptoKeyPair;
@@ -382,19 +352,15 @@ async function encryptPayload(target: PushTarget, payload: PushPayload): Promise
   return concat(salt, recordSize, new Uint8Array([asPublic.length]), asPublic, ciphertext);
 }
 
-// RFC 8292: "the `sub` claim... SHOULD include a contact URI for the
-// application server as either a `mailto:` (email) or an `https:` URI".
-// It is what a push service operator reads when this deployment's traffic
-// causes them a problem, so it wants to identify the deployment and not
-// the project.
+// RFC 8292: the `sub` claim "SHOULD include a contact URI for the
+// application server". A push service operator reads it when this
+// deployment causes them trouble, so it identifies the deployment, not the
+// project.
 //
-// The relay's own https origin, learned from traffic (host.ts) rather
-// than configured -- there is no way to know it at deploy time, since the
-// Worker's name is whatever the deployer typed and a custom domain can be
-// attached later. The upstream project URL is the fallback for the window
-// before any request has reached this object, which in practice does not
-// happen: a subscription only exists because a management POST arrived,
-// and every request that reaches the Durable Object records the host.
+// The relay's own https origin, learned from traffic (host.ts) because it
+// is unknowable at deploy time. The upstream URL is a fallback that should
+// not occur in practice: a subscription exists only because a management
+// request reached this object, and every such request records the host.
 export function pushSubject(host: string | null): string {
   return host === null ? "https://github.com/sybenx/bothy" : `https://${host}`;
 }
@@ -402,18 +368,15 @@ export function pushSubject(host: string | null): string {
 // ---------------------------------------------------------------------
 // One send.
 //
-// Runs in the Durable Object's alarm handler (relay.ts), which is the one
-// place in this object that reaches the network. That is not the
-// exception to "the DO opens no outbound connection" it looks like: the
-// rule exists because an outbound WEBSOCKET pins the object in memory for
-// as long as it stays open -- up to fifteen minutes, which is why
-// profile-lookup.ts and backfill-worker.ts both live in the Worker. An
-// HTTPS request that completes does not; an alarm is a brief billed wake
-// that the platform schedules against a hibernated object and lets
-// hibernate again afterwards, exactly as the live feed's lifetime alarm
-// already does. And there is no Worker-side alternative: nothing in the
-// Worker runs when a WebSocket message arrives, and the hourly cron is
-// three orders of magnitude too slow for a notification.
+// Runs in the Durable Object's alarm handler (relay.ts), the one place the
+// object reaches the network. This does not break the rule that the DO
+// opens no outbound connection: that rule is about outbound WEBSOCKETS,
+// which pin the object in memory while open (why profile-lookup.ts and
+// backfill-worker.ts run in the Worker). An HTTPS request completes, and an
+// alarm is a brief wake after which the object can hibernate again, like
+// the live feed's lifetime alarm. The Worker cannot do this instead:
+// nothing in it runs when a WebSocket message arrives, and the hourly cron
+// is far too slow for a notification.
 // ---------------------------------------------------------------------
 
 export async function sendPush(

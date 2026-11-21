@@ -1,20 +1,16 @@
-// This relay's own signing identity -- distinct from the owner's pubkey
-// (ownership.ts getOwnerPubkey) and from OWNER_PUBKEY. NIP-29 requires
-// 39000-series group metadata events to be "signed by the relay keypair
-// directly," so bothy needs an identity of its own to sign with once that
-// work lands. Not configured: a clean deploy asks for nothing (CLAUDE.md
-// "Configuration"), so this is generated once and stored, never supplied.
+// This relay's own signing identity, unrelated to the owner's pubkey and
+// OWNER_PUBKEY. NIP-29 requires 39000-series group metadata events to be
+// "signed by the relay keypair directly"; nip29.ts signs them through
+// signAsRelay. Generated once and stored, never configured, so a clean
+// deploy asks for nothing.
 //
-// Seeded at schema-init time (schema.ts initSchema, via
-// seedRelayIdentity below) rather than tied to the TOFU claim step: the
-// claim step is skipped entirely when OWNER_PUBKEY is set (relay.ts
-// claim() returns "disabled" before touching storage), and this identity
-// has to exist under that mode too -- the same reason
-// ownership.ts keeps the follow-list watermark off the `owner` table
-// rather than on it. Exactly one row, forever, like relay_meta and
-// backfill_meta (schema.ts initSchema).
+// Seeded at schema init (schema.ts seedRelayIdentity), not at claim:
+// claim is skipped entirely when OWNER_PUBKEY is set, and the identity
+// must exist in that mode too. Exactly one row, forever.
 //
-// This change adds the identity only -- nothing calls signAsRelay yet.
+// The public half is published as `self` on NIP-11 and `relayPubkey` on
+// /api/stats. The secret half must never leave this file: not in NIP-11,
+// /api/stats, NIP-86 or a log line.
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 
@@ -23,9 +19,8 @@ export function generateRelayKeypair(): { secretKeyHex: string; publicKeyHex: st
   return { secretKeyHex: bytesToHex(secretKey), publicKeyHex: bytesToHex(publicKey) };
 }
 
-// For NIP-11 and /api/stats -- see relay.ts getIdentity/collectStats.
-// Never returns the secret key; signAsRelay below is the only reader of
-// that column, and it never returns it either.
+// The public key only. signAsRelay is the only reader of the secret key
+// column, and it never returns it.
 export function getRelayPubkey(sql: SqlStorage): string {
   const row = sql.exec<{ public_key: string }>(`SELECT public_key FROM relay_identity LIMIT 1`).toArray()[0];
   if (!row) {
@@ -34,9 +29,8 @@ export function getRelayPubkey(sql: SqlStorage): string {
   return row.public_key;
 }
 
-// `messageHex` is a 32-byte hash, the same shape validate.ts
-// verifySignature consumes for event.id. Nothing calls this yet -- see
-// the header comment above.
+// `messageHex` is a 32-byte hash (an event id, computed by validate.ts
+// computeEventId), so these events verify like any other.
 export function signAsRelay(sql: SqlStorage, messageHex: string): string {
   const row = sql.exec<{ secret_key: string }>(`SELECT secret_key FROM relay_identity LIMIT 1`).toArray()[0];
   if (!row) {

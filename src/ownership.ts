@@ -16,22 +16,17 @@ import {
   type WritePolicy,
 } from "./write-policy";
 
-// Kind-3 is NIP-01/NIP-02's contact list; its `p` tags are the follow set.
-// Exported so relay.ts can recognize an owner kind-3 write and refresh the
-// follow cache immediately rather than waiting for the next cron tick.
+// NIP-02 contact list; its `p` tags are the follow set. Exported so
+// relay.ts can refresh the follow cache the moment the owner publishes one.
 export const CONTACT_LIST_KIND = 3;
-// Kind-0 is NIP-01's profile metadata event.
 const PROFILE_KIND = 0;
 
-// Icon refresh cadence (see refreshProfile below) -- at most once/day
-// regardless of how often the hourly cron fires.
+// refreshProfile runs at most once a day, though the cron is hourly.
 const ICON_REFRESH_INTERVAL_SECONDS = 86400;
 
-// Memoised per isolate, keyed on the raw string, because this function
-// is on the write path: every event compares its author against the
-// owner, and an `npub1...` value would otherwise pay a bech32 decode per
-// event. The key is the raw value, so a changed variable cannot be
-// served a stale answer.
+// Memoised per isolate because getOwnerPubkey is on the write path and an
+// `npub1...` value would otherwise cost a bech32 decode per event. Keyed
+// on the raw value, so a changed variable is never served a stale answer.
 let normalizedEnvOwner: { raw: string; hex: string | null } | undefined;
 
 function envOwnerPubkey(raw: string): string | null {
@@ -43,47 +38,33 @@ function envOwnerPubkey(raw: string): string | null {
 
 // The owner's pubkey as lowercase hex, or null while unclaimed.
 //
-// OWNER_PUBKEY is normalized here rather than trusted verbatim, which is
-// the same rule every other pubkey boundary in this project follows
-// (pubkey.ts normalizePubkey: /api/claim, NIP-86's banpubkey, the
-// bech32 forms clients paste). It was the one boundary that did not, and
-// the value it returns is compared against `event.pubkey` -- always
-// lowercase hex, since validate.ts checks the id against the serialized
-// event. So an operator who set an npub, or hex with a capital letter,
-// got a relay where the string never matched anything: the owner could
-// not write, could not read their own gift wraps, and no gift wrap could
-// be addressed to them, with nothing anywhere saying why.
+// OWNER_PUBKEY is normalized (pubkey.ts normalizePubkey), like every
+// pubkey boundary: the result is compared against `event.pubkey`, which
+// is always lowercase hex, so an npub or capitalised hex used verbatim
+// would silently match nothing (the owner could not write or read their
+// gift wraps).
 //
-// A malformed value yields null -- the relay reads as unclaimed and does
-// nothing, rather than half-working. It cannot be claimed out from under
-// the operator by that: index.ts gates /api/claim on `env.OWNER_PUBKEY`
-// being SET, not on this resolving, so a broken value fails loudly and
-// closed instead of quietly opening TOFU to a stranger.
+// A malformed value yields null, so the relay reads as unclaimed. That
+// does not reopen TOFU: index.ts gates the claim endpoints on
+// `env.OWNER_PUBKEY` being SET, not on this resolving, so it fails closed.
 export function getOwnerPubkey(sql: SqlStorage, env: Env): string | null {
   if (env.OWNER_PUBKEY) return envOwnerPubkey(env.OWNER_PUBKEY);
   const row = sql.exec<{ pubkey: string }>(`SELECT pubkey FROM owner LIMIT 1`).toArray()[0];
   return row?.pubkey ?? null;
 }
 
-// TOFU claim (CLAUDE.md "What it is"): "the claim handler is
-// the only writer, and it refuses if a row already exists." The
-// Durable Object is single-threaded per instance, so this
-// check-then-write is atomic without locking -- no other code path may
-// write this row. Returns false if a row already existed (already
-// claimed by an earlier call).
-// `profile` is the owner's kind-0 name/picture, looked up once by the
-// Worker at claim time (CLAUDE.md "What it is"): the NIP-11
-// name and icon are derived from the owner's kind-0 at claim time and
-// written to DO storage there. Optional and best-effort --
-// undefined fields are stored as null and nip11.ts falls back to
-// hardcoded defaults.
+// TOFU claim: binds the owner permanently, no signature required. This is
+// the only INSERT into `owner`, and it refuses if a row exists; the
+// Durable Object is single-threaded, so the check-then-write is atomic
+// without locking. Returns false if already claimed.
 //
-// `nonce` is set only by a QR claim (ownership.ts claimWithNonce, below)
-// -- the claim nonce that won, so getClaimStatus below can answer "was
-// *this* QR the one that worked" rather than just "is the relay claimed by
-// someone, somehow". The paste path passes nothing and the column stays
-// NULL, which is also what every relay claimed before this column existed
-// reads as.
+// `profile` is the owner's kind-0, looked up by the Worker before the call
+// (the DO opens no outbound connections). Best-effort: missing fields are
+// stored as null and nip11.ts falls back to defaults.
+//
+// `nonce` is set only by a QR claim (claimWithNonce below): the code that
+// won, so getClaimStatus can tell "this QR won" from "claimed some other
+// way". NULL for a paste claim.
 export function claimOwner(sql: SqlStorage, pubkey: string, profile?: Profile, nonce: string | null = null): boolean {
   const existing = sql.exec(`SELECT 1 FROM owner LIMIT 1`).toArray();
   if (existing.length > 0) return false;
@@ -100,22 +81,27 @@ export function claimOwner(sql: SqlStorage, pubkey: string, profile?: Profile, n
 }
 
 // ---------------------------------------------------------------------
-// QR claim (src/relay.ts issueClaimNonce/claim/claimSigned, src/index.ts
-// POST /api/claim-nonce, /api/claim with a nonce, /api/claim-signed, GET
-// /api/claim-status). See CLAUDE.md "The budget" for the row-cost
-// reasoning behind the sweep-on-issue below.
+// QR claim (relay.ts issueClaimNonce/claim/claimSigned; index.ts
+// /api/claim-nonce, /api/claim with a nonce, /api/claim-signed,
+// /api/claim-status).
+//
+// The admin page shows a QR of its own URL with a one-time code in the
+// fragment. The code authenticates nothing: the claim is the same unsigned
+// first-come TOFU claim as pasting. It exists so the desktop page, polling
+// /api/claim-status, can learn that its own QR landed.
 // ---------------------------------------------------------------------
 
 export type IssueClaimNonceResult = { nonce: string; expiresAt: number } | "capped";
 
-// Mints a short-lived, single-use nonce for the QR claim flow.
-// Sweeps expired rows FIRST, not just excludes them from the count --
-// unlike group_invites, which only the owner can grow, this table can be
-// grown by anyone loading a public, unclaimed relay's admin page, so
-// merely excluding expired rows from MAX_OUTSTANDING_CLAIM_NONCES would
-// let a sustained flood mint that many more every CLAIM_NONCE_TTL_SECONDS,
-// forever. The sweep bounds the table at exactly that many rows, total,
-// permanently.
+// Mints a single-use, short-lived claim code. Minted only on a button
+// press, never per page view (index.ts handleClaimNonce).
+//
+// Sweeps expired rows FIRST rather than merely excluding them from the
+// count: anyone can mint on an unclaimed relay, so excluding alone would
+// let a flood write MAX_OUTSTANDING_CLAIM_NONCES new rows every
+// CLAIM_NONCE_TTL_SECONDS forever. With the sweep the table never exceeds
+// that many rows. Costs 2 rows written per issue (row + PK index) plus the
+// sweep's deletes.
 export function issueClaimNonce(sql: SqlStorage, nowSec: number): IssueClaimNonceResult {
   sql.exec(`DELETE FROM claim_nonces WHERE expires_at < ?`, nowSec);
   const outstanding = sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM claim_nonces`).toArray()[0]?.n ?? 0;
@@ -126,15 +112,8 @@ export function issueClaimNonce(sql: SqlStorage, nowSec: number): IssueClaimNonc
   return { nonce, expiresAt };
 }
 
-// The "nonce freshness" check the QR claim flow needs: does this
-// nonce exist and hasn't it expired. Deletes it either way it matters --
-// a nonce that's about to become the winning claim has no further use,
-// and clearClaimNonces below wipes whatever's left the moment the claim
-// actually succeeds -- so this is single-use by construction rather than
-// by a separate "used" flag. Looked up before deleting, the same
-// check-then-write shape storage.ts redeemInvite uses for the same reason:
-// a DELETE's own row count isn't otherwise read as application logic
-// anywhere in this codebase.
+// True if the code exists and has not expired, deleting it if so: single
+// use by deletion rather than by a "used" flag.
 export function consumeClaimNonce(sql: SqlStorage, nonce: string, nowSec: number): boolean {
   const row = sql
     .exec<{ expires_at: number }>(`SELECT expires_at FROM claim_nonces WHERE nonce = ?`, nonce)
@@ -144,21 +123,15 @@ export function consumeClaimNonce(sql: SqlStorage, nonce: string, nowSec: number
   return true;
 }
 
-// Called once a claim succeeds, whichever nonce won -- every remaining
-// nonce is moot the instant the relay has an owner, since a second claim
-// is refused regardless of what it names.
+// Called once any claim succeeds, paste included: every remaining code is
+// moot once the relay has an owner.
 export function clearClaimNonces(sql: SqlStorage): void {
   sql.exec(`DELETE FROM claim_nonces`);
 }
 
-// A claim that names a nonce from the QR: both claim endpoints end here
-// (relay.ts claim with a nonce, the phone pasting or fetching an npub;
-// relay.ts claimSigned, a signer proving possession). The nonce does not
-// authenticate anything on the unsigned path -- that claim is
-// first-come-first-served exactly like the paste form -- it is what lets
-// GET /api/claim-status tell the desktop page that THIS QR is the one
-// that landed. An unknown, used or expired one is refused rather than
-// ignored, so a phone holding a stale page is told to fetch a new code
+// A claim naming a QR code. Both relay.ts claim (with a nonce) and
+// claimSigned end here. An unknown, used or expired code is refused rather
+// than ignored, so a phone holding a stale page is told to get a new code
 // instead of claiming as though it had scanned a live one.
 export function claimWithNonce(
   sql: SqlStorage,
@@ -175,35 +148,20 @@ export function claimWithNonce(
 
 export type ClaimStatus = "pending" | "claimed" | "claimed-elsewhere";
 
-// Backs GET /api/claim-status. Answers from the `owner` row's
-// `claim_nonce` alone -- no row yet -> "pending"; the row's nonce matches
-// the one this poll is asking about -> "claimed"; anything else,
-// including a paste-claimed relay where the column is NULL -> the caller
-// asked about a QR that didn't win, but the relay is claimed regardless.
+// Backs GET /api/claim-status, from the `owner` row alone: no row ->
+// "pending"; this code won -> "claimed"; otherwise (another code, or a
+// paste claim with NULL) -> "claimed-elsewhere".
 export function getClaimStatus(sql: SqlStorage, nonce: string): ClaimStatus {
   const row = sql.exec<{ claim_nonce: string | null }>(`SELECT claim_nonce FROM owner LIMIT 1`).toArray()[0];
   if (!row) return "pending";
   return row.claim_nonce === nonce ? "claimed" : "claimed-elsewhere";
 }
 
-// Whether the owner's own resolved kind-10002 already names this relay --
-// the outcome public/index.html's claimed view actually cares about when
-// deciding whether the wss:// copy box still has a job to do. Deliberately
-// NOT keyed to which claim path was used: a phone signing a NIP-42 AUTH
-// event to claim the relay does not also publish a relay-list update as a
-// side effect, so "claimed by QR" and "already in the owner's relay list"
-// are two different facts, and only the second one makes the box
-// redundant.
-//
-// Reads the owner's own most recently stored kind-10002 the same way
-// refreshFollows reads their kind-3 -- both partitions, newest wins -- so
-// this needs no schema of its own and no change to backfill.ts at all: it
-// sees whatever kind-10002 bothy already has locally, however it arrived
-// (backfill, or a live publish), and self-corrects the moment a fresher
-// one lands rather than describing a snapshot taken once at claim time.
-// Every `r`-tag URL counts, not just the write-marked ones NIP-65 would
-// have backfill.ts prioritize -- the box is redundant the moment the
-// relay is listed at all, read or write.
+// Whether the owner's newest locally stored kind-10002 names this relay;
+// public/index.html hides the wss:// copy box when it does. Checked live
+// rather than keyed to the claim path, because claiming does not publish a
+// relay list. Both partitions, newest wins (see refreshFollows). Any `r`
+// tag counts, read or write.
 export function ownerListsThisRelay(sql: SqlStorage, env: Env, host: string): boolean {
   const owner = getOwnerPubkey(sql, env);
   if (owner === null) return false;
@@ -226,11 +184,8 @@ export function ownerListsThisRelay(sql: SqlStorage, env: Env, host: string): bo
   return tags.some((t) => t[0] === "r" && t[1] && normalizeHost(t[1]) === relayHost);
 }
 
-// Backs the NIP-11 document's name/icon (nip11.ts, via Relay.getProfile
-// in relay.ts). Null when unclaimed, when OWNER_PUBKEY skips storage
-// entirely (no row to read a profile from), or when the claim-time
-// lookup found nothing -- the caller falls back to hardcoded defaults in
-// all of those cases.
+// Backs the kind-0 rung of nip11.ts's identity chain. Null when unclaimed
+// or under OWNER_PUBKEY (no `owner` row exists then).
 export function getOwnerProfile(sql: SqlStorage, env: Env): OwnerProfile {
   if (env.OWNER_PUBKEY) return null;
   const row = sql
@@ -244,15 +199,9 @@ export function getOwnerProfile(sql: SqlStorage, env: Env): OwnerProfile {
   return row ?? null;
 }
 
-// Discriminated result for isAllowedWriter below, so callers (handleEvent
-// in relay.ts) can surface a rejection reason instead of a bare boolean --
-// an unclaimed relay and a non-follow under follows mode are different
-// situations for the sender, even though they both end in "you may not
-// write here".
-// `isOwner` rides along on the allowed case so relay.ts's write path
-// doesn't have to re-read the owner pubkey to answer "is this the owner?"
-// -- isAllowedWriter has already resolved it, and the abuse caps in
-// acceptEvent (limits.ts) exempt the owner from two of the three.
+// A reason rather than a bare boolean, so relay.ts can tell the sender why.
+// `isOwner` rides along so the write path need not re-read the owner for
+// the abuse caps that exempt the owner (relay.ts acceptEvent).
 export type WriteRejection =
   | "unclaimed"
   | "not-follow"
@@ -265,56 +214,38 @@ export type WriteAuthorization =
   | { allowed: true; isOwner: boolean }
   | { allowed: false; reason: WriteRejection };
 
-// What the write gate needs beyond the pubkey, and why each is optional.
+// `policy`: relay.ts caches the resolved policy per instance and passes it
+// in, so the gate pays no row per event; omitted, it is resolved here at
+// one row read.
 //
-// `policy` is the effective write policy (write-policy.ts). relay.ts
-// caches it per instance and passes it in, so the gate pays no row for
-// it per event; a caller that omits it (the tests that drive this
-// function directly against real storage) gets it resolved from the
-// environment and the stored setting at one row read.
-//
-// `tags` are the event's tags, consulted only under `mentions` and only
-// on the path already about to refuse -- that policy's test is "does
-// this event p-tag the owner", which is answered from the event itself.
-// Omitted, `mentions` admits nobody `follows` would not, which is the
-// safe direction for a caller that has no event in hand.
+// `tags`: the event's tags, consulted only under `mentions`. Omitted,
+// `mentions` admits nobody `follows` would not, the safe direction.
 export interface WriterContext {
   policy?: WritePolicy;
   tags?: string[][];
 }
 
-// The write policy (write-policy.ts), enforced.
+// The write policy (write-policy.ts), enforced. Gift wraps (the `inbox`
+// level), NIP-62 vanish and NIP-29 join requests are dispatched above
+// this gate in relay.ts and never reach it.
 //
-// Owner writes are always allowed, and so is an explicitly allowlisted
-// pubkey (NIP-86 allowpubkey) under every policy -- that is the owner
-// deciding by hand who else may write. banpubkey is the mirror image and
-// refuses under every policy. The policy then decides who ELSE gets in:
+// The owner always passes. Under every policy NIP-86 allowpubkey admits
+// and banpubkey refuses. Beyond that, `follows` and above consult the
+// follow cache, `mentions` admits an event that p-tags the owner (within
+// MAX_MENTION_EVENT_INDEXED_TAGS, see limits.ts), and `all` admits anyone
+// not banned.
 //
-//   - `follows` and above consult the follow cache (refreshFollows below);
-//   - `mentions` admits any author whose event p-tags the owner, provided
-//     the event carries no more indexed tags than
-//     MAX_MENTION_EVENT_INDEXED_TAGS -- see limits.ts for why a bound on
-//     WHO is not a bound on ROWS once "who" is anyone;
-//   - `all` admits everyone who is not banned.
+// Order:
+//   - banned_pubkeys for every non-owner write, before the follows lookup,
+//     so a banned follow is still refused (nip86.ts refuses to ban the
+//     owner, so there is no lockout case).
+//   - allowed_pubkeys only on the path already about to refuse, so the
+//     common accept path does not pay for it.
+//   - the mention test last; it reads only the event's tags.
 //
-// Ordering is by cost and by certainty, per CLAUDE.md "Conventions":
-//
-//   - banned_pubkeys is checked for every non-owner write, before the
-//     follows lookup, so a banned pubkey is refused even if it is also a
-//     follow -- src/nip86.ts also refuses to ever let the owner's own
-//     pubkey be banned, so there's no owner-lockout case to guard against
-//     here.
-//   - allowed_pubkeys is checked only on the path already about to
-//     reject a write (a policy below `follows`, or "not a follow"), so it
-//     costs nothing on the common accept path.
-//   - the mention test runs last, after both lookups, and costs no
-//     storage at all: it reads the event's own tags.
-//
-// The refusal names the policy's OWN boundary -- "not a follow" under
-// `follows`, "does not mention the owner" under `mentions` -- so the
-// message a stranger reads in their client tells them what this relay
-// would have accepted, which is the one thing a refused writer wants to
-// know.
+// The refusal names the policy's own boundary ("not-follow",
+// "not-mention"), so a refused writer learns what would have been
+// accepted.
 export function isAllowedWriter(
   sql: SqlStorage,
   env: Env,
@@ -344,122 +275,56 @@ export function isAllowedWriter(
   return { allowed: false, reason: admitsAtLeast(policy, "follows") ? "not-follow" : "owner-only" };
 }
 
-// Fingerprint of a follow set, in the style of schema.ts
-// computeSchemaHash and for the same reason: derived from the content it
-// describes, so it cannot be forgotten, only recomputed. Sorted before
-// hashing, because a set has no order and two kind-3s listing the same
-// people in a different tag order are the same follow set. Built over the
-// deduplicated set rather than the raw tags, so a list that repeats a
-// pubkey hashes the same as one that does not -- which matches what the
-// rebuild below actually stores, since `follows.pubkey` is a PRIMARY KEY
-// that would collapse the duplicates anyway.
+// Fingerprint of a follow set: sorted and deduplicated, so tag order and
+// repeated pubkeys do not change it, matching what the rebuild stores.
 export function computeFollowsHash(follows: ReadonlySet<string>): string {
   return bytesToHex(sha256(new TextEncoder().encode(JSON.stringify([...follows].sort()))));
 }
 
-// Re-derives the follow cache from the owner's own most recent kind-3
-// event already stored on this relay -- not a fresh fetch from other
-// relays. This relay is in the owner's relay list by construction (it's
-// where they claimed it), so their client will have replicated their
-// contact list here; reading it locally avoids an outbound connection
-// (CLAUDE.md "The budget": an outbound connection keeps the DO in memory
-// for up to 15 minutes). Called from the cron handler, and from
-// relay.ts acceptEvent the moment the owner publishes a kind-3 here.
+// Re-derives the follow cache from the owner's newest kind-3 already
+// stored here, never a fetch: the Durable Object must not open outbound
+// connections (an outbound WebSocket pins it in memory for up to 15
+// minutes and breaks hibernation). Called by relay.ts acceptEvent when the
+// owner publishes a kind-3, and by the hourly cron as the fallback for a
+// list that arrived another way (backfill). So a call that finds nothing
+// new is the normal case and must cost nothing.
 //
-// Measures the property before writing, like refreshProfile below.
-// This used to DELETE the table and re-INSERT every row on every call,
-// unconditionally: 900 rows written per refresh at 300 follows (measured
-// -- 300 for the delete, 600 for the inserts), 21,600/day on an hourly
-// cron, 21.6% of the daily rows-written ceiling, spent to discover that a
-// contact list nobody had touched still said what it said an hour ago.
-// The cron path is the FALLBACK -- acceptEvent refreshes the instant the
-// owner publishes a new kind-3 to this relay, and the tick exists only
-// for a list that arrived some other way (backfill, or a client that
-// published it elsewhere first) -- so a tick that finds nothing new is
-// the normal case, not the exception, and it should cost nothing.
+// "Nothing new" is decided by CONTENT: `relay_meta.follows_hash`
+// (computeFollowsHash) of the set last rebuilt from. Not by created_at,
+// because clients routinely re-sign an unchanged contact list (login,
+// settings save), and a full rebuild costs ~3F rows written each time
+// (measured: one owner's clients made this most of a day's writes); and
+// a same-second replacement (NIP-01 breaks ties by lowest id) can change
+// content without moving the timestamp. The check costs one row read and
+// a sha256 over the event already fetched, flat in F on storage.
 //
-// "Nothing new" is decided by CONTENT, not by timestamp:
-// `relay_meta.follows_hash` holds a fingerprint of the follow set the
-// cache was last rebuilt from (computeFollowsHash above), and a kind-3
-// whose parsed set hashes to the same value writes nothing, whatever its
-// created_at says. The previous guard compared created_at watermarks,
-// which is a proxy for "the follows changed" rather than a measurement
-// of it, and the gap between the two was not hypothetical: many clients
-// re-sign and republish an UNCHANGED contact list as a matter of course
-// (a "broadcast", a login, a settings save), each one a legitimately
-// newer replaceable event that storeEvent stores and acceptEvent then
-// hands to this function -- which rebuilt the whole table to reproduce
-// its own contents, 3F + 1 rows per touch, at whatever frequency the
-// owner's clients happened to choose. Measured live: ~7,700 of an
-// 18-hour window's 8,158 rows written, from 34 events ingested.
-// The timestamp guard also missed in the OTHER direction: NIP-01 breaks
-// an equal-created_at tie by lowest id, so a replacement at the identical
-// second could change the content while the watermark stood still. The
-// hash catches both, because it looks at the thing itself.
+// The hash lives on `relay_meta`, not `owner`, because under OWNER_PUBKEY
+// there is no owner row. It is written LAST, after the rebuild: a rebuild
+// that throws leaves the old hash, so the next call retries rather than
+// trusting a half-written table (the schema.ts initSchema pattern).
+// `follows.fetched_at` is the created_at of the kind-3 whose set last
+// differed; it is not advanced for an identical list, since that would
+// cost F writes.
 //
-// What the check costs: one row read for the stored hash, plus a parse
-// and a sha256 over the ONE event body the function has already fetched
-// -- CPU linear in the list, storage flat in it, which is the constraint
-// that matters here (reading the F cached rows back to compare would
-// also have scaled with F, on a path that runs on every owner kind-3
-// publish and every cron tick). At 334 follows the hash is ~21KB through
-// sha256, well under the ~1.1ms schnorr verify every stored event
-// already pays (validate.ts).
+// A real change still rebuilds the whole table (3F + 2 rows to add one
+// follow). Acceptable while changes are human-rate and F is hundreds. A
+// delta rebuild would read F rows to write ~3 per change, but needs
+// `fetched_at` moved off the per-row schema (dragging storage.ts
+// followsListAt and auditMaintainedCounts along); worth it if F grows
+// toward thousands.
 //
-// The hash lives on `relay_meta` (single row, seeded by initSchema)
-// rather than on the `owner` row, for the reason `follows.fetched_at`
-// already does: OWNER_PUBKEY skips the claim flow that creates the owner
-// row (see refreshProfile), and a watermark keyed to a row that may not
-// exist is a watermark that never compares. It is written only AFTER a
-// rebuild completes -- the schema_meta pattern (schema.ts initSchema):
-// a rebuild that throws partway leaves the previous hash standing, the
-// next call finds the mismatch again and retries from the DELETE, and
-// the half-written table never gets mistaken for a finished one.
-// `follows.fetched_at` still records the created_at of the kind-3 whose
-// SET last differed -- deliberately not advanced when an identical list
-// arrives under a newer timestamp, since touching it would cost the F
-// row writes this guard exists to not spend, to restate a list that did
-// not change.
-//
-// When the set genuinely DID change, the rebuild below is still
-// delete-everything-reinsert-everything -- 3F + 2 rows to add one
-// follow, the same shape of problem this guard fixes, one layer down.
-// Left that way deliberately, for now: the identical-republish case
-// fires at client-automation frequency (unbounded by human intent,
-// which is what made it dominate the live budget), while a genuine
-// follow/unfollow fires at human-action frequency -- a handful a day,
-// ~1,000 rows each at the live relay's 334 follows, real but bounded by
-// the owner actually doing something. A delta rebuild would cost F rows
-// READ per change (the current membership has to come from somewhere)
-// to write ~3 rows per actual delta -- a good trade of the plentiful
-// ceiling for the scarce one -- but it also requires moving
-// `fetched_at` off the per-row schema (delta-updated rows would
-// disagree on it, and rewriting it on all F rows re-spends what the
-// delta saved), which drags storage.ts followsListAt and the audit
-// along. Worth doing if follow counts grow toward the thousands, where
-// one change is ~3F rows and a day of ordinary follow activity starts
-// to crowd the budget; not worth the refactor to shave a cost that
-// human-rate actions bound today.
-//
-// NOT gated on the write policy, deliberately. The cache is a fact about
-// the owner's contact list and the policy is about who may write;
-// isAllowedWriter consults the cache only under `follows` and above, so
-// a relay under `owner` or `inbox` maintains a table nothing reads -- at
-// the cost of the hash comparison above, one row and a sha256, per tick.
-// What that buys is a policy change that takes effect the moment it is
-// made: a changewritepolicy call opening the relay to follows finds the
-// cache already current, rather than admitting nobody until the next
-// cron tick rebuilt it.
+// NOT gated on the write policy: maintaining the cache under `owner` or
+// `inbox` costs one row and a sha256 per tick, and means a
+// changewritepolicy to `follows` takes effect immediately rather than at
+// the next cron tick.
 export function refreshFollows(sql: SqlStorage, env: Env): void {
   const owner = getOwnerPubkey(sql, env);
   if (owner === null) return;
 
-  // Once per partition, newest wins. `is_group` splits the REQ-serving
-  // indexes into partial pairs (schema.ts), so a lookup that names no
-  // partition uses neither half and scans -- 51,500 rows against 1,
-  // measured. Both halves are read rather than assuming the owner's
-  // contact list is public: an h-tagged kind-3 is still the owner's kind-3,
-  // and NIP-01 replaceability does not know about groups.
+  // Once per partition, newest wins: a lookup naming no `is_group` uses
+  // neither half of the partial index pairs and scans the table
+  // (measured: 51,500 rows against 1). Both partitions, because an
+  // h-tagged kind-3 is still the owner's kind-3.
   const latest = acrossScopes((scope) =>
     sql
       .exec<{ created_at: number; tags: string }>(
@@ -477,19 +342,14 @@ export function refreshFollows(sql: SqlStorage, env: Env): void {
       ?.follows_hash ?? null;
 
   if (!latest) {
-    // The contact list is gone -- deleted, vanished, or never stored.
-    // Only pay for the DELETE if there is something to delete; an empty
-    // cache on a relay with no kind-3 is already the right answer. The
-    // hash alone cannot decide that: a relay upgrading to this column
-    // has follows rows and a NULL hash, so the table is checked directly
-    // -- one row read, only on the no-kind-3 path.
+    // No contact list stored. DELETE only if there is something to
+    // delete; the table is checked directly because rows can exist with a
+    // NULL hash.
     //
-    // The counter moves with the DELETE and inside the same branch, not
-    // after the `if`: this is one of exactly two places that write the
-    // `follows` table (see schema.ts `maintained_counts`), and a counter
-    // update parked at the function's exit would be a separate step that
-    // an early return could skip -- which is precisely what the two
-    // returns above it do on the common path.
+    // This branch and the rebuild below are the only writes to `follows`,
+    // and each moves the maintained follow count itself (schema.ts
+    // `maintained_counts`) rather than at the function's exit, where an
+    // early return would skip it.
     const hasCache = sql.exec(`SELECT 1 FROM follows LIMIT 1`).toArray().length > 0;
     if (hasCache || storedHash !== null) {
       sql.exec(`DELETE FROM follows`);
@@ -503,11 +363,7 @@ export function refreshFollows(sql: SqlStorage, env: Env): void {
   const follows = new Set(
     tags.filter((t) => t[0] === "p" && t[1]).map((t) => t[1] as string),
   );
-  // The content check -- see the header comment for why this is a hash
-  // of the set rather than a created_at watermark. A NULL stored hash
-  // (fresh relay, or first call after the upgrade that added the column)
-  // never equals a real one, so both rebuild exactly once and then
-  // settle.
+  // A NULL stored hash never matches, so a fresh relay rebuilds once.
   const hash = computeFollowsHash(follows);
   if (hash === storedHash) return;
 
@@ -515,35 +371,21 @@ export function refreshFollows(sql: SqlStorage, env: Env): void {
   for (const pubkey of follows) {
     sql.exec(`INSERT INTO follows (pubkey, fetched_at) VALUES (?, ?)`, pubkey, latest.created_at);
   }
-  // After the inserts, so a rebuild that threw partway leaves a count that
-  // is too low rather than one claiming rows that were never written --
-  // and either way the daily audit (storage.ts auditMaintainedCounts) has
-  // something to report. `follows.size`, not `tags.length`: the Set is
-  // what was actually inserted, since a contact list may repeat a pubkey
-  // and the table's PRIMARY KEY would collapse the duplicates.
-  //
-  // Rows written: 2, on top of the hundreds this rebuild already costs,
-  // and only when the list has genuinely changed -- the hash check above
-  // returns before reaching here on every other call. That is the whole
-  // price of `/api/stats` no longer counting `follows` per request.
+  // After the inserts, so a rebuild that threw partway leaves a count too
+  // low rather than too high, for storage.ts auditMaintainedCounts to
+  // catch. `follows.size`, the deduplicated set actually inserted.
   setFollowCount(sql, follows.size);
-  // The hash lands LAST, after every row it vouches for -- the
-  // schema_meta ordering (see the header comment). Written even for an
-  // empty set: hash-of-empty is a real fingerprint, and NULL is reserved
-  // for "no cache", which the clear branch above owns.
+  // LAST, after every row it vouches for (see the header comment).
+  // Written even for an empty set: NULL means "no cache", which belongs to
+  // the clear branch above.
   sql.exec(`UPDATE relay_meta SET follows_hash = ?`, hash);
 }
 
-// Re-derives the cached name/picture (backing NIP-11's icon and
-// /api/stats' favicon, nip11.ts resolveIcon) from the owner's own most
-// recent locally-stored kind-0 -- never a fresh fetch. The owner's own
-// client publishes kind 0 here like any other event, so profile changes
-// arrive on their own; there is nothing to poll for. Called from the
-// cron handler, gated to run at most once/day (icon_refreshed_at) even
-// though the cron itself fires hourly, and to actually re-parse content
-// only when a newer kind-0 has arrived since the last sync
-// (profile_synced_at) -- both cheap reads compared against a fresh parse
-// on every tick.
+// Re-derives the cached kind-0 fields on the `owner` row (the kind-0 rung
+// of nip11.ts's identity chain) from the owner's newest locally stored
+// kind-0, never a fetch. Called from the hourly cron but runs at most once
+// a day (icon_refreshed_at), and re-parses only when a newer kind-0 has
+// arrived (profile_synced_at).
 export function refreshProfile(sql: SqlStorage, env: Env, nowSec: number): void {
   const owner = getOwnerPubkey(sql, env);
   if (owner === null) return;
@@ -560,9 +402,7 @@ export function refreshProfile(sql: SqlStorage, env: Env, nowSec: number): void 
       `SELECT name, picture, about, website, profile_synced_at, icon_refreshed_at FROM owner LIMIT 1`,
     )
     .toArray()[0];
-  // No `owner` row exists when OWNER_PUBKEY skips the claim flow
-  // entirely (claimOwner above is the only writer) -- nothing to cache a
-  // profile onto.
+  // No `owner` row under OWNER_PUBKEY: nothing to cache onto.
   if (!row) return;
   if (row.icon_refreshed_at !== null && nowSec - row.icon_refreshed_at < ICON_REFRESH_INTERVAL_SECONDS) return;
 
@@ -590,15 +430,12 @@ export function refreshProfile(sql: SqlStorage, env: Env, nowSec: number): void 
       name = typeof content.name === "string" ? content.name : null;
       picture = typeof content.picture === "string" ? content.picture : null;
       about = typeof content.about === "string" ? content.about : null;
-      // Backs NIP-11's `contact` -- see nip11.ts resolveContact for why
-      // `website` and not `nip05` or `lud16`.
+      // NIP-11 `contact` (nip11.ts resolveContact).
       website = typeof content.website === "string" ? content.website : null;
       syncedAt = latest.created_at;
     } catch {
-      // Malformed kind-0 content -- leave the cached profile as-is, but
-      // icon_refreshed_at is still bumped below so a bad kind 0 isn't
-      // re-parsed every cron tick until the owner republishes a valid
-      // one.
+      // Malformed content: keep the cached profile. icon_refreshed_at is
+      // still bumped below, so it is not re-parsed every tick.
     }
   }
 

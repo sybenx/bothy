@@ -21,9 +21,8 @@ export function computeEventId(event: NostrEvent): string {
   return bytesToHex(sha256(new TextEncoder().encode(serialized)));
 }
 
-// Structural shape only -- id/signature validity is checked separately,
-// since the reject-path tests need to distinguish "malformed" from
-// "invalid: bad signature" from "invalid: id mismatch".
+// Structural shape only. id and signature are checked separately so a
+// refusal can say which failed: malformed, id mismatch, or bad signature.
 export function parseEventShape(raw: unknown): NostrEvent | null {
   if (typeof raw !== "object" || raw === null) return null;
   const e = raw as Record<string, unknown>;
@@ -47,12 +46,10 @@ export function parseEventShape(raw: unknown): NostrEvent | null {
   };
 }
 
-// See limits.ts MAX_CREATED_AT_FUTURE_SECONDS for why this exists.
-// Deliberately one-sided -- no lower bound, since backfilled and
-// republished history is expected to carry old timestamps forever.
-// Shared by both write paths (relay.ts acceptEvent, backfill.ts
-// applyBackfillPage) and checked before id/signature verification on
-// each, so a rejected event never pays for a schnorr verify.
+// See limits.ts MAX_CREATED_AT_FUTURE_SECONDS. One-sided on purpose:
+// backfilled and republished history legitimately carries old
+// timestamps. Checked before id/signature verification on both write
+// paths (relay.ts acceptEvent, backfill.ts applyBackfillPage).
 export function isCreatedAtTooFarInFuture(event: NostrEvent, nowSec: number): boolean {
   return event.created_at > nowSec + MAX_CREATED_AT_FUTURE_SECONDS;
 }
@@ -61,23 +58,15 @@ export function idMatchesContent(event: NostrEvent): boolean {
   return computeEventId(event) === event.id;
 }
 
-// The CPU-expensive step, and the reason every cheap rejection on the
-// write path runs ahead of it (relay.ts acceptEvent, CLAUDE.md
-// "Conventions").
+// The CPU-expensive step: every cheaper rejection on a write path runs
+// ahead of it (relay.ts acceptEvent).
 //
-// Measured at ~1.11ms per verification, averaged over 5,000 calls to
-// @noble/curves' schnorr.verify(), against the 10ms of Worker CPU per
-// request that CLAUDE.md "The budget" records. Roughly nine verifies to
-// the ceiling.
-//
-// Read that with its caveat, which is why the number lives here rather
-// than in a file of its own: it was measured in Node, not in workerd.
-// The miniflare/workerd harness does not expose isolate CPU time to test
-// code, so nothing in the suite can assert this the way
-// test/hibernation.test.ts asserts rows written. workerd's engine is also
-// V8, so it is a reasonable proxy and not a measurement -- re-measure
-// against real `wrangler dev` or production logs before treating the 10ms
-// ceiling as comfortably clear rather than merely plausible.
+// ~1.11ms per verify (mean of 5,000 @noble/curves schnorr.verify calls)
+// against Workers Free's 10ms CPU per request: roughly nine verifies to
+// the ceiling. Measured in Node, not workerd; the test harness does not
+// expose isolate CPU time, so the suite cannot assert it. Both are V8, so
+// it is a proxy, not a measurement: re-measure under `wrangler dev` or in
+// production before relying on the margin.
 export function verifySignature(event: NostrEvent): boolean {
   try {
     return schnorr.verify(hexToBytes(event.sig), hexToBytes(event.id), hexToBytes(event.pubkey));

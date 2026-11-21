@@ -314,12 +314,12 @@ describe("NIP-42 gift wrap read gate: filter-shape coverage", () => {
   it("omits a gift wrap from an ids-only filter naming it, rather than refusing", async () => {
     // An id is an unguessable content hash, so an ids-only filter is no
     // discovery vector for anyone who does not already hold the event --
-    // but that is not the rule this relay promises (CLAUDE.md "What it
-    // is": gift wraps go only to the authenticated p-tagged recipient,
-    // with no carve-out for "unless you already know the id"). The rule
-    // is kept; what changed is that keeping it no longer requires saying
-    // so. The client asked for an id and gets nothing back, which is what
-    // it would get for an id this relay never stored.
+    // but that is not the rule this relay promises: gift wraps go only to
+    // the authenticated p-tagged recipient, with no carve-out for "unless
+    // you already know the id" (src/filters.ts excludeGiftWraps). The
+    // gate omits rather than refuses: the client asked for an id and gets
+    // nothing back, which is what it would get for an id this relay never
+    // stored.
     const conn = await connectRelay();
     const giftWrap = signEvent(randomKeypair().secretKeyHex, {
       kind: 1059,

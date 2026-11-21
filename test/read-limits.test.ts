@@ -1,7 +1,7 @@
-// Read-abuse mitigations (CLAUDE.md "Threat model"): reads are public by
-// design, so these caps -- not authentication -- are what stands between
-// a normal deployment and a stranger burning the daily 5M rows-read /
-// 100k DO-requests ceiling.
+// Read-abuse mitigations (src/limits.ts boundFilter and the caps beside
+// it): reads are public by design, so these caps -- not authentication --
+// are what stands between a normal deployment and a stranger burning the
+// daily 5M rows-read / 100k DO-requests ceiling.
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { buildFilterQuery, filterParamCount } from "../src/filters";

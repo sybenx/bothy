@@ -1,25 +1,13 @@
-// The deployment's own host -- e.g. "my-notes.example.workers.dev" or a
-// custom domain -- recorded opportunistically from whichever inbound
-// request reaches the DO first (Relay.fetch, claim, NIP-11/getProfile,
-// getStats all pass their request's host through). There is no way to
-// know this at deploy time: the Worker's own name is whatever the
-// deployer typed into the Cloudflare deploy button, and a custom domain
-// can be attached later, so this is learned from traffic rather than
-// guessed from a project name.
-//
-// Backfill (backfill.ts seedBackfillRelays) is the reason this exists:
-// the owner's own kind-10002 write-relay list legitimately lists this
-// relay among their write relays, and without filtering it out,
-// /api/stats' nextRelay ends up pointing at the relay's own URL forever.
+// The deployment's own host (a workers.dev name or a custom domain),
+// learned from inbound requests that reach the DO (Relay.fetch, the claim
+// calls, getIdentity, getStats). It cannot be known at deploy time: the
+// Worker is named by whoever deployed it, and a domain can be attached
+// later. Backfill uses it to drop this relay from the owner's write-relay
+// list (backfill.ts seedBackfillRelays/purgeSelfRelay).
 
-// Extracts a bare, lowercased host (with port, if any) from either a
-// full relay URL ("wss://relay.example.com/") or a bare host
-// ("relay.example.com") -- both shapes flow through here: relay URLs
-// come from a kind-10002 tag, the deployment's own host comes from a
-// Request's `.host`. Scheme and trailing slash are both irrelevant once
-// reduced to `.host`, which the WHATWG URL parser already lowercases.
-// Returns null for a value that isn't parseable as a URL at all (a
-// malformed relay-list tag, say) rather than throwing.
+// Reduces a relay URL ("wss://relay.example.com/", from a kind-10002 tag)
+// or a bare host (a Request's `.host`) to a lowercased host with any
+// port. Null rather than a throw for an unparseable value.
 export function normalizeHost(value: string): string | null {
   const candidate = /^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `http://${value}`;
   try {
@@ -34,9 +22,8 @@ export function getOwnHost(sql: SqlStorage): string | null {
   return row?.host ?? null;
 }
 
-// Idempotent: only writes when the normalized host actually changes, so
-// calling this on every request that touches the DO (as callers do)
-// doesn't cost a row write per request once the host is known.
+// Writes only when the host changes, so calling it on every request
+// costs no row write once the host is known.
 export function recordHost(sql: SqlStorage, host: string): void {
   const normalized = normalizeHost(host);
   if (normalized === null) return;

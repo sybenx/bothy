@@ -11,7 +11,7 @@
   },
 
   // SQLite is the only backend the Workers Free plan can provision for a
-  // new DO class — see CLAUDE.md "Architecture". Never add a KV-backed
+  // new DO class. Never add a KV-backed
   // migration here.
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Relay"] }
@@ -20,17 +20,15 @@
   // No `vars` block here, deliberately -- the Cloudflare deploy button
   // prompts for every var declared in this file with no notion of
   // "optional", so a `RELAY_ICON` prompt would land in front of a
-  // non-technical user before they have anything working (ROADMAP.md
-  // chunk 5). RELAY_NAME/RELAY_DESCRIPTION/RELAY_ICON/ALLOW_FOLLOWS are
-  // all read defensively in code (env.d.ts, ownership.ts, nip11.ts) with
-  // hardcoded fallbacks, and OWNER_PUBKEY is deliberately absent per
-  // CLAUDE.md "Ownership": a real deploy stays unclaimed (TOFU) by
-  // default. Anyone who wants any of these adds the variable in the
+  // non-technical user before they have anything working. Every optional
+  // variable (src/env.d.ts lists them) is read defensively in code with
+  // a hardcoded fallback, and OWNER_PUBKEY is deliberately absent: a
+  // real deploy stays unclaimed (TOFU) by default. Anyone who wants any of these adds the variable in the
   // Cloudflare dashboard -- the Cloudflare account is the authentication.
   // A git-connected Worker may sync vars from this config on deploy and
   // overwrite dashboard-added ones -- see README.md "Configuration".
 
-  // Static admin page (CLAUDE.md "Admin page") -- static assets are
+  // Static admin page -- static assets are
   // free and unlimited on Workers Free, unlike Worker/DO requests.
   // run_worker_first is required: without it, asset serving would
   // intercept `/` before the Worker's Accept-header check for NIP-11
@@ -46,7 +44,7 @@
   // code -- and therefore before the Durable Object -- rather than inside
   // the thing being protected, and because it needs no account resource
   // to provision and no user input, so a clean deploy still asks for
-  // nothing (CLAUDE.md "Configuration").
+  // nothing.
   //
   // Two namespaces, because the two paths are expensive in different
   // currencies:
@@ -94,7 +92,7 @@
     { "name": "RATE_LIMIT_PROFILE", "namespace_id": "1002", "simple": { "limit": 10, "period": 60 } }
   ],
 
-  // Drives the ALLOW_FOLLOWS refresh (a no-op when unset) -- see
+  // Drives the hourly maintenance tick and the backfill tick -- see
   // src/index.ts scheduled(). One of the account-wide 5 cron triggers on
   // Workers Free.
   "triggers": {

@@ -1,15 +1,10 @@
 // NIP-98 HTTP Auth (nips/98.md), as NIP-86 requires it. Runs in the
-// Worker, never inside the Durable Object -- schnorr verification is the
-// CPU-expensive step (validate.ts) and there is no
-// reason to spend DO time on a request that may turn out to be forged.
-// The DO only ever sees a management call that already passed this gate.
+// Worker, never inside the Durable Object, so a forged request costs no DO
+// time. The DO only ever sees a management call that already passed this.
 //
-// NIP-86 tightens bare NIP-98 in one place: "The request must contain an
-// Authorization header with a valid NIP-98 event, except the `payload`
-// tag is required." So `payload` is checked unconditionally here rather
-// than "optionally, for POST/PUT/PATCH" as nips/98.md puts it -- an
-// operator sending a management command must bind that exact body to
-// that exact signature.
+// NIP-86 makes the `payload` tag required ("except the `payload` tag is
+// required"), where bare NIP-98 makes it optional, so the signature always
+// binds the exact body.
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { idMatchesContent, parseEventShape, verifySignature } from "./validate";
@@ -24,11 +19,8 @@ export const HTTP_AUTH_MAX_DRIFT_SECONDS = 60;
 
 export type Nip98Result =
   | { ok: true; pubkey: string }
-  // Never surfaced to the caller verbatim as the whole story -- the
-  // handler answers 401 either way (nips/98.md: "Failed validation should
-  // return a 401 Unauthorized response"). Carried so the response body
-  // can say which check failed, which is the difference between an
-  // operator fixing a clock skew in seconds and guessing for an hour.
+  // The handler answers 401 either way (nips/98.md); the reason goes in
+  // the body so an operator can tell clock skew from a wrong `u` tag.
   | { ok: false; reason: string };
 
 function tagValue(tags: string[][], name: string): string | null {
@@ -36,13 +28,10 @@ function tagValue(tags: string[][], name: string): string | null {
   return tag?.[1] ?? null;
 }
 
-// Two URLs that differ only in the ways `new URL()` canonicalizes away
-// (a missing path, a default port, percent-encoding case) address the
-// same request, and a signer typing the relay's own wss:// URL by hand
-// will produce one of those forms rather than whatever exact string the
-// runtime hands back as request.url. Comparing canonical forms keeps the
-// binding to host, path, and query exact -- URL canonicalization changes
-// none of those -- while not failing an operator over a trailing slash.
+// Compares canonical forms, so a hand-typed URL differing only in what
+// `new URL()` normalizes (missing path, default port, percent-encoding
+// case) still matches request.url, while host, path and query stay bound
+// exactly.
 function sameUrl(a: string, b: string): boolean {
   try {
     return new URL(a).href === new URL(b).href;
@@ -70,42 +59,24 @@ function decodeAuthHeader(header: string | null): string | null {
   }
 }
 
-// The reason returned when a management call arrives at a relay nobody
-// has claimed. Lives here rather than at the call site so the two halves
-// of the check -- this file proving *who* signed, index.ts comparing that
-// to the owner -- still speak with one voice. See ownerReason below.
+// Refusal reasons for ownerReason below.
 export const UNCLAIMED_REASON =
   "this relay has no owner yet -- claim it before using the management API";
 
-// The reason returned when the signature is valid but belongs to someone
-// other than the owner.
 export const WRONG_SIGNER_REASON = "Authorization event is not signed by the relay owner";
 
-// Verifies the request carries a well-formed, correctly signed NIP-98
-// event over this exact method, URL, and body, and returns the pubkey
-// that signed it. `body` is the raw request bytes, already read by the
-// caller -- the payload tag binds the bytes that were actually sent, so
-// they are hashed as received rather than after a decode-and-reencode
-// round trip that could normalize them.
+// Verifies the request carries a correctly signed NIP-98 event over this
+// exact method, URL and body, and returns the signer. `body` is the raw
+// request bytes, hashed as received so no decode/re-encode can normalize
+// them.
 //
-// It deliberately does NOT know who the owner is. Establishing that costs
-// a Durable Object round trip, and a round trip is the single most
-// expensive thing an unauthenticated caller can provoke here: it wakes the
-// object from hibernation, spends one of the day's 100,000 requests, and
-// reads rows -- all before anything has shown the caller is even holding a
-// signature. So this function answers the question that can be answered
-// from the request alone, and index.ts asks the DO only once the answer is
-// yes. Confirming the signer is the owner is index.ts's job (ownerReason
-// below), not this file's.
-//
-// The checks still run cheapest-first (CLAUDE.md "Conventions"), but the
-// schnorr verify now sits at the end of the *whole* chain rather than
-// behind a free string comparison against the owner. That comparison used
-// to come first precisely because it was free -- it is not free any more,
-// because obtaining the owner is what costs. ~1.1ms of Worker CPU
-// (validate.ts), out of a 10ms per-request budget, is the cheaper of the
-// two, and it is spent only by a caller who produced a valid signature
-// over this exact request.
+// Deliberately does NOT know who the owner is: finding out is a Durable
+// Object round trip (a hibernation wake, one of the day's 100,000
+// requests, row reads), the most expensive thing an unauthenticated caller
+// can provoke here. So the schnorr verify (~1.1ms of the 10ms Worker CPU
+// budget, see validate.ts) runs last in this chain but BEFORE the owner
+// lookup, and index.ts asks the DO only after it passes (ownerReason
+// below). The other checks run cheapest-first ahead of it.
 export function verifyNip98(request: Request, body: Uint8Array, nowSec: number): Nip98Result {
   const json = decodeAuthHeader(request.headers.get("Authorization"));
   if (json === null) {
@@ -159,11 +130,8 @@ export function verifyNip98(request: Request, body: Uint8Array, nowSec: number):
   return { ok: true, pubkey: event.pubkey };
 }
 
-// The second half of the check, split out so it stays beside the first:
-// given a verified signer and the owner the Durable Object reported,
-// answer whether this caller is authorized, and if not, why. Returns null
-// when they are. A stranger's perfectly valid signature is still not
-// authorized here.
+// Given a verified signer and the owner the DO reported: null if
+// authorized, else the refusal reason.
 export function ownerReason(signer: string, owner: string | null): string | null {
   if (owner === null) return UNCLAIMED_REASON;
   if (signer !== owner) return WRONG_SIGNER_REASON;

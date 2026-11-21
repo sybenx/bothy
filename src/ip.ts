@@ -1,28 +1,15 @@
-// Canonicalizes an IP address string so the same address compares equal
-// regardless of how it was written. IPv6 in particular has many
-// equivalent textual forms -- leading zeros within a group, and wherever
-// the longest run of zero groups happens to sit -- and nothing upstream
-// of this guarantees two mentions of the same address arrive in the same
-// one: CF-Connecting-IP (relay.ts, index.ts) is Cloudflare's own
-// canonical form, but the IP an operator types into a NIP-86
-// blockip/unblockip call (nip86.ts) is free text they may have pasted
-// from a log line, a different tool, or typed by hand in expanded form.
+// Canonicalizes an IP string so one address always compares equal. IPv6
+// has many textual forms, and while CF-Connecting-IP arrives in
+// Cloudflare's canonical form, an address given to NIP-86
+// blockip/unblockip is free text (pasted, expanded, hand-typed).
+// storage.ts blockIp/unblockIp/isIpBlocked, index.ts's rate-limit key
+// and nip86.ts's self-block check must all use this, or a block stored
+// under one spelling silently never matches the connection it targets,
+// and the self-block warning is skipped.
 //
-// storage.ts blockIp/unblockIp/isIpBlocked and nip86.ts's self-block
-// confirmation all have to agree on one canonical form, or a block can be
-// stored under one spelling and silently fail to match connections
-// presenting another -- listblockedips reads the row back as "blocked"
-// while the connection-time check it exists to drive never fires. Same
-// failure mode for the self-block confirmation: comparing two unequal
-// spellings of the operator's own address as raw strings skips the
-// warning entirely.
-//
-// IPv4 has no equivalent-form problem worth solving here -- Cloudflare
-// sends it in one dotted-decimal shape -- so this only does real work for
-// a value containing ':'. Anything that isn't a parseable IPv6 address
-// (including the literal "unknown" fallback used when the header is
-// absent) passes through trimmed and lowercased, unchanged in substance:
-// there is nothing to canonicalize about a string that isn't an address.
+// Only values containing ':' are rewritten (Cloudflare sends IPv4 in one
+// form). Anything not parseable as IPv6, including the "unknown" fallback
+// for a missing header, is returned trimmed and lowercased.
 export function normalizeIp(value: string): string {
   const trimmed = value.trim().toLowerCase();
   if (!trimmed.includes(":")) return trimmed;
@@ -34,11 +21,9 @@ export function normalizeIp(value: string): string {
   return groups === null ? trimmed : compressIPv6(groups);
 }
 
-// Parses any legal IPv6 textual form -- full, "::"-compressed, or ending
-// in an embedded IPv4 literal -- into exactly 8 lowercase hex groups with
-// no leading zeros. Returns null for anything that doesn't parse, so
-// normalizeIp can fall back to the trimmed original rather than throwing
-// on a malformed value.
+// Parses full, "::"-compressed, or embedded-IPv4 IPv6 into exactly 8
+// lowercase hex groups without leading zeros. Null (not a throw) for
+// anything that doesn't parse.
 function expandIPv6(value: string): string[] | null {
   const halves = value.split("::");
   if (halves.length > 2) return null; // more than one "::" is never valid

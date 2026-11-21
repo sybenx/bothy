@@ -21,7 +21,8 @@
 //
 // Nothing here touches wrangler.jsonc's compatibility_date (it changes how
 // the runtime behaves, which no test of ours can fully see) or the version in
-// package.json (see CLAUDE.md "Release step").
+// package.json, which moves only with a release: it is bumped by hand
+// whenever main moves past the last tag (docs/workflow.md "Releasing").
 //
 // Outside tsconfig's `include` and outside the deploy, like sync-badge.mjs.
 

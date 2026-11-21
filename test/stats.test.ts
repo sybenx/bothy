@@ -1,4 +1,4 @@
-// /api/stats and the static admin page (CLAUDE.md "What it is").
+// /api/stats and the static admin page (public/index.html).
 import { env, exports } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
@@ -613,7 +613,7 @@ describe("rows written today", () => {
 // `ingested24h` and `rowsWrittenToday`, went when those became hourly
 // buckets keyed by ingest time (schema.ts `ingest_hour_counts`). Each
 // time the TTL was rationing a cost that stopped existing, which is the
-// lesson limits.ts records where costs get priced. What is asserted below
+// lesson the limits.ts header records. What is asserted below
 // is that nothing on this document answers to a clock any more.
 describe("/api/stats has no cache left", () => {
   const stub = () => env.RELAY.get(env.RELAY.idFromName("relay"));

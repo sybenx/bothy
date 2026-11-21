@@ -1,141 +1,89 @@
 import { clearReqCache } from "./req-cache";
 
 // ---------------------------------------------------------------------
-// TWO INSTRUMENTS OVER ONE WRAPPER. The rows-READ attribution below is a
-// diagnostic and is still expected to be removed; the rows-WRITTEN total
-// at the bottom of this file is not, and the module can no longer be
-// deleted wholesale. They share `instrumentSql` because they need the
-// same thing -- a cursor, at the moment it is created -- and because
-// wrapping once is what makes both of them unforgettable. Read the
-// diagnostic's own terms first; the write meter's are stated where it
-// starts.
+// Two instruments over one SqlStorage wrapper (instrumentSql below):
+//   - rows-READ attribution per code path: a diagnostic, expected to be
+//     removed eventually;
+//   - the rows-WRITTEN meter (pendingRowsWritten): permanent, it backs
+//     /api/stats `rowsWrittenToday`. Removing the read attribution must
+//     keep it.
+// Wrapping exec once means no code path has to remember to report itself.
 //
-// ---------------------------------------------------------------------
-// DIAGNOSTIC INSTRUMENT -- NOT A LIMIT, AND EXPECTED TO BE REMOVED.
+// The read attribution lets /api/stats `reads` name which path spends the
+// 5,000,000 rows-read/day allowance. In memory, never in storage: a
+// counter row per query would spend a row write to measure a row read. So
+// it resets on every eviction (frequent under hibernation) and gives
+// proportions, not daily totals; `sinceMs` says how long a sample covers.
 //
-// The live relay exhausted the Workers Free plan's 5,000,000 rows-read/
-// day allowance under ordinary single-owner operation and returned 500
-// on every Durable Object path until the 00:00 UTC reset. Nothing in
-// this codebase could say which code path spent them: rows *written* per
-// event had been measured carefully and rows *read* only at the two
-// places somebody happened to be suspicious of (the gift wrap probe, the
-// pubkey-ban lookup). This module answers the question nobody had asked.
-//
-// It attributes rows read to the code path that caused them, so the
-// breakdown in /api/stats can name a dominant consumer instead of
-// leaving the remedy to guesswork. Deliberately measure-first: adding a
-// read budget or a limiter before knowing what to guard is the mistake
-// backfill.ts hasBackfillHeadroom already made once here -- it spent
-// months guarding a number that could not see the writes it was
-// restraining, because nobody had measured what it was actually
-// counting (see schema.ts's `ingested_at` comment).
-//
-// IN MEMORY, NEVER IN STORAGE. A counter row incremented per query
-// would cost a row write to measure a row read -- the same trade
-// schema.ts rejected for a rows-written counter table, and a worse one
-// here, since it spends the scarcer ceiling to measure the scarcer
-// ceiling. The consequence is accepted: these
-// numbers reset whenever the Durable Object is evicted (which, with
-// WebSocket hibernation, is often). They are for PROPORTIONS -- which
-// path dominates -- not for exact daily totals. `sinceMs` in the
-// snapshot is what makes that legible: a breakdown covering four
-// minutes of uptime is a sample, not a day.
-//
-// Cost of the instrument itself: one Proxy allocation per `sql.exec`
-// and a Map lookup per consumed cursor. No storage, no query of its
-// own. Measurable against the ~1.1ms/schnorr-verify baseline only in
-// the sense of being far below it (src/validate.ts).
+// Cost: one Proxy allocation per sql.exec and a Map lookup per consumed
+// cursor. No storage, no query of its own.
 // ---------------------------------------------------------------------
 
-// Every path is named here rather than passed as a free string, so a
-// typo lands as a type error instead of silently opening a new bucket
-// that looks like a real finding.
+// Paths are a closed list so a typo is a type error rather than a new
+// bucket that looks like a real finding.
 export const READ_PATHS = [
   // Client REQ handling: storage.ts queryFilters, one query per filter
   // in the REQ frame (relay.ts handleReq).
   "req",
-  // GET /api/stats (relay.ts getStats), excluding the nested
-  // estimateRowsWrittenSince below, which reports separately.
+  // GET /api/stats (relay.ts getStats).
   "getStats",
-  // storage.ts estimateRowsWrittenSince, on its own wherever it is called
-  // from -- getStats displays it, and backfill.ts hasBackfillHeadroom
-  // calls it on every cron tick AND again inside every ingest.
+  // storage.ts estimateRowsWrittenSince, wherever it is called from:
+  // backfill.ts hasBackfillHeadroom calls it on every cron tick and
+  // again inside every ingest.
   "estimateRowsWrittenSince",
   // backfill.ts applyBackfillPage: the per-event eventExists/isDeleted
   // pair, plus the cursor/exhaustion bookkeeping.
   "backfillIngest",
   // relay.ts getBackfillState, minus the estimate above.
   "backfillState",
-  // relay.ts runCron: refreshFollows, refreshProfile,
-  // resetWronglyExhaustedRelays, purgeSelfRelay.
+  // relay.ts runCron: everything the hourly tick does that has no scope
+  // of its own below.
   "cron",
   // The live write path (relay.ts handleEvent/handleGiftWrap/
   // acceptEvent): ownership gate, tombstone and duplicate checks, the
-  // gift wrap count, and storeEvent's own replaceable/addressable
-  // lookups.
+  // gift wrap count, and storeEvent's replaceable/addressable lookups.
   "write",
   // nip29.ts applyModeration: the membership writes a moderation event
-  // triggers, plus the read of this relay's own three group state events
-  // and whichever of them gets regenerated. Separate from "write" because
-  // it is a cost only a moderation event pays, and averaging it into the
-  // per-event bucket would misdescribe both.
+  // triggers and the group state events it regenerates. Separate from
+  // "write" because only a moderation event pays it.
   "groupState",
-  // nip29.ts handleJoinRequest: the owner/membership/ban lookups a
-  // kind-9021 pays, the invite row it redeems, and the member list the
-  // relay regenerates when one succeeds. Separate from "write" because a
-  // join stores no event at all -- folding it in would put reads into a
-  // per-event bucket for a path that never writes an event row.
+  // nip29.ts handleJoinRequest. Separate from "write" because a join
+  // stores no event.
   "join",
-  // relay.ts notePresence: the call-presence watermark (schema.ts
-  // `presence`). Separate from "write" because it is paid by one
-  // ephemeral kind that stores no event, and because the whole point of
-  // limits.ts PRESENCE_WRITE_INTERVAL_SECONDS is that this bucket stays
-  // small -- a bucket growing with the beat rate rather than with the
-  // write interval is the failure this instrument would catch.
+  // relay.ts notePresence: the call-presence watermark. This bucket
+  // should grow with limits.ts PRESENCE_WRITE_INTERVAL_SECONDS, not with
+  // the beat rate; growth with the beat rate is the failure to watch for.
   "presence",
-  // relay.ts drainPushOutbox: the outbox rows, the subscription page and
-  // the membership lookups one push fan-out pays. Separate from "write"
-  // for the same reason "groupState" is -- it runs in the alarm, not on
-  // the write path, and averaging it into the per-event bucket would
-  // describe a cost no event pays.
+  // relay.ts drainPushOutbox: one push fan-out. Runs in the alarm, not
+  // on the write path.
   "push",
-  // relay.ts runCron -> storage.ts sweepChat: the chat_state row, the
-  // COUNT behind the report, and whatever the sweep removed. Separate
-  // from "cron" because it is the one step of a tick whose size is set by
-  // how much the room has been talking, and because the whole claim of
-  // ephemeral chat is that this bucket stays proportional to a day's
-  // conversation rather than to the accumulated history -- a bucket
-  // growing with the table is that claim failing.
+  // relay.ts runCron -> storage.ts sweepChat. Separate from "cron"
+  // because its size follows how much the room has talked; it should
+  // never grow with the accumulated table.
   "chatSweep",
-  // relay.ts runCron -> storage.ts sweepExpiredGiftWraps: the walk over
-  // stored gift wraps looking for lapsed ones, plus whatever it removed.
-  // Separate from "chatSweep" and from "cron" because its size is set by
-  // how full the gift wrap inbox is rather than by the day's traffic, and
-  // this is the bucket that would show it: a relay whose inbox is
-  // permanently full pays a walk an hour to establish there is nothing to
-  // reclaim, which is the one cost of this sweep worth watching.
+  // relay.ts runCron -> storage.ts sweepExpiredGiftWraps. Its size
+  // follows how full the gift wrap inbox is: a permanently full inbox
+  // pays one walk an hour to find nothing to reclaim.
   "giftWrapSweep",
   // relay.ts fetch(): recordHost plus the once-per-connection
   // isIpBlocked lookup.
   "connect",
-  // NIP-11 document and the Worker's NIP-98 owner lookup.
+  // Owner and identity lookups from the Worker: the NIP-11 document,
+  // the NIP-98 owner check, and the claim, claim-nonce and claim-status
+  // calls.
   "identity",
   // NIP-86 management calls (relay.ts manage).
   "management",
-  // schema.ts initSchema, which runs in the Durable Object constructor
-  // -- i.e. on every wake from hibernation, not once per deploy.
+  // schema.ts initSchema, which runs in the Durable Object constructor,
+  // so on every wake from hibernation.
   "schema",
-  // storage.ts settleRowsWritten: the write meter landing its own total
-  // into an ingest-hour bucket, on the paths that have no bucket write of
-  // their own (cron ticks, NIP-86 calls, the follow rebuild). Named
-  // rather than left to fall into `unattributed`, because a steady
-  // trickle there would read as a gap in the instrument when it is
-  // actually the instrument.
+  // storage.ts settleRowsWritten: the write meter landing its own total,
+  // on the paths that have no bucket write of their own. Named so it
+  // does not read as a gap in `unattributed`.
   "meter",
-  // The gap detector. Anything reaching SQLite outside a withReadPath
-  // scope lands here, and a large `unattributed` share is itself the
-  // finding: it means the instrument is missing a path and no arithmetic
-  // over the named ones can be trusted.
+  // Anything reaching SQLite outside a withReadPath scope. A large share
+  // here means the instrument is missing a path and the named figures
+  // cannot be trusted.
   "unattributed",
 ] as const;
 
@@ -144,13 +92,9 @@ export type ReadPath = (typeof READ_PATHS)[number];
 interface PathCounters {
   // Rows read, summed from SqlStorageCursor.rowsRead.
   rowsRead: number;
-  // Rows written, summed the same way from SqlStorageCursor.rowsWritten
-  // plus deleteEventRow's addRowsWritten top-up -- the per-path mirror of
-  // pendingRowsWritten below. Unlike pendingRowsWritten this is never
-  // taken/reset by a landing: it is a lifetime (since last eviction)
-  // diagnostic total, exactly like rowsRead beside it, so the two can
-  // share one bucket and one snapshot shape instead of the write side
-  // needing its own map and its own gap detector.
+  // Rows written (cursor rowsWritten plus addRowsWritten top-ups): the
+  // per-path mirror of pendingRowsWritten, but never reset by a landing.
+  // A since-eviction diagnostic total, like rowsRead.
   rowsWritten: number;
   // Individual sql.exec calls made inside this path.
   queries: number;
@@ -176,93 +120,59 @@ function bucket(path: ReadPath): PathCounters {
 }
 
 // ---------------------------------------------------------------------
-// THE WRITE METER. Rows written since the last landing, accumulated by
-// the same cursor wrapper the read attribution uses.
+// THE WRITE METER. Not a diagnostic: `pendingRowsWritten` is what
+// /api/stats reports as `rowsWrittenToday`, landed durably into
+// `ingest_hour_counts` by storage.ts settleRowsWritten/insertEventRow.
+// Measured at the wrapper, it sees every write (deletions, tombstones,
+// follow rebuilds, NIP-86 calls, backfill bookkeeping), which a sum over
+// `events.row_cost` cannot. A write can land in the wrong hour if a
+// handler straddles a bucket boundary, but cannot go uncounted.
 //
-// NOT A DIAGNOSTIC ITSELF, though `record`'s per-path bucket now mirrors
-// it row for row: `pendingRowsWritten` below is the number /api/stats
-// reports as `rowsWrittenToday`, measured against a ceiling Cloudflare
-// empties at 00:00 UTC, and it is durable -- landed by
-// storage.ts settleRowsWritten into `ingest_hour_counts`, which survives
-// eviction. `WriteMetricsSnapshot` at the bottom of this file is the
-// in-memory, per-path breakdown of the same deltas, with the read
-// attribution's caveats: it resets on eviction and is for proportions,
-// not a second ledger. It used to be a SUM over `events.row_cost`, which
-// is the cost of storing events and nothing else -- it could not see a
-// deletion, a tombstone, a follow-list rebuild, a NIP-86 ban or
-// backfill's own bookkeeping, every one of which is a real row against
-// the same 100,000/day allowance.
+// It is instance memory, which hibernation discards, and the relay wakes
+// dozens of times per cron interval. A timer or next-tick flush would
+// lose most of the count (more, the quieter the relay), so every DO entry
+// point lands its own total before returning: relay.ts `metered` ->
+// storage.ts settleRowsWritten.
 //
-// MEASURED AT THE WRAPPER, NOT REPORTED BY EACH PATH, and that is the
-// whole design. A path that has to remember to report its own writes is
-// a path that will eventually forget, and nothing catches it: this
-// project has already shipped BACKFILL_PAGE_SIZE wrong three times by
-// hand-maintaining a figure derived from something else. Wrapping
-// `sql.exec` once means a write can land in the wrong HOUR (if a handler
-// straddles a bucket boundary) but never go uncounted.
-//
-// IN MEMORY UNTIL IT LANDS, which is the one correctness property this
-// has to get right. `pendingRowsWritten` is instance memory and instance
-// memory does not survive hibernation -- and this relay wakes on the
-// order of seventy times per cron interval, so a meter that flushed on a
-// timer or deferred to the next tick would lose almost all of what it
-// measured, and lose MORE of it the quieter the relay is. So every entry
-// point lands its own total before returning: see storage.ts
-// settleRowsWritten and the `metered` wrapper in relay.ts.
-//
-// One row of residue can still be lost per wake, and it is exactly the
-// landing statement's own cost: the landing is itself a write, the
-// wrapper sees it, and it carries to the next landing rather than
-// chasing itself. settleRowsWritten declines to land a residue that
-// small, because spending one row to record one row is a treadmill
-// rather than accounting. Against that undercount, deleteEventRow leans
-// the other way by a much larger margin (schema.ts eventRemovalBudget),
-// so the meter as a whole reads high, which is the safe direction for a
-// budget.
+// One small residue can be lost per wake: the landing statement's own
+// write, which carries to the next landing, and settleRowsWritten skips
+// landing a residue below MIN_ROWS_WRITTEN_LANDING. deleteEventRow
+// over-counts by far more (schema.ts eventRemovalBudget), so the meter
+// reads high overall, the safe direction for a budget.
 // ---------------------------------------------------------------------
 let pendingRowsWritten = 0;
 
-// Rows written since the last landing, and reset to zero by the caller
-// taking them. Only storage.ts settleRowsWritten and storage.ts
-// insertEventRow's bucket bump may call this -- taking the total without
-// writing it somewhere durable is how it gets lost.
+// Returns and resets the unlanded total. Only storage.ts
+// settleRowsWritten and insertEventRow's bucket bump may call this:
+// taking the total without writing it somewhere durable loses it.
 export function takeRowsWritten(): number {
   const total = pendingRowsWritten;
   pendingRowsWritten = 0;
   return total;
 }
 
-// Rows written that the cursor did not report. The ONE caller is
-// storage.ts deleteEventRow, and the reason is stated on schema.ts
-// eventRemovalRowsWritten: SqlStorageCursor counts index maintenance on
-// INSERT and not on DELETE, so a wrapper-only figure undercounts every
-// removal -- the wrong direction for a meter whose whole job is saying
-// how close the relay is to a ceiling.
+// Rows written that the cursor did not report. Sole caller: storage.ts
+// deleteEventRow, because SqlStorageCursor counts index maintenance on
+// INSERT but not on DELETE (schema.ts eventRemovalRowsWritten), so a
+// wrapper-only figure would undercount every removal.
 export function addRowsWritten(rows: number): void {
   pendingRowsWritten += rows;
-  // Attributed to whatever path is active when deleteEventRow calls this
-  // -- always one of "write", "cron", "groupState" or "join", the same
-  // scopes trackCursor's own write-tracking uses, never "unattributed":
-  // deleteEventRow is reached only from inside one of those.
+  // Attributed to whichever scope is active, as trackCursor does.
   record(currentPath, 0, 0, rows);
 }
 
-// What has not landed yet. For settleRowsWritten's own threshold and for
-// the tests that assert the landing happened; nothing else should care.
+// For settleRowsWritten's threshold and for tests.
 export function unlandedRowsWritten(): number {
   return pendingRowsWritten;
 }
 
-// The innermost active scope. A plain variable, not an AsyncLocalStorage
-// context: every path measured here is synchronous from the first
-// sql.exec to the last (SqlStorage has no async surface), so there is no
-// interleaving for a stack to get wrong.
+// The innermost active scope. A plain variable rather than
+// AsyncLocalStorage is safe because SqlStorage is synchronous: no
+// measured path can interleave with another between sql.exec calls.
 let currentPath: ReadPath = "unattributed";
 
-// Attributes every read performed by `fn` to `path`, restoring the
-// previous scope afterwards. Nesting is innermost-wins, which is what
-// keeps estimateRowsWrittenSince reporting separately from the getStats
-// and backfill scopes that call it.
+// Attributes every query `fn` issues to `path`, restoring the previous
+// scope afterwards. Nesting is innermost-wins.
 export function withReadPath<T>(path: ReadPath, fn: () => T): T {
   const previous = currentPath;
   currentPath = path;
@@ -281,17 +191,13 @@ function record(path: ReadPath, rowsRead: number, queries: number, rowsWritten =
   entry.queries += queries;
 }
 
-// Wraps one cursor so its rowsRead lands in whichever bucket was active
-// when the query was issued -- captured at exec time, not at consumption
-// time, since a cursor may outlive its scope.
+// Wraps one cursor so its counts land in the scope active when the query
+// was issued (a cursor may outlive its scope).
 //
-// rowsRead is cumulative on the cursor and only reaches its final value
-// once the cursor is consumed, so this syncs the delta after every
-// method call rather than reading it once. It also syncs immediately at
-// exec time, which is what catches INSERT/UPDATE/DELETE statements: those
-// execute eagerly and their cursor is never consumed by anything here,
-// yet they genuinely read rows (`DELETE FROM event_tags WHERE event_id =
-// ?` has no index to use, for one).
+// rowsRead is cumulative and only final once the cursor is consumed, so
+// the delta is synced after every method call. It is also synced at exec
+// time, which is what catches INSERT/UPDATE/DELETE: they execute eagerly,
+// nothing consumes their cursor, and they still read rows.
 function trackCursor<T extends Record<string, SqlStorageValue>>(
   cursor: SqlStorageCursor<T>,
   path: ReadPath,
@@ -304,20 +210,14 @@ function trackCursor<T extends Record<string, SqlStorageValue>>(
       record(path, total - counted, 0);
       counted = total;
     }
-    // The write meter, on the same tick and by the same delta rule.
-    // INSERT/UPDATE/DELETE execute eagerly and their cursor carries a
-    // final rowsWritten immediately, so the sync at exec time below is
-    // what catches every write; the syncs after each method call cost
-    // nothing and are what would catch a statement whose write count
-    // settled later.
+    // The write meter, by the same delta rule. Writes are final at exec
+    // time; the later syncs would catch a count that settled afterwards.
     const written = cursor.rowsWritten;
     if (written > countedWritten) {
       const delta = written - countedWritten;
       pendingRowsWritten += delta;
-      // The per-path lifetime mirror of the accumulator just above --
-      // same delta, same tick, but never taken/reset by a landing. This
-      // is what lets /api/stats say WHICH path is spending the write
-      // budget instead of only how much of it is spent in total.
+      // Per-path mirror, never reset by a landing: says which path is
+      // spending the write budget.
       record(path, 0, 0, delta);
       countedWritten = written;
     }
@@ -325,10 +225,9 @@ function trackCursor<T extends Record<string, SqlStorageValue>>(
   record(path, 0, 1);
   sync();
 
-  // `receiver` is deliberately not forwarded to Reflect.get: native
-  // getters on a workerd cursor (rowsRead, rowsWritten) throw when
-  // invoked with a Proxy as their receiver, so every access is resolved
-  // against the real cursor.
+  // `receiver` is deliberately not forwarded to Reflect.get: workerd's
+  // native cursor getters (rowsRead, rowsWritten) throw when invoked with
+  // a Proxy as receiver.
   return new Proxy(cursor, {
     get(target, property) {
       const value = Reflect.get(target, property, target);
@@ -345,21 +244,17 @@ function trackCursor<T extends Record<string, SqlStorageValue>>(
   }) as SqlStorageCursor<T>;
 }
 
-// NOT PART OF THE DIAGNOSTIC: removing the rows-read attribution above
-// must keep this hook, or req-cache.ts serves stale answers.
+// Not part of the diagnostic: removing the read attribution must keep
+// this hook, or req-cache.ts serves stale answers.
 //
-// Whether a statement can change what a REQ query returns, for
-// req-cache.ts: a write naming `events` or `event_tags`, the only two
-// tables REQ SQL reads. Decided from the statement text rather than from
-// the cursor's rowsWritten, so it does not depend on how Cloudflare
-// reports a DELETE's writes, and narrowed to those two tables rather than
-// "any write" because two statements run on nearly every invocation and
-// write nothing a REQ can see: the constructor's
-// `CREATE TABLE IF NOT EXISTS schema_meta` and connect's
-// `UPDATE relay_meta`. Clearing on those would empty the cache on every
-// reconnect, which is exactly the traffic it exists for. `\b` treats `_`
-// as a word character, so `banned_events` and `event_hour_counts` do not
-// match.
+// True for a write naming `events` or `event_tags`, the only tables REQ
+// SQL reads. Decided from the statement text, not cursor.rowsWritten, so
+// it does not depend on how Cloudflare reports a DELETE's writes.
+// Narrowed to those two tables because writes that run on nearly every
+// connection (host.ts recordHost's `UPDATE relay_meta`) would otherwise
+// empty the cache on every reconnect, the traffic it exists for. `\b`
+// treats `_` as a word character, so `banned_events` and
+// `event_hour_counts` do not match.
 const WRITE_STATEMENT = /^\s*(INSERT|UPDATE|DELETE|REPLACE|DROP|ALTER)\b/i;
 // In table position, not anywhere: `maintained_counts` has a column
 // called `events`.
@@ -369,17 +264,10 @@ function changesReqResults(query: string): boolean {
 }
 
 
-// The single insertion point. Returns a SqlStorage that behaves exactly
-// like the one passed in, except that every cursor it hands out reports
-// its rows read into the active path.
-//
-// A wrapper rather than per-call-site instrumentation, deliberately: the
-// question this exists to answer is "what is consuming the reads," and a
-// list of call sites somebody remembered to annotate can only ever
-// confirm suspicions already held. Wrapping exec means a query can be
-// mis-LABELLED (it falls into `unattributed`) but never missed, which is
-// what makes the `unattributed` bucket a real gap detector rather than
-// decoration.
+// The single insertion point: a SqlStorage identical to the one passed
+// in, except every cursor reports into the active path. Wrapping exec
+// means a query can be mislabelled (into `unattributed`) but never
+// missed, which is what makes `unattributed` a real gap detector.
 export function instrumentSql(sql: SqlStorage): SqlStorage {
   return new Proxy(sql, {
     get(target, property) {
@@ -400,30 +288,19 @@ export interface ReadPathReport {
   rowsRead: number;
   queries: number;
   calls: number;
-  // Rows read per entry into this path -- the figure to multiply by a
-  // daily call frequency when projecting against the ceiling. Null when
-  // the path has not been entered, which is different from having been
-  // entered and read nothing.
+  // Rows read per entry into this path. Null when never entered, which
+  // differs from entered and read nothing.
   rowsPerCall: number | null;
-  // Share of the total, so the dominant consumer is readable without
-  // arithmetic. 0-1.
+  // Share of the total, 0-1.
   share: number;
 }
 
 export interface ReadMetricsSnapshot {
-  // Milliseconds this sample covers. Counters live in memory and reset
-  // on eviction, so this is what says whether the breakdown below
-  // describes a day or the last ninety seconds.
+  // Milliseconds this sample covers (counters reset on eviction).
   sinceMs: number;
   totalRowsRead: number;
-  // Extrapolation of totalRowsRead to 24h at the observed rate, against
-  // the 5,000,000/day ceiling. Always computed and rendered -- an
-  // /api/stats page load costs a bounded handful of rows now that every
-  // figure on it is a maintained counter, where it used to cost ~1,200,
-  // which is what made a short sample projection swing wildly (the
-  // observer dominating the measurement, not the relay). sinceMs stays
-  // alongside it so the reader can judge how much a given projection
-  // should be trusted.
+  // totalRowsRead extrapolated to 24h at the observed rate, against the
+  // 5,000,000/day ceiling. Trust it more the larger sinceMs is.
   projected24h: number;
   paths: ReadPathReport[];
 }
@@ -461,31 +338,20 @@ export interface WritePathReport {
   rowsWritten: number;
   queries: number;
   calls: number;
-  // Rows written per entry into this path -- the figure to multiply by a
-  // daily call frequency when projecting against the 100,000/day ceiling.
-  // Null when the path has not been entered.
+  // Rows written per entry into this path. Null when never entered.
   rowsWrittenPerCall: number | null;
-  // Share of the total, so the dominant consumer of the write budget is
-  // readable without arithmetic. 0-1.
+  // Share of the total, 0-1.
   share: number;
 }
 
-// The write-side twin of ReadMetricsSnapshot, over the same in-memory
-// counters and the same caveats: resets on eviction, sinceMs says how
-// long the sample covers, and this is for PROPORTIONS. It answers the
-// question `rowsWrittenToday` on its own cannot -- that figure is exact
-// and durable (schema.ts `ingest_hour_counts`), but it is one number, and
-// a relay spending far more of its write budget than its stored event
-// count would suggest has no way to say which path is doing the
-// spending. This does, at the same in-memory cost as the read
-// attribution beside it: nothing here is a new instrument, only a second
-// field the existing wrapper already had the numbers for.
+// The write-side twin of ReadMetricsSnapshot, with the same caveats
+// (in memory, resets on eviction, proportions only). `rowsWrittenToday`
+// is the durable total; this says which path is spending it.
 export interface WriteMetricsSnapshot {
   sinceMs: number;
   totalRowsWritten: number;
-  // Extrapolation to 24h at the observed rate, against the 100,000/day
-  // ceiling -- the same caveat as projected24h above: trust it more the
-  // larger sinceMs is.
+  // Extrapolated to 24h against the 100,000/day ceiling; same caveat as
+  // ReadMetricsSnapshot.projected24h.
   projected24h: number;
   paths: WritePathReport[];
 }
@@ -518,8 +384,7 @@ export function writeMetricsSnapshot(): WriteMetricsSnapshot {
   };
 }
 
-// Tests only -- there is no production caller and there should not be
-// one. Nothing outside a test has a reason to discard a sample.
+// Tests only.
 export function resetReadMetrics(): void {
   counters.clear();
   startedAtMs = null;

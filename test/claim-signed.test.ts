@@ -1,8 +1,8 @@
-// The QR claim (CLAUDE.md "What it is"): a one-time code the admin page
-// shows as a QR, redeemed either by the phone pasting an npub (/api/claim
-// with a nonce, unsigned) or by a signer proving possession with a NIP-42
-// AUTH event (/api/claim-signed). Additive to the paste-based TOFU flow
-// test/claim.test.ts covers.
+// The QR claim (src/ownership.ts claimWithNonce): a one-time code the
+// admin page shows as a QR, redeemed either by the phone pasting an npub
+// (/api/claim with a nonce, unsigned) or by a signer proving possession
+// with a NIP-42 AUTH event (/api/claim-signed). Additive to the
+// paste-based TOFU flow test/claim.test.ts covers.
 //
 // Same harness limitation as claim.test.ts, and for the same reason: the
 // global test env injects a fixed OWNER_PUBKEY binding (vitest.config.ts),

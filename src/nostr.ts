@@ -22,9 +22,8 @@ export type Filter = {
 };
 
 // Replaceable, ephemeral, and addressable kind ranges (nips/01.md
-// "Kinds"). Everything outside these three -- regular kinds, and the
-// spec-undefined 45-999 and >=40000 ranges -- falls through storage.ts's
-// default branch and is stored like a regular event.
+// "Kinds"). Everything else, including the spec-undefined 45-999 and
+// >=40000 ranges, is stored as a regular event.
 export function isReplaceableKind(kind: number): boolean {
   return kind === 0 || kind === 3 || (kind >= 10000 && kind < 20000);
 }
@@ -44,18 +43,13 @@ export function dTagValue(tags: string[][]): string {
   return tag?.[1] ?? "";
 }
 
-// NIP-65 (nips/65.md) Relay List Metadata -- the owner's own outbox/inbox
-// relay set. Backfill reads this to know which
-// relays hold the owner's history; it is never written by this relay.
+// NIP-65 (nips/65.md) Relay List Metadata: the owner's outbox/inbox
+// relays. Backfill reads it to find the owner's history.
 export const RELAY_LIST_KIND = 10002;
 
-// NIP-65 "content of these events must be empty... each tag entry must
-// contain a relay URL, and an optional marker of either 'read' or
-// 'write'." No marker means both -- so a relay is a write relay unless
-// explicitly marked 'read'-only. Duplicates collapse via the Set, and a
-// malformed tag (missing URL) is skipped rather than throwing, since this
-// reads an event authored by the owner but relayed through a third
-// party's relay, which is not something this code should trust blindly.
+// NIP-65: an `r` tag with no marker means both read and write, so a relay
+// is a write relay unless marked "read". Malformed tags are skipped, not
+// thrown on: the event arrives via a third-party relay.
 export function writeRelaysFrom(tags: string[][]): string[] {
   const urls = new Set<string>();
   for (const tag of tags) {
@@ -66,30 +60,24 @@ export function writeRelaysFrom(tags: string[][]): string[] {
   return [...urls];
 }
 
-// NIP-59 (nips/59.md) Gift Wrap. Signed by a random one-time key, never
-// the real sender's -- the `p` tag is the only identity information a
-// relay can see, which is why deletion/read authorization for this kind
-// works off `p` tags rather than `pubkey` everywhere else in this
-// codebase (relay.ts, storage.ts, ownership.ts).
+// NIP-59 (nips/59.md) Gift Wrap. Signed by a random one-time key, so the
+// `p` tag is the only identity a relay sees; read and deletion
+// authorization for this kind use the `p` tag, not `pubkey`.
 export const GIFT_WRAP_KIND = 1059;
 
 // NIP-62 (nips/62.md) Request to Vanish.
 export const VANISH_KIND = 62;
 
-// True for a tag this relay writes an `event_tags` row for. Only
-// single-letter tag names are indexed (NIP-01 `#<letter>` filters only
-// ever query those), and only each tag's first value -- see schema.ts's
-// write-cost comment. Shared by storage.ts insertEventRow and its
-// row-cost stamp so the count and the inserts can never disagree, and by
-// write-policy.ts exceedsMentionTagCap so the cap on a stranger's event
-// counts exactly the tags that cost rows.
+// True for a tag this relay writes an `event_tags` row for: single-letter
+// names only (the only ones NIP-01 `#<letter>` filters can query), first
+// value only. The one definition used by storage.ts insertEventRow, its row-cost
+// stamp, and write-policy.ts's mention tag cap, so all three count the
+// same tags.
 export function isIndexedTag(tag: string[]): boolean {
   return tag[0]?.length === 1 && tag[1] !== undefined;
 }
 
-// All `p` tag values on an event -- used to find a gift wrap's
-// recipient(s), since `pubkey` on a gift wrap is a random one-time key
-// and carries no identity.
+// All `p` tag values on an event.
 export function pTagValues(tags: string[][]): string[] {
   return tags.filter((t) => t[0] === "p" && t[1] !== undefined).map((t) => t[1] as string);
 }

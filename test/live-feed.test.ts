@@ -1,10 +1,10 @@
 // Admin page live feed -- a push-only, unauthenticated
 // WebSocket channel at "/live", separate from the nostr protocol
 // connection ("/"), that notifies whoever has the admin page open of
-// newly stored events. CLAUDE.md "What it is": "Never render gift wrap
-// p tags or content to an unauthenticated viewer" -- since the admin
+// newly stored events. Gift wraps (their p tags and content included)
+// go only to their NIP-42-authenticated recipient -- since the admin
 // page is static and unsigned, every live feed viewer is permanently
-// that unauthenticated case, so src/relay.ts liveBroadcast enforces it
+// an unauthenticated one, so src/relay.ts liveBroadcast enforces it
 // by never sending gift wraps here at all, rather than trying to gate
 // per-viewer the way NIP-42 gates real REQ subscriptions.
 import { env } from "cloudflare:workers";

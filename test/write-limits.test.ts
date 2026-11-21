@@ -85,7 +85,7 @@ describe("event size cap", () => {
     expect(message.startsWith("invalid:")).toBe(true);
     // The signature on this event is genuinely valid -- if the size check
     // ran after schnorr, verifySignature would show a call here. It is the
-    // whole point of putting the cheapest check first (CLAUDE.md "The budget").
+    // whole point of putting the cheapest check first.
     expect(verifySignature).not.toHaveBeenCalled();
     conn.close();
   });

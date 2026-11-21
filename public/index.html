@@ -156,7 +156,7 @@
 <div id="unclaimed-view" hidden>
   <p>This relay hasn't been claimed yet.</p>
 
-  <!-- The QR claim (CLAUDE.md "What it is"): carries your npub from your
+  <!-- The QR claim: carries your npub from your
        phone, where it lives, to this relay. The QR opens this same page on
        the phone with a one-time code in the fragment (wireClaimQr,
        claimLinkFromFragment). The code is only minted on this button's
@@ -229,15 +229,17 @@
 </details>
 
 <!-- Vendored, unmodified, from kazuhikoarase/qrcode-generator (MIT), tag
-     v20170724 -- see public/qrcode-generator.LICENSE and CLAUDE.md
-     "Architecture map" for why this is the one third-party file on this
-     page. Loaded before the inline script below so `qrcode` exists by
-     the time wireClaimQr needs it, but only actually called once the
+     v20170724 -- see public/qrcode-generator.LICENSE. It is the one
+     third-party file on this page: a claim QR has to be scannable and
+     nothing else in the project can encode one. sha256
+     c07680db88c9d87597a371fd10cc542bd1e143df77b03941d6803a38382fb28e.
+     Loaded before the inline script below so `qrcode` exists by the time
+     wireClaimQr needs it, but only actually called once the
      "Claim from your phone" button is pressed. -->
 <script src="qrcode-generator.js"></script>
 <script>
 // The three Workers-free-tier ceilings this page displays progress
-// against (CLAUDE.md "The budget"), read from /api/stats rather than
+// against, read from /api/stats rather than
 // hardcoded here a second time -- src/limits.ts STORAGE_BYTES_LIMIT /
 // DAILY_ROWS_WRITTEN_LIMIT / DAILY_ROWS_READ_LIMIT is the one place that
 // declares them. Assigned once main() has the response; every consumer
@@ -603,9 +605,8 @@ function describeKind(kind) {
 // Closed whenever the tab isn't visible, and only reopened when it is --
 // this is the live feed's idle timeout: a background tab
 // left open for hours must not hold a live DO connection the whole time
-// (CLAUDE.md "The budget": duration only stays cheap if hibernation
-// actually works, and a socket nobody is looking at is exactly the kind
-// of thing that's easy to forget is still open).
+// (duration only stays cheap if the Durable Object can hibernate, and
+// a socket nobody is looking at keeps it awake).
 function wireLiveFeed() {
   const statusEl = document.getElementById("live-status");
   const listEl = document.getElementById("live-list");
@@ -700,7 +701,7 @@ function wireLiveFeed() {
 // spending more of it.
 const CLAIM_STATUS_POLL_MS = 5000;
 
-// The desktop half of the QR claim (CLAUDE.md "What it is"): mints a
+// The desktop half of the QR claim: mints a
 // code, shows a QR of this page's own URL carrying it, and polls until a
 // phone claims with it or it expires. Deliberately does nothing until
 // show-qr-btn is clicked -- this page is reachable by anyone while the
@@ -859,8 +860,7 @@ function wireClaimForm(claimLink) {
     if (!/^[0-9a-f]{64}$/i.test(value)) return; // profile lookup only knows hex; npub is still accepted on submit
     const token = ++lookupToken;
     // Courtesy lookup only -- the hex/npub the user typed is what gets
-    // claimed regardless of whether this succeeds (CLAUDE.md "Claim
-    // implementation": "If the lookup fails, allow the claim anyway").
+    // claimed regardless of whether this succeeds.
     //
     // /api/profile answers only while the relay is unclaimed and 404s
     // once it is (src/index.ts handleProfile), which is the same window

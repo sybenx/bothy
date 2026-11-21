@@ -47,10 +47,8 @@ function convertBits(data: number[], fromBits: number, toBits: number): number[]
   return out;
 }
 
-// Decodes a bech32 string, returning its human-readable part and 8-bit
-// payload bytes -- or null if the checksum doesn't verify. A bad checksum
-// catches a typo; it does not catch a valid-but-wrong key (see CLAUDE.md
-// "Claim implementation").
+// Returns the human-readable part and 8-bit payload, or null if the
+// checksum fails. A checksum catches a typo, not a valid-but-wrong key.
 export function bech32Decode(input: string): { hrp: string; bytes: Uint8Array } | null {
   const lower = input.toLowerCase();
   if (lower !== input && input.toUpperCase() !== input) return null;

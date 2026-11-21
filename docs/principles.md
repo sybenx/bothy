@@ -85,7 +85,7 @@ Jobs: "We make progress by eliminating things." Apple's products are
 defined as much by what they leave out as by what they do, and leaving
 something out is a decision made on purpose, not a gap.
 
-**For bothy.** "What it refuses to be" in CLAUDE.md is a feature of the
+**For bothy.** "What this is not" in the README is a feature of the
 product, not a list of missing work. Each entry is a decision. A request
 for something on that list is answered with the decision, in the product
 itself where possible: the kind allowlist methods explain why they are
@@ -110,8 +110,8 @@ radio it is using. The person sees what the thing does for them.
 **For bothy.** The owner sees "You and the 336 people you follow can
 publish here." They do not see the ladder, the rung, the follow cache, the
 partition, or the name of the command that would change it. Internal
-vocabulary (rung, partition, scope, budget) stays in code comments,
-CLAUDE.md and the docs folder. If a user-facing string needs an internal
+vocabulary (rung, partition, scope, budget) stays in code comments
+and the docs folder. If a user-facing string needs an internal
 word to make sense, the string is wrong.
 
 ### Simplicity is refinement, not the starting point
@@ -149,7 +149,7 @@ names are capitalised consistently and never used as verbs.
 admin page; "encrypted mail" rather than "kind-1059 gift wraps" where the
 person is not a developer. The README's headings are things you do or
 things that are true, and its paragraphs are instructions. Reasoning goes
-in code comments and CLAUDE.md, never in the README unless it is a choice
+in code comments, never in the README unless it is a choice
 the owner would want to know they are making.
 
 ### Errors say what would have worked

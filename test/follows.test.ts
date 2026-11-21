@@ -1,4 +1,4 @@
-// The `follows` write policy (CLAUDE.md "Configuration": writes from the
+// The `follows` write policy (src/write-policy.ts: writes from the
 // owner's kind-3 follow list). Follows are re-derived from the owner's
 // own most recent kind-3 event already stored on this relay, not fetched
 // from elsewhere -- see ownership.ts refreshFollows(). Both the follows

@@ -2,9 +2,8 @@
 // #<tag>/since/until/limit, AND-within-a-filter, OR-across-filters, and
 // the ordering + tie-break rules for `limit`.
 //
-// All fixtures are owner-authored since only the owner can write (see
-// test/ownership.test.ts) -- this single-user relay never has more than
-// one distinct author's events stored, so "authors" is tested via list
+// All fixtures are owner-authored, so the write gate never refuses one
+// (see test/ownership.test.ts); "authors" is therefore tested via list
 // membership (owner's key present among others) rather than by storing
 // events from multiple authors.
 import { describe, expect, it } from "vitest";

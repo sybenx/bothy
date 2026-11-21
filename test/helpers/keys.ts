@@ -4,8 +4,9 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 // Fixed test keypair for the relay owner. The public half is injected as
 // the OWNER_PUBKEY binding in vitest.config.ts (miniflare.bindings) --
 // deliberately NOT in wrangler.jsonc, so a real deploy stays unclaimed
-// (TOFU) by default. See CLAUDE.md "What it is" for the env-override path
-// this fixture exercises.
+// (TOFU) by default. This fixture exercises the env-override path in
+// src/ownership.ts getOwnerPubkey: with OWNER_PUBKEY set, the stored owner
+// row is never consulted.
 export const OWNER_SECRET_KEY_HEX =
   "030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dc";
 export const OWNER_PUBKEY_HEX =

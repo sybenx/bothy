@@ -180,8 +180,7 @@ describe("NIP-98 authentication of management requests", () => {
 // management content type and nothing else still woke the object from
 // hibernation and spent one of the day's 100,000 requests. An
 // unauthenticated flood therefore cost a DO wake each, at no cost to the
-// sender -- the same shape as the gift wrap gate probe (CLAUDE.md
-// "The budget"): an expensive operation on the far side of no gate.
+// sender: an expensive operation on the far side of no gate.
 //
 // getOwner is the only thing in this path that touches storage, and it
 // declares the read path "identity" (relay.ts), so read-metrics.ts can

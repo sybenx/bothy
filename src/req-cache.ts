@@ -5,29 +5,23 @@ import type { NostrEvent } from "./nostr";
 // The answers to REQ queries, kept in memory until the data they were
 // read from changes.
 //
-// Why it exists: on 2026-10-09 the live relay was projected at 6.26M rows
-// read/day against the 5M ceiling, and 99.4% of that was `req`. The
-// table was effectively static (~8 new events a day); what was not was a
-// client reconnecting every ~13 seconds and re-sending its REQs, each
-// expanding to ~108 index seeks (filters.ts expandFilter) and costing
-// ~236 rows to return the answer it had been given thirteen seconds
-// earlier. Refusing that client was the other option, and the wrong one:
-// it is doing nothing worse than having a tab open. A hit here costs zero
-// rows read.
+// It exists for clients that reconnect every few seconds and re-send the
+// same REQs against data that rarely changes: measured on 2026-10-09,
+// that traffic was 99.4% of rows read and projected past the 5M/day
+// ceiling. A hit costs zero rows read. Refusing such a client would be
+// wrong; it is only holding a tab open.
 //
-// MODULE STATE, NOT INSTANCE STATE. A field on the Relay object would be
-// lost on every wake from hibernation -- 39 of them in 24 minutes in the
-// sample above -- while module memory lives as long as the isolate does,
-// which read-metrics.ts's counters showed spanning all 39. There is one
-// Durable Object per deployment, so there is exactly one database this
-// state can describe.
+// Module state, not instance state: a field on the Relay object is lost
+// on every wake from hibernation, while module memory lives as long as
+// the isolate, across many wakes. There is one Durable Object per
+// deployment, so one database for this state to describe.
 //
-// WHAT CAN MAKE AN ENTRY WRONG, and what handles each:
+// What can make an entry wrong, and what handles each:
 //   - A write to `events` or `event_tags`, the only two tables REQ SQL
 //     reads. read-metrics.ts instrumentSql clears the cache on any write
 //     statement naming either, so no path has to remember to; and
-//     storage.ts insertEventRow/deleteEventRow clear it again explicitly,
-//     because tests hand storeEvent an un-instrumented handle.
+//     storage.ts insertEventRow/deleteEventRow clear it again explicitly
+//     for callers (tests) holding an un-instrumented handle.
 //   - The clock, through NIP-40 `expiration`, which the SQL compares
 //     against `nowSec`. Each entry carries the earliest expiration among
 //     the events it holds and stops being a hit when that passes. An
@@ -53,11 +47,10 @@ const entries = new Map<string, Entry>();
 let cachedEvents = 0;
 const stats = { hits: 0, misses: 0, clears: 0 };
 
-// params[0] is `nowSec`, the `(expiration IS NULL OR expiration > ?)`
-// guard filters.ts buildFilterQuery puts first on every query. It changes
-// every second and says nothing about which rows match beyond expiry,
-// which minExpiration handles, so it is left out of the key -- otherwise
-// no two REQs a second apart could ever share an entry.
+// params[0] is `nowSec`, the expiration guard filters.ts buildFilterQuery
+// puts first on every query. Expiry is handled by minExpiration, so it is
+// left out of the key; otherwise no two REQs a second apart could share
+// an entry.
 export function reqCacheKey(sqlText: string, params: readonly unknown[]): string {
   return sqlText + "\u0000" + JSON.stringify(params.slice(1));
 }
@@ -71,8 +64,8 @@ export function readReqCache(key: string, nowSec: number): NostrEvent[] | undefi
   entries.delete(key);
   entries.set(key, entry);
   stats.hits++;
-  // A copy of the array, so a caller sorting or slicing in place cannot
-  // reorder the entry. The events themselves are frozen at insertion.
+  // A copy, so a caller sorting in place cannot reorder the entry. The
+  // events themselves are frozen at insertion.
   return [...entry.events];
 }
 

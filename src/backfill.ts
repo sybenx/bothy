@@ -1,9 +1,7 @@
-// One-shot backfill: fetch the owner's own events
-// from the write relays in their kind 10002 and store them." This module
-// is the DO-storage-facing half -- pure functions over SqlStorage, called
-// from relay.ts's RPC methods, exactly like ownership.ts/storage.ts. The
-// Worker-side half (outbound sockets, never here -- CLAUDE.md "The
-// budget") lives in backfill-worker.ts.
+// One-shot backfill: fetch the owner's own events from the write relays
+// in their kind 10002 and store them. This is the DO-side half, pure
+// functions over SqlStorage called from relay.ts's RPC methods. It opens
+// no connections; the outbound half is backfill-worker.ts.
 import { getOwnHost, normalizeHost } from "./host";
 import { BACKFILL_PAGE_SIZE, BACKFILL_ROWS_SHARE_LIMIT, utcDayStartSeconds } from "./limits";
 import { isEphemeralKind } from "./nostr";
@@ -15,85 +13,52 @@ export interface BackfillStatus {
   totalStored: number;
   relayCount: number;
   exhaustedCount: number;
-  // Null unless status is "running" and a relay remains to pull from --
-  // the Worker's cron tick uses these two fields directly rather than
-  // re-deriving "what's next" itself, so orchestration logic doesn't
-  // have to be duplicated on both sides of the RPC boundary.
+  // Null unless status is "running" and a relay remains. The Worker uses
+  // these directly so "what's next" is decided on one side of the RPC.
   nextRelay: string | null;
   nextUntil: number | null;
-  // Set by applyBackfillPage on every ingest call, successful or not (a
-  // page that stores zero events, e.g. all-duplicates, still updates
-  // this). Null until the first ingest ever runs. The diagnostic value
-  // is in comparing this against "now": stale means ingest is never
-  // being reached (a cron/RPC-level problem); current but totalStored
-  // not moving means it runs but stores nothing (a storage/validation
-  // problem) -- a distinction nothing else on this object can make.
+  // Set on every ingest call, even one that stores nothing. Stale against
+  // "now" means ingest is never reached (a cron/RPC problem); current
+  // while totalStored stays flat means it runs and stores nothing (a
+  // storage/validation problem).
   lastRunAt: number | null;
-  // Events one run asks each relay for -- limits.ts BACKFILL_PAGE_SIZE,
-  // reported rather than restated. Reading it off the wire is what keeps
-  // the admin page honest when the constant moves: it is derived from
-  // the declared index set (CLAUDE.md "The budget"), so adding an index
-  // shrinks it, and that comment records it having been silently wrong
-  // twice already as a hand-copied literal. A second copy in the page
-  // would be a third.
-  //
-  // A constant, not persisted state, so unlike every field above it does
-  // not describe what backfill has done -- it describes what the next
-  // run will ask for. It lives here because it is what the `lastRunAt`
-  // beside it is a run OF, and because this object is already the whole
-  // wire contract for backfill.
+  // limits.ts BACKFILL_PAGE_SIZE, reported rather than copied into the
+  // admin page: it is derived from the declared index set, so it moves
+  // when an index is added. A constant, not persisted state: it describes
+  // the next run, not past ones.
   pageSize: number;
-  // What `nextRelay` last said instead of sending history -- its CLOSED,
-  // NOTICE or AUTH frames, verbatim and truncated (backfill-worker.ts
-  // fetchPage). Null when the last page carried events, or when the relay
-  // genuinely said nothing. That distinction is the point: "stalled" and
-  // "stalled because the relay wants AUTH" are different problems, and
-  // before this field they were the same empty page.
+  // What `nextRelay` last sent instead of history (its CLOSED, NOTICE or
+  // AUTH frames, truncated; backfill-worker.ts fetchPage). Null when the
+  // last page carried events or the relay said nothing, so "stalled" and
+  // "stalled because the relay wants AUTH" stay distinguishable.
   nextRefusal: string | null;
 }
 
-// getBackfillStatus is pure over SqlStorage, like the rest of this
-// module -- it doesn't know the owner's pubkey (that's an env/storage
-// concern, ownership.ts getOwnerPubkey). Relay.getBackfillState (relay.ts)
-// merges that in before handing the result to the Worker, since
-// backfill-worker.ts needs it for every outbound REQ filter and
-// shouldn't have to make a second RPC call just to learn it.
-// canIngestNow is deliberately not part of the persisted BackfillStatus
-// state machine (pending/running/paused-budget/done) -- it's a
-// moment-to-moment read of today's rows-written headroom (below), not a
-// transition backfill itself makes, and it can flip from tick to tick
-// purely because of how much the owner posted in between.
+// Relay.getBackfillState merges in the owner pubkey (which this module
+// does not know) so the Worker needs one RPC, not two. canIngestNow is
+// not part of the persisted state machine: it is a moment-to-moment read
+// of today's headroom (hasBackfillHeadroom) and can flip between ticks.
 export type BackfillState = BackfillStatus & { ownerPubkey: string; canIngestNow: boolean };
 
-// Backfill must yield to the owner's own live traffic, not compete with
-// it for the shared 100,000 rows-written/day ceiling -- a relay that
-// can't accept the owner's new note because it's busy importing 2023 has
-// the priority backwards. True once what this relay has written SINCE THE
-// LAST 00:00 UTC (storage.ts estimateRowsWrittenSince, the same number
-// /api/stats already displays) still leaves backfill its reserved share
-// (BACKFILL_ROWS_SHARE_LIMIT, limits.ts) of the daily ceiling.
+// Backfill yields to the owner's live traffic rather than competing for
+// the 100,000 rows-written/day ceiling. True while rows written since the
+// last 00:00 UTC (storage.ts estimateRowsWrittenSince) leave backfill its
+// reserved share (limits.ts BACKFILL_ROWS_SHARE_LIMIT).
 //
-// Since midnight, not a rolling 24 hours. The ceiling this defends resets
-// at 00:00 UTC, and a rolling window carries yesterday's writes across
-// that reset -- which meant backfill stalling for up to a full day
-// against a budget the account had already been given back. See
-// limits.ts utcDayStartSeconds.
-// Checked twice, for two different reasons: getBackfillState (relay.ts)
-// checks it so the Worker's cron tick can skip opening an outbound
-// socket at all on a day live traffic already dominates, and
-// applyBackfillPage checks it again, authoritatively, immediately before
-// writing -- live traffic can consume real quota during the outbound
-// round-trip in between (backfill-worker.ts's fetch can take several
-// seconds), so only the second check actually protects the reserved
-// share; the first is purely to avoid wasted outbound connections on a
-// day backfill isn't going to be allowed to write anyway.
+// Since midnight, not a rolling 24h: the ceiling resets at 00:00 UTC, and
+// a rolling window would keep backfill paused for up to a day against a
+// budget already restored (limits.ts utcDayStartSeconds).
+//
+// Checked twice: getBackfillState checks it so the Worker can skip the
+// outbound fetch on a day with no headroom, and applyBackfillPage checks
+// again right before writing. Only the second protects the share, since
+// live traffic can spend quota during the fetch (several seconds).
 export function hasBackfillHeadroom(sql: SqlStorage, nowSec: number): boolean {
   return estimateRowsWrittenSince(sql, utcDayStartSeconds(nowSec * 1000)) < BACKFILL_ROWS_SHARE_LIMIT;
 }
 
-// Backs Relay.getBackfillState (relay.ts), read by the Worker's cron tick
-// (backfill-worker.ts) once per invocation to decide whether to discover
-// relays, fetch a page, or do nothing.
+// Backs Relay.getBackfillState, read once per cron tick by
+// backfill-worker.ts runBackfillTick.
 export function getBackfillStatus(sql: SqlStorage): BackfillStatus {
   const meta = sql
     .exec<{ status: string; total_stored: number; last_run_at: number | null }>(
@@ -121,35 +86,23 @@ export function getBackfillStatus(sql: SqlStorage): BackfillStatus {
   };
 }
 
-// Backs Relay.discoverBackfillRelays (relay.ts), called once the Worker
-// has resolved the owner's kind-10002 write relays from well-known
-// relays. A no-op if backfill_relays is already seeded -- the Worker only
-// calls this while status is still "pending" (getBackfillStatus), but
-// guarding here too means a stray duplicate call can't reset progress.
-// An empty `relayUrls` (lookup found nothing) deliberately leaves status
-// at "pending" so the next cron tick retries discovery, rather than
-// giving up after one failed lookup.
+// Backs Relay.discoverBackfillRelays. A no-op if already seeded, so a
+// duplicate call cannot reset progress. An empty `relayUrls` (the lookup
+// failed) leaves status "pending" so the next tick retries discovery.
 export function seedBackfillRelays(sql: SqlStorage, relayUrls: string[], nowSec: number): void {
   const alreadySeeded = sql.exec(`SELECT 1 FROM backfill_relays LIMIT 1`).toArray().length > 0;
   if (alreadySeeded || relayUrls.length === 0) return;
 
-  // The owner's kind-10002 write-relay list legitimately includes this
-  // relay itself -- pulling "history" from itself would seed a relay row
-  // that never exhausts (there is nothing there this relay doesn't
-  // already have) and leave /api/stats' nextRelay permanently pointing
-  // at the relay's own URL (src/host.ts's header comment has the full
-  // story). Detected by comparing the actual request host this
-  // deployment has seen traffic on, not by string-matching a project
-  // name -- the deployer can name their Worker anything.
+  // The owner's write relays usually include this relay. Seeding it would
+  // fetch our own events from ourselves. Matched against the host learned
+  // from traffic (host.ts), since the Worker can be named anything. The
+  // host may not be known yet; purgeSelfRelay covers that case later.
   const ownHost = getOwnHost(sql);
   const relays = ownHost === null ? relayUrls : relayUrls.filter((url) => normalizeHost(url) !== ownHost);
 
   if (relays.length === 0) {
-    // Every listed write relay was this relay itself -- there is no
-    // external history to import. Mark done rather than leaving status
-    // at "pending", which would otherwise retry discovery forever: the
-    // "pending" retry path (relayUrls.length === 0 above) is for a
-    // failed *lookup*, not a lookup that only found this relay.
+    // Every listed relay was this one: nothing to import. "done", not
+    // "pending", or discovery would retry forever.
     sql.exec(`UPDATE backfill_meta SET status = 'done'`);
     return;
   }
@@ -165,50 +118,27 @@ interface IngestResult {
   exhausted: boolean;
 }
 
-// Backs Relay.ingestBackfillPage (relay.ts): the Worker has already
-// fetched one page of raw EVENT payloads from `relayUrl` (authors:
-// [ownerPubkey], until: this relay's current cursor, limit: pageSize) and
-// hands them here to be validated and stored. Nothing in this function
-// opens a connection -- see backfill-worker.ts for the outbound half.
+// Backs Relay.ingestBackfillPage: validates and stores one page the
+// Worker already fetched from `relayUrl` (authors: [owner], until: this
+// relay's cursor, limit: pageSize).
 //
-// Ordering mirrors relay.ts's own accept path (acceptEvent) and its
-// stated reasoning: cheapest/most-certain rejections first, schnorr
-// verification (the expensive step, src/validate.ts) last and only
-// once nothing cheaper has already ruled the event out.
-//   1. author mismatch -- a relay returning events under a pubkey other
-//      than the one asked for is either buggy or hostile; free to check,
-//      and "owner's events only" is this feature's own scope (CLAUDE.md
-//      "What it is"), not just an artifact of the REQ filter.
-//   2. exact-id duplicate (eventExists) -- the same event will come back
-//      from every relay that has it, and re-verifying + re-storing an id
-//      this relay already has wastes the write budget this whole feature
-//      exists to protect. Same reasoning as the tombstone/ownership
-//      checks in relay.ts: check before paying for a schnorr verification
-//      whose result can't change the outcome.
-//   3. tombstoned id (isDeleted) -- a NIP-09/NIP-62 deletion made on this
-//      relay must stay deleted even though the event still lives on
-//      whatever relay backfill just pulled it from; without this check,
-//      backfill would resurrect exactly what those NIPs say must not be
-//      re-broadcastable.
+// Cheapest rejections first, schnorr verification last, as in relay.ts
+// acceptEvent:
+//   1. author mismatch: only the owner's events are in scope, whatever
+//      the remote relay returns.
+//   2. exact-id duplicate: every relay returns the same events; don't pay
+//      a verify whose result cannot change the outcome.
+//   3. tombstoned id: a NIP-09/NIP-62 deletion here must not be undone by
+//      a copy still living on the remote relay.
 //   4. id/signature validity.
-//   5. storeEvent -- the same function relay.ts's live write path calls,
-//      so replaceable/addressable/ephemeral semantics are identical by
-//      construction: a page containing several old versions of the
-//      owner's kind 0 collapses to one row (storeEvent's replaceable-kind
-//      branch), and ephemeral kinds are dropped rather than stored
-//      (storeEvent's ephemeral-kind branch) -- backfill does not
-//      reimplement any of this.
+//   5. storeEvent, the same function the live path uses, so replaceable,
+//      addressable and ephemeral semantics are identical.
 //
-// Cursor/exhaustion bookkeeping happens over every event in the raw page
-// that at least has a parseable created_at, regardless of whether it was
-// ultimately stored -- a duplicate or tombstoned id still represents real
-// progress through this relay's history, and skipping it in the cursor
-// walk would make backfill re-fetch it forever.
-// If storeEvent throws mid-page -- the real shape a Cloudflare
-// rows-written-quota failure takes (CLAUDE.md "Free-tier limits reset at
-// 00:00 UTC. Exceeding them fails operations rather than billing the
-// user") -- the loop stops immediately rather than continuing to attempt
-// (and fail) the rest of the page.
+// The cursor advances over every parseable event, stored or not: a
+// duplicate or tombstoned id is still progress, and skipping it would
+// re-fetch it forever. If storeEvent throws (the shape a rows-written
+// quota failure takes) the loop stops rather than failing the rest of
+// the page.
 export function applyBackfillPage(
   sql: SqlStorage,
   ownerPubkey: string,
@@ -217,27 +147,20 @@ export function applyBackfillPage(
   eose: boolean,
   nowSec: number,
   // Whatever the relay sent that was not history (backfill-worker.ts
-  // fetchPage). Recorded only when the page is empty -- a page that
-  // carried events explains itself.
+  // fetchPage). Recorded only when the page is empty.
   refusals: string[] = [],
 ): IngestResult {
-  // Authoritative yield-to-live-traffic check (see hasBackfillHeadroom's
-  // comment) -- the fetched page is discarded unstored and the cursor is
-  // left untouched, so the Worker will simply fetch this same page again
-  // once headroom reopens. In the common case backfill-worker.ts already
-  // skipped the outbound fetch entirely (its own check of the same
-  // condition, from getBackfillState), so this only fires on the race
-  // between that check and this one.
+  // The authoritative headroom check (see hasBackfillHeadroom). The page
+  // is discarded and the cursor left alone, so the same page is fetched
+  // again once headroom returns.
   if (!hasBackfillHeadroom(sql, nowSec)) {
     return { stored: 0, exhausted: false };
   }
 
   let stored = 0;
-  // Only advances past an event once it's been fully handled (stored, or
-  // legitimately skipped as a duplicate/tombstone/invalid) -- an event
-  // that threw partway through storeEvent must NOT be folded into the
-  // cursor, or a budget failure would silently skip it forever instead of
-  // retrying it once the daily quota resets.
+  // Advances only past fully handled events. An event whose storeEvent
+  // threw must not be folded in, or a budget failure would skip it
+  // forever instead of retrying it after the reset.
   let oldestProcessed: number | null = null;
   let budgetExceeded = false;
 
@@ -256,20 +179,13 @@ export function applyBackfillPage(
     ) {
       if (idMatchesContent(event) && verifySignature(event)) {
         try {
-          // nowSec, not event.created_at -- a backfilled event's own
-          // timestamp is years old, and attributing its write cost to
-          // that timestamp is exactly the bug that made this function's
-          // own headroom guard blind to backfill. See schema.ts.
+          // Ingested at nowSec, not created_at: a backfilled event is
+          // years old, and dating its write cost there would hide
+          // backfill's own writes from hasBackfillHeadroom.
           const result = storeEvent(sql, event, nowSec);
-          // storeEvent's `stored` field means "broadcast-worthy," not
-          // "a row now exists" -- for ephemeral kinds those diverge on
-          // purpose (storage.ts: a row is never written, but the event is
-          // still returned so relay.ts's live path can broadcast it).
-          // Backfill never broadcasts, so counting an ephemeral kind here
-          // would report progress that doesn't correspond to anything in
-          // `events` -- CLAUDE.md's storage-semantics
-          // requirement is "dropped rather than stored," and that has to
-          // hold for the counter too, not just the row.
+          // `stored` means "broadcast-worthy", not "a row exists": an
+          // ephemeral kind gets no row but is still returned. Backfill
+          // never broadcasts, so ephemeral kinds are not counted.
           if (result.stored && !isEphemeralKind(event.kind)) stored++;
         } catch {
           budgetExceeded = true;
@@ -280,37 +196,21 @@ export function applyBackfillPage(
     if (oldestProcessed === null || event.created_at < oldestProcessed) oldestProcessed = event.created_at;
   }
 
-  // Exhaustion means "the relay told us, via a real EOSE, that it has
-  // nothing older" -- NOT "the page came back short." A short-but-nonempty
-  // page is normal: relays apply their own per-REQ limit caps, so asking
-  // for BACKFILL_PAGE_SIZE and receiving fewer is routine, not a signal of
-  // exhaustion. And backfill-worker.ts's fetchPage calls the same done()
-  // for EOSE, a fetch timeout, a socket error, and a socket close, all
-  // resolving with whatever partial page had been collected so far -- a
-  // timed-out or failed fetch looks exactly like a short page and must not
-  // be mistaken for one, or a transient failure permanently retires a
-  // relay that still has history left. `eose` disambiguates: only a page
-  // that both terminated on a genuine EOSE AND has nothing in it is
-  // "nothing older" -- standard nostr history pagination walks `until`
-  // backwards until a page comes back empty, not until one comes back
-  // short. A budget failure ends the loop early for reasons that have
-  // nothing to do with this relay's remaining history, so it must never be
-  // mistaken for exhaustion either.
+  // Exhausted only when a genuine EOSE arrives with an empty page, never
+  // on a short page. Relays cap their own REQ limits, so short pages are
+  // routine, and fetchPage resolves a timeout, socket error or close with
+  // whatever partial page it had, which looks the same. Treating either
+  // as exhaustion would permanently retire a relay that still has
+  // history. History pagination walks `until` back until a page is empty.
+  // A budget failure is never exhaustion either.
   const exhausted = !budgetExceeded && eose && rawEvents.length === 0;
 
-  // Two separate updates rather than one: an empty page has no events to
-  // derive a cursor from (oldestProcessed stays null) but must still be
-  // able to record exhaustion -- folding both into one statement gated on
-  // oldestProcessed would silently skip the exhausted flag for exactly
-  // the page shape (zero events) that most commonly signals real
-  // exhaustion.
-  // exhausted and last_refusal move together in one statement rather than
-  // two: both are written on every ingest, so folding them costs one row
-  // write per tick instead of two and keeps the per-ingest cost exactly
-  // what it was before the refusal channel existed. last_refusal is
-  // cleared as soon as a page carries events, so it never reports a
-  // refusal the relay has since stopped making -- a stale explanation is
-  // worse than none.
+  // Two updates: an empty page has no cursor to derive (oldestProcessed
+  // is null) but must still record exhaustion, so the exhausted flag
+  // cannot be gated on the cursor. `exhausted` and `last_refusal` share
+  // one statement so the refusal costs no extra row write. last_refusal
+  // is cleared as soon as a page carries events, so it never reports a
+  // refusal the relay has stopped making.
   sql.exec(
     `UPDATE backfill_relays SET exhausted = ?, last_refusal = ? WHERE relay_url = ?`,
     exhausted ? 1 : 0,
@@ -334,28 +234,15 @@ export function applyBackfillPage(
   return { stored, exhausted };
 }
 
-// Removes any backfill_relays row pointing at this deployment itself, and
-// keeps removing it on every cron tick rather than only at seed time.
-//
-// seedBackfillRelays already filters the owner's own relay out of the
-// kind-10002 list -- but only `if (ownHost !== null)`, and the host is
-// learned from inbound traffic (src/host.ts), not known at deploy time.
-// On a fresh deployment whose first cron tick beats its first HTTP
-// request, that filter has nothing to compare against and the relay seeds
-// its own URL as a source of its own history. Every deployment is exposed
-// to that race, not just one that has already hit it.
-//
-// The row then sits flagged exhausted and harmless -- until
-// resetWronglyExhaustedRelays clears every flag unconditionally, at which
-// point it sorts first by URL for many host names and becomes `nextRelay`.
-// Backfill then spends its ticks fetching its own events from itself:
-// every event a duplicate, `stored` stuck at zero, the cursor still
-// advancing, and the relay that actually has history left waiting behind
-// it.
-//
-// Self-healing rather than a stricter guard at seed time, because the
-// host genuinely is unknowable then. The data to fix it arrives later and
-// was simply never consulted again; this consults it.
+// Removes any backfill_relays row pointing at this deployment, on every
+// cron tick rather than only at seed time. seedBackfillRelays can only
+// filter the own host once it is known, and it is learned from inbound
+// traffic (host.ts); a first cron tick that beats the first HTTP request
+// seeds this relay as a source of its own history. Backfill would then
+// spend ticks fetching its own events (all duplicates, nothing stored)
+// while real sources wait behind it. Runs after
+// resetWronglyExhaustedRelays in runCron, since that reset un-flags this
+// row too.
 export function purgeSelfRelay(sql: SqlStorage): number {
   const ownHost = getOwnHost(sql);
   if (ownHost === null) return 0;
@@ -369,32 +256,20 @@ export function purgeSelfRelay(sql: SqlStorage): number {
     }
   }
 
-  // If this relay was the only source listed, there is no external
-  // history to import and status must say so -- otherwise it stays
-  // 'running' forever against an empty table, which reads as "still
-  // working" when nothing will ever happen again. Same conclusion
-  // seedBackfillRelays reaches when every listed write relay was this
-  // relay. Guarded on having actually removed something, so an empty
-  // table that simply has not been seeded yet keeps its 'pending'.
+  // If this relay was the only source, mark done, or status stays
+  // 'running' forever over an empty table. Guarded on having removed
+  // something, so a not-yet-seeded table keeps 'pending'.
   if (removed > 0 && sql.exec(`SELECT 1 FROM backfill_relays LIMIT 1`).toArray().length === 0) {
     sql.exec(`UPDATE backfill_meta SET status = 'done'`);
   }
   return removed;
 }
 
-// One-time reset for relays wrongly marked exhausted by the pre-fix
-// short-page heuristic (a relay's own per-REQ cap, or a fetchPage
-// timeout/connection error, could each produce a short page that old
-// applyBackfillPage mistook for "no more history" -- see this function's
-// caller, Relay.runCron). Gated by backfill_meta.exhaust_reset_applied so
-// it runs at most once per deployment; checked before any write, so a
-// duplicate cron invocation racing this one just no-ops on its second
-// call. Deliberately leaves until_cursor untouched -- each relay's cursor
-// already points at exactly where it stopped, and rewinding it would
-// re-fetch history already stored. Safe even for a relay that really was
-// exhausted: clearing its flag costs exactly one wasted page fetch, which
-// comes back empty with a genuine EOSE and is immediately re-flagged
-// exhausted under the fixed rule above (applyBackfillPage).
+// One-time migration: clears exhausted flags that an older rule (a short
+// page counted as exhaustion) may have set wrongly. Runs at most once per
+// deployment (backfill_meta.exhaust_reset_applied). Leaves until_cursor
+// alone, so nothing already stored is re-fetched. A relay that really was
+// exhausted costs one empty page and is re-flagged by applyBackfillPage.
 export function resetWronglyExhaustedRelays(sql: SqlStorage): void {
   const applied =
     sql

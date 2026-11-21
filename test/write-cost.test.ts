@@ -3,15 +3,15 @@
 //
 // This file exists because a live relay reported rowsWrittenToday at 42,006
 // of 100,000 with only 146 events ingested that day -- roughly 3,000 of that
-// is event storage (CLAUDE.md "The budget"'s per-event figures), and nothing
-// before this file could say what the other ~39,000 was. src/read-metrics.ts
-// WriteMetricsSnapshot answers "which path", mirroring the rows-read
-// attribution row for row; this file asserts that mirror is wired correctly
-// and uses it (plus direct measurement, for the paths the shared "cron"
-// bucket cannot itself distinguish) to test one specific hypothesis: that
-// ownership.ts refreshFollows is rebuilding the follow cache on every cron
-// tick because backfill keeps ingesting a kind-3 older than the one already
-// cached.
+// is event storage (the per-event figures test/hibernation.test.ts pins),
+// and nothing before this file could say what the other ~39,000 was.
+// src/read-metrics.ts WriteMetricsSnapshot answers "which path",
+// mirroring the rows-read attribution row for row; this file asserts that
+// mirror is wired correctly and uses it (plus direct measurement, for the
+// paths the shared "cron" bucket cannot itself distinguish) to test one
+// specific hypothesis: that ownership.ts refreshFollows is rebuilding the
+// follow cache on every cron tick because backfill keeps ingesting a
+// kind-3 older than the one already cached.
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { signEvent } from "./helpers/event";
@@ -105,10 +105,11 @@ describe("write attribution", () => {
   });
 });
 
-// CLAUDE.md "The budget" ascribes refreshFollows's own cost to "3 rows per
-// member on the insert and 1 on the removal" for a NIP-29 membership
-// change; a full follow-cache rebuild is the same shape (delete all, insert
-// all) over a much larger N. The hypothesis under test: does an ordinary
+// A NIP-29 membership change costs ~3 rows per member on the insert and 1
+// on the removal, because the kind-39002 member list is deleted and
+// rewritten whole (test/nip29-groups.test.ts "rows written per membership
+// change"); a full follow-cache rebuild is the same shape (delete all,
+// insert all) over a much larger N. The hypothesis under test: does an ordinary
 // cron tick, finding backfill has ingested a kind-3 OLDER than the one
 // already cached, rebuild the cache anyway?
 describe("follow cache rebuild: does an unchanged or backfill-superseded kind-3 retrigger it", () => {

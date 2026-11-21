@@ -2,10 +2,10 @@
 // EVENT/EOSE (nips/01.md lines 113-161). Covers subscription lifecycle,
 // not filter-matching semantics -- see nip01-filters.test.ts for that.
 //
-// All fixture events are owner-authored since only the owner can write
-// (see test/ownership.test.ts); reads themselves are public per
-// CLAUDE.md's threat model, so subscription behavior does not depend on
-// who is connected.
+// All fixture events are owner-authored, so the write gate never refuses
+// one (see test/ownership.test.ts); reads of ordinary events need no
+// authentication, so subscription behavior does not depend on who is
+// connected.
 import { describe, expect, it } from "vitest";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";

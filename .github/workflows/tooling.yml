@@ -6,8 +6,8 @@ name: Update tooling
 # version, after a week's cooldown, and only if the typecheck, the whole test
 # suite and a build all pass on the result.
 #
-# It commits straight to main, because this repository has no pull requests
-# (CLAUDE.md "Conventions"). A push to main is a deploy, so a green run
+# It commits straight to main, because this repository has one contributor
+# and uses no branches or pull requests. A push to main is a deploy, so a green run
 # rebuilds the relay with the new wrangler. A red run commits nothing, and
 # GitHub emails the owner about the failure, which is the signal that an
 # update needs a person.

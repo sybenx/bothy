@@ -1,13 +1,10 @@
 // The write policy: who may publish to this relay, as one named level.
 //
-// docs/rungs.md describes a relay's write policy as a ladder, each step
-// defined by WHO may write and WHAT BOUNDS THE VOLUME. This file is that
-// ladder made concrete. The levels are CUMULATIVE -- each admits everyone
-// the one below it admits and one more class of writer -- so the policy is
-// a single value, and the ordering below is what "cumulative" means in
-// code. The ordering is internal: nothing that reaches an owner (the
-// management API, the env var, /api/stats, the admin page, the README)
-// ever shows a number or the word "rung". They see the five names.
+// The ladder docs/rungs.md describes, each step defined by WHO may write
+// and WHAT BOUNDS THE VOLUME. The levels are CUMULATIVE -- each admits
+// everyone the one before it does plus one more class of writer -- so the
+// policy is a single value. The ordering is internal: owners only ever see
+// the five names, never a number or the word "rung".
 //
 //   owner     Only events signed by the relay's owner.
 //             Bounded by the owner's own posting rate.
@@ -35,13 +32,10 @@
 // banpubkey is the mirror image: a banned pubkey is refused under every
 // policy, follows and mentions and all included.
 //
-// Where the value lives. `WRITE_POLICY` in the environment is for an
-// operator who configures in the dashboard and wants the policy pinned
-// there, where a stored value cannot quietly override it; the stored
-// value (NIP-86 changewritepolicy, relay_settings) is for the owner
-// changing it from a client without a redeploy; the default is
-// `follows`, which is the policy this relay has shipped with since
-// writes opened to the owner's contact list.
+// Where the value lives: `WRITE_POLICY` in the environment pins it from
+// the dashboard, where a stored value cannot override it; the stored value
+// (NIP-86 changewritepolicy, relay_settings) lets the owner change it from
+// a client without a redeploy; otherwise `follows`.
 
 import { pTagValues, isIndexedTag, type NostrEvent } from "./nostr";
 import { MAX_MENTION_EVENT_INDEXED_TAGS } from "./limits";
@@ -104,11 +98,10 @@ export function parsePolicy(value: unknown): WritePolicy | null {
 // the write caps: a typo in the dashboard should cost the operator the
 // override, not the policy.
 //
-// `stored` is the relay_settings value as storage.ts getRelaySettings
-// reads it (null when no changewritepolicy has ever been stored), passed
-// in rather than read here so this function costs no rows on its own:
-// relay.ts caches the resolved policy per instance and pays the one-row
-// read once per wake, not once per event.
+// `stored` is the relay_settings value (storage.ts getStoredWritePolicy;
+// null if never set), passed in so this function reads no rows: relay.ts
+// caches the resolved policy per instance, paying the read once per wake
+// and again after each management call, not per event.
 export function resolveWritePolicy(env: Env, stored: string | null): ResolvedWritePolicy {
   if (env.WRITE_POLICY !== undefined) {
     const policy = parsePolicy(env.WRITE_POLICY);
@@ -132,36 +125,26 @@ export function envOverridesPolicy(env: Env): boolean {
   return env.WRITE_POLICY !== undefined && parsePolicy(env.WRITE_POLICY) !== null;
 }
 
-// The `mentions` test: does the event concern the owner? docs/rungs.md
-// says "must reference or address the owner", and a `p` tag is how nostr
-// does both -- a reply p-tags the author it answers (NIP-10), a mention
-// p-tags the person mentioned, a reaction p-tags the note's author, a
-// zap p-tags its recipient. Read off the event itself, which is what
-// puts this on the CHEAP tier of the filter ladder underneath the
-// policy: no storage read and no outbound connection, just a walk over
-// tags the relay already holds. An `e` tag pointing at one of the
-// owner's events would also be a reference, but deciding that needs a
-// lookup per event, and every event that references the owner that way
-// already carries the owner's `p` under NIP-10.
+// The `mentions` test: does the event reference or address the owner? A
+// `p` tag is how nostr does both (replies under NIP-10, mentions,
+// reactions, zaps). Read off the event alone, so it costs no storage read.
+// An `e` tag pointing at an owner's event is not checked: that needs a
+// lookup per event, and NIP-10 replies already carry the owner's `p`.
 export function mentionsPubkey(event: Pick<NostrEvent, "tags">, pubkey: string): boolean {
   return pTagValues(event.tags).includes(pubkey);
 }
 
-// The cap that keeps `mentions` bounded in ROWS and not only in authors.
-// A non-owner event costs 3 rows written per single-letter tag it carries
-// (CLAUDE.md "The budget"), and under `mentions` the author is anyone, so
-// a stranger could otherwise mention the owner once inside a 64KB event
-// carrying two thousand `p` tags and spend six percent of the day's
-// ceiling on it -- twenty a minute, from as many pubkeys as they care to
-// generate. Counted over the tags this relay would actually index (the
-// same isIndexedTag storage.ts prices), so the cap bounds what it costs
-// rather than the shape of the event: an NIP-92 `imeta` or an `emoji`
-// tag costs no rows and is not counted.
+// Keeps `mentions` bounded in ROWS, not only in authors. Each indexed tag
+// costs 3 rows written (schema.ts eventRowCost), and under `mentions` the
+// author can be anyone, so one 64KB event carrying two thousand `p` tags
+// would spend about 6% of the 100,000 rows/day ceiling, repeatable at the
+// per-pubkey rate from any number of fresh keys. Counted with isIndexedTag,
+// the same test storage pricing uses, so tags that cost no rows (`imeta`,
+// `emoji`) are not counted.
 //
-// NOT applied under `all`. That policy's stated bound is the per-writer
-// caps and nothing else, and an open relay that refused a stranger's
-// kind-3 contact list -- hundreds of `p` tags, every one of them
-// legitimate -- would not be open.
+// NOT applied under `all` (ownership.ts isAllowedWriter returns before
+// it): that policy is bounded by the per-writer caps alone, and an open
+// relay must accept a stranger's kind-3 with hundreds of `p` tags.
 export function exceedsMentionTagCap(event: Pick<NostrEvent, "tags">): boolean {
   let indexed = 0;
   for (const tag of event.tags) {

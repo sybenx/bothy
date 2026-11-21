@@ -128,7 +128,7 @@ This relay's read path is intentionally public, so it is worth adding a free Clo
 
 ## Inbox mode (encrypted mail)
 
-This relay also accepts encrypted mail addressed to you, from anyone ([NIP-59](https://github.com/nostr-protocol/nips/blob/master/59.md) gift wraps, kind 1059), regardless of who else is allowed to write here — see "Who can write here" below for that policy. It's the write path a client needs if you publish a `kind:10050` DM relay list naming this relay; bothy itself never publishes that list for you, so nothing changes unless you deliberately turn your relay into a DM inbox by signing one.
+This relay also accepts encrypted mail addressed to you, from anyone ([NIP-59](https://github.com/nostr-protocol/nips/blob/master/59.md) gift wraps, kind 1059), under every write policy except `owner` — see "Who can write here" below for that policy. It's the write path a client needs if you publish a `kind:10050` DM relay list naming this relay; bothy itself never publishes that list for you, so nothing changes unless you deliberately turn your relay into a DM inbox by signing one.
 
 Reading them back is restricted to you. A query that names kind 1059 gets a [NIP-42](https://github.com/nostr-protocol/nips/blob/master/42.md) AUTH challenge instead of results; a query that doesn't name a kind is answered normally, with the gift wraps simply absent from what comes back. The second half matters as much as the first: refusing a query only when it would have matched a gift wrap makes the refusal itself the answer, and a stranger sliding a time window across your relay could count and time-correlate your incoming DMs from the refusals alone, without ever mentioning kind 1059. Leaving them out answers the same way whether your inbox is full or empty. You can delete a gift wrap the same way you'd delete any note ([NIP-09](https://github.com/nostr-protocol/nips/blob/master/09.md)), and [NIP-62](https://github.com/nostr-protocol/nips/blob/master/62.md) "Request to Vanish" support means either you or a message's sender can ask for it to be permanently purged.
 
@@ -164,7 +164,7 @@ bothy_rpc https://your-relay.workers.dev/ changewritepolicy '["mentions"]'
 bothy_rpc https://your-relay.workers.dev/ getwritepolicy
 ```
 
-The URL must be exactly the relay's, trailing slash included, because the signature covers it. It takes effect immediately. `getwritepolicy` reads back the policy in force and where it was set. An empty string clears the stored policy and returns to the default. `all` asks you to confirm: the first call refuses and tells you the exact confirmation string to pass as a second parameter. If `WRITE_POLICY` is set in the Cloudflare dashboard it outranks the management API, and `changewritepolicy` tells you so.
+The URL must be the relay's own `https://` address, because the signature covers it. It takes effect immediately. `getwritepolicy` reads back the policy in force and where it was set. An empty string clears the stored policy and returns to the default. `all` asks you to confirm: the first call refuses and tells you the exact confirmation string to pass as a second parameter. If `WRITE_POLICY` is set in the Cloudflare dashboard it outranks the management API, and `changewritepolicy` tells you so.
 
 Under `all`, NIP-11 advertises `restricted_writes: false`; under every other policy it is `true`.
 
@@ -205,7 +205,7 @@ Each of the three resolves in the same order, from most to least authoritative:
 1. The environment variable (`RELAY_NAME`, `RELAY_DESCRIPTION`, `RELAY_ICON`), if you set one in the Cloudflare dashboard.
 2. The value stored through `changerelayname`, `changerelaydescription` or `changerelayicon`.
 3. Your kind-0 profile — its `name`, `about` and `picture`.
-4. A built-in default.
+4. A built-in default. The icon has none: with nothing above it set, the NIP-11 document leaves the icon out.
 
 When a name comes from your kind-0 profile it is derived rather than chosen, so it reads possessively: a profile name of "Aaron" becomes "Aaron's relay". A name you set yourself, by either of the first two routes, is used exactly as you wrote it.
 
@@ -221,15 +221,15 @@ The effective name also appears on the admin page, since NIP-86 has no `getrelay
 
 ## HTTP endpoints
 
-- `GET /api/stats` — relay stats for the admin page. Returns `{ version, claimed, ownerPubkey, totalEvents, events24h, ingested24h, rowsWrittenToday, storageBytes, storageBytesLimit, dailyRowsWrittenLimit, dailyRowsReadLimit, backfill, icon, relayName, writePolicy, writePolicySource, groupPolicy, chatPolicy, followCount, countAudit, followsListAt, vanishing, reads }`. `writePolicy` is the write policy in force by name and `writePolicySource` is where it was set (`env`, `stored` or `default`); `groupPolicy` is `on` or `paused`. `events24h` counts events by their own timestamp, which is what you posted; `ingested24h` counts what this relay actually took in, backfill included. During a backfill those differ by orders of magnitude. `vanishing` is a count, a progress total and an age — never the pubkeys that asked, since this endpoint is public and naming them would publish exactly the list a vanish request exists to remove someone from.
-  Every figure here is a maintained counter, exact and current as of the request — nothing on this document is cached or dated. `events24h` and `ingested24h` are windowed in whole hours, so each spans 24–25 hours rather than exactly 24; `rowsWrittenToday` is exact, since a UTC day starts on a whole hour.
+- `GET /api/stats` — relay stats for the admin page. Returns `{ version, claimed, ownerPubkey, relayPubkey, totalEvents, events24h, ingested24h, rowsWrittenToday, storageBytes, storageBytesLimit, dailyRowsWrittenLimit, dailyRowsReadLimit, backfill, icon, relayName, writePolicy, writePolicySource, groupPolicy, chatPolicy, followCount, countAudit, followsListAt, vanishing, ownerListsThisRelay, reads, writes, reqCache, connections, latestVersion, updateAvailable }`. `relayPubkey` is the relay's own signing key (the NIP-11 `self` field), not yours. `ownerListsThisRelay` says whether your own relay list (kind 10002) already names this relay; the admin page hides the `wss://` copy box once it does. `latestVersion` and `updateAvailable` are the update check described in "Keeping it updated" (`null` and `false` when it is off or failed). `reads`, `writes`, `reqCache` and `connections` are diagnostics held in memory, which start again from zero whenever Cloudflare evicts the relay. `writePolicy` is the write policy in force by name and `writePolicySource` is where it was set (`env`, `stored` or `default`); `groupPolicy` is `on` or `paused`. `events24h` counts events by their own timestamp, which is what you posted; `ingested24h` counts what this relay actually took in, backfill included. During a backfill those differ by orders of magnitude. `vanishing` is a count, a progress total and an age — never the pubkeys that asked, since this endpoint is public and naming them would publish exactly the list a vanish request exists to remove someone from.
+  Every other figure here is a maintained counter, exact and current as of the request — nothing on this document is cached or dated except `latestVersion`, which is cached for six hours. `events24h` and `ingested24h` are windowed in whole hours, so each spans 24–25 hours rather than exactly 24; `rowsWrittenToday` is exact, since a UTC day starts on a whole hour.
   `rowsWrittenToday` counts every row the relay wrote today: event rows and their index entries, tag rows, tombstones, counter updates, the follow-list rebuild, management calls and backfill bookkeeping. It is measured, and it reads slightly high because a removal is charged a pessimistic figure.
 - `POST /api/claim` — TOFU claim; body `{ pubkey }` (npub or hex), plus `nonce` when the claim comes from the QR (a code from `/api/claim-nonce`; `410` if it has expired or was already used). See "Ownership and lifecycle" above.
 - `POST /api/claim-nonce` — mints a short-lived, single-use code for the QR claim; returns `{ nonce, exp }`. Setup-only: 404s under `OWNER_PUBKEY`, refuses with `409` once claimed.
 - `POST /api/claim-signed` — a proof-of-possession claim for signer apps that implement it (none do yet); body is a signed [NIP-42](https://github.com/nostr-protocol/nips/blob/master/42.md) AUTH event (kind 22242) naming this relay in its `relay` tag and a code from `/api/claim-nonce` in its `challenge` tag. Answers cross-origin (CORS), since a signer app — not this relay's own admin page — would call it directly, from whatever origin it runs on.
 - `GET /api/claim-status?nonce=` — polled by the admin page while a QR is on screen; returns `{ status }` (`pending`, `claimed`, or `claimed-elsewhere` if the relay was claimed some other way while this code was outstanding).
 - `GET /api/profile?pubkey=<hex>` — the claim form's courtesy profile preview: it looks your kind-0 up on a couple of well-known relays so you can see the name and avatar attached to a pubkey before binding the relay to it permanently. **This is a setup endpoint and it is only reachable during setup** — once the relay is claimed it returns 404, because it exists to guard one irreversible step and there is no reason to leave a path that opens outbound connections to third-party relays permanently open to anybody. Results are cached for five minutes.
-- `GET /live` — unauthenticated, push-only WebSocket for the admin page's live feed (max 5 connections, 10-minute lifetime); sends `{ kind, created_at, id }` per stored event, never gift wraps.
+- `GET /live` — unauthenticated, push-only WebSocket for the admin page's live feed (max 5 connections, 10-minute lifetime); sends `{ kind, created_at, id }` per stored event, with `id` cut to its first 8 characters, never gift wraps.
 - Any path, with header `Accept: application/nostr+json` — the [NIP-11](https://github.com/nostr-protocol/nips/blob/master/11.md) relay information document. It reports the relay's name, description and icon, along with `pubkey` (yours, once the relay is claimed), and `contact` (the `website` from your kind-0 profile, if you have one). Both are omitted rather than left empty when there is nothing to report.
 - `POST /`, with header `Content-Type: application/nostr+json+rpc` — the [NIP-86](https://github.com/nostr-protocol/nips/blob/master/86.md) management API, authenticated with a [NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md) event signed by the owner. See "Relay management API" above.
 
@@ -245,9 +245,9 @@ The NIPs leave some behavior unspecified. A few choices are worth knowing if you
 
 ## What this is not
 
-This project deliberately does not do: payments/zaps, multi-region scaling, NIP-05 hosting, media uploads, or community moderation tooling. The NIP-86 management API is the owner administering their own relay, not moderation tooling in the community sense. See `CLAUDE.md` for the full list — most feature requests are already ruled out there. The write policies in "Who can write here" follow the ladder described in [docs/rungs.md](docs/rungs.md).
+This project deliberately does not do: payments/zaps, multi-region scaling, NIP-05 hosting, media uploads, or community moderation tooling. The NIP-86 management API is the owner administering their own relay, not moderation tooling in the community sense. The write policies in "Who can write here" follow the ladder described in [docs/rungs.md](docs/rungs.md).
 
-**Group support is paused.** There is code in this relay for a single NIP-29 group, with invites, private reads and ephemeral chat, and web push to go with it. It is not documented here because it does not yet work well enough to rely on, and it is off unless the `GROUPS` environment variable is set to `on`: a paused relay refuses group writes and does not advertise NIP-29. The code and tests stay; the documentation comes back when it works.
+**Group support is paused.** There is code in this relay for NIP-29 groups — as many as the owner creates with a kind-9007 create-group event, with the owner as the only admin of each — with invites, members-only reads and ephemeral chat, and web push to go with it. It is not documented here because it does not yet work well enough to rely on, and it is off unless the `GROUPS` environment variable is set to `on`: a paused relay refuses group writes and does not advertise NIP-29. The code and tests stay; the documentation comes back when it works.
 
 ## Attribution
 
@@ -262,8 +262,6 @@ npm run test       # protocol conformance + budget regression
 npm run typecheck
 npm run deploy      # wrangler deploy
 ```
-
-See `CLAUDE.md` for architecture, the free-tier budget this project is built against, and the working conventions for this repo.
 
 ## License
 

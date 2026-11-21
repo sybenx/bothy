@@ -17,7 +17,7 @@
 //     relay, which is the assertion with the most ways to go wrong.
 //   + the cost: what a conversation of a few hundred messages spends
 //     against the 100,000 rows-written/day ceiling, measured on a real
-//     SqlStorageCursor like every other figure in CLAUDE.md "The budget".
+//     SqlStorageCursor.
 //
 // Driven at the storage layer rather than over the wire, for the reason
 // test/nip29-groups.test.ts gives: these are assertions about what got
@@ -492,8 +492,8 @@ describe("reporting mode", () => {
   });
 });
 
-// What this costs against the 100,000 rows-written/day ceiling
-// (CLAUDE.md "The budget"). Measured on a real SqlStorageCursor, so a
+// What this costs against the 100,000 rows-written/day ceiling.
+// Measured on a real SqlStorageCursor, so a
 // change that moves it fails here rather than drifting.
 describe("rows written per swept message", () => {
   function measureRowsWritten(sql: SqlStorage, fn: (sql: SqlStorage) => void): number {
@@ -525,8 +525,8 @@ describe("rows written per swept message", () => {
       const message = chat(emptiedAt - 60, 1);
 
       const stored = measureRowsWritten(sql, (metered) => storeEvent(metered, message, now));
-      // 9 base + 3 for the one `h` tag -- CLAUDE.md "The budget", the
-      // measured figure.
+      // 9 base + 3 for the one `h` tag -- the measured cost
+      // (schema.ts eventRowCostMeasured), not the charged one.
       expect(stored).toBe(12);
 
       const state = setRoomOccupiedAt(sql, emptiedAt);
@@ -671,8 +671,8 @@ describe("rows read per chat REQ", () => {
   });
 });
 
-// The one figure a reader of CLAUDE.md "The budget" will want to check
-// against the constant rather than against the prose.
+// Pins limits.ts CHAT_SWEEP_BATCH_SIZE to its derivation, so the
+// constant cannot move without this changing too.
 describe("the derived constants", () => {
   it("sizes one tick's sweep at five percent of the day's rows-written ceiling", () => {
     // 100,000 / 20 = 5,000 rows a tick, at the charged cost of a two-tag

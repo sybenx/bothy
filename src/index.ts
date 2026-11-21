@@ -20,12 +20,9 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-// Same as json() above, plus CORS_HEADERS -- used only by
-// POST /api/claim-signed, the one endpoint a cross-origin signer has to
-// call directly. Defined here so it sits beside json(); CORS_HEADERS
-// itself is declared further down, beside the NIP-86 preflight it exists
-// for, but referencing it here is safe -- nothing calls this function
-// until long after the whole module has finished evaluating.
+// json() plus CORS_HEADERS, for POST /api/claim-signed. CORS_HEADERS is
+// declared further down; safe, since nothing calls this before the module
+// has finished evaluating.
 function corsJson(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -33,31 +30,24 @@ function corsJson(body: unknown, status = 200): Response {
   });
 }
 
-// Per-IP HTTP rate limiting, via Cloudflare's Rate Limiting binding. The
-// limit and window are declared in wrangler.jsonc, which is also where
-// the reasoning for the two namespaces and their values lives -- nothing
-// here restates a number that the runtime enforces from there.
+// Per-IP HTTP rate limiting via Cloudflare's Rate Limiting binding, which
+// runs before the Durable Object is reached. Limits and their reasoning
+// live in wrangler.jsonc; nothing here restates them.
 //
-// Returns a 429 to send back, or null to continue. The check is placed at
-// the top of each handler rather than at the top of route(), because
-// static assets must not be rate limited: they are served from
-// env.ASSETS, cost neither a Worker request against the daily 100,000 nor
-// any Durable Object time, and are free and unmetered on Workers Free.
-// Throttling the admin page would spend the guard on the one path that
-// does not need it.
+// Returns a 429, or null to continue. Called per handler rather than at
+// the top of route(), so static assets (env.ASSETS: free, unmetered, never
+// touch the DO) are not limited.
 //
-// An absent binding means "allowed", not "denied" -- see env.d.ts. The
-// failure this protects against is expensive; the failure of refusing
-// every request because a binding did not provision would be total.
+// An absent binding means "allowed" (see env.d.ts): refusing every
+// request because a binding did not provision would be worse than no
+// limit.
 async function rateLimited(
   limiter: RateLimit | undefined,
   request: Request,
 ): Promise<Response | null> {
   if (limiter === undefined) return null;
-  // Normalized for the same reason nip86.ts normalizes a blockip
-  // argument (src/ip.ts): one address must not get two allowances by
-  // arriving in two spellings. Cloudflare sends a canonical form today,
-  // so this is belt-and-braces rather than a live bug.
+  // Normalized (src/ip.ts) so one address cannot get two allowances under
+  // two spellings.
   const key = normalizeIp(request.headers.get("CF-Connecting-IP") ?? "unknown");
   const { success } = await limiter.limit({ key });
   if (success) return null;
@@ -86,40 +76,27 @@ async function handleClaim(request: Request, env: Env): Promise<Response> {
     return json({ error: "malformed request body" }, 400);
   }
   const rawPubkey = (body as { pubkey?: unknown } | null)?.pubkey;
-  // Present when the phone that scanned the admin page's QR is the one
-  // claiming (public/index.html's phone view; ownership.ts claimWithNonce).
-  // It authenticates nothing -- this claim is unsigned either way -- and
-  // exists so /api/claim-status can tell the desktop page its QR landed.
+  // Present when the claim comes from the phone that scanned the admin
+  // page's QR (ownership.ts claimWithNonce). Authenticates nothing; it
+  // lets /api/claim-status tell the desktop page its QR landed.
   const rawNonce = (body as { nonce?: unknown } | null)?.nonce;
-  // Looked up here, in the stateless Worker, not inside the claim() RPC --
-  // an outbound WebSocket from inside the DO would pin it in memory for
-  // up to 15 minutes (CLAUDE.md "The budget"; profile-lookup.ts). This
-  // duplicates claim()'s own normalization, but that's cheap and pure;
-  // it's the only way to know which pubkey to look up before calling in.
-  //
-  // Goes through the cache (profile-lookup.ts lookupProfileCached) so the
-  // submit reuses whatever /api/profile already fetched for the same
-  // pubkey moments earlier -- the claim form looks up the profile as you
-  // type it and then again on submit, which is the same question asked
-  // twice within seconds.
+  // Normalized here as well as in claim() so the Worker knows which
+  // profile to look up: the lookup opens outbound WebSockets, which must
+  // happen in the Worker, never the DO (an outbound socket pins the DO in
+  // memory for up to 15 minutes; see profile-lookup.ts). Cached, so the
+  // submit reuses the /api/profile preview fetched seconds earlier.
   const normalized = typeof rawPubkey === "string" ? normalizePubkey(rawPubkey) : null;
 
-  // Everything that can refuse this call runs before the outbound lookup,
-  // because /api/claim has the same amplifier shape /api/profile did: it
-  // opens two WebSockets to relay.damus.io and nos.lol
-  // (profile-lookup.ts), and it stayed permanently open to anyone long
-  // after the one claim it exists for had happened. A claimed relay
-  // answered 409 -- but only after making those two connections on behalf
-  // of whoever asked. Now a call that cannot possibly succeed costs at
-  // most one indexed read and no outbound traffic at all.
+  // Everything that can refuse runs before the outbound lookup, so a
+  // claim that cannot succeed (e.g. on an already claimed relay) costs at
+  // most one indexed read and opens no connections to third-party relays
+  // on a stranger's behalf.
   //
-  // The pubkey and owner checks mirror claim()'s own, in the same order
-  // (the claim code's shape is checked here only; whether it is live is a
-  // storage question claim() answers), and none of them replaces it:
-  // claim() remains the authority.
-  // The Durable Object is single-threaded, so the check-then-write inside
-  // it is what actually makes TOFU atomic, and it still answers
-  // "conflict" if it loses a race this pre-check could not have seen.
+  // These mirror claim()'s checks in the same order (the code's liveness
+  // is a storage question only claim() answers), but claim() remains the
+  // authority: its check-then-write in the single-threaded DO is what
+  // makes TOFU atomic, and it answers "conflict" on a race this pre-check
+  // could not see.
   if (env.OWNER_PUBKEY) return new Response("not found", { status: 404 });
   if (normalized === null) return json({ error: "invalid pubkey: expected npub1... or 64-char hex" }, 400);
   if (rawNonce !== undefined && (typeof rawNonce !== "string" || rawNonce.length === 0 || rawNonce.length > 64)) {
@@ -137,8 +114,7 @@ async function handleClaim(request: Request, env: Env): Promise<Response> {
   );
   switch (result.status) {
     case "disabled":
-      // CLAUDE.md "What it is": "If OWNER_PUBKEY is set in
-      // env... return 404 from /api/claim."
+      // OWNER_PUBKEY set: the claim endpoints do not exist.
       return new Response("not found", { status: 404 });
     case "invalid":
       return json({ error: "invalid pubkey: expected npub1... or 64-char hex" }, 400);
@@ -151,19 +127,18 @@ async function handleClaim(request: Request, env: Env): Promise<Response> {
   }
 }
 
-// POST /api/claim-nonce -- the QR claim's setup step, always
-// called by bothy's own admin page (same-origin, no CORS needed) right
-// before it renders a QR. Mints the nonce the QR embeds and the eventual
-// kind-22242 claim event must name -- see src/nip42.ts and CLAUDE.md
-// "What it is" for the full flow.
+// POST /api/claim-nonce: called by bothy's own admin page (same origin)
+// when the owner presses the button to show a claim QR, never on page
+// load. An unclaimed relay is public, so minting per view would let a
+// crawler write rows for free. Mints the code the QR carries; see
+// ownership.ts issueClaimNonce.
 async function handleClaimNonce(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
 
   const limited = await rateLimited(env.RATE_LIMIT_API, request);
   if (limited !== null) return limited;
 
-  // Same disabled-check as /api/claim, and for the same reason: cheapest
-  // and most certain first, before the DO is ever touched.
+  // Before the DO is touched, as in /api/claim.
   if (env.OWNER_PUBKEY) return new Response("not found", { status: 404 });
 
   const result = await relayStub(env).issueClaimNonce();
@@ -182,21 +157,16 @@ async function handleClaimNonce(request: Request, env: Env): Promise<Response> {
   }
 }
 
-// POST /api/claim-signed -- the proof-of-possession claim path. Body is a
-// signed kind-22242 NIP-42 AUTH event naming a nonce issued by
-// /api/claim-nonce and this relay's own host; see src/nip42.ts
-// verifyClaimAuthEvent for the checklist and the README's "Ownership and
-// lifecycle" for the wire contract.
+// POST /api/claim-signed: a proof-of-possession claim. The body is a
+// signed kind-22242 NIP-42 AUTH event naming a code from /api/claim-nonce
+// and this relay's host (checklist: nip42.ts verifyClaimAuthEvent). No
+// signer app implements this yet; it is kept for one that does (e.g.
+// over NIP-46).
 //
-// Reachable cross-origin, unlike its two siblings above: this is the one
-// call a *signer* makes, from whatever origin it runs on (a native app
-// isn't bound by CORS at all, but a web-based signer is), and the
-// rationale is the same one index.ts already states for the NIP-86
-// management endpoint -- the body is a signed event, there's no cookie or
-// session for a cross-origin caller to borrow, so this widens no
-// authorization. The blanket OPTIONS preflight below already answers for
-// this path; what a plain json() response was missing is the header that
-// lets the browser actually read it.
+// CORS-enabled, unlike the other claim endpoints, because a web-based
+// signer calls it from its own origin. Safe for the same reason as the
+// management endpoint (see CORS_HEADERS): the body is a signed event and
+// there is no cookie or session to borrow.
 async function handleClaimSigned(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
 
@@ -229,11 +199,10 @@ async function handleClaimSigned(request: Request, env: Env): Promise<Response> 
   }
 }
 
-// GET /api/claim-status?nonce= -- polled by bothy's own admin page (same
-// origin) while a QR is on screen. Answers forever, claimed or not:
-// there's no outbound call to protect here and nothing sensitive in the
-// answer, and the page's last poll needs to observe the claim landing
-// cleanly rather than race a "setup's over" 404.
+// GET /api/claim-status?nonce=: polled by the admin page while a QR is
+// shown. Answers after the claim too (unlike /api/profile): the page's
+// last poll must see the claim land rather than a 404, and the answer
+// reveals nothing sensitive.
 async function handleClaimStatus(request: Request, env: Env): Promise<Response> {
   const limited = await rateLimited(env.RATE_LIMIT_API, request);
   if (limited !== null) return limited;
@@ -247,19 +216,16 @@ async function handleClaimStatus(request: Request, env: Env): Promise<Response> 
   return json({ status });
 }
 
-// NIP-86 relay management (nips/86.md), Worker-side half: read the body,
-// verify the NIP-98 event over it, then hand the call to the Durable
-// Object (src/nip86.ts handleManagementCall) to actually touch storage.
+// NIP-86 relay management (nips/86.md), Worker-side half: verify the
+// NIP-98 event over the body, then hand the call to the Durable Object
+// (src/nip86.ts handleManagementCall).
 //
-// Verification lives here rather than in the DO because the schnorr
-// verify is the expensive step (src/validate.ts) and
-// a forged request should never cost Durable Object time at all. The DO's
-// manage() RPC does no authentication of its own -- this function is the
-// only caller, and it must stay that way.
+// Verification lives here so a forged request costs no DO time. The DO's
+// manage() RPC does no authentication of its own: this function must stay
+// its only caller.
 //
-// Deliberately never consults `blocked_ips`. An operator who blocks their
-// own address must still be able to call unblockip; see the
-// connection-time check in src/relay.ts and blockip in src/nip86.ts.
+// Never consults `blocked_ips`, so an operator who blocks their own
+// address can still call unblockip.
 async function handleManagement(request: Request, env: Env): Promise<Response> {
   const limited = await rateLimited(env.RATE_LIMIT_API, request);
   if (limited !== null) return limited;
@@ -269,38 +235,19 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
   // as-sent, before any decoding or parsing can normalize them.
   const body = new Uint8Array(await request.arrayBuffer());
 
-  // Verify first, touch the Durable Object second, and the order is the
-  // whole point. This used to fetch the owner before looking at the
-  // Authorization header at all, so a POST with no header -- or no body,
-  // or a header full of nonsense -- still woke the object from
-  // hibernation and spent a request against the daily 100,000. An
-  // unauthenticated flood therefore cost a DO wake each, at no cost to
-  // the sender. Exactly the shape of the gift wrap gate probe
-  // (CLAUDE.md "The budget"): an expensive operation sitting on the far
-  // side of no gate.
-  //
-  // Now the DO is reached only by a caller who has already produced a
-  // valid schnorr signature over this exact method, URL and body. That
-  // still is not proof of *ownership* -- anyone can sign their own
-  // event -- but it is proof of work no flood gets for free, and the
-  // rate limiter above bounds what remains.
+  // Verify BEFORE touching the Durable Object. Otherwise a POST with no
+  // valid header still wakes the DO and spends one of the day's 100,000
+  // requests, free for the sender. A valid signature over this exact
+  // request is not proof of ownership, but no flood gets it for free.
   const auth = verifyNip98(request, body, Math.floor(Date.now() / 1000));
   if (!auth.ok) {
-    // nips/98.md: "Failed validation should return a 401 Unauthorized
-    // response." The reason travels in the body rather than being
-    // swallowed -- every failure mode here (clock skew, a wrong `u` tag,
-    // the wrong key) is something the operator can fix in seconds once
-    // told which one it was, and guessing at it otherwise.
+    // 401 per nips/98.md, with the reason in the body.
     return managementResponse({ error: auth.reason }, 401);
   }
 
-  // Parsed before the ownership round trip, which it was not before. The
-  // parse is free -- no storage, no network -- and the method name is now
-  // needed to know WHICH gate applies: almost everything here is
-  // owner-only, and subscribepush/unsubscribepush are callable by a group
-  // member too (nip86.ts MEMBER_CALLABLE_METHODS). Doing it in the other
-  // order would mean refusing a member's subscription before having read
-  // the word that says it was one.
+  // Parsed before the owner round trip (it is free) because the method
+  // name decides which gate applies: subscribepush/unsubscribepush are
+  // callable by group members too (nip86.ts MEMBER_CALLABLE_METHODS).
   let parsed: unknown;
   try {
     parsed = JSON.parse(new TextDecoder().decode(body));
@@ -310,21 +257,17 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
   const call = parsed as { method?: unknown; params?: unknown } | null;
   const params = Array.isArray(call?.params) ? (call.params as unknown[]) : [];
 
-  // The first DO round trip of the request, and the last thing standing
-  // between a valid signature and a management call.
+  // The first DO round trip of the request.
   const denial = ownerReason(auth.pubkey, await relayStub(env).getOwner());
   if (denial !== null) {
-    // A member's subscribepush is the one thing a non-owner signature can
-    // buy here, and it buys nothing else: the method has to be on the
-    // short list AND the signer has to be in the group. Two conditions,
-    // checked in that order, because the first is free and the second is
-    // a second round trip -- so a stranger signing `banpubkey` still
-    // costs exactly what it cost before this existed.
+    // A non-owner passes only if the method is member-callable AND the
+    // signer is a group member, checked in that order: the first is free,
+    // the second is another round trip, so a stranger signing `banpubkey`
+    // costs no extra. relay.ts isGroupMember checks membership of the
+    // default group (`_`) only.
     //
-    // UNCLAIMED still refuses whatever the method is. `ownerReason`
-    // returns its unclaimed reason before any signer comparison, and a
-    // relay with no owner has no group and no members, so there is
-    // nobody the membership check could admit anyway.
+    // An unclaimed relay has no members, so this refuses there whatever
+    // the method.
     const memberCallable =
       typeof call?.method === "string" && MEMBER_CALLABLE_METHODS.includes(call.method);
     if (!memberCallable || !(await relayStub(env).isGroupMember(auth.pubkey))) {
@@ -344,69 +287,39 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
 }
 
 // ---------------------------------------------------------------------
-// CORS on the management endpoint.
+// CORS on the management endpoint (and on /api/claim-signed via
+// corsJson). Safe, and must not be removed as an oversight.
 //
-// WHY THIS IS SAFE, AND WHY IT MUST NOT BE REMOVED AS AN OVERSIGHT.
+// Every management call is authenticated by a NIP-98 signature over this
+// exact method, URL and body, carried in a header a page must construct
+// deliberately. There is no cookie, session or other ambient authority
+// for a cross-origin request to borrow, which is what the same-origin
+// policy protects. `*` rather than a reflected origin: with no credentials
+// there is no origin to keep secret, and a wildcard cannot be combined
+// with credentials. A preflight reveals only that the endpoint exists,
+// which NIP-11 `supported_nips` already advertises.
 //
-// Every management call is authenticated by a NIP-98 event (src/nip98.ts)
-// signed over this exact method, URL and body, and index.ts refuses
-// anything else before the Durable Object is touched. Allowing a browser
-// to make the request from another origin therefore weakens no
-// authorization whatsoever: the signature is the credential, it travels
-// in a header the page has to construct deliberately, and no browser
-// attaches it on a page's behalf. There is no cookie, no session and no
-// ambient authority here for a cross-origin request to borrow -- which is
-// exactly the thing the same-origin policy exists to protect, and exactly
-// the thing this endpoint does not have. `*` rather than a reflected
-// origin for the same reason: with no credentials in play there is no
-// origin to keep secret, and a wildcard cannot be combined with
-// credentials even if some later change tried to.
-//
-// What an unauthenticated preflight reveals is that a management endpoint
-// exists, which the NIP-11 document already advertises to anyone --
-// `supported_nips` lists 86 unauthenticated, on the same URL.
-//
-// WITHOUT THIS, the management API is reachable only from a page the
-// relay itself served. hearth is served from GitHub Pages, so every
-// management call from it failed at the browser: listunusedinvites, which
-// already shipped, and now subscribepush -- which means push could not be
-// turned on from the copy of hearth most people use.
-//
-// The same constant now backs corsJson() above, for POST /api/claim-signed
-// -- the QR/signed claim path's one endpoint a *signer*, not bothy's own
-// admin page, calls directly, from whatever origin it runs on. The
-// argument is identical: the body is a signed event, there is no cookie or
-// session to borrow, so cross-origin costs nothing. Without it, only a
-// native app (which CORS doesn't bind) could ever use that path, and the
-// whole point of building it against plain NIP-42 is that it isn't
-// native-app-only.
+// Without it the API works only from a page this relay served; hearth is
+// served from GitHub Pages, so its management calls (invites, push
+// subscription) would fail in the browser.
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
-  // Exactly the two headers a NIP-86 call sets. `Authorization` is what
-  // makes the request non-simple and forces the preflight in the first
-  // place; `Content-Type` is non-simple too, since
-  // application/nostr+json+rpc is not one of the three CORS-safelisted
-  // media types.
+  // The two headers a NIP-86 call sets; both are non-simple
+  // (application/nostr+json+rpc is not a CORS-safelisted media type).
   "Access-Control-Allow-Headers": "Authorization, Content-Type",
-  // A day, so a client making repeated management calls preflights once
-  // rather than doubling every call into two requests against the same
-  // per-IP allowance.
+  // A day, so repeated calls preflight once rather than doubling every
+  // request against the per-IP allowance.
   "Access-Control-Max-Age": "86400",
 };
 
-// The preflight. Answered for any path, because the management endpoint
-// is the relay ROOT (nips/86.md: "on the same URI as the relay's
-// websocket") and a browser preflighting it sends OPTIONS with no
-// Content-Type header at all -- so the management branch in route()
-// cannot recognize it, and without an explicit branch it would fall
-// through to the static asset handler and answer 405.
+// The preflight, answered for any path: the management endpoint is the
+// relay root (nips/86.md), and an OPTIONS request carries no Content-Type,
+// so route()'s management branch cannot recognise it and it would
+// otherwise fall through to the asset handler's 405.
 //
-// Deliberately NOT rate limited, unlike every other HTTP path here. It
-// never reaches the Durable Object, reads no storage and opens nothing,
-// so there is no cost for the limiter to protect; and counting it would
-// spend two of an IP's sixty per minute for every single management call,
-// halving the real allowance for the one client that has to preflight.
+// NOT rate limited: it reaches no DO and reads nothing, and counting it
+// would halve a preflighting client's per-IP allowance.
 function preflightResponse(): Response {
   return new Response(null, { status: 204, headers: CORS_HEADERS });
 }
@@ -422,23 +335,15 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
   const limited = await rateLimited(env.RATE_LIMIT_API, request);
   if (limited !== null) return limited;
 
-  // The "a newer bothy exists" notice (src/upstream-version.ts), merged
-  // in HERE rather than inside getStats, and the placement is the point:
-  // it is an outbound request, and the Durable Object is the one place in
-  // this project that must not make one on a read path (CLAUDE.md "The
-  // budget" -- a socket held there costs duration and blocks
-  // hibernation). The Worker is stateless and pays neither.
+  // The "newer bothy available" check (src/upstream-version.ts) runs here
+  // in the Worker, not in getStats: it is an outbound request, which the
+  // DO must not make on a read path (it costs duration and blocks
+  // hibernation).
   //
-  // Started before the DO round trip and awaited after it, so the two
-  // overlap: on the rare cache miss this adds latency only if
-  // githubusercontent is slower than the relay's own storage, and never
-  // more than UPSTREAM_VERSION_TIMEOUT_MS. It cannot reject
-  // (cachedUpstreamVersion catches everything and answers null), so no
-  // failure here can turn a working stats page into an error.
-  //
-  // The version it is compared against is the one getStats already
-  // reports, not a second import of package.json -- CLAUDE.md "Release
-  // step" keeps exactly one source of truth for that string.
+  // Started before the DO round trip and awaited after, so they overlap
+  // (bounded by UPSTREAM_VERSION_TIMEOUT_MS). It never rejects
+  // (cachedUpstreamVersion answers null on failure). Compared against the
+  // version getStats reports, so package.json stays the one source.
   const upstream = updateCheckEnabled(env) ? cachedUpstreamVersion() : Promise.resolve(null);
 
   const stats = await relayStub(env).getStats(new URL(request.url).host);
@@ -446,35 +351,19 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
   return json({ ...stats, ...describeUpdate(await upstream, stats.version) });
 }
 
-// The claim form's courtesy profile preview, and nothing else: you paste
-// a pubkey, it shows you the name and avatar attached to it so you can
-// see it is yours before binding the relay to it permanently. A typo
-// guard for a one-time, irreversible setup step (CLAUDE.md "What it is").
+// The claim form's profile preview: shows the name and avatar for a
+// pasted pubkey, as a typo guard before the irreversible claim.
 //
-// Which means it is a setup endpoint, and it is now scoped to setup. It
-// used to be permanently open: unauthenticated, uncached, and opening two
-// outbound WebSockets to relay.damus.io and nos.lol per request
-// (profile-lookup.ts). A flood spent the day's 100,000 requests and the
-// duration budget, and -- the part that is not ours to spend -- pointed
-// this deployment's IP at third-party relays on demand, making it an
-// amplifier toward the same infrastructure backfill and the claim-time
-// lookup depend on. Getting throttled or blocked by damus for traffic a
-// stranger caused is a failure this relay cannot fix from its own side.
+// Each cache miss opens two outbound WebSockets to third-party relays
+// (profile-lookup.ts), so an open endpoint would make this deployment an
+// amplifier toward relays that backfill and the claim lookup depend on.
+// It cannot be authenticated (there is no owner yet), so it is scoped by
+// time instead: it answers only while the relay is unclaimed and 404s
+// after. Also rate limited at a sixth of the other paths.
 //
-// It cannot be authenticated -- during a TOFU claim there is by
-// definition no owner to authenticate against, which is the whole premise
-// (ownership.ts). So the available scope is time, not identity: it
-// answers while the relay is unclaimed and 404s the moment it is not,
-// which is the same window the claim form itself is rendered in
-// (public/index.html switches to the claimed view off /api/stats). On a
-// claimed relay -- which is every relay, for all but the first few
-// minutes of its life -- this path no longer reaches the network at all.
-//
-// Ordering: the free format check, then ownership, then the fetch. The
-// ownership check is a DO round trip and the cache lookup is free, but
-// the cache is deliberately consulted *after* it. Serving a cached answer
-// to a claimed relay would leave the endpoint open for the cache's
-// lifetime after the thing that justified it ended.
+// The owner check runs BEFORE the cache, though the cache is free:
+// serving cached answers on a claimed relay would keep the endpoint open
+// for the cache's lifetime.
 async function handleProfile(request: Request, env: Env): Promise<Response> {
   const limited = await rateLimited(env.RATE_LIMIT_PROFILE, request);
   if (limited !== null) return limited;
@@ -484,9 +373,7 @@ async function handleProfile(request: Request, env: Env): Promise<Response> {
     return json({ error: "expected a ?pubkey= hex query param" }, 400);
   }
 
-  // 404, matching /api/claim's disabled branch above rather than
-  // inventing a second vocabulary for "this endpoint is not part of this
-  // relay any more". A claimed relay has no profile endpoint.
+  // 404, as /api/claim answers when disabled.
   if ((await relayStub(env).getOwner()) !== null) {
     return new Response("not found", { status: 404 });
   }
@@ -495,25 +382,19 @@ async function handleProfile(request: Request, env: Env): Promise<Response> {
   return json({ profile });
 }
 
-// The routing table, split out from `fetch` below so the exhaustion
-// wrapper there has something to wrap.
+// The routing table, separate from `fetch` so the exhaustion wrapper there
+// covers it.
 async function route(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
 
-  // The CORS preflight for the management endpoint, answered before
-  // anything else because an OPTIONS request carries neither the
-  // Content-Type that identifies a management call nor the Accept header
-  // that identifies a NIP-11 fetch -- see preflightResponse above for why
-  // cross-origin management calls are safe and why this must stay.
+  // First: an OPTIONS request carries neither the Content-Type nor the
+  // Accept header the branches below test (see preflightResponse).
   if (request.method === "OPTIONS") return preflightResponse();
 
-  // NIP-86 is checked BEFORE NIP-11, and the order is load-bearing:
-  // "application/nostr+json+rpc" contains "application/nostr+json" as a
-  // substring, so a management client that also sets an Accept header
-  // would otherwise be served the relay information document instead of
-  // having its command run. Substring match here too, for the same
-  // reason as below -- a real client sends
-  // "application/nostr+json+rpc; charset=utf-8".
+  // NIP-86 BEFORE NIP-11: "application/nostr+json+rpc" contains
+  // "application/nostr+json", so a management client that also sends that
+  // Accept header would otherwise get the info document. Substring match,
+  // since clients send e.g. "application/nostr+json+rpc; charset=utf-8".
   if (
     request.method === "POST" &&
     request.headers.get("Content-Type")?.includes(MANAGEMENT_CONTENT_TYPE)
@@ -521,13 +402,10 @@ async function route(request: Request, env: Env): Promise<Response> {
     return handleManagement(request, env);
   }
 
-  // Substring match, not equality -- clients commonly send compound
-  // Accept headers ("application/nostr+json, */*"), and NIP-11 only
-  // requires the media type be present, not that it stand alone.
+  // Substring match: clients send compound Accept headers
+  // ("application/nostr+json, */*").
   if (request.headers.get("Accept")?.includes("application/nostr+json")) {
-    // Rate limited like the rest: serving this document is a DO round
-    // trip (getIdentity), and nothing about an Accept header makes the
-    // caller trustworthy.
+    // Rate limited: serving this is a DO round trip (getIdentity).
     const limited = await rateLimited(env.RATE_LIMIT_API, request);
     if (limited !== null) return limited;
     const { profile, settings, ownerPubkey, relayPubkey } = await relayStub(env).getIdentity(url.host);
@@ -535,12 +413,9 @@ async function route(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
-    // The upgrade is an HTTP request and it wakes the Durable Object;
-    // the per-IP throttle in relay.ts only starts counting once the
-    // connection exists, so a connect-and-drop loop paid nothing before
-    // this. Bounding connects per minute rather than messages is the
-    // right axis here -- a client that stays connected is not the
-    // problem, and is not charged for staying.
+    // The upgrade wakes the DO, and relay.ts's per-IP message throttle
+    // only counts once a connection exists, so this is what bounds a
+    // connect-and-drop loop. Connects are limited, not staying connected.
     const limited = await rateLimited(env.RATE_LIMIT_API, request);
     if (limited !== null) return limited;
     return relayStub(env).fetch(request);
@@ -557,27 +432,19 @@ async function route(request: Request, env: Env): Promise<Response> {
 }
 
 export default {
-  // Wrapped as a whole rather than per handler, because the failure this
-  // catches is not route-specific: when a Cloudflare allowance is
-  // consumed, every path that reaches the Durable Object fails at once
-  // while the static admin page -- served from env.ASSETS, which never
-  // touches the DO -- keeps returning 200. That combination is exactly
-  // what made the last outage undiagnosable from the outside: the only
-  // symptom was a page that loaded the word "bothy" and no numbers, and
-  // nothing anywhere named a resource or a ceiling. See src/exhaustion.ts.
-  //
-  // Non-exhaustion errors are logged and rethrown, so this cannot turn an
-  // ordinary bug into a quiet 503.
+  // Wrapped as a whole: when a Cloudflare free-tier allowance is used up,
+  // every DO path fails at once while the static admin page still loads,
+  // so the failure must be named (src/exhaustion.ts) to be diagnosable.
+  // Non-exhaustion errors are logged and rethrown, never turned into a
+  // quiet 503.
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
       return await route(request, env);
     } catch (err) {
       const verdict = logExhaustion(`fetch ${new URL(request.url).pathname}`, err);
       if (!verdict.exhausted) throw err;
-      // 503 with a Retry-After, not a 500. This is a temporary refusal
-      // with a known end time, and saying so is the difference between
-      // "the relay is broken" and "the relay is out of budget until
-      // midnight" -- a distinction the owner could not make last time.
+      // 503 with Retry-After, not 500: a temporary refusal with a known
+      // end (allowances reset at 00:00 UTC).
       return new Response(
         JSON.stringify({
           error: `relay is out of its daily ${verdict.resource} allowance`,
@@ -595,23 +462,15 @@ export default {
     }
   },
 
-  // follow-cache refresh -- see
-  // Relay.runCron(). One-shot backfill shares this same trigger rather
-  // than requesting a second of the account's 5 available cron triggers
-  // -- see backfill-worker.ts for why its outbound sockets are opened
-  // here, in the Worker, and not inside runCron().
+  // The hourly tick: the DO's maintenance (Relay.runCron) and backfill,
+  // which share one trigger rather than use a second of the account's 5
+  // cron triggers. Backfill runs here in the Worker because it opens
+  // outbound sockets (see backfill-worker.ts).
   //
-  // These two do unrelated jobs and must not share a failure: each is
-  // caught and logged independently, so an exception in runCron (e.g. a
-  // storage error while refreshing the follow cache) can never silently
-  // stop backfill from ever running again, and vice versa.
-  //
-  // Both go through logExhaustion rather than a bare console.error. The
-  // cron tick is where budget exhaustion shows up FIRST -- it runs hourly
-  // whether or not anyone is connected, and the whole of the relay's
-  // client-independent read floor is spent here (CLAUDE.md "The budget")
-  // -- so a tick that dies on an allowance is the earliest warning the
-  // deployment gets.
+  // Each is caught separately so one failing can never stop the other.
+  // Both go through logExhaustion: the tick runs whether or not anyone is
+  // connected, so it is usually the first thing to hit an exhausted
+  // allowance.
   async scheduled(_event: ScheduledController, env: Env): Promise<void> {
     try {
       await relayStub(env).runCron();

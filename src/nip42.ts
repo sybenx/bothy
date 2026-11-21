@@ -1,28 +1,18 @@
-// NIP-42 Authentication of clients to relays (nips/42.md) -- the
-// verification checklist, factored out of relay.ts so it runs once rather
-// than twice.
+// NIP-42 Authentication of clients to relays (nips/42.md): the AUTH
+// verification checklist, shared by two callers that differ only in what
+// counts as "the right challenge". So each check is its own function and
+// each caller composes them in its own order:
 //
-// It grew a second caller when the QR/signed claim path
-// (src/index.ts handleClaimSigned) needed to verify the same event shape
-// over HTTP instead of over an open WebSocket. The two callers differ in
-// exactly one respect -- what counts as "the right challenge" -- so this
-// file exports each check as its own small function rather than one
-// monolithic verifier, and each caller composes them in its own order:
+//   relay.ts handleAuth (WebSocket AUTH) compares the challenge tag to the
+//   one it issued this connection (state.challenge), inline, in the order
+//   kind -> drift -> challenge-match -> relay-tag. Keep that order: a
+//   doubly-wrong AUTH event must get the reason string
+//   test/nip42-auth.test.ts asserts.
 //
-//   relay.ts handleAuth (WebSocket AUTH) already knows the challenge it
-//   issued to this connection (state.challenge), so it compares the
-//   event's challenge tag to that directly, inline, in the same place it
-//   always has -- preserving the exact original check order
-//   (kind -> drift -> challenge-match -> relay-tag) so a doubly-wrong AUTH
-//   event still gets the same reason string test/nip42-auth.test.ts
-//   already asserts.
-//
-//   verifyClaimAuthEvent below (HTTP) has no live connection to compare
-//   against -- the "right" challenge is whatever storage says is a live,
-//   unexpired claim nonce, which is a DB read best done last, after every
-//   free check has passed. So it checks kind/drift and the relay tag here,
-//   then hands the extracted (not yet validated) challenge value back to
-//   the caller, which looks it up.
+//   verifyClaimAuthEvent below (HTTP, index.ts handleClaimSigned) has no
+//   connection; the right challenge is a live claim nonce in storage. It
+//   runs the free checks and hands the extracted, unvalidated challenge
+//   back to the caller to look up.
 import { idMatchesContent, parseEventShape, verifySignature } from "./validate";
 import type { NostrEvent } from "./nostr";
 
@@ -79,16 +69,10 @@ export type ClaimAuthResult =
   | { ok: true; pubkey: string; challenge: string }
   | { ok: false; reason: string };
 
-// The Worker-side entry point for POST /api/claim-signed (src/index.ts).
-// Mirrors nip98.ts verifyNip98's shape -- parse, then id, then signature,
-// then the event-specific checklist -- and like it, is pure and does no
-// I/O, so it runs before the Durable Object is ever touched.
-//
-// Ordering here is new (nothing existing constrains it, unlike
-// relay.ts's handleAuth): kind/drift and the relay tag are both free, so
-// they run first; the challenge is only extracted, not validated, because
-// deciding whether it names a live claim nonce is a storage read and
-// belongs one level up, in the DO call that also has to consume it.
+// Worker-side entry point for POST /api/claim-signed (src/index.ts).
+// Pure, no I/O, so a forged claim costs no Durable Object time. The
+// challenge is only extracted here: whether it names a live claim nonce is
+// a storage read, done by the DO call that also consumes it.
 export function verifyClaimAuthEvent(raw: unknown, host: string, nowSec: number): ClaimAuthResult {
   const event = parseEventShape(raw);
   if (event === null) return { ok: false, reason: "invalid: malformed event" };

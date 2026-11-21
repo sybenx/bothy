@@ -1,20 +1,16 @@
-// NIP-86 relay management API (nips/86.md), method dispatch. This is the
-// half that touches storage, so it runs inside the Durable Object, via
-// Relay.manage() -- authentication (src/nip98.ts) has already happened in
-// the Worker by the time anything here is called, and nothing here opens
-// an outbound connection.
+// NIP-86 relay management API (nips/86.md), method dispatch. Runs inside
+// the Durable Object via Relay.manage(), after the Worker has
+// authenticated the request (src/nip98.ts). Nothing here opens an outbound
+// connection.
 //
-// Phase one deliberately implemented only the methods that cost nothing
-// on the per-event write path. banpubkey/allowpubkey and their list
-// methods (phase two, CLAUDE.md "The budget") are the one addition that costs a
-// per-event lookup, added only once a metrics baseline existed to compare
-// against. bothy pairs each with its own inverse (unbanpubkey,
-// unallowpubkey) for symmetry with blockip/unblockip, rather than
-// overloading allowpubkey to mean both "grant write access" and "lift a
-// ban" the way allowevent lifts a banevent tombstone -- banned_pubkeys and
+// banpubkey/allowpubkey are the only methods whose lists the per-event
+// write path consults (ownership.ts isAllowedWriter); everything else
+// costs nothing per event. Each has its own inverse (unbanpubkey,
+// unallowpubkey) rather than allowpubkey also lifting a ban the way
+// allowevent lifts a banevent tombstone: banned_pubkeys and
 // allowed_pubkeys are two independent lists, not opposite ends of one.
 // supportedmethods reports exactly what is here, which is what makes a
-// partial implementation conformant rather than broken.
+// partial implementation conformant.
 import {
   allowEvent,
   allowPubkey,
@@ -52,9 +48,9 @@ import {
 
 // nips/86.md: "a JSON-RPC-like request-response protocol over HTTP, on
 // the same URI as the relay's websocket", distinguished by this
-// content-type. Matched as a substring, never by equality -- clients send
-// compound types ("application/nostr+json+rpc; charset=utf-8"), the same
-// trap eb59501 fixed for the NIP-11 Accept header.
+// content-type. Matched as a substring, never by equality: clients send
+// compound types ("application/nostr+json+rpc; charset=utf-8"). index.ts
+// explains why it is checked before NIP-11.
 export const MANAGEMENT_CONTENT_TYPE = "application/nostr+json+rpc";
 
 // nips/86.md: {"result": <value>, "error": "<optional error message>"}.
@@ -88,49 +84,35 @@ export const SUPPORTED_METHODS = [
   "changerelayname",
   "changerelaydescription",
   "changerelayicon",
-  // bothy's own: the write policy (src/write-policy.ts). NIP-86 has no
-  // notion of a write policy beyond its per-pubkey lists, and the policy
-  // is the thing those lists sit inside. changewritepolicy takes a policy
-  // name and follows the change* conventions (empty string clears, an
-  // environment variable outranks the stored value and the response
-  // says so); getwritepolicy reads back the policy in force and where it
-  // came from, which NIP-11 has no field for.
+  // bothy's own (NIP-86 has no write policy). changewritepolicy follows the
+  // change* conventions: empty string clears, and the response says when
+  // an environment variable outranks the stored value. getwritepolicy
+  // reads back the policy in force and its source, which NIP-11 cannot.
   "changewritepolicy",
   "getwritepolicy",
-  // bothy's own, not NIP-86's. The spec defines no invite methods at all,
-  // so these two are an extension in the same spirit as the empty-string
-  // unset convention on the change* methods, and are documented in the
-  // README beside it.
-  // Named plainly rather than under a vendor prefix, because
-  // supportedmethods is the discovery mechanism and a client that reads
-  // this list learns what is here without needing to know whose idea it
-  // was. If NIP-86 ever standardises these names with different
-  // semantics, this is the line that has to change.
+  // bothy's own; NIP-86 defines no invite methods (documented in the
+  // README). Named plainly rather than vendor-prefixed so supportedmethods
+  // stays self-explanatory; if NIP-86 ever standardises these names with
+  // different semantics, these must change.
   "listunusedinvites",
   "revokeinvite",
-  // bothy's own as well, and the one pair on this list a member may call
-  // rather than only the owner -- see MEMBER_CALLABLE_METHODS below. The
-  // subscription belongs to whoever signed the NIP-98 event, so the call
-  // has to be reachable by them and by nobody speaking for them.
+  // bothy's own; the one pair a group member may call, not only the owner
+  // (MEMBER_CALLABLE_METHODS below).
   "subscribepush",
   "unsubscribepush",
 ] as const;
 
 // The methods a GROUP MEMBER may call, not just the owner.
 //
-// Every other method here administers the relay, and index.ts refuses a
-// signature that is not the owner's before dispatch ever happens. These
-// two do not administer anything: they register and remove one device's
-// push endpoint, and reference/push.md is explicit that "the signer of
-// that event is the member the subscription belongs to". A member who
-// could not call them could not be notified, which would leave push as
-// an owner-only feature in a room built for a group.
+// Every other method administers the relay, and index.ts refuses a
+// non-owner signature before dispatch. These two only register and remove
+// the caller's own push endpoint (hearth's reference/push.md: "the signer
+// of that event is the member the subscription belongs to"); without them
+// a member could not be notified at all.
 //
-// Widening the gate this far and no further is the whole point of the
-// list being a list. index.ts checks membership only for a method named
-// here, so the owner-only refusal is still what every other method gets,
-// and a member's signature buys them nothing except their own
-// subscription row.
+// index.ts checks membership only for a method named here, so every other
+// method stays owner-only. That check calls isGroupMember with no group
+// id, so "member" means a member of `_` (groups.ts TOP_LEVEL_GROUP_ID).
 export const MEMBER_CALLABLE_METHODS: readonly string[] = ["subscribepush", "unsubscribepush"];
 
 // The methods that belong to the group feature (limits.ts groupsEnabled).
@@ -176,10 +158,8 @@ function optionalReason(params: unknown[], index: number): string | null {
   return typeof value === "string" && value !== "" ? value : null;
 }
 
-// Accepts npub or hex, same as the relay's own claim endpoint (CLAUDE.md
-// "Configuration": "Accept npub1..., and hex, normalize to hex at the
-// boundary, store hex only") -- an operator reaching for these methods
-// most naturally has an npub in hand, not the hex form.
+// Accepts npub or hex and normalizes to hex, like the claim endpoint: an
+// operator most likely has an npub in hand.
 function pubkeyParam(params: unknown[], index: number): string | null {
   const value = params[index];
   return typeof value === "string" ? normalizePubkey(value) : null;
@@ -208,15 +188,11 @@ function identityNote(
   return parts.join(" ");
 }
 
-// The advisory note every changewritepolicy response carries, in the
-// error field for the reason identityNote gives: it is the one field
-// NIP-86 offers for saying anything beside a result. It always ends by
-// stating the policy actually IN FORCE after the call, because that is
-// the question the operator has and there are two ways the answer
-// differs from what they just stored: WRITE_POLICY in the environment
-// outranks the stored value, and clearing the stored value falls back to
-// the default. Store and warn, never silently discard -- the same rule
-// as the name/description/icon methods.
+// The advisory note on every changewritepolicy response (in `error`, as
+// for identityNote). It always ends with the policy actually IN FORCE,
+// which can differ from what was just stored in two ways: WRITE_POLICY in
+// the environment outranks it, and clearing it falls back to the default.
+// Store and warn, never silently discard.
 function writePolicyNote(sql: SqlStorage, env: Env, headline: string): string {
   const parts = [headline];
   if (envOverridesPolicy(env)) {
@@ -251,13 +227,10 @@ function changeIdentity(
 // own serialization of a PushSubscription.
 //
 // Validated to the byte here rather than at send time, because a row that
-// cannot be encrypted to is a row that fails once per message forever:
-// RFC 8291 wants `p256dh` to be an uncompressed P-256 point (65 bytes,
-// leading 0x04) and `auth` to be exactly the 16-byte auth secret, and
-// neither is something a later check can repair. `expirationTime` is
-// accepted and ignored -- it is null in every browser that ships push
-// today, and a relay acting on an expiry it was told rather than on the
-// 410 the push service will send is trusting the wrong party.
+// cannot be encrypted to fails once per message forever: RFC 8291 needs
+// `p256dh` as an uncompressed P-256 point (65 bytes, leading 0x04) and
+// `auth` as exactly 16 bytes. `expirationTime` is ignored: browsers send
+// null, and the push service's 404/410 is the authority on expiry.
 function parsePushSubscription(
   value: unknown,
 ): { endpoint: string; p256dh: string; auth: string } | string {
@@ -268,11 +241,9 @@ function parsePushSubscription(
   if (typeof sub.endpoint !== "string" || sub.endpoint === "") {
     return "subscribepush: the subscription has no endpoint";
   }
-  // https only, and length-bounded. The endpoint is a URL this relay will
-  // POST to on its own initiative, so it is the one field a caller
-  // controls that turns into outbound traffic -- an http:// or file://
-  // endpoint is not a push service, and an unbounded one is a stored
-  // string with no reason to be long.
+  // https only, and length-bounded: this is a URL the relay will POST to on
+  // its own initiative, the one caller-controlled field that becomes
+  // outbound traffic.
   try {
     if (new URL(sub.endpoint).protocol !== "https:") {
       return "subscribepush: the endpoint must be an https URL";
@@ -315,17 +286,14 @@ function decodeBase64Url(value: string): Uint8Array | null {
   }
 }
 
-// `callerIp` is the address the management request itself arrived from
-// (CF-Connecting-IP), threaded through from the Worker purely so blockip
-// can recognize a self-block. It is never used to authorize anything --
-// authorization is the NIP-98 signature and nothing else.
+// `callerIp` (CF-Connecting-IP) is used only so blockip can recognize a
+// self-block, never to authorize anything; authorization is the NIP-98
+// signature alone.
 //
-// `signer` is the pubkey that signature proved, and it is used by exactly
-// one pair of methods: subscribepush/unsubscribepush bind a device to
-// their caller. It is not an authorization input either -- index.ts has
-// already decided this caller may make this call -- it is the ANSWER to
-// "whose device is this", which the request body is deliberately not
-// allowed to give (reference/push.md, schema.ts `push_subscriptions`).
+// `signer` is the pubkey that signature proved. Not an authorization input
+// either (index.ts has already decided): subscribepush/unsubscribepush use
+// it as the answer to "whose device is this", which the request body is
+// deliberately not allowed to give (schema.ts `push_subscriptions`).
 export function handleManagementCall(
   sql: SqlStorage,
   env: Env,
@@ -370,10 +338,9 @@ export function handleManagementCall(
     case "banpubkey": {
       const pubkey = pubkeyParam(params, 0);
       if (pubkey === null) return err("banpubkey takes a pubkey, as npub or 64-character hex");
-      // The one invariant this method can never be allowed to violate --
-      // see ownership.ts isAllowedWriter, which trusts that a banned
-      // pubkey is never the owner and so never checks for that case on
-      // the write path itself.
+      // ownership.ts isAllowedWriter admits the owner before it consults
+      // bans, so banning the owner would do nothing; refused rather than
+      // answered `true`.
       if (pubkey === getOwnerPubkey(sql, env)) {
         return err("banpubkey: the relay owner's own pubkey can never be banned");
       }
@@ -391,10 +358,10 @@ export function handleManagementCall(
     case "listbannedpubkeys":
       return { result: listBannedPubkeys(sql) };
 
-    // A manual allowlist, independent of banned_pubkeys -- see the header
-    // comment above. Grants write access to a pubkey the owner doesn't
-    // follow (or, under the owner/inbox policies, to anyone named individually)
-    // without opening writes more broadly.
+    // A manual allowlist, independent of banned_pubkeys (see the header):
+    // an allowed pubkey writes under every write policy. On a row a group
+    // put-user or join created, this PROMOTES it to owner-granted, so a
+    // later remove-user cannot revoke it (storage.ts allowPubkey).
     case "allowpubkey": {
       const pubkey = pubkeyParam(params, 0);
       if (pubkey === null) return err("allowpubkey takes a pubkey, as npub or 64-character hex");
@@ -412,25 +379,17 @@ export function handleManagementCall(
     case "listallowedpubkeys":
       return { result: listAllowedPubkeys(sql) };
 
-    // The admin's window onto NIP-29 invites (src/nip29.ts). Two methods
-    // and no create: an invite is CREATED by publishing a kind-9009,
-    // which is a signed part of the group's history, and offering a
-    // second way in through an HTTP call would put the same act on two
-    // paths with only one of them recorded in the group.
+    // The owner's view of NIP-29 invites (src/nip29.ts). No create method:
+    // an invite is created by publishing a kind-9009, a signed part of the
+    // group's history, and an HTTP path would be a second, unrecorded way
+    // to do the same thing.
     //
-    // What the owner cannot do without these is see a link they issued
-    // and kill it. Both are answered in full here, spelling out spent
-    // from expired from unknown -- the exact distinction the join path
-    // refuses to make on the wire (nip29.ts JOIN_REFUSAL_MESSAGE). The
-    // difference is who is asking: this endpoint is authenticated by a
-    // NIP-98 signature from the owner, and there is nothing to keep from
-    // the person who issued the code.
+    // These name spent, expired and unknown in full -- the distinction the
+    // join path withholds on the wire (nip29.ts JOIN_REFUSAL_MESSAGE) --
+    // because the caller here is the owner, who issued the codes.
     case "listunusedinvites":
-      // Unused means redeemable right now -- unspent, unrevoked and not
-      // yet expired. A code that is none of those is not a link the admin
-      // can still do anything about, and listing the dead ones would bury
-      // the live ones. `expires_at` is on every row because it is the
-      // thing that decides whether to re-send a link or reissue it.
+      // Only invites redeemable right now; dead ones would bury the live
+      // ones.
       return { result: listUnusedInvites(sql, nowSec) };
 
     case "revokeinvite": {
@@ -440,11 +399,9 @@ export function handleManagementCall(
       switch (outcome) {
         case "revoked":
           return { result: true };
-        // Reported as failures rather than as an idempotent success,
-        // because each one means the admin was looking at something other
-        // than what they thought. "Already used" in particular is the
-        // answer to a question they urgently have -- revoking a code to
-        // stop somebody getting in, and being told somebody already did.
+        // Failures, not idempotent success: each means the owner's picture
+        // was wrong, and "already redeemed" tells them somebody already
+        // got in.
         case "spent":
           return err(
             "revokeinvite: that invite has already been redeemed, so there is nothing left to revoke -- " +
@@ -457,17 +414,14 @@ export function handleManagementCall(
       }
     }
 
-    // bothy's own, and the client half is hearth's subscribeToPush
-    // (reference/push.md). The pubkey stored is `signer` and nothing else
-    // -- the parameters carry a device, not an identity.
+    // bothy's own; the client half is hearth's subscribeToPush. The pubkey
+    // stored is `signer` and nothing else -- the parameters carry a
+    // device, not an identity.
     case "subscribepush": {
-      // Refused rather than stored when this deployment has no VAPID key,
-      // because a stored subscription that can never be pushed to is a
-      // device endpoint held for nothing -- and holding one is the whole
-      // cost reference/push.md asks the person to weigh. A client only
-      // reaches this method after reading `push_key` off the NIP-11
-      // document, so the ordinary way to see this error is a key removed
-      // between the two.
+      // Refused without a VAPID key: a subscription that can never be
+      // pushed to is a device endpoint held for nothing. Clients only call
+      // this after reading `push_key` from NIP-11, so this normally means
+      // the key was removed in between.
       if (!pushConfigured(env)) {
         return err(
           "subscribepush: this relay advertises no push_key, so it cannot send push notifications and " +
@@ -490,13 +444,10 @@ export function handleManagementCall(
       if (endpoint === null || endpoint === "") {
         return err("unsubscribepush takes the subscription endpoint as a string");
       }
-      // `true` whether or not a row went, because the caller's goal is a
-      // state ("this device is not registered") and that state holds
-      // either way. hearth calls this on its way to `sub.unsubscribe()`
-      // and swallows the answer; a failure here would only be noise on a
-      // path where nothing is wrong. Scoped to the signer inside
-      // deletePushSubscription -- one member must not be able to unhook
-      // another's phone.
+      // `true` whether or not a row went: the goal is the state "this
+      // device is not registered", which holds either way. Scoped to the
+      // signer inside deletePushSubscription, so one member cannot unhook
+      // another's device (endpoints are not secret).
       deletePushSubscription(sql, signer, endpoint);
       return { result: true };
     }
@@ -505,22 +456,14 @@ export function handleManagementCall(
       const ip = stringParam(params, 0);
       if (ip === null || ip === "") return err("blockip takes a non-empty IP address string");
       const reason = optionalReason(params, 1);
-      // Self-block is allowed, but never on the first try. Blocking the
-      // address you are calling from is a legitimate thing to want (a
-      // shared exit node, a test), and it is also the single most
-      // plausible way to lock yourself out of your own relay by
-      // accident -- so it costs one extra deliberate call.
+      // Self-block is allowed, but never on the first try: it is a
+      // legitimate want (a shared exit node, a test) and also the likeliest
+      // accidental lockout, so it costs one extra deliberate call.
       //
-      // Compared through normalizeIp (ip.ts), not as raw strings: `ip` is
-      // whatever the operator typed, `callerIp` is Cloudflare's own
-      // CF-Connecting-IP form, and an IPv6 address written two different
-      // ways (expanded vs. compressed) is the same address failing a
-      // literal `===`. Missing that would skip this very warning -- and
-      // since blockIp below normalizes the same way, the block it then
-      // stores would silently never match the operator's own future
-      // connections, which is worse than the lockout this check exists to
-      // prevent: listblockedips would report it active while it blocks
-      // nothing.
+      // Compared through normalizeIp (ip.ts), not as raw strings: the
+      // operator's typed form and Cloudflare's CF-Connecting-IP form can
+      // spell the same IPv6 address differently, and a literal `===` would
+      // skip this warning.
       if (normalizeIp(ip) === normalizeIp(callerIp) && reason !== SELF_BLOCK_CONFIRMATION) {
         return err(
           `${ip} is the address this management request arrived from. Blocking it will refuse WebSocket ` +
@@ -552,10 +495,9 @@ export function handleManagementCall(
     case "changerelayicon":
       return changeIdentity(sql, params, "icon", method, "RELAY_ICON", env.RELAY_ICON);
 
-    // The write policy (src/write-policy.ts). Stored as the operator gave
-    // it, resolved on the write path through the same env-then-stored-
-    // then-default chain the relay's name uses -- see writePolicyNote
-    // for what the response has to tell them and why.
+    // The write policy (src/write-policy.ts), resolved env, then stored,
+    // then default. relay.ts clears its cached policy after every
+    // management call, so a change applies to the next event.
     case "changewritepolicy": {
       const raw = params[0];
       if (raw === "") {
@@ -569,10 +511,9 @@ export function handleManagementCall(
             `An empty string clears the stored policy.`,
         );
       }
-      // Opening the relay to everyone is allowed, but never on the first
-      // try -- the blockip self-block shape. It is the one policy whose
-      // consequence is unbounded by anything the owner chose, and the
-      // command that sets it is one word long.
+      // `all` is never accepted on the first try (the blockip self-block
+      // shape): it is the one policy not bounded by people the owner
+      // chose, and the command is one word long.
       if (policy === "all" && params[1] !== OPEN_POLICY_CONFIRMATION) {
         return err(
           `changewritepolicy: "all" lets anyone publish any event to this relay, bounded only by the ` +
@@ -597,12 +538,9 @@ export function handleManagementCall(
       };
     }
 
-    // Implemented as an explanation rather than left to the
-    // unknown-method fallback below. "Unknown method" would read as
-    // "not built yet"; the truth is that bothy stores every kind on
-    // purpose (CLAUDE.md "What it refuses to be"), so an operator
-    // reaching for a kind allowlist should be told the design answer,
-    // not left waiting for a feature that is never coming.
+    // Answered with an explanation rather than the unknown-method
+    // fallback, which would read as "not built yet": bothy stores every
+    // kind on purpose and will never have a kind allowlist.
     case "allowkind":
     case "disallowkind":
     case "listallowedkinds":

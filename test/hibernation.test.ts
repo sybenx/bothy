@@ -90,7 +90,7 @@ describe("hibernation", () => {
   });
 });
 
-// The rows-written baseline (CLAUDE.md "The budget").
+// The rows-written baseline.
 //
 // These assert the DERIVATION in schema.ts against what SQLite actually
 // does, which is the only reason it is safe for eventRowCost to compute
@@ -208,8 +208,8 @@ describe("rows written per stored event", () => {
     // The whole reason the indexes are partial PAIRS rather than one
     // widened index or one index plus a flag: a row pays for its own
     // partition and not the other. If this ever diverges, the group
-    // partition has stopped being free and every figure in
-    // CLAUDE.md "The budget" needs redoing.
+    // partition has stopped being free and every rows-written figure
+    // derived from schema.ts eventRowCost needs redoing.
     const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
     const now = Math.floor(Date.now() / 1000);
     const publicNote = signEvent(OWNER_SECRET_KEY_HEX, {

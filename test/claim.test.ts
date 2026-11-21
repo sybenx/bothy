@@ -1,9 +1,9 @@
-// TOFU claim flow (CLAUDE.md "What it is" / "Claim implementation").
+// TOFU claim flow (src/ownership.ts claimOwner, src/index.ts /api/claim).
 //
-// The global test env injects a fixed OWNER_PUBKEY binding (see
-// DECISIONS.md's "Test-only OWNER_PUBKEY" entry and
+// The global test env injects a fixed OWNER_PUBKEY binding
+// (vitest.config.ts; the key is test/helpers/keys.ts, and see
 // test/ownership.test.ts) so the write-gate tests have a deterministic
-// owner without depending on this chunk's claim endpoint. That same
+// owner without depending on the claim endpoint. That same
 // binding means every DO instance in this test run already has
 // env.OWNER_PUBKEY set -- there is no way, under the current global
 // vitest config, to exercise the *unclaimed* relay over the wire or
@@ -193,8 +193,8 @@ describe("pubkey normalization", () => {
   });
 
   it("decodes a valid npub to its hex pubkey", () => {
-    // bech32("npub", OWNER_PUBKEY_HEX) -- see CLAUDE.md "Accept npub1...
-    // and hex, normalize to hex at the boundary".
+    // bech32("npub", OWNER_PUBKEY_HEX) -- src/pubkey.ts normalizePubkey
+    // accepts npub or hex and normalizes to hex at the boundary.
     const npub = "npub17vjpx0uj7gp4xlxhl8z0rncs0qpqzkg3rgvy27qfec7pr9gdsl4suwp7ea";
     expect(normalizePubkey(npub)).toBe(OWNER_PUBKEY_HEX);
   });
