@@ -275,6 +275,7 @@ describe("answering a request", () => {
         invitedBy: OWNER_PUBKEY_HEX,
         joinedAt: expect.any(Number),
         source: "request",
+        role: "member",
       },
     ]);
   });

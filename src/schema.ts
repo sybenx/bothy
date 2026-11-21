@@ -594,6 +594,17 @@ export const TABLES: readonly TableSpec[] = [
     ],
   },
   {
+    // Admins (nip86.ts addadmin/removeadmin/listadmins): pubkeys the owner
+    // lets run the member list, invites and join requests, and nothing
+    // relay-level (nip86.ts ADMIN_CALLABLE_METHODS). Made for the owner's
+    // own second key, a messenger identity kept apart from the main npub.
+    // Every admin is also a member: addadmin writes the `allowed_pubkeys`
+    // row if there is none, and removing the member removes the admin.
+    // removeadmin takes the role away and leaves the membership.
+    name: "admins",
+    columns: [col("pubkey", "TEXT PRIMARY KEY"), col("added_at", "INTEGER NOT NULL")],
+  },
+  {
     // Join requests (nip86.ts requestjoin): one row per pubkey that asked
     // to become a member without a code. Pending while `declined_at` is
     // NULL; either way the row goes at `expires_at` (limits.ts

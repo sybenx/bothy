@@ -285,8 +285,8 @@ describe("invite codes", () => {
     expect(members.map((m) => m.pubkey)).toEqual([joiner.pubkeyHex]);
   });
 
-  it("is one of the two methods a stranger may call", async () => {
-    expect(ANYONE_CALLABLE_METHODS).toEqual(["redeeminvite", "requestjoin"]);
+  it("is one of the few methods a stranger may call", async () => {
+    expect(ANYONE_CALLABLE_METHODS).toEqual(["redeeminvite", "requestjoin", "myrole"]);
     const stranger = randomKeypair();
     for (const method of ["listallowedpubkeys", "listunusedinvites", "unallowpubkey"]) {
       const reply = await callManagement(method, [stranger.pubkeyHex], {

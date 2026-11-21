@@ -183,6 +183,8 @@ import {
   queueInboxPush,
   sweepFormerMembers,
   sweepExpiredJoinRequests,
+  roleOf,
+  type Role,
   isIpBlocked,
   queryFilters,
   type RelaySettings,
@@ -623,9 +625,10 @@ export class Relay extends DurableObject<Env> {
         const reply = handleManagementCall(sql, this.env, method, params, callerIp, nowSeconds(), signer);
         // What the call stored, delivered like any accepted event: to the
         // owner's open subscriptions, and to their devices.
-        const owner = getOwnerPubkey(sql, this.env);
+        // Each outbox event is a wrap addressed to one person (the owner
+        // or an admin), named by its `p` tag.
         for (const event of reply.outbox ?? []) {
-          this.notePush(sql, event, owner === null ? [] : [owner]);
+          this.notePush(sql, event, pTagValues(event.tags));
           this.broadcast(event);
         }
         const { outbox: _delivered, ...rest } = reply;
@@ -660,13 +663,13 @@ export class Relay extends DurableObject<Env> {
   }
 
   // For the Worker's management gate (src/index.ts), deciding whether a
-  // non-owner signer may call nip86.ts MEMBER_CALLABLE_METHODS. A member
-  // of the relay (storage.ts isMember), or of the top-level group
-  // (TOP_LEVEL_GROUP_ID), whose members a group fan-out pushes to. At most
-  // two PK seeks, reached only after a valid signature.
-  async isMember(pubkey: string): Promise<boolean> {
+  // non-owner signer may call nip86.ts ADMIN_CALLABLE_METHODS or
+  // MEMBER_CALLABLE_METHODS (storage.ts roleOf). "member" includes the
+  // top-level group (TOP_LEVEL_GROUP_ID), whose members a group fan-out
+  // pushes to. A few PK seeks, reached only after a valid signature.
+  async getRole(pubkey: string): Promise<Role> {
     return this.metered(() =>
-      withReadPath("management", () => isMember(this.sql, pubkey) || isGroupMember(this.sql, pubkey)),
+      withReadPath("management", () => roleOf(this.sql, pubkey, getOwnerPubkey(this.sql, this.env))),
     );
   }
 

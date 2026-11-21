@@ -138,15 +138,27 @@ Reading them back is restricted to the person they are addressed to: you, or a m
 
 You can give other people a home here: an inbox for their encrypted mail, and a notification on their phone when some arrives. They need no account, only a key, which any Nostr app (or the friend app) makes for them.
 
-To add someone, make an invite and send them the code:
+To add someone, make an invite and send them the code. These are bothy's own methods, which `nak admin` does not know, so call them with the `bothy_rpc` function under "Who can write here" below:
 
 ```bash
-nak admin createinvite --sec <your nsec> your-relay.workers.dev
+bothy_rpc https://your-relay.workers.dev/ createinvite
 ```
 
 The answer is the code, how many times it can be used and when it stops working. A code works once and for 7 days unless you ask for more: `createinvite` takes the number of uses (up to 100) and then the lifetime in seconds (up to 30 days). Their app redeems it by calling `redeeminvite` with the code, signed with their own key; that is the one management call anyone can make. `listunusedinvites` shows the codes still waiting, and `revokeinvite` kills one.
 
 Your members are the pubkeys on your allow list, so `listallowedpubkeys` lists them and `unallowpubkey` removes one. `listmembers` shows more: who let each one in, when, and how, plus the people you removed whose mail is still waiting to be deleted, with the date it goes. Who let someone in is whoever made the code they used, or whose link their join request came through, or you; every member has one, so an app can draw the whole tree from it. A member can also publish here, as anyone you `allowpubkey` can.
+
+### Admins
+
+An admin is a key that helps you run your members: it can make and revoke invites, answer join requests, see the member list, and add or remove members. It cannot touch anything else: the write policy, bans, blocks, the relay's name, description and icon, or other admins. It is made for a second key of your own, such as the one your messaging app uses, so that key can run your home without being your relay's owner key.
+
+```bash
+bothy_rpc https://your-relay.workers.dev/ addadmin '["<their npub>"]'
+```
+
+`removeadmin` takes the role away and leaves them a member; `listadmins` lists them. An admin is always a member, with an inbox and notifications, and gets its own message about each join request. An admin cannot remove another admin; only you can. Who an admin lets in is listed as invited by that admin.
+
+Any key can call `myrole` to learn what it is here: `owner`, `admin`, `member` or `none`. The list of admins is not published in the relay information document, because it would tie your second key to your relay for anyone to read.
 
 ### Join requests
 
@@ -218,9 +230,9 @@ The tool to send them with is [`nak`](https://github.com/fiatjaf/nak), whose `ad
 nak admin supportedmethods --sec <your nsec> your-relay.workers.dev
 ```
 
-Start there. `supportedmethods` returns exactly what this relay implements, which is the honest answer to what you can do with it, and `nak admin --help` lists the flags each method takes. Every request is authenticated with a [NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md) event signed by the relay owner's key, the same key you claimed the relay with. Nothing else is accepted, and an unsigned or wrongly signed request gets a 401. The exceptions are a member's own notification settings (`subscribepush` and `unsubscribepush`, signed by the member) and `redeeminvite` and `requestjoin` (signed by whoever is joining).
+Start there. `supportedmethods` returns exactly what this relay implements, which is the honest answer to what you can do with it, and `nak admin --help` lists the flags each method takes. Every request is authenticated with a [NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md) event signed by the relay owner's key, the same key you claimed the relay with. Nothing else is accepted, and an unsigned or wrongly signed request gets a 401. The exceptions are a member's own notification settings (`subscribepush` and `unsubscribepush`, signed by the member) `redeeminvite` and `requestjoin` (signed by whoever is joining), `myrole` (any key), and the member methods an admin may call (see "Admins" above).
 
-What this relay implements: `banevent` and `allowevent` and `listbannedevents`; `banpubkey`, `unbanpubkey` and `listbannedpubkeys`; `allowpubkey`, `unallowpubkey` and `listallowedpubkeys`; `blockip` and `unblockip` and `listblockedips`; `changerelayname`, `changerelaydescription` and `changerelayicon`; and, bothy's own, `changewritepolicy` and `getwritepolicy` (see "Who can write here" above), `createinvite`, `redeeminvite`, `listunusedinvites`, `revokeinvite`, `requestjoin`, `listjoinrequests`, `approvejoin`, `declinejoin` and `listmembers` (see "Members" above), and `subscribepush` and `unsubscribepush`. What it does not: the kind allowlist, because bothy stores every kind on purpose; and the moderation queue, because bothy has nothing to report events into.
+What this relay implements: `banevent` and `allowevent` and `listbannedevents`; `banpubkey`, `unbanpubkey` and `listbannedpubkeys`; `allowpubkey`, `unallowpubkey` and `listallowedpubkeys`; `blockip` and `unblockip` and `listblockedips`; `changerelayname`, `changerelaydescription` and `changerelayicon`; and, bothy's own, `changewritepolicy` and `getwritepolicy` (see "Who can write here" above), `createinvite`, `redeeminvite`, `listunusedinvites`, `revokeinvite`, `requestjoin`, `listjoinrequests`, `approvejoin`, `declinejoin`, `listmembers`, `addadmin`, `removeadmin`, `listadmins` and `myrole` (see "Members" above), and `subscribepush` and `unsubscribepush`. What it does not: the kind allowlist, because bothy stores every kind on purpose; and the moderation queue, because bothy has nothing to report events into.
 
 The endpoint answers cross-origin requests, so a client hosted somewhere other than the relay can call it from a browser.
 

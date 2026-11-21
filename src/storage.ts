@@ -2020,9 +2020,15 @@ export function removeMember(
     unallowPubkey(sql, pubkey, nowSec);
     return [pubkey];
   }
-  // The subtree, breadth first. `seen` guards against a cycle, which no
-  // writer makes but a hand-edited row could. The owner is never a row,
-  // so never in it.
+  const order = invitedSubtree(sql, pubkey, owner);
+  for (const member of order) unallowPubkey(sql, member, nowSec);
+  return order;
+}
+
+// `pubkey` and everyone below it in the invite tree, breadth first,
+// `pubkey` first. `seen` guards against a cycle, which no writer makes but
+// a hand-edited row could. The owner is never a row, so never in it.
+export function invitedSubtree(sql: SqlStorage, pubkey: string, owner: string): string[] {
   const seen = new Set<string>([pubkey]);
   const order = [pubkey];
   for (let i = 0; i < order.length; i++) {
@@ -2035,7 +2041,6 @@ export function removeMember(
       order.push(child.pubkey);
     }
   }
-  for (const member of order) unallowPubkey(sql, member, nowSec);
   return order;
 }
 
@@ -2043,6 +2048,8 @@ export function unallowPubkey(sql: SqlStorage, pubkey: string, nowSec: number): 
   const existed = sql.exec(`SELECT 1 FROM allowed_pubkeys WHERE pubkey = ?`, pubkey).toArray().length > 0;
   if (!existed) return;
   sql.exec(`DELETE FROM allowed_pubkeys WHERE pubkey = ?`, pubkey);
+  // An admin is a member first (schema.ts `admins`).
+  sql.exec(`DELETE FROM admins WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM push_subscriptions WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM inbox_push WHERE pubkey = ?`, pubkey);
   sql.exec(
@@ -2244,6 +2251,55 @@ export function revokeMemberInvite(sql: SqlStorage, code: string, nowSec: number
 }
 
 // ---------------------------------------------------------------------
+// Admins (schema.ts `admins`).
+// ---------------------------------------------------------------------
+
+export function isAdmin(sql: SqlStorage, pubkey: string): boolean {
+  return sql.exec(`SELECT 1 FROM admins WHERE pubkey = ?`, pubkey).toArray().length > 0;
+}
+
+// Makes them a member too if they are not one, with the owner as inviter,
+// and leaves an existing membership as it was.
+export function addAdmin(sql: SqlStorage, pubkey: string, owner: string, nowSec: number): void {
+  sql.exec(
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, invited_by)
+       VALUES (?, 'made an admin', ?, 'owner', ?)
+       ON CONFLICT(pubkey) DO NOTHING`,
+    pubkey,
+    nowSec,
+    owner,
+  );
+  readmitFormerMember(sql, pubkey);
+  sql.exec(`INSERT INTO admins (pubkey, added_at) VALUES (?, ?) ON CONFLICT(pubkey) DO NOTHING`, pubkey, nowSec);
+}
+
+// False if they were not an admin. Their membership stays.
+export function removeAdmin(sql: SqlStorage, pubkey: string): boolean {
+  if (!isAdmin(sql, pubkey)) return false;
+  sql.exec(`DELETE FROM admins WHERE pubkey = ?`, pubkey);
+  return true;
+}
+
+export function listAdmins(sql: SqlStorage): { pubkey: string; addedAt: number }[] {
+  return sql
+    .exec<{ pubkey: string; added_at: number }>(`SELECT pubkey, added_at FROM admins ORDER BY added_at ASC`)
+    .toArray()
+    .map((r) => ({ pubkey: r.pubkey, addedAt: r.added_at }));
+}
+
+// Who a key is here, for the management gate (index.ts) and nip86.ts
+// myrole. "member" includes a member of the NIP-29 group `_`, as the
+// member gate always has.
+export type Role = "owner" | "admin" | "member" | "none";
+
+export function roleOf(sql: SqlStorage, pubkey: string, owner: string | null): Role {
+  if (owner !== null && pubkey === owner) return "owner";
+  if (isAdmin(sql, pubkey)) return "admin";
+  if (isPubkeyAllowed(sql, pubkey) || isGroupMember(sql, pubkey)) return "member";
+  return "none";
+}
+
+// ---------------------------------------------------------------------
 // Join requests (schema.ts `join_requests`, nip86.ts requestjoin).
 // ---------------------------------------------------------------------
 
@@ -2354,12 +2410,13 @@ function hasPendingJoinRequest(sql: SqlStorage, pubkey: string, nowSec: number):
 // way an invite does and deletes the request (readmitFormerMember). Their
 // inviter is the request's `via` if that is a member now, else `owner`:
 // a claim about a link is taken only as far as the tree it would join.
-export function approveJoinRequest(sql: SqlStorage, pubkey: string, owner: string, nowSec: number): boolean {
+// `approver` (the owner or an admin) is the inviter otherwise.
+export function approveJoinRequest(sql: SqlStorage, pubkey: string, approver: string, nowSec: number): boolean {
   if (!hasPendingJoinRequest(sql, pubkey, nowSec)) return false;
   const via = sql
     .exec<{ via: string | null }>(`SELECT via FROM join_requests WHERE pubkey = ?`, pubkey)
     .toArray()[0]?.via;
-  const invitedBy = via && via !== pubkey && isPubkeyAllowed(sql, via) ? via : owner;
+  const invitedBy = via && via !== pubkey && isPubkeyAllowed(sql, via) ? via : approver;
   sql.exec(
     `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, invited_by)
        VALUES (?, 'asked to join', ?, 'request', ?)
@@ -2403,6 +2460,8 @@ export interface MemberDetails {
   invitedBy: string | null;
   joinedAt: number;
   source: string;
+  // "admin" for a pubkey in `admins`, else "member".
+  role: "admin" | "member";
 }
 
 export interface RemovedMember {
@@ -2428,11 +2487,15 @@ export function listMembers(
     )
     .toArray();
   const present = new Set(rows.map((r) => r.pubkey));
+  const admins = new Set(
+    sql.exec<{ pubkey: string }>(`SELECT pubkey FROM admins`).toArray().map((r) => r.pubkey),
+  );
   const members = rows.map((r) => ({
     pubkey: r.pubkey,
     invitedBy: r.invited_by !== null && r.invited_by !== r.pubkey && present.has(r.invited_by) ? r.invited_by : owner,
     joinedAt: r.allowed_at,
     source: r.source,
+    role: admins.has(r.pubkey) ? ("admin" as const) : ("member" as const),
   }));
   const removed = sql
     .exec<{ pubkey: string; removed_at: number }>(

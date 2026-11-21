@@ -20,7 +20,13 @@ import {
   banPubkey,
   blockIp,
   approveJoinRequest,
+  addAdmin,
+  invitedSubtree,
+  isAdmin,
+  listAdmins,
+  removeAdmin,
   removeMember,
+  roleOf,
   countOutstandingMemberInvites,
   declineJoinRequest,
   giftWrapCount,
@@ -150,6 +156,12 @@ export const SUPPORTED_METHODS = [
   "approvejoin",
   "declinejoin",
   "listmembers",
+  // bothy's own. The owner's admins (schema.ts `admins`), and myrole, which
+  // tells any signer what they may do here.
+  "addadmin",
+  "removeadmin",
+  "listadmins",
+  "myrole",
   // bothy's own; the one pair a member may call, not only the owner
   // (MEMBER_CALLABLE_METHODS below).
   "subscribepush",
@@ -176,7 +188,33 @@ export const MEMBER_CALLABLE_METHODS: readonly string[] = ["subscribepush", "uns
 //
 // requestjoin likewise: the requester is not a member, and asking is the
 // point. relay.ts throttles it per address before dispatch.
-export const ANYONE_CALLABLE_METHODS: readonly string[] = ["redeeminvite", "requestjoin"];
+//
+// myrole answers any signer with their own role, so an app can decide what
+// to show without trying a method and reading the 401.
+export const ANYONE_CALLABLE_METHODS: readonly string[] = ["redeeminvite", "requestjoin", "myrole"];
+
+// The methods an ADMIN may call besides the member's own: running the
+// member list, invites and join requests. Everything else stays with the
+// owner: admins themselves, the write policy, bans, blocks, the relay's
+// name, description and icon, and anything else relay-level. The
+// owner-side guard against an admin removing another admin is in
+// unallowpubkey below.
+export const ADMIN_CALLABLE_METHODS: readonly string[] = [
+  "createinvite",
+  "listunusedinvites",
+  "revokeinvite",
+  "listjoinrequests",
+  "approvejoin",
+  "declinejoin",
+  "listmembers",
+  "allowpubkey",
+  "unallowpubkey",
+];
+
+// The 401 a member or stranger gets for an admin method (index.ts).
+export function adminOnlyReason(method: string): string {
+  return `${method} is for this relay's owner and admins`;
+}
 
 // The 401 a non-member gets for a MEMBER_CALLABLE_METHODS call (index.ts).
 // Stable on purpose: an app that sees it knows its user is not, or is no
@@ -505,6 +543,18 @@ export function handleManagementCall(
         );
       }
       const owner = getOwnerPubkey(sql, env) ?? signer;
+      // An admin cannot remove an admin, directly or as part of a subtree:
+      // admins are the owner's to give and take away.
+      if (signer !== owner) {
+        const affected = choice === "remove" ? invitedSubtree(sql, pubkey, owner) : [pubkey];
+        if (affected.some((member) => isAdmin(sql, member))) {
+          return err(
+            affected[0] !== undefined && isAdmin(sql, affected[0])
+              ? "unallowpubkey: that member is an admin, and only the owner can remove an admin"
+              : "unallowpubkey: someone they invited is an admin, and only the owner can remove an admin",
+          );
+        }
+      }
       const invited = sql
         .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM allowed_pubkeys WHERE invited_by = ?`, pubkey)
         .toArray()[0]?.n ?? 0;
@@ -658,10 +708,16 @@ export function handleManagementCall(
           const result = { status: "pending", expires_at: outcome.expiresAt };
           // The request stands even if the owner's inbox is full; they
           // still see it in listjoinrequests.
-          if (giftWrapCount(sql) >= maxGiftWraps(env)) return { result };
-          const { wrap } = joinRequestMessage(sql, owner, signer, details.name, details.note, nowSec);
-          const stored = storeEvent(sql, wrap, nowSec);
-          return { result, ...(stored.stored ? { outbox: [stored.stored] } : {}) };
+          // One message per person who can answer: the owner and every
+          // admin. Each is its own wrap, sealed to that person.
+          const outbox: NostrEvent[] = [];
+          for (const recipient of [owner, ...listAdmins(sql).map((a) => a.pubkey)]) {
+            if (giftWrapCount(sql) >= maxGiftWraps(env)) break;
+            const { wrap } = joinRequestMessage(sql, recipient, signer, details.name, details.note, nowSec);
+            const stored = storeEvent(sql, wrap, nowSec);
+            if (stored.stored) outbox.push(stored.stored);
+          }
+          return { result, ...(outbox.length > 0 ? { outbox } : {}) };
         }
       }
     }
@@ -695,7 +751,36 @@ export function handleManagementCall(
     // Members, and the removed ones whose mail has not been deleted yet.
     // Letting a removed one back in is allowpubkey, which stops the clock.
     case "listmembers":
-      return { result: listMembers(sql, MEMBER_REMOVAL_GRACE_SECONDS, signer) };
+      return { result: listMembers(sql, MEMBER_REMOVAL_GRACE_SECONDS, getOwnerPubkey(sql, env) ?? signer) };
+
+    // Owner only. An admin is a member too (made one if not already), with
+    // the owner's member methods (ADMIN_CALLABLE_METHODS) and nothing
+    // relay-level. Their join-request messages arrive like the owner's.
+    case "addadmin": {
+      const pubkey = pubkeyParam(params, 0);
+      if (pubkey === null) return err("addadmin takes a pubkey, as npub or 64-character hex");
+      const owner = getOwnerPubkey(sql, env);
+      if (owner === null || pubkey === owner) {
+        return err("addadmin: that is the owner's own key, which can already do everything an admin can");
+      }
+      addAdmin(sql, pubkey, owner, nowSec);
+      return { result: true };
+    }
+
+    // Takes the role away; they stay a member. To remove them altogether,
+    // unallowpubkey.
+    case "removeadmin": {
+      const pubkey = pubkeyParam(params, 0);
+      if (pubkey === null) return err("removeadmin takes a pubkey, as npub or 64-character hex");
+      if (!removeAdmin(sql, pubkey)) return err("removeadmin: that pubkey is not an admin");
+      return { result: true };
+    }
+
+    case "listadmins":
+      return { result: listAdmins(sql) };
+
+    case "myrole":
+      return { result: { role: roleOf(sql, signer, getOwnerPubkey(sql, env)) } };
 
     // bothy's own; the client half is hearth's subscribeToPush. The pubkey
     // stored is `signer` and nothing else -- the parameters carry a

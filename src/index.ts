@@ -1,7 +1,14 @@
 import { runBackfillTick } from "./backfill-worker";
 import { logExhaustion } from "./exhaustion";
 import { HTTP_RATE_LIMIT_PERIOD_SECONDS, secondsUntilUtcMidnight } from "./limits";
-import { ANYONE_CALLABLE_METHODS, MANAGEMENT_CONTENT_TYPE, MEMBER_CALLABLE_METHODS, NOT_A_MEMBER_REASON } from "./nip86";
+import {
+  ADMIN_CALLABLE_METHODS,
+  ANYONE_CALLABLE_METHODS,
+  MANAGEMENT_CONTENT_TYPE,
+  MEMBER_CALLABLE_METHODS,
+  NOT_A_MEMBER_REASON,
+  adminOnlyReason,
+} from "./nip86";
 import { nip11Response } from "./nip11";
 import { verifyClaimAuthEvent } from "./nip42";
 import { ownerReason, verifyNip98 } from "./nip98";
@@ -267,21 +274,27 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
   // The first DO round trip of the request.
   const denial = anyoneCallable ? null : ownerReason(auth.pubkey, await relayStub(env).getOwner());
   if (denial !== null) {
-    // A non-owner passes only if the method is member-callable AND the
-    // signer is a member, checked in that order: the first is free, the
-    // second is another round trip, so a stranger signing `banpubkey`
-    // costs no extra. relay.ts isMember: a member of the relay, or of the
-    // group `_`.
+    // A non-owner passes only if the method is admin- or member-callable
+    // AND the signer has that role, checked in that order: the first is
+    // free, the second is another round trip, so a stranger signing
+    // `banpubkey` costs no extra. relay.ts getRole: owner, admin, member
+    // (of the relay, or of the group `_`) or none.
     //
     // An unclaimed relay has no members, so this refuses there whatever
     // the method.
+    const adminCallable = method !== null && ADMIN_CALLABLE_METHODS.includes(method);
     const memberCallable = method !== null && MEMBER_CALLABLE_METHODS.includes(method);
-    if (!memberCallable) return managementResponse({ error: denial }, 401);
-    // Its own reason, not the owner refusal: this is how an app learns its
-    // user has lost their home here (a removed member's subscribepush or
-    // unsubscribepush), and "not signed by the owner" would not tell it.
-    if (!(await relayStub(env).isMember(auth.pubkey))) {
-      return managementResponse({ error: NOT_A_MEMBER_REASON }, 401);
+    if (!adminCallable && !memberCallable) return managementResponse({ error: denial }, 401);
+    const role = await relayStub(env).getRole(auth.pubkey);
+    const allowed = adminCallable ? role === "admin" : role === "admin" || role === "member";
+    if (!allowed) {
+      // A member's own methods refuse a non-member with their own reason:
+      // this is how an app learns its user has lost their home here (a
+      // removed member's subscribepush or unsubscribepush), and "not
+      // signed by the owner" would not tell it. An admin's methods say
+      // which role they need.
+      const reason = memberCallable ? NOT_A_MEMBER_REASON : adminOnlyReason(method!);
+      return managementResponse({ error: reason }, 401);
     }
   }
 
