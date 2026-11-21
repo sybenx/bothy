@@ -57,7 +57,8 @@ jobs:
       - name: Restore local config
         # wrangler.jsonc holds the D1/KV/R2 IDs Cloudflare provisioned for this deployment,
         # and .github/ holds this workflow itself — neither must ever be overwritten by upstream.
-        run: git checkout HEAD -- wrangler.jsonc .github/
+        # git restore also drops workflow files that are new upstream (the push token cannot write workflows).
+        run: git restore --source=HEAD --staged --worktree -- wrangler.jsonc .github/
 
       - name: Stage deletions
         run: |
