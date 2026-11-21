@@ -189,7 +189,9 @@ describe("asking to join", () => {
 
   it("refuses details of the wrong shape or length, naming the bound", async () => {
     const who = randomKeypair();
-    expect((await requestJoin(who, "Robin")).error).toContain('{"name": "...", "note": "..."}');
+    expect((await requestJoin(who, "Robin")).error).toContain(
+      '{"name": "...", "note": "...", "via": "<npub>"}',
+    );
     expect((await requestJoin(who, { name: 7 })).error).toBe("requestjoin: name must be a string");
     expect((await requestJoin(who, { name: "x".repeat(JOIN_REQUEST_NAME_MAX_LENGTH + 1) })).error).toContain(
       `at most ${JOIN_REQUEST_NAME_MAX_LENGTH} characters`,
@@ -371,5 +373,150 @@ describe("an invite shown as a QR code", () => {
     expect(
       (await callManagement("redeeminvite", [invite.code], { secretKeyHex: second.secretKeyHex })).error,
     ).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------
+// The invite tree: who let whom in (allowed_pubkeys.invited_by), shown flat
+// by listmembers and respected by removal.
+// ---------------------------------------------------------------------
+
+type Screen = {
+  members: { pubkey: string; invitedBy: string; source: string }[];
+  removed: { pubkey: string }[];
+};
+
+async function screen(): Promise<Screen> {
+  return (await callManagement("listmembers")).result as Screen;
+}
+
+function parentOf(s: Screen, who: Keypair): string | undefined {
+  return s.members.find((m) => m.pubkey === who.pubkeyHex)?.invitedBy;
+}
+
+// A code as a member would make one. Only the owner can call createinvite
+// today, so the row is written directly: what is under test is that the
+// creator is carried into the tree, which is the step that will not change
+// when members can make codes.
+async function codeMadeBy(creator: Keypair): Promise<string> {
+  const code = crypto.randomUUID().replace(/-/g, "");
+  await runInDurableObject(stub(), (_i: Relay, state) => {
+    const now = Math.floor(Date.now() / 1000);
+    state.storage.sql.exec(
+      `INSERT INTO member_invites (code, created_at, expires_at, uses_allowed, uses, created_by)
+         VALUES (?, ?, ?, 1, 0, ?)`,
+      code,
+      now,
+      now + 600,
+      creator.pubkeyHex,
+    );
+  });
+  return code;
+}
+
+async function joinWith(code: string): Promise<Keypair> {
+  const who = randomKeypair();
+  expect((await callManagement("redeeminvite", [code], { secretKeyHex: who.secretKeyHex })).result).toBe(
+    true,
+  );
+  return who;
+}
+
+// owner -> alice -> bob -> carol, and owner -> dave.
+async function tree() {
+  const alice = await joinWith(((await callManagement("createinvite")).result as { code: string }).code);
+  const bob = await joinWith(await codeMadeBy(alice));
+  const carol = await joinWith(await codeMadeBy(bob));
+  const dave = await joinWith(((await callManagement("createinvite")).result as { code: string }).code);
+  return { alice, bob, carol, dave };
+}
+
+describe("the invite tree", () => {
+  it("records each code's creator as the inviter of whoever redeems it", async () => {
+    const { alice, bob, carol, dave } = await tree();
+    const s = await screen();
+    expect(parentOf(s, alice)).toBe(OWNER_PUBKEY_HEX);
+    expect(parentOf(s, bob)).toBe(alice.pubkeyHex);
+    expect(parentOf(s, carol)).toBe(bob.pubkeyHex);
+    expect(parentOf(s, dave)).toBe(OWNER_PUBKEY_HEX);
+    const createdBy = await runInDurableObject(stub(), (_i: Relay, state) =>
+      state.storage.sql
+        .exec<{ created_by: string }>(`SELECT DISTINCT created_by FROM member_invites`)
+        .toArray(),
+    );
+    expect(createdBy).toContainEqual({ created_by: OWNER_PUBKEY_HEX });
+  });
+
+  it("hangs an approved request from the member whose link it came through", async () => {
+    const { alice } = await tree();
+    const robin = randomKeypair();
+    await requestJoin(robin, { name: "Robin", via: npubEncode(alice.pubkeyHex) });
+    const listed = (await callManagement("listjoinrequests")).result as { pubkey: string; via: string }[];
+    expect(listed.find((r) => r.pubkey === robin.pubkeyHex)?.via).toBe(alice.pubkeyHex);
+    await callManagement("approvejoin", [robin.pubkeyHex]);
+    expect(parentOf(await screen(), robin)).toBe(alice.pubkeyHex);
+  });
+
+  it("hangs it from the owner when the link names somebody who is not a member", async () => {
+    const robin = randomKeypair();
+    await requestJoin(robin, { via: randomKeypair().pubkeyHex });
+    await callManagement("approvejoin", [robin.pubkeyHex]);
+    expect(parentOf(await screen(), robin)).toBe(OWNER_PUBKEY_HEX);
+    expect((await requestJoin(randomKeypair(), { via: "nope" })).error).toBe(
+      "requestjoin: via must be a pubkey, as npub or 64-character hex",
+    );
+  });
+
+  it("reports a row with no recorded inviter as the owner's", async () => {
+    const legacy = randomKeypair();
+    await runInDurableObject(stub(), (_i: Relay, state) => {
+      state.storage.sql.exec(
+        `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source) VALUES (?, NULL, 1, 'owner')`,
+        legacy.pubkeyHex,
+      );
+    });
+    expect(parentOf(await screen(), legacy)).toBe(OWNER_PUBKEY_HEX);
+  });
+});
+
+describe("removing someone who invited others", () => {
+  it("by default keeps the people they invited, now invited by the owner", async () => {
+    const { alice, bob, carol } = await tree();
+    const reply = await callManagement("unallowpubkey", [alice.pubkeyHex]);
+    expect(reply.result).toBe(true);
+    expect(reply.error).toBe("The 1 person they invited is still a member, now listed as invited by you.");
+    const s = await screen();
+    expect(parentOf(s, alice)).toBeUndefined();
+    expect(parentOf(s, bob)).toBe(OWNER_PUBKEY_HEX);
+    expect(parentOf(s, carol)).toBe(bob.pubkeyHex);
+    expect(s.removed.map((r) => r.pubkey)).toEqual([alice.pubkeyHex]);
+  });
+
+  it('with {"invitees": "keep"} does the same, said explicitly', async () => {
+    const { alice, bob } = await tree();
+    await callManagement("unallowpubkey", [alice.pubkeyHex, { invitees: "keep" }]);
+    expect(parentOf(await screen(), bob)).toBe(OWNER_PUBKEY_HEX);
+  });
+
+  it('with {"invitees": "remove"} removes everyone below them, each with the usual grace', async () => {
+    const { alice, bob, carol, dave } = await tree();
+    const reply = await callManagement("unallowpubkey", [alice.pubkeyHex, { invitees: "remove" }]);
+    expect(reply.result).toBe(true);
+    expect(reply.error).toBe("Also removed 2 people they invited, directly or through someone they invited.");
+    const s = await screen();
+    expect(s.members.map((m) => m.pubkey)).toEqual([dave.pubkeyHex]);
+    expect(s.removed.map((r) => r.pubkey).sort()).toEqual(
+      [alice.pubkeyHex, bob.pubkeyHex, carol.pubkeyHex].sort(),
+    );
+  });
+
+  it("says nothing extra for someone who invited nobody, and refuses an unknown option", async () => {
+    const { carol, bob } = await tree();
+    const reply = await callManagement("unallowpubkey", [carol.pubkeyHex, { invitees: "remove" }]);
+    expect(reply).toEqual({ status: 200, result: true });
+    expect((await callManagement("unallowpubkey", [bob.pubkeyHex, { invitees: "all" }])).error).toBe(
+      'unallowpubkey: the second parameter is optional, {"invitees": "keep"} or {"invitees": "remove"}',
+    );
+    expect(parentOf(await screen(), bob)).toBeDefined();
   });
 });

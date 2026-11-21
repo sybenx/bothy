@@ -402,11 +402,12 @@ export const TABLES: readonly TableSpec[] = [
       // conflict). DEFAULT 'owner' because allowpubkey was the only writer
       // before this column existed.
       col("source", "TEXT NOT NULL DEFAULT 'owner'"),
-      // Who let them in, as a hex pubkey: the owner, for every way in that
-      // exists today (only the owner makes invites, approves requests and
-      // calls allowpubkey). A column rather than an assumption so members
-      // inviting members can be added without a migration. NULL on rows
-      // written before it existed, and on rows a NIP-29 group wrote.
+      // Who let them in, as a hex pubkey: the edge of the invite tree. The
+      // creator of the code they redeemed, the member whose link a request
+      // came through, or the owner. NULL on rows written before it existed
+      // and on rows a NIP-29 group wrote; listmembers reports those as the
+      // owner's, so every row has a parent. Removing someone re-parents
+      // their invitees or removes them too (storage.ts removeMember).
       col("invited_by", "TEXT"),
     ],
   },
@@ -583,6 +584,13 @@ export const TABLES: readonly TableSpec[] = [
       col("uses_allowed", "INTEGER NOT NULL DEFAULT 1"),
       col("uses", "INTEGER NOT NULL DEFAULT 0"),
       col("revoked_at", "INTEGER"),
+      // Who made the code, as a hex pubkey; whoever redeems it is recorded
+      // as invited by them (`allowed_pubkeys.invited_by`). Only the owner
+      // makes codes today. Members making their own (limited in number,
+      // and in depth below the owner) needs only a count over this column
+      // and a walk up `invited_by`, not a new table. NULL on codes made
+      // before this column, which are read as the owner's.
+      col("created_by", "TEXT"),
     ],
   },
   {
@@ -601,6 +609,10 @@ export const TABLES: readonly TableSpec[] = [
       col("requested_at", "INTEGER NOT NULL"),
       col("expires_at", "INTEGER NOT NULL"),
       col("declined_at", "INTEGER"),
+      // Whose "Message me" link the request came through, as the requester
+      // says (unverified: anyone can name anyone). On approval it becomes
+      // `invited_by` if it names a member then, and the owner otherwise.
+      col("via", "TEXT"),
     ],
   },
   {

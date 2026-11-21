@@ -20,6 +20,7 @@ import {
   banPubkey,
   blockIp,
   approveJoinRequest,
+  removeMember,
   countOutstandingMemberInvites,
   declineJoinRequest,
   giftWrapCount,
@@ -42,7 +43,6 @@ import {
   revokeInvite,
   revokeMemberInvite,
   setRelaySetting,
-  unallowPubkey,
   unbanPubkey,
   unblockIp,
   upsertPushSubscription,
@@ -217,15 +217,23 @@ const HEX_ID_RE = /^[0-9a-f]{64}$/;
 export const REDEEM_REFUSAL_MESSAGE =
   "redeeminvite: this invite cannot be used. Ask whoever sent it for a new one.";
 
-// requestjoin's one optional parameter, {"name", "note"}: each an optional
-// string, squeezed onto one line and length-bounded. Null with a message
-// when it is not that shape.
-function parseJoinDetails(value: unknown): { name: string | null; note: string | null } | string {
-  if (value === undefined || value === null) return { name: null, note: null };
+// requestjoin's one optional parameter, {"name", "note", "via"}: name and
+// note optional strings, squeezed onto one line and length-bounded; via
+// an optional pubkey (npub or hex), whose "Message me" link this came
+// through. A message when it is not that shape.
+function parseJoinDetails(
+  value: unknown,
+): { name: string | null; note: string | null; via: string | null } | string {
+  if (value === undefined || value === null) return { name: null, note: null, via: null };
   if (typeof value !== "object" || Array.isArray(value)) {
-    return 'requestjoin takes one optional object, {"name": "...", "note": "..."}';
+    return 'requestjoin takes one optional object, {"name": "...", "note": "...", "via": "<npub>"}';
   }
-  const raw = value as { name?: unknown; note?: unknown };
+  const raw = value as { name?: unknown; note?: unknown; via?: unknown };
+  let via: string | null = null;
+  if (raw.via !== undefined && raw.via !== null) {
+    via = typeof raw.via === "string" ? normalizePubkey(raw.via) : null;
+    if (via === null) return "requestjoin: via must be a pubkey, as npub or 64-character hex";
+  }
   const field = (v: unknown, label: string, max: number): string | null | { error: string } => {
     if (v === undefined || v === null) return null;
     if (typeof v !== "string") return { error: `requestjoin: ${label} must be a string` };
@@ -237,7 +245,7 @@ function parseJoinDetails(value: unknown): { name: string | null; note: string |
   if (typeof name === "object" && name !== null) return name.error;
   const note = field(raw.note, "note", JOIN_REQUEST_NOTE_MAX_LENGTH);
   if (typeof note === "object" && note !== null) return note.error;
-  return { name, note };
+  return { name, note, via };
 }
 
 // An optional positive integer parameter, or the default when absent.
@@ -478,11 +486,44 @@ export function handleManagementCall(
     // Also removes a member (storage.ts unallowPubkey): new mail for them
     // is refused from now on, their devices are dropped, and the mail
     // already here is deleted after limits.ts MEMBER_REMOVAL_GRACE_SECONDS.
+    //
+    // An optional second parameter, {"invitees": "keep" | "remove"}, says
+    // what happens to the people they invited (storage.ts removeMember).
+    // Without it, "keep". The note in `error` says what happened to them,
+    // when there was anyone.
     case "unallowpubkey": {
       const pubkey = pubkeyParam(params, 0);
       if (pubkey === null) return err("unallowpubkey takes a pubkey, as npub or 64-character hex");
-      unallowPubkey(sql, pubkey, nowSec);
-      return { result: true };
+      const option = params[1] as { invitees?: unknown } | undefined | null;
+      const choice = option?.invitees ?? "keep";
+      if (
+        (option !== undefined && option !== null && (typeof option !== "object" || Array.isArray(option))) ||
+        (choice !== "keep" && choice !== "remove")
+      ) {
+        return err(
+          'unallowpubkey: the second parameter is optional, {"invitees": "keep"} or {"invitees": "remove"}',
+        );
+      }
+      const owner = getOwnerPubkey(sql, env) ?? signer;
+      const invited = sql
+        .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM allowed_pubkeys WHERE invited_by = ?`, pubkey)
+        .toArray()[0]?.n ?? 0;
+      const removed = removeMember(sql, pubkey, owner, choice, nowSec);
+      if (removed.length === 0 || invited === 0) return { result: true };
+      if (choice === "remove") {
+        const others = removed.length - 1;
+        return {
+          result: true,
+          error: `Also removed ${others === 1 ? "1 person" : `${others} people`} they invited, directly or through someone they invited.`,
+        };
+      }
+      return {
+        result: true,
+        error:
+          invited === 1
+            ? "The 1 person they invited is still a member, now listed as invited by you."
+            : `The ${invited} people they invited are still members, now listed as invited by you.`,
+      };
     }
 
     case "listallowedpubkeys":
@@ -564,7 +605,9 @@ export function handleManagementCall(
       }
       const code = bytesToHex(crypto.getRandomValues(new Uint8Array(MEMBER_INVITE_CODE_BYTES)));
       const expiresAt = nowSec + ttl;
-      createMemberInvite(sql, code, uses, nowSec, expiresAt);
+      // The signer is the creator: always the owner today (only the owner
+      // reaches this method), and whoever redeems it hangs from them.
+      createMemberInvite(sql, code, uses, nowSec, expiresAt, signer);
       return { result: { code, uses, expires_at: expiresAt } };
     }
 
@@ -602,6 +645,7 @@ export function handleManagementCall(
         nowSec,
         JOIN_REQUEST_TTL_SECONDS,
         MAX_PENDING_JOIN_REQUESTS,
+        details.via,
       );
       switch (outcome.status) {
         case "full":
@@ -651,7 +695,7 @@ export function handleManagementCall(
     // Members, and the removed ones whose mail has not been deleted yet.
     // Letting a removed one back in is allowpubkey, which stops the clock.
     case "listmembers":
-      return { result: listMembers(sql, MEMBER_REMOVAL_GRACE_SECONDS) };
+      return { result: listMembers(sql, MEMBER_REMOVAL_GRACE_SECONDS, signer) };
 
     // bothy's own; the client half is hearth's subscribeToPush. The pubkey
     // stored is `signer` and nothing else -- the parameters carry a
