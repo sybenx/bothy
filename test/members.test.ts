@@ -18,7 +18,12 @@ import {
   MEMBER_REMOVAL_GRACE_SECONDS,
 } from "../src/limits";
 import { buildRelayInfo } from "../src/nip11";
-import { ANYONE_CALLABLE_METHODS, handleManagementCall, REDEEM_REFUSAL_MESSAGE } from "../src/nip86";
+import {
+  ANYONE_CALLABLE_METHODS,
+  handleManagementCall,
+  NOT_A_MEMBER_REASON,
+  REDEEM_REFUSAL_MESSAGE,
+} from "../src/nip86";
 import type { Relay } from "../src/relay";
 import { sweepFormerMembers } from "../src/storage";
 import { signEvent, withCorruptSignature, type NostrEvent } from "./helpers/event";
@@ -482,7 +487,14 @@ describe("removing a member", () => {
     const [ok, message] = await sendWrap(wrapFor(alice.pubkeyHex));
     expect(ok).toBe(false);
     expect(message).toContain("not addressed to this relay's owner or one of its members");
-    expect((await subscribe(alice, device)).status).toBe(401);
+    // How their app learns it has lost its home here: a stable reason,
+    // with or without a device to register.
+    const refused = await subscribe(alice, device);
+    expect([refused.status, refused.error]).toEqual([401, NOT_A_MEMBER_REASON]);
+    const probe = await callManagement("unsubscribepush", [device.endpoint], {
+      secretKeyHex: alice.secretKeyHex,
+    });
+    expect([probe.status, probe.error]).toEqual([401, NOT_A_MEMBER_REASON]);
   });
 
   it("keeps their stored mail readable for the grace period, then sweeps it", async () => {

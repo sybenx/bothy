@@ -145,6 +145,11 @@ export const MEMBER_CALLABLE_METHODS: readonly string[] = ["subscribepush", "uns
 // never one from the body).
 export const ANYONE_CALLABLE_METHODS: readonly string[] = ["redeeminvite"];
 
+// The 401 a non-member gets for a MEMBER_CALLABLE_METHODS call (index.ts).
+// Stable on purpose: an app that sees it knows its user is not, or is no
+// longer, a member here.
+export const NOT_A_MEMBER_REASON = "you are not a member of this relay";
+
 // The methods that belong to the group feature (limits.ts groupsEnabled).
 // While groups are paused they are left out of supportedmethods and
 // answer with the same refusal every other group path gives: the
