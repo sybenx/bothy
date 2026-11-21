@@ -54,9 +54,21 @@ export type PushReason = "message" | "voice";
 // this deployment pushes to, and when. That is why push is something a
 // person turns on, and a relay with no VAPID key (no `push_key`) never
 // learns any of it.
+//
+// `label` is the one addition: the opaque tag the app gave the account
+// when it subscribed (nip86.ts subscribepush), so an app holding several
+// accounts on one endpoint knows which one a push is for. The app chose
+// it and maps it back itself; it is never a pubkey. Absent when the app
+// gave none.
 export interface PushPayload {
   room: string;
   kind: PushReason;
+  label?: string;
+}
+
+// The payload for one device: the shared one, plus that device's label.
+export function payloadFor(payload: PushPayload, target: { label: string | null }): PushPayload {
+  return target.label === null ? payload : { ...payload, label: target.label };
 }
 
 // One stored subscription, as the fan-out needs it.

@@ -488,8 +488,17 @@ export const TABLES: readonly TableSpec[] = [
     ],
   },
   {
-    // Web push subscriptions (push.ts). One row per ENDPOINT: a phone, a
-    // laptop and a browser tab are three endpoints for one pubkey.
+    // Web push subscriptions (push.ts). One row per (ENDPOINT, PUBKEY): a
+    // phone, a laptop and a browser tab are three endpoints for one pubkey,
+    // and two accounts in one app on one phone are one endpoint under two
+    // pubkeys. Keyed by endpoint alone until 0.20.0, when the second
+    // account's subscribe took the first's row; rekeyPushSubscriptions
+    // rebuilds a table still keyed that way.
+    //
+    // `label`: an opaque tag the app chose for the account (nip86.ts
+    // subscribepush), echoed in the payload so the app knows which account
+    // a push is for without the push service ever seeing a pubkey. NULL
+    // when the app sent none.
     //
     // `pubkey` comes from the NIP-98 signature, never from the request body
     // (nip86.ts subscribepush). A body-supplied pubkey would let anyone
@@ -514,13 +523,15 @@ export const TABLES: readonly TableSpec[] = [
     // drainPushOutbox).
     name: "push_subscriptions",
     columns: [
-      col("endpoint", "TEXT PRIMARY KEY"),
+      col("endpoint", "TEXT NOT NULL"),
       col("pubkey", "TEXT NOT NULL"),
       col("p256dh", "TEXT NOT NULL"),
       col("auth", "TEXT NOT NULL"),
       col("created_at", "INTEGER NOT NULL"),
       col("last_ok_at", "INTEGER"),
+      col("label", "TEXT"),
     ],
+    tableConstraints: ["PRIMARY KEY (endpoint, pubkey)"],
   },
   {
     // The push fan-out queue: one row per REASON ("message", "voice"), so at
@@ -1357,11 +1368,34 @@ function dropUndeclaredIndexes(sql: SqlStorage): void {
   }
 }
 
+// push_subscriptions was keyed by endpoint alone before 0.20.0 (see that
+// table). SQLite cannot change a primary key in place, so a table still
+// keyed that way is renamed, recreated from TABLES and copied back, rows
+// and all, then the old one dropped. Bounded by the per-pubkey device cap
+// times the members, so one pass. Runs only on the reconcile path, ahead
+// of the CREATE TABLE loop, which then finds the new table already there.
+function rekeyPushSubscriptions(sql: SqlStorage): void {
+  const keyed = sql
+    .exec<{ name: string; pk: number }>(`SELECT name, pk FROM pragma_table_info('push_subscriptions')`)
+    .toArray()
+    .filter((c) => c.pk > 0);
+  if (keyed.length !== 1) return;
+  const spec = TABLES.find((t) => t.name === "push_subscriptions")!;
+  sql.exec(`ALTER TABLE push_subscriptions RENAME TO push_subscriptions_old`);
+  sql.exec(createTableSql(spec));
+  sql.exec(
+    `INSERT OR IGNORE INTO push_subscriptions (endpoint, pubkey, p256dh, auth, created_at, last_ok_at)
+       SELECT endpoint, pubkey, p256dh, auth, created_at, last_ok_at FROM push_subscriptions_old`,
+  );
+  sql.exec(`DROP TABLE push_subscriptions_old`);
+}
+
 export function initSchema(sql: SqlStorage): void {
   ensureSchemaMetaTable(sql);
   const hash = currentSchemaHash();
   if (readStoredSchemaHash(sql) === hash) return;
 
+  rekeyPushSubscriptions(sql);
   for (const spec of TABLES) {
     // Creates the table with every declared column on a fresh database,
     // and is a no-op on an existing one -- which is exactly why the

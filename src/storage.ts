@@ -2590,6 +2590,8 @@ export interface PushSubscriptionRow {
   pubkey: string;
   p256dh: string;
   auth: string;
+  // The app's tag for the account (schema.ts `push_subscriptions.label`).
+  label: string | null;
 }
 
 // Plus `last_ok_at`, which decides whether a successful send is worth a
@@ -2601,10 +2603,12 @@ export interface PushFanoutRow extends PushSubscriptionRow {
 // Registers or refreshes one endpoint, evicting this pubkey's oldest beyond
 // the cap.
 //
-// An upsert: browsers re-send the same endpoint on every load, and its keys
-// can change. Rebinding to a DIFFERENT pubkey is allowed because an
-// endpoint belongs to a browser profile, which can switch npubs; the old
-// pubkey then stops receiving on it, which is correct.
+// An upsert on (endpoint, pubkey): browsers re-send the same endpoint on
+// every load, and its keys can change. The same endpoint under a second
+// pubkey is a second row, not a rebinding: an app holding two accounts
+// shares one browser endpoint between them, and each keeps receiving.
+// The label is replaced on every call, so subscribing without one clears
+// it.
 export function upsertPushSubscription(
   sql: SqlStorage,
   row: PushSubscriptionRow,
@@ -2612,18 +2616,19 @@ export function upsertPushSubscription(
   nowSec: number,
 ): void {
   sql.exec(
-    `INSERT INTO push_subscriptions (endpoint, pubkey, p256dh, auth, created_at, last_ok_at)
-       VALUES (?, ?, ?, ?, ?, NULL)
-       ON CONFLICT(endpoint) DO UPDATE SET
-         pubkey = excluded.pubkey,
+    `INSERT INTO push_subscriptions (endpoint, pubkey, p256dh, auth, created_at, last_ok_at, label)
+       VALUES (?, ?, ?, ?, ?, NULL, ?)
+       ON CONFLICT(endpoint, pubkey) DO UPDATE SET
          p256dh = excluded.p256dh,
          auth = excluded.auth,
-         created_at = excluded.created_at`,
+         created_at = excluded.created_at,
+         label = excluded.label`,
     row.endpoint,
     row.pubkey,
     row.p256dh,
     row.auth,
     nowSec,
+    row.label,
   );
   // Evict the oldest rather than refuse the newest: browsers rotate
   // endpoints silently, and refusing would fill the slots with dead rows
@@ -2631,7 +2636,7 @@ export function upsertPushSubscription(
   //
   // `rowid DESC` is a load-bearing tie-break: several registrations often
   // share one `created_at` second, and the implicit rowid (free because the
-  // TEXT primary key is not a rowid alias) keeps the newest.
+  // composite primary key is not a rowid alias) keeps the newest.
   sql.exec(
     `DELETE FROM push_subscriptions
        WHERE pubkey = ?
@@ -2657,20 +2662,31 @@ export function deletePushSubscription(sql: SqlStorage, pubkey: string, endpoint
   return true;
 }
 
-// Deletes by endpoint alone, for an endpoint the push service reported
-// gone (404/410). The authority is the push service, not a caller.
+// Deletes by endpoint alone, every account on it, for an endpoint the push
+// service reported gone (404/410). The authority is the push service, not
+// a caller.
 export function forgetPushEndpoint(sql: SqlStorage, endpoint: string): void {
   sql.exec(`DELETE FROM push_subscriptions WHERE endpoint = ?`, endpoint);
 }
 
-// One page of the fan-out, ordered and resumed by endpoint
-// (schema.ts `push_outbox.cursor`), so subscriptions added or removed
-// mid-fan-out cannot shift the page boundary as a rowid offset would.
+// The fan-out cursor (schema.ts `push_outbox.cursor`) for the row a page
+// ended on: its key, endpoint then pubkey, joined by a newline, which no
+// URL contains. A cursor written before rows had two-part keys is a bare
+// endpoint, read as that endpoint with the lowest pubkey, so a fan-out in
+// flight across the upgrade repeats at most that endpoint's rows.
+export function pushCursor(row: { endpoint: string; pubkey: string }): string {
+  return `${row.endpoint}\n${row.pubkey}`;
+}
+
+// One page of the fan-out, ordered and resumed by the primary key, so
+// subscriptions added or removed mid-fan-out cannot shift the page
+// boundary as a rowid offset would.
 export function pushSubscriptionsAfter(
   sql: SqlStorage,
   after: string | null,
   limit: number,
 ): PushFanoutRow[] {
+  const [endpoint = "", pubkey = ""] = (after ?? "").split("\n");
   return sql
     .exec<{
       endpoint: string;
@@ -2678,10 +2694,14 @@ export function pushSubscriptionsAfter(
       p256dh: string;
       auth: string;
       last_ok_at: number | null;
+      label: string | null;
     }>(
-      `SELECT endpoint, pubkey, p256dh, auth, last_ok_at FROM push_subscriptions
-         WHERE endpoint > ? ORDER BY endpoint ASC LIMIT ?`,
-      after ?? "",
+      `SELECT endpoint, pubkey, p256dh, auth, last_ok_at, label FROM push_subscriptions
+         WHERE endpoint > ? OR (endpoint = ? AND pubkey > ?)
+         ORDER BY endpoint ASC, pubkey ASC LIMIT ?`,
+      endpoint,
+      endpoint,
+      pubkey,
       limit,
     )
     .toArray();
@@ -2698,8 +2718,9 @@ export function pushSubscriptionsFor(sql: SqlStorage, pubkey: string): PushFanou
       p256dh: string;
       auth: string;
       last_ok_at: number | null;
+      label: string | null;
     }>(
-      `SELECT endpoint, pubkey, p256dh, auth, last_ok_at FROM push_subscriptions
+      `SELECT endpoint, pubkey, p256dh, auth, last_ok_at, label FROM push_subscriptions
          WHERE pubkey = ? ORDER BY endpoint ASC`,
       pubkey,
     )

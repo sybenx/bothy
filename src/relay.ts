@@ -82,6 +82,7 @@ import {
   GROUP_CHAT_KIND,
   type PushPayload,
   type PushReason,
+  payloadFor,
   pushConfigured,
   pushSubject,
   sendPush,
@@ -144,6 +145,7 @@ import {
   pendingPushes,
   type PushFanoutRow,
   pushSubscriptionsAfter,
+  pushCursor,
   queuePush,
   noteRoomOccupied,
   readChatState,
@@ -1869,7 +1871,9 @@ export class Relay extends DurableObject<Env> {
       plan.serve.map(async (entry) => ({
         entry,
         outcomes: await Promise.all(
-          entry.targets.map((target) => sendPush(keys, plan.subject, target, plan.payload, nowSec)),
+          entry.targets.map((target) =>
+            sendPush(keys, plan.subject, target, payloadFor(plan.payload, target), nowSec),
+          ),
         ),
       })),
     );
@@ -1995,7 +1999,9 @@ export class Relay extends DurableObject<Env> {
       plan.batches.map(async (batch) => ({
         batch,
         outcomes: await Promise.all(
-          batch.targets.map((target) => sendPush(keys, plan.subject, target, batch.payload, nowSec)),
+          batch.targets.map((target) =>
+            sendPush(keys, plan.subject, target, payloadFor(batch.payload, target), nowSec),
+          ),
         ),
       })),
     );
@@ -2021,7 +2027,7 @@ export class Relay extends DurableObject<Env> {
           clearPush(sql, batch.reason);
           continue;
         }
-        advancePush(sql, batch.reason, last.endpoint, sent);
+        advancePush(sql, batch.reason, pushCursor(last), sent);
         more = true;
       }
     });

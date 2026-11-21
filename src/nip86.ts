@@ -248,6 +248,19 @@ export const SELF_BLOCK_CONFIRMATION = "yes, block my own address";
 
 const HEX_ID_RE = /^[0-9a-f]{64}$/;
 
+// subscribepush's label: short, and from an alphabet with no room for an
+// npub (63 characters) or a sentence.
+const PUSH_LABEL_RE = /^[A-Za-z0-9_-]{1,16}$/;
+
+// The label, null for none, undefined when the parameter is malformed.
+function parsePushLabel(value: unknown): string | null | undefined {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) return undefined;
+  const label = (value as { label?: unknown }).label;
+  if (label === undefined || label === null) return null;
+  return typeof label === "string" && PUSH_LABEL_RE.test(label) ? label : undefined;
+}
+
 // The one refusal redeeminvite gives for every dead code, unknown,
 // revoked, used up or expired alike, so a presenter cannot tell which (the
 // NIP-29 join path's rule, nip29.ts JOIN_REFUSAL_MESSAGE). The owner sees
@@ -798,9 +811,19 @@ export function handleManagementCall(
       }
       const parsed = parsePushSubscription(params[0]);
       if (typeof parsed === "string") return err(parsed);
+      // Optional {"label": "..."}: the app's own tag for this account,
+      // echoed in every push to this device (push.ts PushPayload). Short
+      // and plain so it cannot carry a pubkey or anything else the push
+      // service should not read.
+      const label = parsePushLabel(params[1]);
+      if (label === undefined) {
+        return err(
+          'subscribepush: the second parameter is optional, {"label": "..."} with 1 to 16 letters, digits, "_" or "-"',
+        );
+      }
       upsertPushSubscription(
         sql,
-        { ...parsed, pubkey: signer },
+        { ...parsed, pubkey: signer, label },
         MAX_PUSH_SUBSCRIPTIONS_PER_PUBKEY,
         nowSec,
       );
