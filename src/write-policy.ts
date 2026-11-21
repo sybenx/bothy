@@ -8,8 +8,9 @@
 //
 //   owner     Only events signed by the relay's owner.
 //             Bounded by the owner's own posting rate.
-//   inbox     + NIP-59 gift wraps from anyone, p-tagged to the owner
-//             (relay.ts handleGiftWrap). Bounded by MAX_EVENT_BYTES, the
+//   inbox     + NIP-59 gift wraps from anyone, p-tagged to the owner or
+//             a member (relay.ts handleGiftWrap; members are storage.ts
+//             isMember). Bounded by MAX_EVENT_BYTES, the
 //             gift wrap storage share and the per-IP wrap throttle
 //             (limits.ts).
 //   follows   + any event signed by a pubkey in the owner's kind-3

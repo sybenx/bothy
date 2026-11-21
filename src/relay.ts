@@ -24,6 +24,10 @@ import {
   MAX_SCOPED_GROUPS,
   boundFilter,
   MAX_PUSHES_PER_TICK,
+  MAX_WRAP_RECIPIENTS_CHECKED,
+  MEMBER_REMOVAL_GRACE_SECONDS,
+  FORMER_MEMBER_SWEEP_PUBKEYS,
+  FORMER_MEMBER_SWEEP_BATCH_SIZE,
   MAX_PUSH_ENDPOINTS_PER_NOTIFICATION,
   PRESENCE_MAX_TRACKED,
   PRESENCE_STALE_SECONDS,
@@ -166,7 +170,15 @@ import {
   hasNonOwnerStorageHeadroom,
   isDeleted,
   isGroupMember,
+  isMember,
   listMemberGroups,
+  clearInboxPush,
+  hasPushSubscription,
+  memberCount,
+  pendingInboxPushes,
+  pushSubscriptionsFor,
+  queueInboxPush,
+  sweepFormerMembers,
   isIpBlocked,
   queryFilters,
   type RelaySettings,
@@ -298,6 +310,16 @@ function writeRejectionMessage(reason: WriteRejection): string {
     case "too-many-tags":
       return `restricted: an event from someone the owner does not follow may carry at most ${MAX_MENTION_EVENT_INDEXED_TAGS} indexed tags`;
   }
+}
+
+// Whether a filter asks only for mail addressed to `pubkey`: its `#p` is
+// present and names nobody else. The one shape in which somebody other
+// than the owner may read kind 1059 (handleReqInner, broadcast). NIP-17
+// clients already ask for their inbox exactly this way
+// (`{"kinds":[1059],"#p":[me]}`).
+function readsOnlyOwnMail(filter: Filter, pubkey: string): boolean {
+  const recipients = filter["#p"];
+  return Array.isArray(recipients) && recipients.length > 0 && recipients.every((value) => value === pubkey);
 }
 
 export class Relay extends DurableObject<Env> {
@@ -546,6 +568,7 @@ export class Relay extends DurableObject<Env> {
     settings: RelaySettings;
     ownerPubkey: string | null;
     relayPubkey: string;
+    memberCount: number;
   }> {
     return this.metered(() =>
       withReadPath("identity", () => {
@@ -559,6 +582,8 @@ export class Relay extends DurableObject<Env> {
           settings: getRelaySettings(sql),
           ownerPubkey: getOwnerPubkey(sql, this.env),
           relayPubkey: getRelayPubkey(sql),
+          // M rows, M the size of a friend group (storage.ts memberCount).
+          memberCount: memberCount(sql),
         };
       }),
     );
@@ -595,11 +620,14 @@ export class Relay extends DurableObject<Env> {
   }
 
   // For the Worker's management gate (src/index.ts), deciding whether a
-  // non-owner signer may call nip86.ts MEMBER_CALLABLE_METHODS. One indexed
-  // row, reached only after a valid signature. storage.ts isGroupMember
-  // with no group id checks the top-level group (TOP_LEVEL_GROUP_ID) only.
-  async isGroupMember(pubkey: string): Promise<boolean> {
-    return this.metered(() => withReadPath("management", () => isGroupMember(this.sql, pubkey)));
+  // non-owner signer may call nip86.ts MEMBER_CALLABLE_METHODS. A member
+  // of the relay (storage.ts isMember), or of the top-level group
+  // (TOP_LEVEL_GROUP_ID), whose members a group fan-out pushes to. At most
+  // two PK seeks, reached only after a valid signature.
+  async isMember(pubkey: string): Promise<boolean> {
+    return this.metered(() =>
+      withReadPath("management", () => isMember(this.sql, pubkey) || isGroupMember(this.sql, pubkey)),
+    );
   }
 
   // Backs GET /api/stats (src/index.ts), which is public and
@@ -670,6 +698,14 @@ export class Relay extends DurableObject<Env> {
     // From the same `maintained_counts` row as `totalEvents`; ownership.ts
     // refreshFollows is the only writer of `follows` and moves it.
     followCount: number;
+    // Members (storage.ts memberCount): the people this relay keeps an
+    // inbox for besides the owner. The same figure as NIP-11
+    // `member_count`.
+    memberCount: number;
+    // Whether this relay can send push notifications at all (push.ts
+    // pushConfigured): "on" or "off". Configuration, like groupPolicy;
+    // NIP-11 says the same thing by carrying `push_key` or not.
+    pushPolicy: "on" | "off";
     // Whether the daily counter audit (storage.ts auditMaintainedCounts)
     // has run and what it last found, from the same row. `lastRanAt: null`
     // means it has never run and must NOT be rendered as "no drift found".
@@ -783,6 +819,8 @@ export class Relay extends DurableObject<Env> {
       groupPolicy: groupsEnabled(this.env) ? "on" : "paused",
       chatPolicy: chatMode(this.env),
       followCount: counts.follows,
+      memberCount: memberCount(sql),
+      pushPolicy: pushConfigured(this.env) ? "on" : "off",
       countAudit: { lastRanAt: counts.lastRanAt, drift: counts.drift },
       followsListAt: followsListAt(sql),
       vanishing: vanishSummary(sql),
@@ -874,6 +912,9 @@ export class Relay extends DurableObject<Env> {
         // not just hidden, because kind 1059 is capped by count (limits.ts
         // maxGiftWraps) and a hidden row would still hold a slot.
         withReadPath("giftWrapSweep", () => this.sweepExpiredWraps(sql, now));
+        // Removed members' mail, once their grace period is over
+        // (storage.ts sweepFormerMembers). Free while nobody is waiting.
+        withReadPath("giftWrapSweep", () => this.sweepFormerMemberMail(sql, now));
         // Last: see the comment on runCron.
         this.drainPendingVanishes(sql);
       });
@@ -1088,8 +1129,10 @@ export class Relay extends DurableObject<Env> {
   }
 
   // NIP-59 gift wrap accept path: any pubkey may write a kind-1059 that
-  // p-tags the owner, with no prior relationship to the relay. Hence the
-  // extra controls below on top of the per-IP message throttle.
+  // p-tags the owner or a member (storage.ts isMember), with no prior
+  // relationship to the relay. Hence the extra controls below on top of
+  // the per-IP message throttle. One inbox share and one throttle for all
+  // of them: a member's mail is the owner's mail as far as the bounds go.
   private handleGiftWrap(ws: WebSocket, event: NostrEvent): void {
     // First, for safety rather than cost. This path skips
     // authorizeGroupWrite, and storeEvent partitions by groups.ts
@@ -1103,7 +1146,7 @@ export class Relay extends DurableObject<Env> {
         ws,
         event.id,
         false,
-        "invalid: a gift wrap is mail addressed to this relay's owner and cannot carry a group tag",
+        "invalid: a gift wrap is mail addressed to one person and cannot carry a group tag",
       );
       return;
     }
@@ -1122,8 +1165,18 @@ export class Relay extends DurableObject<Env> {
       ok(ws, event.id, false, "restricted: relay has not been claimed yet");
       return;
     }
-    if (!pTagValues(event.tags).includes(owner)) {
-      ok(ws, event.id, false, "restricted: gift wrap is not addressed to this relay's owner");
+    // Who the wrap is for: the owner (free, from memory) and any members
+    // among its first few `p` values (a PK seek each, bounded by
+    // MAX_WRAP_RECIPIENTS_CHECKED). A removed member is no longer in
+    // `allowed_pubkeys`, so their new mail stops here.
+    const named = [...new Set(pTagValues(event.tags))];
+    const recipients = named
+      .filter((pubkey) => pubkey !== owner)
+      .slice(0, MAX_WRAP_RECIPIENTS_CHECKED)
+      .filter((pubkey) => isMember(sql, pubkey));
+    if (named.includes(owner)) recipients.unshift(owner);
+    if (recipients.length === 0) {
+      ok(ws, event.id, false, "restricted: gift wrap is not addressed to this relay's owner or one of its members");
       return;
     }
 
@@ -1142,7 +1195,7 @@ export class Relay extends DurableObject<Env> {
     // Compared rather than hardcoded false: a wrap is normally signed by a
     // one-time key, but acceptEvent's exemptions should follow who signed
     // it.
-    this.acceptEvent(ws, sql, event, event.pubkey === owner);
+    this.acceptEvent(ws, sql, event, event.pubkey === owner, recipients);
   }
 
   // NIP-29 kind-9021 join request. The decision is nip29.ts
@@ -1352,7 +1405,15 @@ export class Relay extends DurableObject<Env> {
   // Shared tail of the write path once authorization is settled, reached
   // from handleEventInner and handleGiftWrap. Cheapest and most certain
   // rejections run first; schnorr runs as late as possible.
-  private acceptEvent(ws: WebSocket, sql: SqlStorage, event: NostrEvent, isOwner: boolean): void {
+  // `wrapRecipients`: for a gift wrap, who handleGiftWrap found it is for,
+  // so the push queue does not look them up a second time.
+  private acceptEvent(
+    ws: WebSocket,
+    sql: SqlStorage,
+    event: NostrEvent,
+    isOwner: boolean,
+    wrapRecipients: readonly string[] = [],
+  ): void {
     // Size first: it bounds the cost of everything after it (hashing
     // re-serializes the event, storage keeps every byte). Applied to the
     // owner too, or it would not bound stored bytes (limits.ts
@@ -1457,7 +1518,7 @@ export class Relay extends DurableObject<Env> {
       if (isGroupEvent(event, groupHost(sql))) this.noteRoomOccupancy(sql, nowSeconds());
       // Only for an accepted event: a notification about a refused event
       // would be about nothing.
-      this.notePush(sql, event);
+      this.notePush(sql, event, wrapRecipients);
       this.broadcast(result.stored);
       this.liveBroadcast(result.stored);
     }
@@ -1549,6 +1610,24 @@ export class Relay extends DurableObject<Env> {
     );
   }
 
+  // One cron tick of the removed-member sweep. Logs counts only: which
+  // pubkeys were removed is the owner's business, not the log's.
+  private sweepFormerMemberMail(sql: SqlStorage, nowSec: number): void {
+    const result = sweepFormerMembers(
+      sql,
+      nowSec,
+      MEMBER_REMOVAL_GRACE_SECONDS,
+      getOwnerPubkey(sql, this.env),
+      FORMER_MEMBER_SWEEP_PUBKEYS,
+      FORMER_MEMBER_SWEEP_BATCH_SIZE,
+    );
+    if (result.removed === 0 && result.finished === 0) return;
+    console.log(
+      `member sweep: removed ${result.removed} gift wrap(s) held for removed members; ` +
+        `${result.finished} removed member(s) now have nothing left here`,
+    );
+  }
+
   // One cron tick of the expired-gift-wrap sweep (storage.ts
   // sweepExpiredGiftWraps). No mode switch, unlike the chat sweep: it
   // removes only rows whose author set an expiry that has passed, and no
@@ -1568,10 +1647,23 @@ export class Relay extends DurableObject<Env> {
   // error.
   // ------------------------------------------------------------------
 
-  // What an accepted event owes the notification queue. Only two kinds
+  // What an accepted event owes the notification queue. Only three kinds
   // qualify, decided by integer comparisons, so other writes pay nothing.
-  private notePush(sql: SqlStorage, event: NostrEvent): void {
+  private notePush(sql: SqlStorage, event: NostrEvent, wrapRecipients: readonly string[]): void {
     if (!pushConfigured(this.env)) return;
+    // Mail: queued per recipient who has a device registered (one indexed
+    // read each), so mail for someone without push writes nothing.
+    if (event.kind === GIFT_WRAP_KIND) {
+      withReadPath("push", () => {
+        const now = nowSeconds();
+        for (const pubkey of wrapRecipients) {
+          if (!hasPushSubscription(sql, pubkey)) continue;
+          queueInboxPush(sql, pubkey, now);
+          this.pushAlarmWanted = true;
+        }
+      });
+      return;
+    }
     if (event.kind === CALL_PRESENCE_KIND) {
       withReadPath("presence", () => this.notePresence(sql, event));
       return;
@@ -1656,6 +1748,117 @@ export class Relay extends DurableObject<Env> {
     }
   }
 
+  // Nobody with an open socket is pushed to (reference/push.md): they
+  // already see what arrived. Only authenticated sockets count; group
+  // reads and gift wrap reads both require NIP-42, so a client reading
+  // either has authenticated. No storage: the pubkey is in the attachment.
+  private onlinePubkeys(): Set<string> {
+    const online = new Set<string>();
+    for (const ws of this.ctx.getWebSockets()) {
+      if (this.ctx.getTags(ws).includes(LIVE_FEED_TAG)) continue;
+      const authed = getState(ws).authedPubkey;
+      if (authed !== undefined) online.add(authed);
+    }
+    return online;
+  }
+
+  // Announces mail (schema.ts `inbox_push`): each queued recipient's own
+  // devices get one "message" push, the same payload a group message
+  // gets, the room name and the word and nothing else. The relay could
+  // not add a sender or a conversation if it wanted to: a gift wrap is
+  // signed by a throwaway key and its contents are sealed.
+  //
+  // Recipients are served whole or not at all, oldest first, until the
+  // subrequest budget would run out; the rest wait for the next alarm. A
+  // recipient online now, or with no devices left (removed, or every
+  // endpoint gone), is dequeued without a push.
+  //
+  // Returns how many subrequests it spent and whether anyone is still
+  // queued.
+  private async drainInboxPushes(budget: number): Promise<{ spent: number; more: boolean }> {
+    const keys = vapidKeys(this.env);
+    if (keys === null) return { spent: 0, more: false };
+    const sql = this.sql;
+    const nowSec = nowSeconds();
+    const online = this.onlinePubkeys();
+
+    const plan = withReadPath("push", () => {
+      // One more than could possibly be served, so "more" is known without
+      // a second query.
+      const pending = pendingInboxPushes(sql, budget + 1);
+      if (pending.length === 0) return null;
+      const payload: PushPayload = {
+        room: resolveName(this.env, getRelaySettings(sql), getOwnerProfile(sql, this.env)),
+        kind: "message",
+      };
+      const subject = pushSubject(getOwnHost(sql));
+      let left = budget;
+      const serve: { pubkey: string; targets: PushFanoutRow[] }[] = [];
+      const skip: string[] = [];
+      let more = false;
+      for (const pubkey of pending) {
+        if (online.has(pubkey)) {
+          skip.push(pubkey);
+          continue;
+        }
+        const targets = pushSubscriptionsFor(sql, pubkey);
+        if (targets.length === 0) {
+          skip.push(pubkey);
+          continue;
+        }
+        if (targets.length > left) {
+          more = true;
+          break;
+        }
+        serve.push({ pubkey, targets });
+        left -= targets.length;
+      }
+      // The extra row read above was there: somebody beyond this batch is
+      // waiting, whatever happened to the ones before them.
+      if (pending.length > budget) more = true;
+      return { payload, subject, serve, skip, more };
+    });
+    if (plan === null) return { spent: 0, more: false };
+
+    const results = await Promise.all(
+      plan.serve.map(async (entry) => ({
+        entry,
+        outcomes: await Promise.all(
+          entry.targets.map((target) => sendPush(keys, plan.subject, target, plan.payload, nowSec)),
+        ),
+      })),
+    );
+
+    let spent = 0;
+    withReadPath("push", () => {
+      for (const pubkey of plan.skip) clearInboxPush(sql, pubkey);
+      for (const { entry, outcomes } of results) {
+        spent += outcomes.length;
+        outcomes.forEach((outcome, index) => this.settlePushOutcome(sql, entry.targets[index]!, outcome, nowSec));
+        clearInboxPush(sql, entry.pubkey);
+      }
+    });
+    return { spent, more: plan.more };
+  }
+
+  // What one send's outcome does to its subscription row, shared by both
+  // drains. 404/410: the endpoint is gone for good, so the row goes
+  // (reference/push.md "Cleanup"). Anything else (429, 5xx, network)
+  // keeps the row; this notification just misses that device, with no
+  // retry queue, since a retried notification is stale by the time it
+  // lands. A success refreshes last_ok_at at most once a day (limits.ts
+  // PUSH_LAST_OK_INTERVAL_SECONDS), never per push.
+  private settlePushOutcome(sql: SqlStorage, target: PushFanoutRow, outcome: string, nowSec: number): void {
+    if (outcome === "gone") {
+      forgetPushEndpoint(sql, target.endpoint);
+      return;
+    }
+    if (outcome !== "sent") return;
+    if (target.last_ok_at === null || nowSec - target.last_ok_at >= PUSH_LAST_OK_INTERVAL_SECONDS) {
+      markPushEndpointOk(sql, target.endpoint, nowSec);
+    }
+  }
+
   // One batch of the fan-out. Returns true when the alarm should come back
   // for more.
   //
@@ -1668,22 +1871,15 @@ export class Relay extends DurableObject<Env> {
   //
   // Reads and writes sit in separate synchronous withReadPath scopes with
   // the awaits between them; a scope must not straddle an await.
-  private async drainPushOutbox(): Promise<boolean> {
+  //
+  // `budget`: the subrequests this invocation has left after
+  // drainInboxPushes, which runs first.
+  private async drainPushOutbox(budgetLeft: number): Promise<boolean> {
     const keys = vapidKeys(this.env);
     if (keys === null) return false;
     const sql = this.sql;
     const nowSec = nowSeconds();
-
-    // Nobody with an open socket is pushed to (reference/push.md): they
-    // already get hearth's in-app banner. Only authenticated sockets count;
-    // group reads require NIP-42, so a client reading the room has
-    // authenticated. No storage: the pubkey is in the attachment.
-    const online = new Set<string>();
-    for (const ws of this.ctx.getWebSockets()) {
-      if (this.ctx.getTags(ws).includes(LIVE_FEED_TAG)) continue;
-      const authed = getState(ws).authedPubkey;
-      if (authed !== undefined) online.add(authed);
-    }
+    const online = this.onlinePubkeys();
 
     const plan = withReadPath("push", () => {
       const pending = pendingPushes(sql);
@@ -1709,7 +1905,7 @@ export class Relay extends DurableObject<Env> {
       const payloadRoom = resolveName(this.env, getRelaySettings(sql), getOwnerProfile(sql, this.env));
       const subject = pushSubject(getOwnHost(sql));
 
-      let budget = MAX_PUSHES_PER_TICK;
+      let budget = budgetLeft;
       const batches: {
         reason: string;
         payload: PushPayload;
@@ -1762,26 +1958,7 @@ export class Relay extends DurableObject<Env> {
     let more = plan.deferred;
     withReadPath("push", () => {
       for (const { batch, outcomes } of results) {
-        outcomes.forEach((outcome, index) => {
-          const endpoint = batch.targets[index]!.endpoint;
-          // 404/410: the endpoint is gone for good, so the row goes
-          // (reference/push.md "Cleanup"). Anything else (429, 5xx,
-          // network) keeps the row; this notification just misses that
-          // device, with no retry queue, since a retried notification is
-          // stale by the time it lands.
-          if (outcome === "gone") {
-            forgetPushEndpoint(sql, endpoint);
-            return;
-          }
-          if (outcome !== "sent") return;
-          // At most once a day per endpoint (limits.ts
-          // PUSH_LAST_OK_INTERVAL_SECONDS), never per push, so the fan-out
-          // writes no rows per device on the ordinary path.
-          const lastOk = batch.targets[index]!.last_ok_at;
-          if (lastOk === null || nowSec - lastOk >= PUSH_LAST_OK_INTERVAL_SECONDS) {
-            markPushEndpointOk(sql, endpoint, nowSec);
-          }
-        });
+        outcomes.forEach((outcome, index) => this.settlePushOutcome(sql, batch.targets[index]!, outcome, nowSec));
         const sent = batch.sent + outcomes.filter((outcome) => outcome === "sent").length;
         const last = batch.page[batch.page.length - 1];
         if (batch.exhausted || last === undefined) {
@@ -1859,8 +2036,11 @@ export class Relay extends DurableObject<Env> {
     //
     // Three permissions:
     //
-    //   gift wraps    the owner alone: every accepted wrap p-tags the owner
-    //                 (handleGiftWrap).
+    //   gift wraps    the owner, all of them; anyone else authenticated,
+    //                 only those addressed to them, and only by asking for
+    //                 exactly that (readsOnlyOwnMail). That is how a member
+    //                 reads their inbox, and how a removed member reads
+    //                 what was stored for them until it is swept.
     //   groups        the owner, or a member of that group, from
     //                 `group_membership`, the same list nip29.ts
     //                 authorizeGroupWrite uses, so anyone who may write to
@@ -1951,7 +2131,14 @@ export class Relay extends DurableObject<Env> {
       }
       return;
     }
-    if (!mayReadGiftWraps && filters.some((f) => f.kinds?.includes(GIFT_WRAP_KIND))) {
+    if (
+      !mayReadGiftWraps &&
+      filters.some(
+        (f) =>
+          f.kinds?.includes(GIFT_WRAP_KIND) &&
+          (state.authedPubkey === undefined || !readsOnlyOwnMail(f, state.authedPubkey)),
+      )
+    ) {
       if (state.authedPubkey === undefined) {
         if (!state.challenge) {
           state.challenge = crypto.randomUUID();
@@ -1960,7 +2147,11 @@ export class Relay extends DurableObject<Env> {
         send(ws, ["AUTH", state.challenge]);
         this.refuse(ws, subId, "auth-required: authentication required to read gift wraps");
       } else {
-        this.refuse(ws, subId, "restricted: not allowed to read gift wraps");
+        this.refuse(
+          ws,
+          subId,
+          'restricted: you can read only the gift wraps addressed to you; ask with "#p" set to your own pubkey',
+        );
       }
       return;
     }
@@ -2080,7 +2271,11 @@ export class Relay extends DurableObject<Env> {
     // later gift wrap, and an unauthenticated `{"kinds":[1]}` matches
     // later group kind-1s.
     //
-    //   gift wrap    owner only.
+    //   gift wrap    the owner; anyone else only on a subscription that
+    //                asked for their own mail (readsOnlyOwnMail), which
+    //                the REQ gate already required of any filter naming
+    //                kind 1059. Checked again per filter here anyway, so
+    //                the two cannot drift.
     //   kind-9009    owner only, even inside a group the reader belongs
     //                to: a member holding `{"kinds":[9009]}` would
     //                otherwise receive a live invite code the moment the
@@ -2116,7 +2311,17 @@ export class Relay extends DurableObject<Env> {
       // a LiveFeedState, not a ConnState; liveBroadcast serves them.
       if (this.ctx.getTags(ws).includes(LIVE_FEED_TAG)) continue;
       const state = getState(ws);
-      if (gated && !mayReceive(state.authedPubkey)) continue;
+      const authed = state.authedPubkey;
+      if (giftWrap && authed !== undefined && authed !== owner) {
+        // Their own mail, on a subscription that asked for it, and nothing
+        // else: matchesAnyFilter then checks the wrap's `p` is theirs.
+        for (const [subId, filters] of Object.entries(state.subs)) {
+          const own = filters.filter((f) => f.kinds?.includes(GIFT_WRAP_KIND) && readsOnlyOwnMail(f, authed));
+          if (own.length > 0 && matchesAnyFilter(event, own)) send(ws, ["EVENT", subId, event]);
+        }
+        continue;
+      }
+      if (gated && !mayReceive(authed)) continue;
       for (const [subId, filters] of Object.entries(state.subs)) {
         if (matchesAnyFilter(event, filters)) {
           send(ws, ["EVENT", subId, event]);
@@ -2164,8 +2369,12 @@ export class Relay extends DurableObject<Env> {
   }
 
   private async alarmInner(): Promise<void> {
-    // Push first: it is the one with a deadline.
-    const morePushes = await this.drainPushOutbox();
+    // Push first: it is the one with a deadline. Mail before group
+    // traffic: it is for one person, and it is the reason most members
+    // have push at all. The two share one invocation's subrequests.
+    const inbox = await this.drainInboxPushes(MAX_PUSHES_PER_TICK);
+    const moreGroupPushes = await this.drainPushOutbox(MAX_PUSHES_PER_TICK - inbox.spent);
+    const morePushes = inbox.more || moreGroupPushes;
 
     const now = Date.now();
     let next: number | null = morePushes ? now + PUSH_ALARM_DELAY_MS : null;

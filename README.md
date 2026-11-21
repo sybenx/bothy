@@ -128,11 +128,35 @@ This relay's read path is intentionally public, so it is worth adding a free Clo
 
 ## Inbox mode (encrypted mail)
 
-This relay also accepts encrypted mail addressed to you, from anyone ([NIP-59](https://github.com/nostr-protocol/nips/blob/master/59.md) gift wraps, kind 1059), under every write policy except `owner` — see "Who can write here" below for that policy. It's the write path a client needs if you publish a `kind:10050` DM relay list naming this relay; bothy itself never publishes that list for you, so nothing changes unless you deliberately turn your relay into a DM inbox by signing one.
+This relay also accepts encrypted mail addressed to you or one of your members (see "Members" below), from anyone ([NIP-59](https://github.com/nostr-protocol/nips/blob/master/59.md) gift wraps, kind 1059), under every write policy except `owner` (see "Who can write here" below for that policy). It's the write path a client needs if you publish a `kind:10050` DM relay list naming this relay; bothy itself never publishes that list for you, so nothing changes unless you deliberately turn your relay into a DM inbox by signing one.
 
-Reading them back is restricted to you. A query that names kind 1059 gets a [NIP-42](https://github.com/nostr-protocol/nips/blob/master/42.md) AUTH challenge instead of results; a query that doesn't name a kind is answered normally, with the gift wraps simply absent from what comes back. The second half matters as much as the first: refusing a query only when it would have matched a gift wrap makes the refusal itself the answer, and a stranger sliding a time window across your relay could count and time-correlate your incoming DMs from the refusals alone, without ever mentioning kind 1059. Leaving them out answers the same way whether your inbox is full or empty. You can delete a gift wrap the same way you'd delete any note ([NIP-09](https://github.com/nostr-protocol/nips/blob/master/09.md)), and [NIP-62](https://github.com/nostr-protocol/nips/blob/master/62.md) "Request to Vanish" support means either you or a message's sender can ask for it to be permanently purged.
+Reading them back is restricted to the person they are addressed to: you, or a member asking for their own with `"#p"` set to their pubkey. A query that names kind 1059 gets a [NIP-42](https://github.com/nostr-protocol/nips/blob/master/42.md) AUTH challenge instead of results; a query that doesn't name a kind is answered normally, with the gift wraps simply absent from what comes back. The second half matters as much as the first: refusing a query only when it would have matched a gift wrap makes the refusal itself the answer, and a stranger sliding a time window across your relay could count and time-correlate your incoming DMs from the refusals alone, without ever mentioning kind 1059. Leaving them out answers the same way whether your inbox is full or empty. You can delete a gift wrap the same way you'd delete any note ([NIP-09](https://github.com/nostr-protocol/nips/blob/master/09.md)), and [NIP-62](https://github.com/nostr-protocol/nips/blob/master/62.md) "Request to Vanish" support means either you or a message's sender can ask for it to be permanently purged.
 
-**Worth knowing:** Cloudflare terminates the TLS connection in front of this relay, so it necessarily sees the `p` tag (who a gift wrap is addressed to), the arrival time, and the sender's IP address, the same as any other Worker traffic. On a personal relay the `p` tag is always you, so that part leaks nothing new; the sender IPs, though, belong to other people sending you mail through infrastructure that you chose.
+**Worth knowing:** Cloudflare terminates the TLS connection in front of this relay, so it necessarily sees the `p` tag (who a gift wrap is addressed to), the arrival time, and the sender's IP address, the same as any other Worker traffic. On a personal relay the `p` tag is you or a member, so that part says only who has mail; the sender IPs, though, belong to other people sending you mail through infrastructure that you chose.
+
+## Members
+
+You can give other people a home here: an inbox for their encrypted mail, and a notification on their phone when some arrives. They need no account, only a key, which any Nostr app (or the friend app) makes for them.
+
+To add someone, make an invite and send them the code:
+
+```bash
+nak admin createinvite --sec <your nsec> your-relay.workers.dev
+```
+
+The answer is the code, how many times it can be used and when it stops working. A code works once and for 7 days unless you ask for more: `createinvite` takes the number of uses (up to 100) and then the lifetime in seconds (up to 30 days). Their app redeems it by calling `redeeminvite` with the code, signed with their own key; that is the one management call anyone can make. `listunusedinvites` shows the codes still waiting, and `revokeinvite` kills one.
+
+Your members are the pubkeys on your allow list, so `listallowedpubkeys` lists them and `unallowpubkey` removes one. A member can also publish here, as anyone you `allowpubkey` can.
+
+A removed member's new mail is refused from that moment, and their phones stop being notified. What is already stored for them stays readable to them for 14 days, so their app can collect it and move to another home; then it is deleted. Letting them back in stops the clock.
+
+Notifications need a key of their own. Generate a P-256 private key (32 bytes, base64url) and store it as a secret, never a variable:
+
+```bash
+npx wrangler secret put VAPID_PRIVATE_KEY
+```
+
+Without it everything above still works, with no notifications. A notification says only that there is a new message: not who sent it, not what it says, and not which conversation it belongs to. It passes through Apple's or Google's push service, and none of that is theirs to see. The relay could not add it anyway, because the mail is sealed.
 
 ## Who can write here
 
@@ -141,7 +165,7 @@ Your relay has one write policy, and you choose it:
 | Policy | Who can publish |
 |---|---|
 | `owner` | Only you. |
-| `inbox` | You, and anyone sending you encrypted mail (see "Inbox mode" above). |
+| `inbox` | You, and anyone sending you or a member encrypted mail (see "Inbox mode" and "Members" above). |
 | `follows` | Everything above, plus the people you follow. **The default.** |
 | `mentions` | Everything above, plus anyone whose event mentions or replies to you. An event from someone you don't follow may carry at most 32 indexed tags. |
 | `all` | Anyone, any event. |
@@ -186,9 +210,9 @@ The tool to send them with is [`nak`](https://github.com/fiatjaf/nak), whose `ad
 nak admin supportedmethods --sec <your nsec> your-relay.workers.dev
 ```
 
-Start there. `supportedmethods` returns exactly what this relay implements, which is the honest answer to what you can do with it, and `nak admin --help` lists the flags each method takes. Every request is authenticated with a [NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md) event signed by the relay owner's key — the same key you claimed the relay with. Nothing else is accepted, and an unsigned or wrongly signed request gets a 401.
+Start there. `supportedmethods` returns exactly what this relay implements, which is the honest answer to what you can do with it, and `nak admin --help` lists the flags each method takes. Every request is authenticated with a [NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md) event signed by the relay owner's key, the same key you claimed the relay with. Nothing else is accepted, and an unsigned or wrongly signed request gets a 401. The exceptions are a member's own notification settings (`subscribepush` and `unsubscribepush`, signed by the member) and `redeeminvite` (signed by whoever is joining).
 
-What this relay implements: `banevent` and `allowevent` and `listbannedevents`; `banpubkey`, `unbanpubkey` and `listbannedpubkeys`; `allowpubkey`, `unallowpubkey` and `listallowedpubkeys`; `blockip` and `unblockip` and `listblockedips`; `changerelayname`, `changerelaydescription` and `changerelayicon`; and, bothy's own, `changewritepolicy` and `getwritepolicy` (see "Who can write here" above). What it does not: the kind allowlist, because bothy stores every kind on purpose; and the moderation queue, because bothy has nothing to report events into.
+What this relay implements: `banevent` and `allowevent` and `listbannedevents`; `banpubkey`, `unbanpubkey` and `listbannedpubkeys`; `allowpubkey`, `unallowpubkey` and `listallowedpubkeys`; `blockip` and `unblockip` and `listblockedips`; `changerelayname`, `changerelaydescription` and `changerelayicon`; and, bothy's own, `changewritepolicy` and `getwritepolicy` (see "Who can write here" above), `createinvite`, `redeeminvite`, `listunusedinvites` and `revokeinvite` (see "Members" above), and `subscribepush` and `unsubscribepush`. What it does not: the kind allowlist, because bothy stores every kind on purpose; and the moderation queue, because bothy has nothing to report events into.
 
 The endpoint answers cross-origin requests, so a client hosted somewhere other than the relay can call it from a browser.
 

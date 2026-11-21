@@ -639,6 +639,42 @@ export const GIFT_WRAP_SWEEP_BATCH_SIZE = Math.max(
 );
 
 // ---------------------------------------------------------------------
+// Members (storage.ts, the section "Members"). A member is a pubkey in
+// `allowed_pubkeys`: the relay keeps an inbox for them (relay.ts
+// handleGiftWrap) and pushes to their devices when mail arrives. Someone
+// joins with an invite code the owner made (nip86.ts createinvite,
+// redeeminvite).
+// ---------------------------------------------------------------------
+
+// How many times one code may be redeemed, by default and at most. One by
+// default: a code is normally made for one person and sent to them. The
+// most is for a code posted to a group chat; the owner chooses it.
+export const MEMBER_INVITE_DEFAULT_USES = 1;
+export const MEMBER_INVITE_MAX_USES = 100;
+
+// Random bytes in a generated code: 128 bits, hex-encoded to 32
+// characters. The relay makes every member code itself, so unlike the
+// NIP-29 path (MIN_INVITE_CODE_LENGTH) there is no owner-chosen code to
+// put a floor under; guessing one is not a strategy at any request rate.
+export const MEMBER_INVITE_CODE_BYTES = 16;
+
+// How long a removed member can still fetch the mail stored for them
+// before it is deleted (storage.ts sweepFormerMembers). Long enough for
+// their app to notice it has lost its home and fetch what is waiting; new
+// mail for them is refused from the moment they are removed.
+export const MEMBER_REMOVAL_GRACE_SECONDS = 14 * 24 * 60 * 60;
+
+// Former members one cron tick looks at, and wraps it deletes for them.
+// The second is the gift wrap sweep's batch: the same rows, the same cost.
+export const FORMER_MEMBER_SWEEP_PUBKEYS = 8;
+export const FORMER_MEMBER_SWEEP_BATCH_SIZE = GIFT_WRAP_SWEEP_BATCH_SIZE;
+
+// Distinct `p` values one gift wrap is checked against for membership. A
+// NIP-59 wrap names exactly one recipient (TAGS_PER_GIFT_WRAP), so this
+// only bounds the lookups a malformed wrap can make a stranger cost.
+export const MAX_WRAP_RECIPIENTS_CHECKED = 4;
+
+// ---------------------------------------------------------------------
 // Call presence (push.ts CALL_PRESENCE_KIND; hearth's reference/push.md).
 // hearth beats every five seconds during a call and treats a pubkey as
 // gone 13 seconds after its last beat. A notification is owed only on the

@@ -1,7 +1,7 @@
 import { runBackfillTick } from "./backfill-worker";
 import { logExhaustion } from "./exhaustion";
 import { HTTP_RATE_LIMIT_PERIOD_SECONDS, secondsUntilUtcMidnight } from "./limits";
-import { MANAGEMENT_CONTENT_TYPE, MEMBER_CALLABLE_METHODS } from "./nip86";
+import { ANYONE_CALLABLE_METHODS, MANAGEMENT_CONTENT_TYPE, MEMBER_CALLABLE_METHODS } from "./nip86";
 import { nip11Response } from "./nip11";
 import { verifyClaimAuthEvent } from "./nip42";
 import { ownerReason, verifyNip98 } from "./nip98";
@@ -247,7 +247,8 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
 
   // Parsed before the owner round trip (it is free) because the method
   // name decides which gate applies: subscribepush/unsubscribepush are
-  // callable by group members too (nip86.ts MEMBER_CALLABLE_METHODS).
+  // callable by members too (nip86.ts MEMBER_CALLABLE_METHODS), and
+  // redeeminvite by anyone (ANYONE_CALLABLE_METHODS).
   let parsed: unknown;
   try {
     parsed = JSON.parse(new TextDecoder().decode(body));
@@ -257,20 +258,25 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
   const call = parsed as { method?: unknown; params?: unknown } | null;
   const params = Array.isArray(call?.params) ? (call.params as unknown[]) : [];
 
+  // redeeminvite skips both gates below: its caller is not a member yet,
+  // and the invite code, checked in the DO, is the authority. The
+  // signature still had to verify, so the pubkey it joins is the signer's.
+  const method = typeof call?.method === "string" ? call.method : null;
+  const anyoneCallable = method !== null && ANYONE_CALLABLE_METHODS.includes(method);
+
   // The first DO round trip of the request.
-  const denial = ownerReason(auth.pubkey, await relayStub(env).getOwner());
+  const denial = anyoneCallable ? null : ownerReason(auth.pubkey, await relayStub(env).getOwner());
   if (denial !== null) {
     // A non-owner passes only if the method is member-callable AND the
-    // signer is a group member, checked in that order: the first is free,
-    // the second is another round trip, so a stranger signing `banpubkey`
-    // costs no extra. relay.ts isGroupMember checks membership of the
-    // default group (`_`) only.
+    // signer is a member, checked in that order: the first is free, the
+    // second is another round trip, so a stranger signing `banpubkey`
+    // costs no extra. relay.ts isMember: a member of the relay, or of the
+    // group `_`.
     //
     // An unclaimed relay has no members, so this refuses there whatever
     // the method.
-    const memberCallable =
-      typeof call?.method === "string" && MEMBER_CALLABLE_METHODS.includes(call.method);
-    if (!memberCallable || !(await relayStub(env).isGroupMember(auth.pubkey))) {
+    const memberCallable = method !== null && MEMBER_CALLABLE_METHODS.includes(method);
+    if (!memberCallable || !(await relayStub(env).isMember(auth.pubkey))) {
       return managementResponse({ error: denial }, 401);
     }
   }
@@ -408,8 +414,8 @@ async function route(request: Request, env: Env): Promise<Response> {
     // Rate limited: serving this is a DO round trip (getIdentity).
     const limited = await rateLimited(env.RATE_LIMIT_API, request);
     if (limited !== null) return limited;
-    const { profile, settings, ownerPubkey, relayPubkey } = await relayStub(env).getIdentity(url.host);
-    return nip11Response(env, settings, profile, ownerPubkey, relayPubkey);
+    const { profile, settings, ownerPubkey, relayPubkey, memberCount } = await relayStub(env).getIdentity(url.host);
+    return nip11Response(env, settings, profile, ownerPubkey, relayPubkey, memberCount);
   }
 
   if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {

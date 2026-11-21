@@ -144,6 +144,7 @@
   </div>
 
   <p id="write-policy-status">-</p>
+  <p id="members-status">-</p>
 
   <p id="backfill-status" hidden></p>
   <p id="backfill-refusal" class="refusal" hidden></p>
@@ -324,6 +325,7 @@ async function main() {
     setBar("stat-rows", "bar-rows", stats.rowsWrittenToday, ROWS_WRITTEN_LIMIT, stats.rowsWrittenToday + " rows");
 
     renderWritePolicyStatus(stats);
+    renderMembersStatus(stats);
     renderBackfillStatus(stats.backfill);
     renderDiagnostics(stats);
     wireLiveFeed();
@@ -409,6 +411,21 @@ function renderWritePolicyStatus(stats) {
         : "You and the " + follows + " can publish here.";
   }
   el.textContent = text;
+}
+
+// Who has a home here besides you, and whether their phones are told when
+// mail arrives (/api/stats `memberCount` and `pushPolicy`). One sentence,
+// like the write policy line above it.
+function renderMembersStatus(stats) {
+  const el = document.getElementById("members-status");
+  const n = stats.memberCount;
+  const who = n === 0 ? "No one else has an inbox here yet."
+    : n === 1 ? "1 member has an inbox here."
+    : n + " members have an inbox here.";
+  const push = stats.pushPolicy !== "on" ? " Notifications are off."
+    : n === 0 ? " Notifications are on."
+    : " New mail notifies their phones.";
+  el.textContent = who + push;
 }
 
 // One-shot backfill progress (visible progress on

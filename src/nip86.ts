@@ -5,7 +5,9 @@
 //
 // banpubkey/allowpubkey are the only methods whose lists the per-event
 // write path consults (ownership.ts isAllowedWriter); everything else
-// costs nothing per event. Each has its own inverse (unbanpubkey,
+// costs nothing per event. The allowlist is also the member list
+// (storage.ts isMember): unallowpubkey is how a member is removed, and
+// createinvite/redeeminvite are how one joins. Each has its own inverse (unbanpubkey,
 // unallowpubkey) rather than allowpubkey also lifting a ban the way
 // allowevent lifts a banevent tombstone: banned_pubkeys and
 // allowed_pubkeys are two independent lists, not opposite ends of one.
@@ -17,6 +19,8 @@ import {
   banEvent,
   banPubkey,
   blockIp,
+  countOutstandingMemberInvites,
+  createMemberInvite,
   deletePushSubscription,
   getStoredWritePolicy,
   listAllowedPubkeys,
@@ -24,14 +28,27 @@ import {
   listBannedPubkeys,
   listBlockedIps,
   listUnusedInvites,
+  listUnusedMemberInvites,
+  redeemMemberInvite,
   revokeInvite,
+  revokeMemberInvite,
   setRelaySetting,
   unallowPubkey,
   unbanPubkey,
   unblockIp,
   upsertPushSubscription,
 } from "./storage";
-import { groupsEnabled, MAX_PUSH_SUBSCRIPTIONS_PER_PUBKEY } from "./limits";
+import { bytesToHex } from "@noble/hashes/utils.js";
+import {
+  groupsEnabled,
+  INVITE_DEFAULT_TTL_SECONDS,
+  INVITE_MAX_TTL_SECONDS,
+  MAX_OUTSTANDING_INVITES,
+  MAX_PUSH_SUBSCRIPTIONS_PER_PUBKEY,
+  MEMBER_INVITE_CODE_BYTES,
+  MEMBER_INVITE_DEFAULT_USES,
+  MEMBER_INVITE_MAX_USES,
+} from "./limits";
 import { GROUPS_PAUSED_MESSAGE } from "./nip29";
 import { pushConfigured } from "./push";
 import { getOwnerPubkey } from "./ownership";
@@ -94,15 +111,22 @@ export const SUPPORTED_METHODS = [
   // README). Named plainly rather than vendor-prefixed so supportedmethods
   // stays self-explanatory; if NIP-86 ever standardises these names with
   // different semantics, these must change.
+  //
+  // createinvite makes a member invite (schema.ts `member_invites`);
+  // redeeminvite spends one. listunusedinvites and revokeinvite cover both
+  // member invites and NIP-29 group invites, so there is one place to see
+  // and kill a live code whichever kind it is.
+  "createinvite",
+  "redeeminvite",
   "listunusedinvites",
   "revokeinvite",
-  // bothy's own; the one pair a group member may call, not only the owner
+  // bothy's own; the one pair a member may call, not only the owner
   // (MEMBER_CALLABLE_METHODS below).
   "subscribepush",
   "unsubscribepush",
 ] as const;
 
-// The methods a GROUP MEMBER may call, not just the owner.
+// The methods a MEMBER may call, not just the owner.
 //
 // Every other method administers the relay, and index.ts refuses a
 // non-owner signature before dispatch. These two only register and remove
@@ -111,9 +135,15 @@ export const SUPPORTED_METHODS = [
 // a member could not be notified at all.
 //
 // index.ts checks membership only for a method named here, so every other
-// method stays owner-only. That check calls isGroupMember with no group
-// id, so "member" means a member of `_` (groups.ts TOP_LEVEL_GROUP_ID).
+// method stays owner-only. "Member" there is relay.ts isMember: a member
+// of the relay (storage.ts isMember), or of the group `_`.
 export const MEMBER_CALLABLE_METHODS: readonly string[] = ["subscribepush", "unsubscribepush"];
+
+// The method ANY valid signature may call: redeeminvite, whose caller is
+// by definition not a member yet. The code is the authority, and the
+// signature only says who is joining (the pubkey stored is the signer's,
+// never one from the body).
+export const ANYONE_CALLABLE_METHODS: readonly string[] = ["redeeminvite"];
 
 // The methods that belong to the group feature (limits.ts groupsEnabled).
 // While groups are paused they are left out of supportedmethods and
@@ -121,12 +151,11 @@ export const MEMBER_CALLABLE_METHODS: readonly string[] = ["subscribepush", "uns
 // discovery list is what a client trusts, and a listed method that
 // belongs to a feature the relay is not running is an advertisement for
 // something that does not work.
-export const GROUP_METHODS: readonly string[] = [
-  "listunusedinvites",
-  "revokeinvite",
-  "subscribepush",
-  "unsubscribepush",
-];
+//
+// Empty now: invites and push used to be group-only and are now how
+// members join and are notified, which does not depend on groups. Kept so
+// a future group-only method has its place.
+export const GROUP_METHODS: readonly string[] = [];
 
 export function supportedMethods(env: Env): string[] {
   return groupsEnabled(env)
@@ -142,6 +171,22 @@ export function supportedMethods(env: Env): string[] {
 export const SELF_BLOCK_CONFIRMATION = "yes, block my own address";
 
 const HEX_ID_RE = /^[0-9a-f]{64}$/;
+
+// The one refusal redeeminvite gives for every dead code, unknown,
+// revoked, used up or expired alike, so a presenter cannot tell which (the
+// NIP-29 join path's rule, nip29.ts JOIN_REFUSAL_MESSAGE). The owner sees
+// the distinction through revokeinvite.
+export const REDEEM_REFUSAL_MESSAGE =
+  "redeeminvite: this invite cannot be used. Ask whoever sent it for a new one.";
+
+// An optional positive integer parameter, or the default when absent.
+// Null when present but not a whole number in [1, max].
+function optionalCount(params: unknown[], index: number, fallback: number, max: number): number | null {
+  const value = params[index];
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > max) return null;
+  return value;
+}
 
 function err(message: string): ManagementResponse {
   return { error: message };
@@ -369,10 +414,13 @@ export function handleManagementCall(
       return { result: true };
     }
 
+    // Also removes a member (storage.ts unallowPubkey): new mail for them
+    // is refused from now on, their devices are dropped, and the mail
+    // already here is deleted after limits.ts MEMBER_REMOVAL_GRACE_SECONDS.
     case "unallowpubkey": {
       const pubkey = pubkeyParam(params, 0);
       if (pubkey === null) return err("unallowpubkey takes a pubkey, as npub or 64-character hex");
-      unallowPubkey(sql, pubkey);
+      unallowPubkey(sql, pubkey, nowSec);
       return { result: true };
     }
 
@@ -389,12 +437,29 @@ export function handleManagementCall(
     // because the caller here is the owner, who issued the codes.
     case "listunusedinvites":
       // Only invites redeemable right now; dead ones would bury the live
-      // ones.
-      return { result: listUnusedInvites(sql, nowSec) };
+      // ones. Member invites carry `uses_left`; group invites are single
+      // use and do not.
+      return { result: [...listUnusedMemberInvites(sql, nowSec), ...listUnusedInvites(sql, nowSec)] };
 
     case "revokeinvite": {
       const code = stringParam(params, 0);
       if (code === null || code === "") return err("revokeinvite takes the invite code as a string");
+      // Member codes first: they are the relay's own 32-hex strings, so a
+      // group code the owner chose cannot collide with one by accident.
+      const memberOutcome = revokeMemberInvite(sql, code, nowSec);
+      switch (memberOutcome) {
+        case "revoked":
+          return { result: true };
+        case "used-up":
+          return err(
+            "revokeinvite: that invite has been used as many times as it allows, so there is nothing left " +
+              "to revoke. To remove someone it let in, call unallowpubkey with their pubkey.",
+          );
+        case "already-revoked":
+          return err("revokeinvite: that invite was already revoked");
+        case "unknown":
+          break;
+      }
       const outcome = revokeInvite(sql, code, nowSec);
       switch (outcome) {
         case "revoked":
@@ -412,6 +477,47 @@ export function handleManagementCall(
         case "unknown":
           return err("revokeinvite: this relay has never issued that invite code");
       }
+    }
+
+    // A member invite: a code the relay generates, good for `uses`
+    // redemptions (default 1) until it expires (default 7 days, at most
+    // 30). Parameters are positional and both optional: [uses, seconds].
+    // The response is the code and what it now allows, which is what the
+    // owner shares.
+    case "createinvite": {
+      const uses = optionalCount(params, 0, MEMBER_INVITE_DEFAULT_USES, MEMBER_INVITE_MAX_USES);
+      if (uses === null) {
+        return err(`createinvite: uses must be a whole number from 1 to ${MEMBER_INVITE_MAX_USES}`);
+      }
+      const ttl = optionalCount(params, 1, INVITE_DEFAULT_TTL_SECONDS, INVITE_MAX_TTL_SECONDS);
+      if (ttl === null) {
+        return err(
+          `createinvite: the lifetime must be a whole number of seconds from 1 to ${INVITE_MAX_TTL_SECONDS} (30 days)`,
+        );
+      }
+      if (countOutstandingMemberInvites(sql, nowSec) >= MAX_OUTSTANDING_INVITES) {
+        return err(
+          `createinvite: ${MAX_OUTSTANDING_INVITES} invites are already waiting to be used. ` +
+            `Revoke some with revokeinvite (listunusedinvites shows them) and try again.`,
+        );
+      }
+      const code = bytesToHex(crypto.getRandomValues(new Uint8Array(MEMBER_INVITE_CODE_BYTES)));
+      const expiresAt = nowSec + ttl;
+      createMemberInvite(sql, code, uses, nowSec, expiresAt);
+      return { result: { code, uses, expires_at: expiresAt } };
+    }
+
+    // Any valid signature may call this (ANYONE_CALLABLE_METHODS); the
+    // signer becomes the member. An existing member gets `true` without
+    // spending a use, so a retry is safe. Every dead code gets the same
+    // refusal (REDEEM_REFUSAL_MESSAGE).
+    case "redeeminvite": {
+      const code = stringParam(params, 0);
+      if (code === null || code === "") return err("redeeminvite takes the invite code as a string");
+      if (getOwnerPubkey(sql, env) === signer) return { result: true };
+      const outcome = redeemMemberInvite(sql, code, signer, nowSec);
+      if (outcome === "joined" || outcome === "already-member") return { result: true };
+      return err(REDEEM_REFUSAL_MESSAGE);
     }
 
     // bothy's own; the client half is hearth's subscribeToPush. The pubkey

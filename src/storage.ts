@@ -1710,6 +1710,7 @@ export function allowPubkey(sql: SqlStorage, pubkey: string, reason: string | nu
     reason,
     nowSec,
   );
+  readmitFormerMember(sql, pubkey);
 }
 
 // ---------------------------------------------------------------------
@@ -1738,6 +1739,7 @@ export function allowPubkeyForGroup(
     reason,
     nowSec,
   );
+  readmitFormerMember(sql, pubkey);
 }
 
 // The inverse: removes only a group-granted ('invite') row, never an owner
@@ -1974,8 +1976,25 @@ export function revokeInvite(sql: SqlStorage, code: string, nowSec: number): Rev
   return "revoked";
 }
 
-export function unallowPubkey(sql: SqlStorage, pubkey: string): void {
+// NIP-86 unallowpubkey, which is also how a member is removed: every
+// `allowed_pubkeys` row is a member (isMember). Removal refuses new mail
+// for them from now on (relay.ts handleGiftWrap), drops their devices and
+// any notification queued for them, and starts the grace period after
+// which their stored mail is deleted (schema.ts `former_members`,
+// sweepFormerMembers). Nothing beyond the row delete happens for a pubkey
+// that was not on the list, so removing a stranger starts no clock.
+export function unallowPubkey(sql: SqlStorage, pubkey: string, nowSec: number): void {
+  const existed = sql.exec(`SELECT 1 FROM allowed_pubkeys WHERE pubkey = ?`, pubkey).toArray().length > 0;
+  if (!existed) return;
   sql.exec(`DELETE FROM allowed_pubkeys WHERE pubkey = ?`, pubkey);
+  sql.exec(`DELETE FROM push_subscriptions WHERE pubkey = ?`, pubkey);
+  sql.exec(`DELETE FROM inbox_push WHERE pubkey = ?`, pubkey);
+  sql.exec(
+    `INSERT INTO former_members (pubkey, removed_at) VALUES (?, ?)
+       ON CONFLICT(pubkey) DO UPDATE SET removed_at = excluded.removed_at`,
+    pubkey,
+    nowSec,
+  );
 }
 
 export function listAllowedPubkeys(sql: SqlStorage): AllowedPubkey[] {
@@ -1990,6 +2009,241 @@ export function listAllowedPubkeys(sql: SqlStorage): AllowedPubkey[] {
 // reject the write, so the common accept path never pays it.
 export function isPubkeyAllowed(sql: SqlStorage, pubkey: string): boolean {
   return sql.exec(`SELECT 1 FROM allowed_pubkeys WHERE pubkey = ?`, pubkey).toArray().length > 0;
+}
+
+// ---------------------------------------------------------------------
+// Members. A member is a pubkey with an `allowed_pubkeys` row, however it
+// got there (schema.ts `allowed_pubkeys.source`): the owner allowed them,
+// a group admitted them, or they redeemed a member invite. Being a member
+// means the relay keeps an inbox for you and pushes to your devices; the
+// owner is not a row here and is handled by name wherever it matters.
+//
+// One list rather than a second table on purpose: a member can also
+// publish here, and two lists would have to be kept from disagreeing
+// about who that is.
+// ---------------------------------------------------------------------
+
+// One PK seek. The gift wrap path (relay.ts handleGiftWrap) asks it once
+// per recipient, bounded by limits.ts MAX_WRAP_RECIPIENTS_CHECKED.
+export function isMember(sql: SqlStorage, pubkey: string): boolean {
+  return isPubkeyAllowed(sql, pubkey);
+}
+
+// For NIP-11 and /api/stats. Reads M rows; M is the size of a friend group.
+export function memberCount(sql: SqlStorage): number {
+  return sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM allowed_pubkeys`).toArray()[0]?.n ?? 0;
+}
+
+// Called wherever a pubkey is (re)admitted: a returning member's mail is
+// theirs again, so the grace clock stops.
+function readmitFormerMember(sql: SqlStorage, pubkey: string): void {
+  sql.exec(`DELETE FROM former_members WHERE pubkey = ?`, pubkey);
+}
+
+export interface MemberInvite {
+  code: string;
+  created_at: number;
+  expires_at: number;
+  uses_allowed: number;
+  uses: number;
+  revoked_at: number | null;
+}
+
+function lookupMemberInvite(sql: SqlStorage, code: string): MemberInvite | null {
+  return (
+    sql
+      .exec<{
+        code: string;
+        created_at: number;
+        expires_at: number;
+        uses_allowed: number;
+        uses: number;
+        revoked_at: number | null;
+      }>(
+        `SELECT code, created_at, expires_at, uses_allowed, uses, revoked_at
+           FROM member_invites WHERE code = ?`,
+        code,
+      )
+      .toArray()[0] ?? null
+  );
+}
+
+export function createMemberInvite(
+  sql: SqlStorage,
+  code: string,
+  usesAllowed: number,
+  createdAt: number,
+  expiresAt: number,
+): void {
+  sql.exec(
+    `INSERT INTO member_invites (code, created_at, expires_at, uses_allowed, uses) VALUES (?, ?, ?, ?, 0)`,
+    code,
+    createdAt,
+    expiresAt,
+    usesAllowed,
+  );
+}
+
+// Redeemable now: uses left, unrevoked, unexpired. Keep these conditions
+// identical to listUnusedMemberInvites and redeemMemberInvite's UPDATE.
+export function countOutstandingMemberInvites(sql: SqlStorage, nowSec: number): number {
+  return (
+    sql
+      .exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM member_invites
+          WHERE uses < uses_allowed AND revoked_at IS NULL AND expires_at > ?`,
+        nowSec,
+      )
+      .toArray()[0]?.n ?? 0
+  );
+}
+
+export interface UnusedMemberInvite {
+  code: string;
+  created_at: number;
+  expires_at: number;
+  uses_left: number;
+}
+
+export function listUnusedMemberInvites(sql: SqlStorage, nowSec: number): UnusedMemberInvite[] {
+  return sql
+    .exec<{ code: string; created_at: number; expires_at: number; uses_left: number }>(
+      `SELECT code, created_at, expires_at, uses_allowed - uses AS uses_left FROM member_invites
+        WHERE uses < uses_allowed AND revoked_at IS NULL AND expires_at > ?
+        ORDER BY created_at DESC`,
+      nowSec,
+    )
+    .toArray();
+}
+
+// What presenting a member code did. nip86.ts redeeminvite gives the
+// presenter one refusal for all four failures, as the NIP-29 join path
+// does, so a code cannot be probed for which way it is dead; the split is
+// for revokeinvite and the tests.
+export type MemberInviteOutcome = "joined" | "already-member" | "unknown" | "revoked" | "used-up" | "expired";
+
+// Classify, then spend, both here. An existing member is answered
+// "already-member" WITHOUT spending a use: an app that retries a request
+// it never saw the answer to must not burn a second use of a code meant
+// for someone else. Checked before the code, so a member presenting any
+// string learns nothing about it.
+//
+// The UPDATE repeats the SELECT's conditions for the reason redeemInvite
+// gives: the SELECT decides what to report, the UPDATE what to write.
+// Nothing awaits between them, so inside this object they cannot
+// interleave with another redemption.
+export function redeemMemberInvite(
+  sql: SqlStorage,
+  code: string,
+  pubkey: string,
+  nowSec: number,
+): MemberInviteOutcome {
+  if (isPubkeyAllowed(sql, pubkey)) return "already-member";
+  const invite = lookupMemberInvite(sql, code);
+  if (invite === null) return "unknown";
+  if (invite.revoked_at !== null) return "revoked";
+  if (invite.uses >= invite.uses_allowed) return "used-up";
+  if (invite.expires_at <= nowSec) return "expired";
+  sql.exec(
+    `UPDATE member_invites SET uses = uses + 1
+      WHERE code = ? AND uses < uses_allowed AND revoked_at IS NULL AND expires_at > ?`,
+    code,
+    nowSec,
+  );
+  sql.exec(
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source)
+       VALUES (?, 'joined with an invite', ?, 'member')
+       ON CONFLICT(pubkey) DO NOTHING`,
+    pubkey,
+    nowSec,
+  );
+  readmitFormerMember(sql, pubkey);
+  return "joined";
+}
+
+export type RevokeMemberInviteOutcome = "revoked" | "unknown" | "used-up" | "already-revoked";
+
+// The member half of nip86.ts revokeinvite. A used-up code is left alone,
+// like a spent group invite: there is nothing left to revoke, and the
+// people it let in are removed one by one.
+export function revokeMemberInvite(sql: SqlStorage, code: string, nowSec: number): RevokeMemberInviteOutcome {
+  const invite = lookupMemberInvite(sql, code);
+  if (invite === null) return "unknown";
+  if (invite.revoked_at !== null) return "already-revoked";
+  if (invite.uses >= invite.uses_allowed) return "used-up";
+  sql.exec(`UPDATE member_invites SET revoked_at = ? WHERE code = ?`, nowSec, code);
+  return "revoked";
+}
+
+export interface FormerMemberSweep {
+  // Wraps deleted this tick.
+  removed: number;
+  // Former members whose grace ended and who now have nothing left here.
+  finished: number;
+}
+
+// Deletes the mail of members removed more than `graceSec` ago
+// (limits.ts MEMBER_REMOVAL_GRACE_SECONDS), then forgets them.
+//
+// A wrap is deleted only if it names nobody who is still entitled to it:
+// not the owner, not a current member. Mail p-tagged to two people is
+// rare, but it is the remaining recipient's mail too. Those wraps are
+// excluded in SQL, so they never fill a batch and stall the sweep.
+//
+// Per former member: one indexed range over `event_tags` for their `p`,
+// per partition, at most `limit` rows. A former member with no wraps left
+// is deleted, which ends the work for them. Called from the cron tick.
+export function sweepFormerMembers(
+  sql: SqlStorage,
+  nowSec: number,
+  graceSec: number,
+  owner: string | null,
+  pubkeyLimit: number,
+  limit: number,
+): FormerMemberSweep {
+  const due = sql
+    .exec<{ pubkey: string }>(
+      `SELECT pubkey FROM former_members WHERE removed_at <= ? ORDER BY removed_at ASC LIMIT ?`,
+      nowSec - graceSec,
+      pubkeyLimit,
+    )
+    .toArray();
+  let removed = 0;
+  let finished = 0;
+  for (const { pubkey } of due) {
+    const budget = limit - removed;
+    if (budget <= 0) break;
+    const targets = acrossScopes((scope) =>
+      sql
+        .exec<{ id: string }>(
+          `SELECT e.id AS id FROM event_tags t JOIN events e ON e.id = t.event_id
+            WHERE t.is_group = ? AND t.tag_name = 'p' AND t.tag_value = ? AND e.kind = ?
+              AND NOT EXISTS (
+                SELECT 1 FROM event_tags o
+                 WHERE o.event_id = e.id AND o.tag_name = 'p' AND o.tag_value != ?
+                   AND (o.tag_value = ? OR o.tag_value IN (SELECT pubkey FROM allowed_pubkeys))
+              )
+            LIMIT ?`,
+          scope,
+          pubkey,
+          GIFT_WRAP_KIND,
+          pubkey,
+          owner ?? "",
+          budget,
+        )
+        .toArray(),
+    );
+    const batch = targets.slice(0, budget);
+    for (const target of batch) deleteEventRow(sql, target.id);
+    removed += batch.length;
+    // Fewer than asked for in total means both partitions are empty of
+    // this member's mail now.
+    if (targets.length < budget) {
+      sql.exec(`DELETE FROM former_members WHERE pubkey = ?`, pubkey);
+      finished++;
+    }
+  }
+  return { removed, finished };
 }
 
 // ---------------------------------------------------------------------
@@ -2100,6 +2354,57 @@ export function pushSubscriptionsAfter(
       limit,
     )
     .toArray();
+}
+
+// One member's devices, for their own mail (relay.ts drainInboxPushes).
+// An index seek on idx_push_subscriptions_pubkey, at most
+// limits.ts MAX_PUSH_SUBSCRIPTIONS_PER_PUBKEY rows.
+export function pushSubscriptionsFor(sql: SqlStorage, pubkey: string): PushFanoutRow[] {
+  return sql
+    .exec<{
+      endpoint: string;
+      pubkey: string;
+      p256dh: string;
+      auth: string;
+      last_ok_at: number | null;
+    }>(
+      `SELECT endpoint, pubkey, p256dh, auth, last_ok_at FROM push_subscriptions
+         WHERE pubkey = ? ORDER BY endpoint ASC`,
+      pubkey,
+    )
+    .toArray();
+}
+
+// Asked on the gift wrap write path before queuing, so mail for a member
+// with no devices writes no queue row and wakes no alarm.
+export function hasPushSubscription(sql: SqlStorage, pubkey: string): boolean {
+  return sql.exec(`SELECT 1 FROM push_subscriptions WHERE pubkey = ? LIMIT 1`, pubkey).toArray().length > 0;
+}
+
+// ---------------------------------------------------------------------
+// The inbox push queue (schema.ts `inbox_push`): one row per recipient
+// with mail not yet announced.
+// ---------------------------------------------------------------------
+
+// DO NOTHING on conflict: a recipient already queued gets one
+// notification for the burst, and the fold costs no row.
+export function queueInboxPush(sql: SqlStorage, pubkey: string, nowSec: number): void {
+  sql.exec(
+    `INSERT INTO inbox_push (pubkey, queued_at) VALUES (?, ?) ON CONFLICT(pubkey) DO NOTHING`,
+    pubkey,
+    nowSec,
+  );
+}
+
+export function pendingInboxPushes(sql: SqlStorage, limit: number): string[] {
+  return sql
+    .exec<{ pubkey: string }>(`SELECT pubkey FROM inbox_push ORDER BY queued_at ASC, pubkey ASC LIMIT ?`, limit)
+    .toArray()
+    .map((row) => row.pubkey);
+}
+
+export function clearInboxPush(sql: SqlStorage, pubkey: string): void {
+  sql.exec(`DELETE FROM inbox_push WHERE pubkey = ?`, pubkey);
 }
 
 export function markPushEndpointOk(sql: SqlStorage, endpoint: string, nowSec: number): void {

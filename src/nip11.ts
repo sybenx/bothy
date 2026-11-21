@@ -90,6 +90,7 @@ export function buildRelayInfo(
   profile: OwnerProfile,
   ownerPubkey: string | null,
   relayPubkey: string,
+  memberCount?: number,
 ): Record<string, unknown> {
   const info: Record<string, unknown> = {
     name: resolveName(env, stored, profile),
@@ -158,6 +159,13 @@ export function buildRelayInfo(
   if (pushKey) {
     info.push_key = pushKey;
   }
+  // How many people this relay keeps an inbox for besides the owner
+  // (storage.ts memberCount). bothy's own field. A client deciding whether
+  // to offer this relay as a home reads it beside `push_key`. Omitted while
+  // unclaimed: an unclaimed relay has no members to count.
+  if (ownerPubkey && memberCount !== undefined) {
+    info.member_count = memberCount;
+  }
   const contact = resolveContact(profile);
   if (contact) {
     info.contact = contact;
@@ -171,8 +179,9 @@ export function nip11Response(
   profile: OwnerProfile,
   ownerPubkey: string | null,
   relayPubkey: string,
+  memberCount?: number,
 ): Response {
-  return new Response(JSON.stringify(buildRelayInfo(env, stored, profile, ownerPubkey, relayPubkey)), {
+  return new Response(JSON.stringify(buildRelayInfo(env, stored, profile, ownerPubkey, relayPubkey, memberCount)), {
     headers: {
       "Content-Type": "application/nostr+json",
       // Web clients fetch NIP-11 cross-origin.

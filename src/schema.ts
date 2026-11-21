@@ -390,6 +390,11 @@ export const TABLES: readonly TableSpec[] = [
       // deleting every row would revoke grants the owner made separately,
       // deleting none would let removed members write forever.
       //
+      // 'member': written by a redeemed member invite (nip86.ts
+      // redeeminvite, storage.ts redeemMemberInvite). Every row is a member,
+      // whatever its source (storage.ts isMember); the source only says
+      // how they got in.
+      //
       // allowpubkey on an existing row promotes it to 'owner'; nothing
       // demotes an 'owner' row (allowPubkeyForGroup does nothing on
       // conflict). DEFAULT 'owner' because allowpubkey was the only writer
@@ -482,10 +487,12 @@ export const TABLES: readonly TableSpec[] = [
     // register a device against someone else's name, and since the fan-out
     // skips a message's author, that could also suppress their notifications.
     //
-    // No secondary index, deliberately: the fan-out pages through every
-    // endpoint anyway (storage.ts pushSubscriptionsAfter), the per-pubkey cap
-    // (limits.ts MAX_PUSH_SUBSCRIPTIONS_PER_PUBKEY) keeps the table small,
-    // and an index on `pubkey` would cost a row written per subscribe.
+    // One secondary index, idx_push_subscriptions_pubkey: a member's mail
+    // is pushed to that member's endpoints alone (relay.ts
+    // drainInboxPushes), and the write path asks whether they have any
+    // before queuing. It costs one row written per subscribe, which is
+    // rare; the group fan-out still pages through every endpoint
+    // (storage.ts pushSubscriptionsAfter).
     //
     // `p256dh`/`auth` are the subscription's RFC 8291 keys, base64url as the
     // browser produced them. Stored verbatim because the relay presents them
@@ -532,6 +539,53 @@ export const TABLES: readonly TableSpec[] = [
       col("cursor", "TEXT"),
       col("sent", "INTEGER NOT NULL DEFAULT 0"),
     ],
+  },
+  {
+    // Mail waiting to be announced, one row per RECIPIENT (relay.ts
+    // drainInboxPushes). Unlike `push_outbox`, which fans a group message
+    // out to everyone, a gift wrap is for one person, so the queue is keyed
+    // by who it is for. Mail arriving for someone already queued folds into
+    // the row (INSERT ... DO NOTHING), so a burst is one notification.
+    // Nothing else is recorded: not the wrap, not its sender, not when the
+    // wraps after the first arrived.
+    name: "inbox_push",
+    columns: [col("pubkey", "TEXT PRIMARY KEY"), col("queued_at", "INTEGER NOT NULL")],
+  },
+  {
+    // Member invite codes (nip86.ts createinvite/redeeminvite). Separate
+    // from `group_invites`: those admit to a NIP-29 group, are created by a
+    // signed kind-9009 and are single-use by construction; these make
+    // someone a member of the relay, are created by a management call, and
+    // may be redeemed `uses_allowed` times.
+    //
+    // Stored verbatim for the reason `group_invites` gives: the owner reads
+    // live codes back (listunusedinvites). The relay generates every code
+    // (limits.ts MEMBER_INVITE_CODE_BYTES), so one cannot be guessed.
+    //
+    // Never swept, like `group_invites`: rows accumulate at owner pace, and
+    // a dead row is what lets revokeinvite say "already used up" rather
+    // than "never issued".
+    name: "member_invites",
+    columns: [
+      col("code", "TEXT PRIMARY KEY"),
+      col("created_at", "INTEGER NOT NULL"),
+      // Always set: there is no never-expiring code (limits.ts
+      // INVITE_DEFAULT_TTL_SECONDS gives the reason).
+      col("expires_at", "INTEGER NOT NULL"),
+      col("uses_allowed", "INTEGER NOT NULL DEFAULT 1"),
+      col("uses", "INTEGER NOT NULL DEFAULT 0"),
+      col("revoked_at", "INTEGER"),
+    ],
+  },
+  {
+    // Members the owner removed (nip86.ts unallowpubkey), kept for
+    // limits.ts MEMBER_REMOVAL_GRACE_SECONDS so the mail already stored for
+    // them stays readable while their app moves house. After that the cron
+    // tick deletes it (storage.ts sweepFormerMembers) and then this row.
+    // Re-admitting the pubkey deletes the row, so nothing of a returning
+    // member's is swept.
+    name: "former_members",
+    columns: [col("pubkey", "TEXT PRIMARY KEY"), col("removed_at", "INTEGER NOT NULL")],
   },
   {
     // Call presence (push.ts CALL_PRESENCE_KIND): one row per pubkey, holding
@@ -858,6 +912,15 @@ export const INDEXES: readonly IndexSpec[] = [
   // written per stored event. No `orderedBy`: it is a range SUM, and
   // `ingested_at` is not a filterable field (limits.ts PINS), so
   // filterReadCost never treats it as bounding a REQ.
+  // Serves `WHERE pubkey = ?` on push_subscriptions: whose devices a
+  // member's mail goes to (relay.ts drainInboxPushes, storage.ts
+  // hasPushSubscription), and dropping a removed member's devices. One row
+  // written per subscribe.
+  {
+    name: "idx_push_subscriptions_pubkey",
+    table: "push_subscriptions",
+    keyColumns: ["pubkey"],
+  },
   {
     name: "idx_events_ingested",
     table: "events",
