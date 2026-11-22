@@ -1,7 +1,7 @@
 // The `network` write policy's second ring: everyone the owner's follows
 // follow ("the outer wall"). Built from the follows' own contact lists
 // (kind 3), which the relay does not otherwise hold: the hourly tick
-// fetches a few follows' lists at a time from WELL_KNOWN_RELAYS
+// fetches a few follows' lists at a time from limits.ts NETWORK_RELAYS
 // (network-worker.ts, in the Worker, never here: an outbound socket pins a
 // Durable Object in memory), and this file checks and stores them.
 //
@@ -17,9 +17,9 @@
 //
 // A rebuild walks the follows in pubkey order (`network_state.cursor`).
 // Every key a list names is stamped with the rebuild's `gen`; when the
-// walk ends, keys with an older `gen` are dropped, unless too few lists
-// were found (limits.ts NETWORK_MIN_COVERAGE), in which case they are
-// kept until a better rebuild. A tick that runs out of its row budget
+// walk ends, keys with an older `gen` are dropped, unless this rebuild
+// found clearly fewer lists than the last trusted one (limits.ts
+// NETWORK_MIN_COVERAGE), in which case they are kept until a better one. A tick that runs out of its row budget
 // partway through a list stops before that follow, and the next tick
 // takes the same list again: keys already stamped cost nothing.
 import {
@@ -42,6 +42,7 @@ interface NetworkState {
   seen: number;
   key_count: number;
   capped: number;
+  last_found: number;
 }
 
 function readState(sql: SqlStorage): NetworkState {
@@ -55,8 +56,10 @@ function readState(sql: SqlStorage): NetworkState {
       seen: number;
       key_count: number;
       capped: number;
+      last_found: number;
     }>(
-      `SELECT gen, cursor, started_at, completed_at, found, seen, key_count, capped FROM network_state WHERE id = 1`,
+      `SELECT gen, cursor, started_at, completed_at, found, seen, key_count, capped, last_found
+         FROM network_state WHERE id = 1`,
     )
     .toArray()[0]!;
 }
@@ -101,16 +104,17 @@ export function networkWork(sql: SqlStorage, nowSec: number): { authors: string[
     .map((r) => r.pubkey);
   if (authors.length > 0) return { authors };
 
-  // The walk is done. Drop keys no list named this time, if enough lists
-  // were found to trust that.
-  if (s.seen > 0 && s.found / s.seen >= NETWORK_MIN_COVERAGE) {
-    sql.exec(`DELETE FROM network_keys WHERE gen < ?`, s.gen);
-  }
+  // The walk is done. Drop keys no list named this time, if this rebuild
+  // found about as many lists as the last trusted one. The bar moves only
+  // with a trusted rebuild, so a bad week cannot lower it.
+  const trusted = s.found > 0 && s.found >= NETWORK_MIN_COVERAGE * s.last_found;
+  if (trusted) sql.exec(`DELETE FROM network_keys WHERE gen < ?`, s.gen);
   const count = sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM network_keys`).toArray()[0]?.n ?? 0;
   sql.exec(
-    `UPDATE network_state SET cursor = NULL, completed_at = ?, key_count = ? WHERE id = 1`,
+    `UPDATE network_state SET cursor = NULL, completed_at = ?, key_count = ?, last_found = ? WHERE id = 1`,
     nowSec,
     count,
+    trusted ? s.found : s.last_found,
   );
   return null;
 }

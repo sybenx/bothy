@@ -704,21 +704,23 @@ export function memberListVisibility(env: Env): MemberListVisibility {
 
 // The `network` write policy (src/network.ts): the people the owner's
 // follows follow, built from the follows' own contact lists, which the
-// hourly tick fetches from WELL_KNOWN_RELAYS and verifies.
+// hourly tick fetches from NETWORK_RELAYS and verifies.
 //
 // Keys it may hold. Each costs 2 rows written to add and 1 to keep on each
-// weekly refresh, so 20,000 is about 40,000 rows once and 20,000 a week.
-// Past the cap, further keys are not added and /api/stats says so.
-// NETWORK_MAX_KEYS overrides.
-export const NETWORK_MAX_KEYS_DEFAULT = 20_000;
+// weekly refresh, so 40,000 is about 80,000 rows once and 40,000 a week,
+// both paced by NETWORK_ROWS_PER_TICK. Sized from one real owner
+// (2026-11-22): 361 follows, 217 of whose lists three public relays had,
+// naming 25,450 distinct people. Past the cap, further keys are not added
+// and /api/stats says so. NETWORK_MAX_KEYS overrides.
+export const NETWORK_MAX_KEYS_DEFAULT = 40_000;
 
 export function networkMaxKeys(env: Env): number {
   return resolveLimit(env.NETWORK_MAX_KEYS, NETWORK_MAX_KEYS_DEFAULT) ?? NETWORK_MAX_KEYS_DEFAULT;
 }
 
 // Rows one tick may write to the list: a tenth of the day's 100,000,
-// spread over the 24 hourly ticks. Filling 20,000 keys takes about four
-// days; a refresh of them about two.
+// spread over the 24 hourly ticks. Filling 40,000 keys takes about eight
+// days; a refresh of them about four.
 export const NETWORK_ROWS_PER_TICK = Math.floor(100_000 / 10 / 24);
 
 // Follows whose contact lists one tick fetches, in one REQ per relay.
@@ -728,10 +730,17 @@ export const NETWORK_AUTHORS_PER_TICK = 25;
 // someone a follow stops following drops out.
 export const NETWORK_REFRESH_SECONDS = 7 * 24 * 60 * 60;
 
-// A rebuild only drops keys nobody re-listed when at least this share of
-// follows' lists were actually found: a relay that answered for few of
-// them must not empty the list.
+// A rebuild only drops keys nobody re-listed when it found at least this
+// share of the lists the previous rebuild found: a relay that answered for
+// fewer this week must not empty the list. Relative, not a share of all
+// follows, because public relays hold only some follows' lists (60% in
+// the measurement above), and an absolute bar would never be met.
 export const NETWORK_MIN_COVERAGE = 0.8;
+
+// Where the follows' lists are fetched from (network-worker.ts). Wider
+// than WELL_KNOWN_RELAYS: measured 2026-11-22, relay.primal.net had most
+// of one owner's follows' lists where the other two had few.
+export const NETWORK_RELAYS = ["wss://relay.primal.net", "wss://relay.damus.io", "wss://nos.lol"];
 
 // Members' own invites (nip86.ts createinvite from a member). The owner
 // and admins are not limited; a member may let in INVITES_PER_MEMBER

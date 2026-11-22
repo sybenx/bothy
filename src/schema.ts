@@ -773,6 +773,9 @@ export const TABLES: readonly TableSpec[] = [
       col("seen", "INTEGER NOT NULL DEFAULT 0"),
       col("key_count", "INTEGER NOT NULL DEFAULT 0"),
       col("capped", "INTEGER NOT NULL DEFAULT 0"),
+      // Lists the last finished rebuild found, the bar for
+      // limits.ts NETWORK_MIN_COVERAGE.
+      col("last_found", "INTEGER NOT NULL DEFAULT 0"),
     ],
   },
   {

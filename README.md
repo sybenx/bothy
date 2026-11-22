@@ -121,7 +121,7 @@ The deploy button only asks for a project name. Everything else is an optional v
 | `WRITE_POLICY` | Who can publish here: `owner`, `inbox`, `follows`, `mentions`, `network` or `all` (see "Who can write here" below). Set here it outranks the value set through the management API. Unset, the management API's value applies, then the default, `follows`. |
 | `MAIL_STORAGE_BYTES` | How much all stored mail may take, in bytes. Defaults to 30% of `STORAGE_BUDGET_BYTES` (about 300 MB). Set it to `off` to remove this cap; the share reserved for you (`NON_OWNER_STORAGE_BYTES`) still applies. |
 | `MAIL_BYTES_PER_MEMBER` | How much mail any one person may have stored here, you included, in bytes. Defaults to a tenth of the mail total (about 30 MB). Set it to `off` to remove it. |
-| `NETWORK_MAX_KEYS` | Under the `network` policy, how many of the people your follows follow the relay keeps on its list. Defaults to `20000`. |
+| `NETWORK_MAX_KEYS` | Under the `network` policy, how many of the people your follows follow the relay keeps on its list. Defaults to `40000`. |
 | `MEMBER_LIST` | Whether members can see who else is in your home. `members` (the default) lets every member see the list; `hidden` keeps it to you and your admins. |
 | `INVITES_PER_MEMBER` | How many people each member may invite. Defaults to `5`. Set it to `off` so only you and your admins make invites. You and your admins are never limited. |
 | `INVITE_DEPTH` | How many steps from you invites reach: your own invitees are one step away, and a member this many steps away cannot invite. Defaults to `3`. `off` also keeps invites to you and your admins. |
@@ -272,7 +272,7 @@ bothy_rpc https://your-relay.workers.dev/ getwritepolicy
 
 The URL must be the relay's own `https://` address, because the signature covers it. It takes effect immediately. `getwritepolicy` reads back the policy in force and where it was set. An empty string clears the stored policy and returns to the default. `all` asks you to confirm: the first call refuses and tells you the exact confirmation string to pass as a second parameter. If `WRITE_POLICY` is set in the Cloudflare dashboard it outranks the management API, and `changewritepolicy` tells you so.
 
-Under `network`, the relay gathers your follows' own contact lists, a few each hour, from two public relays, checks every signature, and keeps the people they name on a list of up to 20,000. Nobody can see the list, or which follow brought someone onto it; the admin page shows only how many are on it. It costs about 2 rows written to add a person and 1 a week to keep them, at most a tenth of the day's write allowance: filling the list takes about four days after you switch, and it is rebuilt every week, so someone a follow stops following drops off within about a week. Nothing is gathered under any other policy.
+Under `network`, the relay gathers your follows' own contact lists, a few each hour, from three public relays, checks every signature, and keeps the people they name on a list of up to 40,000. Nobody can see the list, or which follow brought someone onto it; the admin page shows only how many are on it. It costs about 2 rows written to add a person and 1 a week to keep them, at most a tenth of the day's write allowance: filling the list takes about a week after you switch, and it is rebuilt every week, so someone a follow stops following drops off within about a week. Nothing is gathered under any other policy.
 
 Under `all`, NIP-11 advertises `restricted_writes: false`; under every other policy it is `true`.
 

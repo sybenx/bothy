@@ -221,6 +221,21 @@ describe("rebuilding", () => {
     expect((await sqlOf((sql) => networkSummary(sql))).count).toBe(1);
   });
 
+  it("still drops stale keys when public relays hold only some lists, as they usually do", async () => {
+    // Measured on a real owner: about 60% of follows' lists were findable.
+    const friends = Array.from({ length: 5 }, () => randomKeypair());
+    await follow(...friends);
+    const dropped = randomKeypair().pubkeyHex;
+    const kept = randomKeypair().pubkeyHex;
+    const t0 = Math.floor(Date.now() / 1000);
+    await rebuild([contactList(friends[0]!, [dropped, kept], t0 - 10)], t0);
+    await rebuild([contactList(friends[0]!, [kept], t0)], t0 + 8 * 24 * 3600);
+    const keys = await sqlOf((sql) =>
+      sql.exec<{ pubkey: string }>(`SELECT pubkey FROM network_keys`).toArray().map((r) => r.pubkey),
+    );
+    expect(keys).toEqual([kept]);
+  });
+
   it("keeps the list when too few lists were found to trust a rebuild", async () => {
     const friends = Array.from({ length: 5 }, () => randomKeypair());
     await follow(...friends);
