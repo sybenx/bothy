@@ -426,17 +426,25 @@ export function parseVaultPut(params: unknown[], signer: string): VaultPutInput 
   if (typeof f.alg !== "number" || !SUPPORTED_ALGS.has(f.alg)) {
     return "vaultput: alg must be -7 (ES256), -8 (EdDSA) or -257 (RS256)";
   }
-  if (typeof f.blob !== "string") return "vaultput: blob must be the locked copy, as a JSON string";
-  if (utf8Length(f.blob) > VAULT_BLOB_MAX_BYTES) {
+  // The locked copy, as a JSON object (a string holding one is taken too).
+  // Stored as its JSON text, which is what the size cap counts, and given
+  // back as an object by vaultopen.
+  let blob: unknown = f.blob;
+  if (typeof blob === "string") {
+    try {
+      blob = JSON.parse(blob);
+    } catch {
+      return "vaultput: blob must be the locked copy, a JSON object";
+    }
+  }
+  if (typeof blob !== "object" || blob === null || Array.isArray(blob)) {
+    return "vaultput: blob must be the locked copy, a JSON object";
+  }
+  const blobText = JSON.stringify(blob);
+  if (utf8Length(blobText) > VAULT_BLOB_MAX_BYTES) {
     return `vaultput: blob can be at most ${VAULT_BLOB_MAX_BYTES} bytes`;
   }
-  let blob: unknown;
-  try {
-    blob = JSON.parse(f.blob);
-  } catch {
-    return "vaultput: blob must be the locked copy, as a JSON string";
-  }
-  const b = (typeof blob === "object" && blob !== null ? blob : {}) as Record<string, unknown>;
+  const b = blob as Record<string, unknown>;
   if (b.v !== 2 || typeof b.iv !== "string" || typeof b.ct !== "string") {
     return 'vaultput: blob must be {"v": 2, "pubkey", "cred", "iv", "ct"}';
   }
@@ -456,9 +464,9 @@ export function parseVaultPut(params: unknown[], signer: string): VaultPutInput 
   }
   const credentialId = toBase64url(credentialBytes);
   const publicKeyText = toBase64url(publicKey);
-  const size = credentialId.length + publicKeyText.length + utf8Length(f.blob) + (label === null ? 0 : utf8Length(label));
+  const size = credentialId.length + publicKeyText.length + utf8Length(blobText) + (label === null ? 0 : utf8Length(label));
   if (size > VAULT_ROW_MAX_BYTES) return `vaultput: a row can be at most ${VAULT_ROW_MAX_BYTES} bytes`;
-  return { hash, credentialId, publicKey, publicKeyText, alg: f.alg, blob: f.blob, label, size };
+  return { hash, credentialId, publicKey, publicKeyText, alg: f.alg, blob: blobText, label, size };
 }
 
 // Stores a checked vaultput (the key already imported). A refusal
@@ -518,9 +526,9 @@ export interface VaultListEntry {
   credentialId: string;
   alg: number;
   label: string | null;
-  added: number;
-  updated: number;
-  lastUsed: number | null;
+  addedAt: number;
+  updatedAt: number;
+  lastUsedAt: number | null;
 }
 
 // The signer's rows, oldest first, without their blobs.
@@ -545,9 +553,9 @@ export function listVaultRows(sql: SqlStorage, signer: string): VaultListEntry[]
       credentialId: r.credential_id,
       alg: r.alg,
       label: r.label,
-      added: r.added_at,
-      updated: r.updated_at,
-      lastUsed: r.last_used_at,
+      addedAt: r.added_at,
+      updatedAt: r.updated_at,
+      lastUsedAt: r.last_used_at,
     }));
 }
 

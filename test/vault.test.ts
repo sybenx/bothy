@@ -153,15 +153,19 @@ async function assert(passkey: Passkey, challenge: string, opts: AssertionOption
   };
 }
 
-function blobFor(owner: Keypair | string, passkey: Passkey, extra: Record<string, unknown> = {}): string {
-  return JSON.stringify({
+function blobFor(
+  owner: Keypair | string,
+  passkey: Passkey,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
     v: 2,
     pubkey: typeof owner === "string" ? owner : owner.pubkeyHex,
     cred: toBase64url(passkey.credentialId),
     iv: toBase64url(randomBytes(12)),
     ct: toBase64url(randomBytes(48)),
     ...extra,
-  });
+  };
 }
 
 function putParams(owner: Keypair, passkey: Passkey, fields: Record<string, unknown> = {}) {
@@ -212,13 +216,16 @@ async function open(passkey: Passkey, opts: AssertionOptions & { challenge?: str
   return unsigned("vaultopen", [opts.hash ?? passkey.hash, await assert(passkey, c, opts)]);
 }
 
-async function stored(member: Keypair, passkey = makePasskey()): Promise<{ passkey: Passkey; blob: string }> {
+async function stored(
+  member: Keypair,
+  passkey = makePasskey(),
+): Promise<{ passkey: Passkey; blob: Record<string, unknown> }> {
   const key = await passkey;
   const params = putParams(member, key);
   const reply = await as(member, "vaultput", params);
   expect(reply.error).toBeUndefined();
   expect(reply.result).toBe(true);
-  return { passkey: key, blob: (params[1] as { blob: string }).blob };
+  return { passkey: key, blob: (params[1] as { blob: Record<string, unknown> }).blob };
 }
 
 async function sqlRows<T>(query: string, ...bindings: unknown[]): Promise<T[]> {
@@ -251,7 +258,7 @@ describe("a member's own rows", () => {
       credentialId: toBase64url(passkey.credentialId),
       alg: COSE_ES256,
       label: "Google Password Manager",
-      lastUsed: null,
+      lastUsedAt: null,
     });
     expect(list[0]).not.toHaveProperty("blob");
     // Someone else's list does not show it, and their delete does nothing.
@@ -290,6 +297,16 @@ describe("a member's own rows", () => {
     const wrongHash = await as(alice, "vaultput", [other.hash, putParams(alice, passkey)[1]]);
     expect(wrongHash.error).toBe("vaultput: the hash must be the sha256 of the credential id");
     expect((await as(alice, "vaultlist")).result).toEqual([]);
+  });
+
+  it("takes the blob as a JSON string too, and gives back the object", async () => {
+    const alice = await newMember();
+    const passkey = await makePasskey();
+    const blob = blobFor(alice, passkey);
+    expect((await as(alice, "vaultput", putParams(alice, passkey, { blob: JSON.stringify(blob) }))).result).toBe(true);
+    expect((await open(passkey)).body).toEqual({ result: { blob } });
+    const notObject = await as(alice, "vaultput", putParams(alice, passkey, { blob: [1] }));
+    expect(notObject.error).toBe("vaultput: blob must be the locked copy, a JSON object");
   });
 
   it("refuses a blob over 1 KB, a bad key and an unknown alg", async () => {
@@ -340,8 +357,9 @@ describe("vaultopen", () => {
     const { passkey, blob } = await stored(alice);
     const reply = await open(passkey, { userHandle: toBase64url(hexToBytes(alice.pubkeyHex)) });
     expect(reply.body).toEqual({ result: { blob } });
-    const row = ((await as(alice, "vaultlist")).result as { lastUsed: number | null }[])[0]!;
-    expect(row.lastUsed).not.toBeNull();
+    const row = ((await as(alice, "vaultlist")).result as { lastUsedAt: number | null; addedAt: number }[])[0]!;
+    expect(row.lastUsedAt).not.toBeNull();
+    expect(row.addedAt).toBeGreaterThan(1_700_000_000);
   });
 
   it("verifies EdDSA and RS256 passkeys too", async () => {

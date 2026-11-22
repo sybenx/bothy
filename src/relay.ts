@@ -747,7 +747,8 @@ export class Relay extends DurableObject<Env> {
     }
     return this.metered(async () => {
       const blob = await openVault(this.sql, this.env, this.challengeKey(), hash, assertion, nowSeconds());
-      return blob === null ? { error: VAULT_NOT_FOUND } : { result: { blob } };
+      // Stored as JSON text (vault.ts parseVaultPut), given back as the object.
+      return blob === null ? { error: VAULT_NOT_FOUND } : { result: { blob: JSON.parse(blob) as unknown } };
     });
   }
 
