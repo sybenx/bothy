@@ -26,6 +26,7 @@ import {
   MAX_PUSHES_PER_TICK,
   MAX_WRAP_RECIPIENTS_CHECKED,
   PHOTO_UPLOADS_PER_DAY,
+  HOME_STATS_DAYS_KEPT,
   photoStorageBytes,
   MAX_REQUEST_JOINS_PER_IP_PER_WINDOW,
   REQUEST_JOIN_RATE_LIMIT_WINDOW_MS,
@@ -188,6 +189,10 @@ import {
   queueInboxPush,
   sweepFormerMembers,
   sweepExpiredJoinRequests,
+  countMailDay,
+  noteMemberSeen,
+  pruneHomeStats,
+  utcDay,
   roleOf,
   type Role,
   isIpBlocked,
@@ -1031,6 +1036,7 @@ export class Relay extends DurableObject<Env> {
         withReadPath("giftWrapSweep", () => this.sweepFormerMemberMail(sql, now));
         // Join requests past their 30 days, answered or not.
         sweepExpiredJoinRequests(sql, now);
+        pruneHomeStats(sql, utcDay(now), HOME_STATS_DAYS_KEPT);
         // Last: see the comment on runCron.
         this.drainPendingVanishes(sql);
       });
@@ -1635,6 +1641,8 @@ export class Relay extends DurableObject<Env> {
       // Only for an accepted event: a notification about a refused event
       // would be about nothing.
       this.notePush(sql, event, wrapRecipients);
+      // Messages per day for homestats: a count, nothing about the wrap.
+      if (event.kind === GIFT_WRAP_KIND) countMailDay(sql, utcDay(nowSeconds()));
       this.broadcast(result.stored);
       this.liveBroadcast(result.stored);
     }
@@ -2381,6 +2389,22 @@ export class Relay extends DurableObject<Env> {
     state.authedPubkey = event.pubkey;
     setState(ws, state);
     ok(ws, event.id, true, "");
+    this.noteSeen(event.pubkey);
+  }
+
+  // A member's last-seen day (schema.ts `member_seen`), for homestats'
+  // active-member counts. Memory first, so a member authenticating all
+  // day writes one row, and a stranger costs one PK seek a day.
+  private seenToday = new Map<string, number>();
+
+  private noteSeen(pubkey: string): void {
+    const day = utcDay(nowSeconds());
+    if (this.seenToday.get(pubkey) === day) return;
+    if (this.seenToday.size >= 1024) this.seenToday.clear();
+    this.seenToday.set(pubkey, day);
+    withReadPath("connect", () => {
+      if (isMember(this.sql, pubkey)) noteMemberSeen(this.sql, pubkey, day);
+    });
   }
 
   private broadcast(event: NostrEvent): void {

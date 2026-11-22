@@ -652,6 +652,12 @@ export const GIFT_WRAP_SWEEP_BATCH_SIZE = Math.max(
 export const MEMBER_INVITE_DEFAULT_USES = 1;
 export const MEMBER_INVITE_MAX_USES = 100;
 
+// Home activity (nip86.ts homestats): 14 days of messages per day, 8
+// weeks of joins, and the per-day counts kept a little longer than shown.
+export const HOME_STATS_DAYS = 14;
+export const HOME_STATS_WEEKS = 8;
+export const HOME_STATS_DAYS_KEPT = 30;
+
 // Members' own invites (nip86.ts createinvite from a member). The owner
 // and admins are not limited; a member may let in INVITES_PER_MEMBER
 // people, and only while they are fewer than INVITE_DEPTH steps from the

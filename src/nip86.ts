@@ -27,6 +27,7 @@ import {
   removeAdmin,
   removeMember,
   roleOf,
+  homeStats,
   inviteDepth,
   inviteSlotsUsed,
   countOutstandingMemberInvites,
@@ -72,7 +73,11 @@ import {
   maxGiftWraps,
   MEMBER_REMOVAL_GRACE_SECONDS,
   memberInviteLimits,
+  HOME_STATS_DAYS,
+  HOME_STATS_WEEKS,
+  photoStorageBytes,
 } from "./limits";
+import { sqlitePhotoStore } from "./photos";
 import { GROUPS_PAUSED_MESSAGE } from "./nip29";
 import { pushConfigured } from "./push";
 import { joinRequestMessage, oneLine } from "./join-requests";
@@ -167,6 +172,8 @@ export const SUPPORTED_METHODS = [
   "myrole",
   // bothy's own: what a member's invite allowance is right now.
   "myinvites",
+  // bothy's own: how the home is used, in counts (owner and admins).
+  "homestats",
   // bothy's own; the one pair a member may call, not only the owner
   // (MEMBER_CALLABLE_METHODS below).
   "subscribepush",
@@ -219,6 +226,7 @@ export const ANYONE_CALLABLE_METHODS: readonly string[] = ["redeeminvite", "requ
 // The invite methods are not here: members may call them too
 // (MEMBER_CALLABLE_METHODS), and admins pass that gate as well.
 export const ADMIN_CALLABLE_METHODS: readonly string[] = [
+  "homestats",
   "listjoinrequests",
   "approvejoin",
   "declinejoin",
@@ -669,6 +677,21 @@ export function handleManagementCall(
       // see every code, group ones included.
       if (isPlainMember(sql, env, signer)) return { result: listUnusedMemberInvites(sql, nowSec, signer) };
       return { result: [...listUnusedMemberInvites(sql, nowSec), ...listUnusedInvites(sql, nowSec)] };
+
+    // Counts only, never a pubkey: how many members were seen lately, how
+    // many messages arrived a day, how many joined a week, how many get
+    // push, and what photos take. Owner and admins, who can already see
+    // more than this (listmembers); never on the public /api/stats.
+    case "homestats": {
+      const photos = sqlitePhotoStore(sql).usedBytes();
+      return {
+        result: {
+          ...homeStats(sql, nowSec, HOME_STATS_DAYS, HOME_STATS_WEEKS),
+          photoBytes: photos,
+          photoStorageLimit: photoStorageBytes(env),
+        },
+      };
+    }
 
     case "myinvites": {
       const standing = inviteStanding(sql, env, signer, nowSec);

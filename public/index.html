@@ -107,6 +107,11 @@
   #diagnostics .diag-grid { display: grid; grid-template-columns: auto 1fr; gap: 0.2rem 0.75rem; margin: 0.2rem 0; }
   #diagnostics .diag-grid dt { opacity: 0.7; }
   #diagnostics .diag-grid dd { margin: 0; }
+  /* Home activity: the same two-column list, at body size. */
+  #activity-list { display: grid; grid-template-columns: auto 1fr; gap: 0.2rem 0.75rem; margin: 0.5rem 0; }
+  #activity-list[hidden] { display: none; }
+  #activity-list dt { opacity: 0.7; }
+  #activity-list dd { margin: 0; }
 </style>
 </head>
 <body>
@@ -146,6 +151,15 @@
   <p id="write-policy-status">-</p>
   <p id="members-status">-</p>
   <p id="photos-status" hidden></p>
+  <!-- How the home is used, in counts (NIP-86 homestats). Never part of
+       /api/stats, which is public: the counts load only after you sign a
+       request with your browser signer, so the section appears only when
+       one exists. -->
+  <div id="activity" hidden>
+    <button type="button" id="activity-btn">Show how your home is used</button>
+    <p id="activity-error" class="live-status"></p>
+    <dl id="activity-list" hidden></dl>
+  </div>
 
   <p id="backfill-status" hidden></p>
   <p id="backfill-refusal" class="refusal" hidden></p>
@@ -328,6 +342,7 @@ async function main() {
     renderWritePolicyStatus(stats);
     renderMembersStatus(stats);
     renderPhotosStatus(stats);
+    offerActivity(stats);
     renderBackfillStatus(stats.backfill);
     renderDiagnostics(stats);
     wireLiveFeed();
@@ -432,6 +447,85 @@ function renderMembersStatus(stats) {
 
 // Members' profile photos (/api/stats `photoBytes` against
 // `photoStorageLimit`), hidden when photo storage is off.
+// Home activity. Signs a NIP-98 event over a homestats call with the
+// browser signer (NIP-07) and shows the counts. Owner or admin only; the
+// relay refuses anyone else.
+function offerActivity(stats) {
+  const box = document.getElementById("activity");
+  const show = () => {
+    if (stats.claimed && window.nostr && typeof window.nostr.signEvent === "function") box.hidden = false;
+  };
+  show();
+  setTimeout(show, 500);
+  const button = document.getElementById("activity-btn");
+  if (button.dataset.wired) return;
+  button.dataset.wired = "1";
+  button.addEventListener("click", async () => {
+    const errorEl = document.getElementById("activity-error");
+    errorEl.textContent = "";
+    try {
+      const body = JSON.stringify({ method: "homestats", params: [] });
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body)));
+      const payload = Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
+      const signed = await window.nostr.signEvent({
+        kind: 27235,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [["u", location.origin + "/"], ["method", "POST"], ["payload", payload]],
+        content: "",
+      });
+      const res = await fetch("/", {
+        method: "POST",
+        headers: { "Content-Type": "application/nostr+json+rpc", Authorization: "Nostr " + btoa(JSON.stringify(signed)) },
+        body,
+      });
+      const reply = JSON.parse(new TextDecoder().decode(await res.arrayBuffer()));
+      if (!reply.result) {
+        errorEl.textContent = res.status === 401 ? "Only the owner or an admin can see this." : reply.error || "That did not work.";
+        return;
+      }
+      renderActivity(reply.result);
+      button.hidden = true;
+    } catch {
+      errorEl.textContent = "Your signer did not sign the request.";
+    }
+  });
+}
+
+// One character per value, lowest to highest, so fourteen days fit on a
+// line. Every value also goes in the row's title.
+function spark(values) {
+  const bars = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588";
+  const max = Math.max(1, ...values);
+  return values.map((v) => (v === 0 ? "\u00b7" : bars[Math.min(7, Math.floor((v / max) * 7.999))])).join("");
+}
+
+function renderActivity(a) {
+  const list = document.getElementById("activity-list");
+  list.replaceChildren();
+  const row = (label, value, title) => {
+    const dt = document.createElement("dt");
+    dt.textContent = label;
+    const dd = document.createElement("dd");
+    dd.textContent = value;
+    if (title) dd.title = title;
+    list.append(dt, dd);
+  };
+  const people = (n) => n + (n === 1 ? " member" : " members");
+  row("Members", String(a.members));
+  row("Seen", a.activeMembers.last1Day + " today, " + a.activeMembers.last7Days + " this week, " +
+    a.activeMembers.last30Days + " this month");
+  const counts = a.messagesPerDay.map((d) => d.count);
+  row("Messages, last 14 days", spark(counts) + "  " + counts.reduce((x, y) => x + y, 0) + " in all",
+    a.messagesPerDay.map((d) => d.day + ": " + d.count).join("\n"));
+  const joined = a.weeks.map((w) => w.newMembers);
+  const invited = a.weeks.reduce((x, w) => x + w.invitesUsed, 0);
+  row("Joined, last 8 weeks", spark(joined) + "  " + joined.reduce((x, y) => x + y, 0) + " in all, " + invited + " by invite",
+    a.weeks.map((w) => "from " + w.from + ": " + w.newMembers + " joined, " + w.invitesUsed + " by invite").join("\n"));
+  row("Notifications on", people(a.pushSubscribers));
+  if (a.photoStorageLimit !== null) row("Profile photos", formatBytes(a.photoBytes) + " of " + formatBytes(a.photoStorageLimit));
+  list.hidden = false;
+}
+
 function renderPhotosStatus(stats) {
   const el = document.getElementById("photos-status");
   el.hidden = stats.photoStorageLimit === null || stats.photoStorageLimit === undefined;

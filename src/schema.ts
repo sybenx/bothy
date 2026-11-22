@@ -666,6 +666,23 @@ export const TABLES: readonly TableSpec[] = [
     ],
   },
   {
+    // Home activity (nip86.ts homestats), the one per-person thing it keeps:
+    // the last UTC day each member completed NIP-42 auth, one row each,
+    // overwritten, never a log. Read only as counts ("members seen in the
+    // last 7 days"); nothing returns a row. Deleted when the member is
+    // removed (storage.ts unallowPubkey).
+    name: "member_seen",
+    columns: [col("pubkey", "TEXT PRIMARY KEY"), col("day", "INTEGER NOT NULL")],
+  },
+  {
+    // Gift wraps accepted per UTC day (relay.ts handleGiftWrap), for
+    // homestats' "messages per day". A count and nothing else: not who to,
+    // not who from. Kept for limits.ts HOME_STATS_DAYS_KEPT days, pruned
+    // by the cron tick.
+    name: "mail_days",
+    columns: [col("day", "INTEGER PRIMARY KEY"), col("n", "INTEGER NOT NULL")],
+  },
+  {
     // Members the owner removed (nip86.ts unallowpubkey), kept for
     // limits.ts MEMBER_REMOVAL_GRACE_SECONDS so the mail already stored for
     // them stays readable while their app moves house. After that the cron

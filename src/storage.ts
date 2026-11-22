@@ -2050,6 +2050,7 @@ export function unallowPubkey(sql: SqlStorage, pubkey: string, nowSec: number): 
   sql.exec(`DELETE FROM allowed_pubkeys WHERE pubkey = ?`, pubkey);
   // An admin is a member first (schema.ts `admins`).
   sql.exec(`DELETE FROM admins WHERE pubkey = ?`, pubkey);
+  sql.exec(`DELETE FROM member_seen WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM push_subscriptions WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM inbox_push WHERE pubkey = ?`, pubkey);
   sql.exec(
@@ -2308,6 +2309,105 @@ export function revokeMemberInvite(
   if (invite.uses >= invite.uses_allowed) return "used-up";
   sql.exec(`UPDATE member_invites SET revoked_at = ? WHERE code = ?`, nowSec, code);
   return "revoked";
+}
+
+// ---------------------------------------------------------------------
+// Home activity (nip86.ts homestats): counts only, for the owner and
+// admins. Nothing here returns a pubkey.
+// ---------------------------------------------------------------------
+
+export function utcDay(nowSec: number): number {
+  return Math.floor(nowSec / 86400);
+}
+
+// A member's last-seen day. The caller (relay.ts handleAuth) skips it when
+// memory already has today, so this is at most one row a member a day.
+export function noteMemberSeen(sql: SqlStorage, pubkey: string, day: number): void {
+  sql.exec(
+    `INSERT INTO member_seen (pubkey, day) VALUES (?, ?)
+       ON CONFLICT(pubkey) DO UPDATE SET day = excluded.day WHERE excluded.day > member_seen.day`,
+    pubkey,
+    day,
+  );
+}
+
+export function countMailDay(sql: SqlStorage, day: number): void {
+  sql.exec(`INSERT INTO mail_days (day, n) VALUES (?, 1) ON CONFLICT(day) DO UPDATE SET n = n + 1`, day);
+}
+
+export function pruneHomeStats(sql: SqlStorage, today: number, daysKept: number): void {
+  sql.exec(`DELETE FROM mail_days WHERE day <= ?`, today - daysKept);
+}
+
+export interface HomeStats {
+  members: number;
+  // Members seen on one of the last N UTC days, today included, so
+  // last1Day is "seen today".
+  activeMembers: { last1Day: number; last7Days: number; last30Days: number };
+  // Oldest first, one entry a UTC day, zeros included. Gift wraps: a
+  // NIP-17 message is usually two, one for each side.
+  messagesPerDay: { day: string; count: number }[];
+  // Oldest first: seven-day windows ending today. newMembers counts people
+  // still members who joined in the window, any way; invitesUsed those of
+  // them who came with an invite code.
+  weeks: { from: string; newMembers: number; invitesUsed: number }[];
+  pushSubscribers: number;
+}
+
+function isoDay(day: number): string {
+  return new Date(day * 86400 * 1000).toISOString().slice(0, 10);
+}
+
+export function homeStats(sql: SqlStorage, nowSec: number, days: number, weeks: number): HomeStats {
+  const today = utcDay(nowSec);
+  const seen = sql
+    .exec<{ d1: number; d7: number; d30: number }>(
+      `SELECT COALESCE(SUM(s.day >= ?), 0) AS d1, COALESCE(SUM(s.day > ?), 0) AS d7,
+              COALESCE(SUM(s.day > ?), 0) AS d30
+         FROM member_seen s JOIN allowed_pubkeys a ON a.pubkey = s.pubkey`,
+      today,
+      today - 7,
+      today - 30,
+    )
+    .toArray()[0] ?? { d1: 0, d7: 0, d30: 0 };
+  const counted = new Map(
+    sql
+      .exec<{ day: number; n: number }>(`SELECT day, n FROM mail_days WHERE day > ?`, today - days)
+      .toArray()
+      .map((r) => [r.day, r.n] as const),
+  );
+  const messagesPerDay = Array.from({ length: days }, (_, i) => {
+    const day = today - days + 1 + i;
+    return { day: isoDay(day), count: counted.get(day) ?? 0 };
+  });
+  const joins = sql
+    .exec<{ allowed_at: number; source: string }>(
+      `SELECT allowed_at, source FROM allowed_pubkeys WHERE allowed_at > ?`,
+      (today - weeks * 7 + 1) * 86400,
+    )
+    .toArray();
+  const weekly = Array.from({ length: weeks }, (_, i) => {
+    const fromDay = today - (weeks - i) * 7 + 1;
+    const inWeek = joins.filter((j) => utcDay(j.allowed_at) >= fromDay && utcDay(j.allowed_at) < fromDay + 7);
+    return {
+      from: isoDay(fromDay),
+      newMembers: inWeek.length,
+      invitesUsed: inWeek.filter((j) => j.source === "member").length,
+    };
+  });
+  return {
+    members: memberCount(sql),
+    activeMembers: { last1Day: seen.d1, last7Days: seen.d7, last30Days: seen.d30 },
+    messagesPerDay,
+    weeks: weekly,
+    pushSubscribers:
+      sql
+        .exec<{ n: number }>(
+          `SELECT COUNT(DISTINCT p.pubkey) AS n FROM push_subscriptions p
+             JOIN allowed_pubkeys a ON a.pubkey = p.pubkey`,
+        )
+        .toArray()[0]?.n ?? 0,
+  };
 }
 
 // ---------------------------------------------------------------------
