@@ -1019,16 +1019,19 @@ export function handleManagementCall(
     // Letting a removed one back in is allowpubkey, which stops the clock.
     // listmembers for the caller's own branch (storage.ts listInvitees):
     // the same row shape, for any member's "People you invited".
-    case "myinvitees":
-      return {
-        result: listInvitees(
-          sql,
-          MEMBER_REMOVAL_GRACE_SECONDS,
-          getOwnerPubkey(sql, env) ?? signer,
-          signer,
-          nowSec,
-        ),
+    // A plain member gets the rows without the activity fields (lastSeen,
+    // push, waiting), which stay the owner's and admins' (v0.29): a member
+    // does not see when a friend was last online. Owner and admins keep them.
+    case "myinvitees": {
+      const owner = getOwnerPubkey(sql, env) ?? signer;
+      const listing = listInvitees(sql, MEMBER_REMOVAL_GRACE_SECONDS, owner, signer, nowSec);
+      if (roleOf(sql, signer, owner) !== "member") return { result: listing };
+      const strip = <T extends { lastSeen: unknown; push: unknown; waiting: unknown }>(row: T) => {
+        const { lastSeen: _seen, push: _push, waiting: _waiting, ...rest } = row;
+        return rest;
       };
+      return { result: { members: listing.members.map(strip), removed: listing.removed.map(strip) } };
+    }
 
     case "listmembers":
       return { result: listMembers(sql, MEMBER_REMOVAL_GRACE_SECONDS, getOwnerPubkey(sql, env) ?? signer) };

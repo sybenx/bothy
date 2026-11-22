@@ -328,10 +328,13 @@ describe("myinvitees", () => {
     expect(pubkeys(mine.members)).toEqual([bob.pubkeyHex, carol.pubkeyHex, child.pubkeyHex].sort());
     expect(pubkeys(mine.members)).not.toContain(outsider.pubkeyHex);
     expect(pubkeys(mine.members)).not.toContain(alice.pubkeyHex);
+    // listmembers' row, less the activity fields a plain member may not see.
     const all = ((await callManagement("listmembers")).result as Listing).members;
-    expect(mine.members.find((r) => r.pubkey === carol.pubkeyHex)).toEqual(
-      all.find((r) => r.pubkey === carol.pubkeyHex),
-    );
+    const { lastSeen: _s, push: _p, waiting: _w, ...shared } = all.find((r) => r.pubkey === carol.pubkeyHex)! as Record<
+      string,
+      unknown
+    >;
+    expect(mine.members.find((r) => r.pubkey === carol.pubkeyHex)).toEqual(shared);
     expect(pubkeys((await listing(bob)).members)).toEqual([carol.pubkeyHex]);
     expect((await listing(carol)).members).toEqual([]);
   });
@@ -346,6 +349,25 @@ describe("myinvitees", () => {
     expect(pubkeys(mine.removed)).toEqual([bob.pubkeyHex, carol.pubkeyHex].sort());
     // Not in anyone else's branch.
     expect((await listing(await newMember())).removed).toEqual([]);
+  });
+
+  it("leaves lastSeen, push and waiting out for plain members, and keeps them for the owner and admins", async () => {
+    const alice = await newMember();
+    const bob = await newMember(alice);
+    const carol = await newMember(bob);
+    await callManagement("unallowpubkey", [carol.pubkeyHex]);
+    const plain = await listing(alice);
+    for (const row of [...plain.members, ...plain.removed] as Record<string, unknown>[]) {
+      for (const field of ["lastSeen", "push", "waiting"]) expect(row).not.toHaveProperty(field);
+    }
+    expect(plain.removed).toHaveLength(1);
+    await callManagement("addadmin", [alice.pubkeyHex]);
+    const asAdmin = await listing(alice);
+    for (const row of [...asAdmin.members, ...asAdmin.removed] as Record<string, unknown>[]) {
+      for (const field of ["lastSeen", "push", "waiting"]) expect(row).toHaveProperty(field);
+    }
+    const owners = (await callManagement("myinvitees")).result as Listing;
+    expect(owners.members[0]).toHaveProperty("lastSeen");
   });
 
   it("gives the owner and admins their own branch; strangers get 401", async () => {
