@@ -2060,7 +2060,12 @@ export function invitedSubtree(sql: SqlStorage, pubkey: string, owner: string): 
   return order;
 }
 
-export function unallowPubkey(sql: SqlStorage, pubkey: string, nowSec: number): void {
+export function unallowPubkey(
+  sql: SqlStorage,
+  pubkey: string,
+  nowSec: number,
+  reason: "removed" | "erased" = "removed",
+): void {
   const existed = sql.exec(`SELECT 1 FROM allowed_pubkeys WHERE pubkey = ?`, pubkey).toArray().length > 0;
   if (!existed) return;
   sql.exec(`DELETE FROM allowed_pubkeys WHERE pubkey = ?`, pubkey);
@@ -2071,10 +2076,104 @@ export function unallowPubkey(sql: SqlStorage, pubkey: string, nowSec: number): 
   sql.exec(`DELETE FROM fcm_tokens WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM inbox_push WHERE pubkey = ?`, pubkey);
   sql.exec(
-    `INSERT INTO former_members (pubkey, removed_at) VALUES (?, ?)
-       ON CONFLICT(pubkey) DO UPDATE SET removed_at = excluded.removed_at`,
+    `INSERT INTO former_members (pubkey, removed_at, reason) VALUES (?, ?, ?)
+       ON CONFLICT(pubkey) DO UPDATE SET removed_at = excluded.removed_at, reason = excluded.reason`,
     pubkey,
     nowSec,
+    reason,
+  );
+}
+
+// A member erasing their own account (nip86.ts eraseme). Unlike removal
+// there is no grace: what bothy holds for them goes now.
+//
+//   - Their invitees stay members, re-hung under the person who invited
+//     them (or the owner, if that person is not a member).
+//   - The invite place they used goes back to whoever invited them
+//     (giveBackInvite).
+//   - Codes of their own still waiting are revoked: nobody joins under
+//     someone who has left.
+//   - Their mail here (wraps addressed to them and no one else still
+//     entitled to it), their profile photo, their devices, any join
+//     request and group rows are deleted.
+//   - The membership ends as a removal does, recorded as 'erased' so the
+//     storage service can tell (memberkeys), with nothing left for the
+//     grace sweep to delete.
+//
+// Returns how many wraps were deleted. `mailLimit` bounds the work; the
+// inbox is capped (limits.ts maxGiftWraps), so passing that cap deletes
+// everything.
+export function eraseMember(
+  sql: SqlStorage,
+  pubkey: string,
+  owner: string | null,
+  nowSec: number,
+  mailLimit: number,
+): number {
+  const row = sql
+    .exec<{ invited_by: string | null; via_code: string | null }>(
+      `SELECT invited_by, via_code FROM allowed_pubkeys WHERE pubkey = ?`,
+      pubkey,
+    )
+    .toArray()[0];
+  if (row === undefined) return 0;
+  const inviter =
+    row.invited_by !== null && row.invited_by !== pubkey && isPubkeyAllowed(sql, row.invited_by)
+      ? row.invited_by
+      : owner;
+  if (inviter !== null) {
+    sql.exec(`UPDATE allowed_pubkeys SET invited_by = ? WHERE invited_by = ?`, inviter, pubkey);
+  }
+  if (row.invited_by !== null) giveBackInvite(sql, row.invited_by, row.via_code);
+  sql.exec(
+    `UPDATE member_invites SET revoked_at = ?
+      WHERE created_by = ? AND revoked_at IS NULL AND uses < uses_allowed AND expires_at > ?`,
+    nowSec,
+    pubkey,
+    nowSec,
+  );
+  let deleted = 0;
+  for (const { id } of mailOnlyFor(sql, pubkey, owner, mailLimit)) {
+    deleteEventRow(sql, id);
+    deleted++;
+  }
+  sql.exec(`DELETE FROM photos WHERE pubkey = ?`, pubkey);
+  sql.exec(`DELETE FROM photo_uploads WHERE pubkey = ?`, pubkey);
+  sql.exec(`DELETE FROM join_requests WHERE pubkey = ?`, pubkey);
+  sql.exec(`DELETE FROM group_membership WHERE pubkey = ?`, pubkey);
+  unallowPubkey(sql, pubkey, nowSec, "erased");
+  return deleted;
+}
+
+// Gives one invite place back to `creator` (limits.ts memberInviteLimits
+// counts places: all uses of a live code, the used ones of a dead one).
+// The code the person redeemed if it was recorded (`via_code`), otherwise
+// any used code of the creator's. Taking one from both `uses` and
+// `uses_allowed` frees the place without making a used-up code
+// redeemable again.
+function giveBackInvite(sql: SqlStorage, creator: string, code: string | null): void {
+  const exact =
+    code === null
+      ? undefined
+      : sql
+          .exec<{ code: string }>(
+            `SELECT code FROM member_invites WHERE code = ? AND created_by = ? AND uses > 0`,
+            code,
+            creator,
+          )
+          .toArray()[0];
+  const target =
+    exact ??
+    sql
+      .exec<{ code: string }>(
+        `SELECT code FROM member_invites WHERE created_by = ? AND uses > 0 ORDER BY created_at DESC LIMIT 1`,
+        creator,
+      )
+      .toArray()[0];
+  if (target === undefined) return;
+  sql.exec(
+    `UPDATE member_invites SET uses = uses - 1, uses_allowed = MAX(uses_allowed - 1, 0) WHERE code = ?`,
+    target.code,
   );
 }
 
@@ -2294,12 +2393,13 @@ export function redeemMemberInvite(
     nowSec,
   );
   sql.exec(
-    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, invited_by)
-       VALUES (?, 'joined with an invite', ?, 'member', ?)
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, invited_by, via_code)
+       VALUES (?, 'joined with an invite', ?, 'member', ?, ?)
        ON CONFLICT(pubkey) DO NOTHING`,
     pubkey,
     nowSec,
     invite.created_by ?? owner,
+    code,
   );
   readmitFormerMember(sql, pubkey);
   return "joined";
@@ -2675,7 +2775,13 @@ export function memberKeys(
       `SELECT pubkey, removed_at, reason FROM former_members ORDER BY removed_at DESC`,
     )
     .toArray()
-    .map((r) => ({ pubkey: r.pubkey, removedAt: r.removed_at, deletesAt: r.removed_at + graceSec, reason: r.reason }));
+    // An erased account's mail is already gone, so its deadline is now.
+    .map((r) => ({
+      pubkey: r.pubkey,
+      removedAt: r.removed_at,
+      deletesAt: r.reason === "erased" ? r.removed_at : r.removed_at + graceSec,
+      reason: r.reason,
+    }));
   return { owner, members, removed };
 }
 
@@ -2721,11 +2827,16 @@ export function listMembers(
     role: admins.has(r.pubkey) ? ("admin" as const) : ("member" as const),
   }));
   const removed = sql
-    .exec<{ pubkey: string; removed_at: number }>(
-      `SELECT pubkey, removed_at FROM former_members ORDER BY removed_at DESC`,
+    .exec<{ pubkey: string; removed_at: number; reason: string }>(
+      `SELECT pubkey, removed_at, reason FROM former_members ORDER BY removed_at DESC`,
     )
     .toArray()
-    .map((r) => ({ pubkey: r.pubkey, removedAt: r.removed_at, deletesAt: r.removed_at + graceSec }));
+    // An erased account's mail is already gone, so its deadline is now.
+    .map((r) => ({
+      pubkey: r.pubkey,
+      removedAt: r.removed_at,
+      deletesAt: r.reason === "erased" ? r.removed_at : r.removed_at + graceSec,
+    }));
   return { members, removed };
 }
 
@@ -2747,6 +2858,32 @@ export interface FormerMemberSweep {
 // Per former member: one indexed range over `event_tags` for their `p`,
 // per partition, at most `limit` rows. A former member with no wraps left
 // is deleted, which ends the work for them. Called from the cron tick.
+// Gift wraps addressed to `pubkey` and to nobody else still entitled to
+// them (the owner, a current member), up to `limit` per partition. What
+// leaves with a person who leaves: the grace sweep below and eraseMember.
+function mailOnlyFor(sql: SqlStorage, pubkey: string, owner: string | null, limit: number): { id: string }[] {
+  return acrossScopes((scope) =>
+    sql
+      .exec<{ id: string }>(
+        `SELECT e.id AS id FROM event_tags t JOIN events e ON e.id = t.event_id
+          WHERE t.is_group = ? AND t.tag_name = 'p' AND t.tag_value = ? AND e.kind = ?
+            AND NOT EXISTS (
+              SELECT 1 FROM event_tags o
+               WHERE o.event_id = e.id AND o.tag_name = 'p' AND o.tag_value != ?
+                 AND (o.tag_value = ? OR o.tag_value IN (SELECT pubkey FROM allowed_pubkeys))
+            )
+          LIMIT ?`,
+        scope,
+        pubkey,
+        GIFT_WRAP_KIND,
+        pubkey,
+        owner ?? "",
+        limit,
+      )
+      .toArray(),
+  );
+}
+
 export function sweepFormerMembers(
   sql: SqlStorage,
   nowSec: number,
@@ -2767,26 +2904,7 @@ export function sweepFormerMembers(
   for (const { pubkey } of due) {
     const budget = limit - removed;
     if (budget <= 0) break;
-    const targets = acrossScopes((scope) =>
-      sql
-        .exec<{ id: string }>(
-          `SELECT e.id AS id FROM event_tags t JOIN events e ON e.id = t.event_id
-            WHERE t.is_group = ? AND t.tag_name = 'p' AND t.tag_value = ? AND e.kind = ?
-              AND NOT EXISTS (
-                SELECT 1 FROM event_tags o
-                 WHERE o.event_id = e.id AND o.tag_name = 'p' AND o.tag_value != ?
-                   AND (o.tag_value = ? OR o.tag_value IN (SELECT pubkey FROM allowed_pubkeys))
-              )
-            LIMIT ?`,
-          scope,
-          pubkey,
-          GIFT_WRAP_KIND,
-          pubkey,
-          owner ?? "",
-          budget,
-        )
-        .toArray(),
-    );
+    const targets = mailOnlyFor(sql, pubkey, owner, budget);
     const batch = targets.slice(0, budget);
     for (const target of batch) deleteEventRow(sql, target.id);
     removed += batch.length;

@@ -410,6 +410,11 @@ export const TABLES: readonly TableSpec[] = [
       // owner's, so every row has a parent. Removing someone re-parents
       // their invitees or removes them too (storage.ts removeMember).
       col("invited_by", "TEXT"),
+      // The member invite code they redeemed, if they came that way, so
+      // erasing their account (storage.ts eraseMember) gives the place
+      // back on that exact code. NULL for every other way in, and for
+      // members who joined before this column.
+      col("via_code", "TEXT"),
     ],
   },
   // The groups this relay hosts, one row each. NIP-29 leaves creation to the

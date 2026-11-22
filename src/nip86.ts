@@ -20,6 +20,7 @@ import {
   banPubkey,
   blockIp,
   approveJoinRequest,
+  eraseMember,
   mailTimes,
   memberKeys,
   deleteFcmToken,
@@ -192,6 +193,8 @@ export const SUPPORTED_METHODS = [
   "setstorage",
   "memberkeys",
   "mailtimes",
+  // bothy's own: a member deleting their own account.
+  "eraseme",
 ] as const;
 
 // The methods a MEMBER may call, not just the owner.
@@ -210,6 +213,7 @@ export const SUPPORTED_METHODS = [
 // codes within their own allowance and sees and revokes only their own
 // (memberInviteStanding). Owner and admins pass the same gate unlimited.
 export const MEMBER_CALLABLE_METHODS: readonly string[] = [
+  "eraseme",
   "mailtimes",
   "subscribepush",
   "unsubscribepush",
@@ -1055,6 +1059,20 @@ export function handleManagementCall(
         return err(`mailtimes takes an array of 1 to ${MAX_MAILTIMES_IDS} event ids, as 64-character hex`);
       }
       return { result: mailTimes(sql, signer, ids as string[]) };
+    }
+
+    // A member deleting their own account (storage.ts eraseMember): the
+    // membership ends, their devices are dropped, their mail and photo
+    // here are deleted at once, their place goes back to whoever invited
+    // them, and the people they invited stay, under that person. An admin
+    // stops being one. The owner cannot: the relay is theirs.
+    case "eraseme": {
+      const owner = getOwnerPubkey(sql, env);
+      if (signer === owner) {
+        return err("eraseme: the relay owner cannot erase themselves; the relay itself is your account here");
+      }
+      const deleted = eraseMember(sql, signer, owner, nowSec, maxGiftWraps(env));
+      return { result: { erased: true, messagesDeleted: deleted } };
     }
 
     case "unsubscribepush": {
