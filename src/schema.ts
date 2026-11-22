@@ -730,6 +730,16 @@ export const TABLES: readonly TableSpec[] = [
     ],
   },
   {
+    // "Removed on purpose" (storage.ts markRemovedOnPurpose): people the
+    // owner or an admin removed, so nip86.ts addmykey will not bring them
+    // back as someone's own key. Outlives the grace period, unlike
+    // `former_members`. Holds only the sha256 of the pubkey and when.
+    // Cleared by letting the person back in, by forgetremoval, and by the
+    // person's own eraseme.
+    name: "removal_marks",
+    columns: [col("hash", "TEXT PRIMARY KEY"), col("removed_at", "INTEGER NOT NULL")],
+  },
+  {
     // vaultchallenge nonces already spent by a vaultopen (src/vault.ts).
     // Issuing one writes nothing (it carries its own HMAC and expiry);
     // spending it writes this row, so it cannot be spent twice. Rows past
@@ -826,6 +836,17 @@ export const TABLES: readonly TableSpec[] = [
       // 'removed' by the owner or an admin. Room for a member erasing
       // their own account, which will write 'erased'.
       col("reason", "TEXT NOT NULL DEFAULT 'removed'"),
+      // Their `allowed_pubkeys` row as it was when they were removed, so
+      // allowpubkey during the grace ("Let back in") puts them back where
+      // they were in the tree, with their join date (storage.ts
+      // allowPubkey). NULL on rows written before these columns, and
+      // `member_allowed_at` NULL means there is nothing to restore.
+      col("member_reason", "TEXT"),
+      col("member_allowed_at", "INTEGER"),
+      col("member_source", "TEXT"),
+      col("member_invited_by", "TEXT"),
+      col("member_via_code", "TEXT"),
+      col("member_close", "INTEGER"),
     ],
   },
   {

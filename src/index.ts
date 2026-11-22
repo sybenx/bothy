@@ -22,6 +22,7 @@ import {
   type ManagementResponse,
 } from "./nip86";
 import { VAULT_NOT_FOUND } from "./vault";
+import { checkOwnKeyProof } from "./own-keys";
 import { nip11Response } from "./nip11";
 import { verifyClaimAuthEvent } from "./nip42";
 import { ownerReason, verifyNip98 } from "./nip98";
@@ -327,6 +328,13 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
       const reason = memberCallable ? NOT_A_MEMBER_REASON : adminOnlyReason(method!);
       return managementResponse({ error: reason }, 401);
     }
+  }
+
+  // addmykey's second signature, the other key's proof, is checked here
+  // like the first, before the Durable Object (src/own-keys.ts).
+  if (method === "addmykey") {
+    const refusal = checkOwnKeyProof(params, auth.pubkey, new URL(request.url).host, nowSec());
+    if (refusal !== null) return managementResponse({ error: refusal });
   }
 
   const result = await relayStub(env).manage(

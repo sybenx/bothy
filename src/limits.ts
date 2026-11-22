@@ -760,6 +760,21 @@ export function memberInviteLimits(env: Env): { perMember: number; depth: number
   return { perMember: Math.floor(perMember), depth: Math.floor(depth) };
 }
 
+// Own keys per member (nip86.ts addmykey): other keys of the same person,
+// e.g. the per-app children a Keykin account makes, let in with a proof
+// signed by both keys. They spend no invite place, so this is their own
+// cap. Ten is one per app with room to spare. OWN_KEYS_PER_MEMBER
+// overrides; "off" turns addmykey off.
+export const OWN_KEYS_PER_MEMBER_DEFAULT = 10;
+
+export function ownKeysPerMember(env: Env): number | null {
+  const cap = resolveLimit(env.OWN_KEYS_PER_MEMBER, OWN_KEYS_PER_MEMBER_DEFAULT);
+  return cap === null ? null : Math.floor(cap);
+}
+
+// How far the addmykey proof's created_at may be from now, either way.
+export const OWN_KEY_PROOF_MAX_AGE_SECONDS = 60;
+
 // Random bytes in a generated code: 128 bits, hex-encoded to 32
 // characters. The relay makes every member code itself, so unlike the
 // NIP-29 path (MIN_INVITE_CODE_LENGTH) there is no owner-chosen code to

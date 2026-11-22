@@ -1,5 +1,7 @@
 import { buildFilterQuery, compareEvents, expandFilter, type FilterQueryOptions } from "./filters";
 import { deleteVaultRowsOf } from "./vault";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 import {
   groupIdOf,
   GROUP_METADATA_KIND,
@@ -14,7 +16,12 @@ import {
   scopeOf,
   TOP_LEVEL_GROUP_ID,
 } from "./groups";
-import { CHAT_BACKLOG_SECONDS, CONVERSATION_IDLE_SECONDS, MAX_WRAP_RECIPIENTS_CHECKED } from "./limits";
+import {
+  CHAT_BACKLOG_SECONDS,
+  CONVERSATION_IDLE_SECONDS,
+  MAX_WRAP_RECIPIENTS_CHECKED,
+  MEMBER_REMOVAL_GRACE_SECONDS,
+} from "./limits";
 import {
   EVENT_BASE_ROW_COST,
   EVENT_BASE_ROW_COST_MEASURED,
@@ -1853,18 +1860,61 @@ export function allowPubkey(
   reason: string | null,
   nowSec: number,
   invitedBy: string | null = null,
-): void {
+  graceSec: number = MEMBER_REMOVAL_GRACE_SECONDS,
+): "unchanged" | "restored" | "added" {
+  // A current member: nothing changes, not their place in the tree, how
+  // they came in or when (an app calling allowpubkey for someone already
+  // in must not rewrite them).
+  if (isPubkeyAllowed(sql, pubkey)) return "unchanged";
+  // Removed and still in the grace ("Let back in"): their old row comes
+  // back as it was. The rest of the removal (devices, admin role) stays
+  // undone, and their invitees stay where removal put them.
+  const former = sql
+    .exec<{
+      removed_at: number;
+      reason: string;
+      member_reason: string | null;
+      member_allowed_at: number | null;
+      member_source: string | null;
+      member_invited_by: string | null;
+      member_via_code: string | null;
+      member_close: number | null;
+    }>(
+      `SELECT removed_at, reason, member_reason, member_allowed_at, member_source, member_invited_by,
+              member_via_code, member_close
+         FROM former_members WHERE pubkey = ?`,
+      pubkey,
+    )
+    .toArray()[0];
+  if (
+    former !== undefined &&
+    former.reason === "removed" &&
+    former.removed_at > nowSec - graceSec &&
+    former.member_allowed_at !== null
+  ) {
+    sql.exec(
+      `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, invited_by, via_code, close)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      pubkey,
+      former.member_reason,
+      former.member_allowed_at,
+      former.member_source ?? "owner",
+      former.member_invited_by,
+      former.member_via_code,
+      former.member_close ?? 1,
+    );
+    readmitFormerMember(sql, pubkey);
+    return "restored";
+  }
   sql.exec(
-    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, invited_by) VALUES (?, ?, ?, 'owner', ?)
-       ON CONFLICT(pubkey) DO UPDATE SET reason = excluded.reason, allowed_at = excluded.allowed_at,
-                                         source = 'owner',
-                                         invited_by = COALESCE(excluded.invited_by, invited_by)`,
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, invited_by) VALUES (?, ?, ?, 'owner', ?)`,
     pubkey,
     reason,
     nowSec,
     invitedBy,
   );
   readmitFormerMember(sql, pubkey);
+  return "added";
 }
 
 // ---------------------------------------------------------------------
@@ -2164,13 +2214,123 @@ export function removeMember(
     return [];
   }
   if (invitees === "keep") {
-    sql.exec(`UPDATE allowed_pubkeys SET invited_by = ? WHERE invited_by = ?`, newParent, pubkey);
-    unallowPubkey(sql, pubkey, nowSec);
-    return [pubkey];
+    // Their own keys (nip86.ts addmykey) are the same person and go with
+    // them whatever the choice; everyone else they or those keys invited
+    // stays, under `newParent`.
+    const people = [pubkey, ...ownKeysOf(sql, pubkey)];
+    const leaving = new Set(people);
+    for (const person of people) {
+      const children = sql
+        .exec<{ pubkey: string }>(`SELECT pubkey FROM allowed_pubkeys WHERE invited_by = ?`, person)
+        .toArray();
+      for (const child of children) {
+        if (leaving.has(child.pubkey)) continue;
+        sql.exec(`UPDATE allowed_pubkeys SET invited_by = ? WHERE pubkey = ?`, newParent, child.pubkey);
+      }
+    }
+    for (const person of people) unallowPubkey(sql, person, nowSec);
+    return people;
   }
   const order = invitedSubtree(sql, pubkey, owner);
   for (const member of order) unallowPubkey(sql, member, nowSec);
   return order;
+}
+
+// A member's own keys (nip86.ts addmykey, source 'own'), and their own
+// keys in turn, breadth first. Not `pubkey` itself.
+export function ownKeysOf(sql: SqlStorage, pubkey: string): string[] {
+  const seen = new Set<string>([pubkey]);
+  const order: string[] = [];
+  const queue = [pubkey];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    const keys = sql
+      .exec<{ pubkey: string }>(
+        `SELECT pubkey FROM allowed_pubkeys WHERE invited_by = ? AND source = 'own'`,
+        current,
+      )
+      .toArray();
+    for (const key of keys) {
+      if (seen.has(key.pubkey)) continue;
+      seen.add(key.pubkey);
+      order.push(key.pubkey);
+      queue.push(key.pubkey);
+    }
+  }
+  return order;
+}
+
+// ---------------------------------------------------------------------
+// "Removed on purpose" marks (schema.ts `removal_marks`): a pubkey the
+// owner or an admin removed, kept past the grace period so addmykey can
+// refuse to bring it back in. Only the sha256 of the pubkey and when.
+// Cleared when the person is let back in (readmitFormerMember), by the
+// owner's forgetremoval, and by the person's own eraseme.
+// ---------------------------------------------------------------------
+
+function pubkeyHash(pubkey: string): string {
+  return bytesToHex(sha256(hexToBytes(pubkey)));
+}
+
+export function markRemovedOnPurpose(sql: SqlStorage, pubkeys: string[], nowSec: number): void {
+  for (const pubkey of pubkeys) {
+    sql.exec(
+      `INSERT INTO removal_marks (hash, removed_at) VALUES (?, ?)
+         ON CONFLICT(hash) DO UPDATE SET removed_at = excluded.removed_at`,
+      pubkeyHash(pubkey),
+      nowSec,
+    );
+  }
+}
+
+export function isRemovedOnPurpose(sql: SqlStorage, pubkey: string): boolean {
+  return sql.exec(`SELECT 1 FROM removal_marks WHERE hash = ?`, pubkeyHash(pubkey)).toArray().length > 0;
+}
+
+// True if there was a mark.
+export function clearRemovalMark(sql: SqlStorage, pubkey: string): boolean {
+  const cursor = sql.exec(`DELETE FROM removal_marks WHERE hash = ?`, pubkeyHash(pubkey));
+  cursor.toArray();
+  return cursor.rowsWritten > 0;
+}
+
+export type AddOwnKeyOutcome = "added" | "already-member" | "banned" | "removed-on-purpose" | "too-many";
+
+// nip86.ts addmykey, after the Worker checked the child's proof: the
+// child joins as the member's own key, under them in the tree, with no
+// invite place spent. `cap` is limits.ts ownKeysPerMember.
+export function addOwnKey(
+  sql: SqlStorage,
+  member: string,
+  child: string,
+  nowSec: number,
+  cap: number,
+): AddOwnKeyOutcome {
+  if (isPubkeyAllowed(sql, child)) return "already-member";
+  if (isPubkeyBanned(sql, child)) return "banned";
+  if (isRemovedOnPurpose(sql, child)) return "removed-on-purpose";
+  const mine =
+    sql
+      .exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM allowed_pubkeys WHERE invited_by = ? AND source = 'own'`,
+        member,
+      )
+      .toArray()[0]?.n ?? 0;
+  if (mine >= cap) return "too-many";
+  // The same person, so the same location trust as the member.
+  const close =
+    sql.exec<{ close: number }>(`SELECT close FROM allowed_pubkeys WHERE pubkey = ?`, member).toArray()[0]?.close ?? 1;
+  sql.exec(
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, invited_by, via_code, close)
+       VALUES (?, 'their own key', ?, 'own', ?, NULL, ?)
+       ON CONFLICT(pubkey) DO NOTHING`,
+    child,
+    nowSec,
+    member,
+    close,
+  );
+  readmitFormerMember(sql, child);
+  return "added";
 }
 
 // Whether `pubkey` is somewhere below `ancestor` in the invite tree:
@@ -2217,8 +2377,17 @@ export function unallowPubkey(
   nowSec: number,
   reason: "removed" | "erased" = "removed",
 ): void {
-  const existed = sql.exec(`SELECT 1 FROM allowed_pubkeys WHERE pubkey = ?`, pubkey).toArray().length > 0;
-  if (!existed) return;
+  const row = sql
+    .exec<{
+      reason: string | null;
+      allowed_at: number;
+      source: string;
+      invited_by: string | null;
+      via_code: string | null;
+      close: number;
+    }>(`SELECT reason, allowed_at, source, invited_by, via_code, close FROM allowed_pubkeys WHERE pubkey = ?`, pubkey)
+    .toArray()[0];
+  if (row === undefined) return;
   sql.exec(`DELETE FROM allowed_pubkeys WHERE pubkey = ?`, pubkey);
   // An admin is a member first (schema.ts `admins`).
   sql.exec(`DELETE FROM admins WHERE pubkey = ?`, pubkey);
@@ -2227,11 +2396,22 @@ export function unallowPubkey(
   sql.exec(`DELETE FROM fcm_tokens WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM inbox_push WHERE pubkey = ?`, pubkey);
   sql.exec(
-    `INSERT INTO former_members (pubkey, removed_at, reason) VALUES (?, ?, ?)
-       ON CONFLICT(pubkey) DO UPDATE SET removed_at = excluded.removed_at, reason = excluded.reason`,
+    `INSERT INTO former_members (pubkey, removed_at, reason, member_reason, member_allowed_at, member_source,
+                                 member_invited_by, member_via_code, member_close)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(pubkey) DO UPDATE SET removed_at = excluded.removed_at, reason = excluded.reason,
+         member_reason = excluded.member_reason, member_allowed_at = excluded.member_allowed_at,
+         member_source = excluded.member_source, member_invited_by = excluded.member_invited_by,
+         member_via_code = excluded.member_via_code, member_close = excluded.member_close`,
     pubkey,
     nowSec,
     reason,
+    row.reason,
+    row.allowed_at,
+    row.source,
+    row.invited_by,
+    row.via_code,
+    row.close,
   );
 }
 
@@ -2261,13 +2441,20 @@ export function eraseMember(
   nowSec: number,
   mailLimit: number,
 ): number {
+  // Their own keys (addmykey) are the same person and go first, deepest
+  // last-in first-out, each erased like them.
+  let erasedOwn = 0;
+  for (const key of ownKeysOf(sql, pubkey).reverse()) {
+    erasedOwn += eraseMember(sql, key, owner, nowSec, mailLimit);
+  }
+  clearRemovalMark(sql, pubkey);
   const row = sql
-    .exec<{ invited_by: string | null; via_code: string | null }>(
-      `SELECT invited_by, via_code FROM allowed_pubkeys WHERE pubkey = ?`,
+    .exec<{ invited_by: string | null; via_code: string | null; source: string }>(
+      `SELECT invited_by, via_code, source FROM allowed_pubkeys WHERE pubkey = ?`,
       pubkey,
     )
     .toArray()[0];
-  if (row === undefined) return 0;
+  if (row === undefined) return erasedOwn;
   const inviter =
     row.invited_by !== null && row.invited_by !== pubkey && isPubkeyAllowed(sql, row.invited_by)
       ? row.invited_by
@@ -2275,7 +2462,8 @@ export function eraseMember(
   if (inviter !== null) {
     sql.exec(`UPDATE allowed_pubkeys SET invited_by = ? WHERE invited_by = ?`, inviter, pubkey);
   }
-  if (row.invited_by !== null) giveBackInvite(sql, row.invited_by, row.via_code);
+  // An own key took no invite place, so there is none to give back.
+  if (row.invited_by !== null && row.source !== "own") giveBackInvite(sql, row.invited_by, row.via_code);
   sql.exec(
     `UPDATE member_invites SET revoked_at = ?
       WHERE created_by = ? AND revoked_at IS NULL AND uses < uses_allowed AND expires_at > ?`,
@@ -2283,7 +2471,7 @@ export function eraseMember(
     pubkey,
     nowSec,
   );
-  let deleted = 0;
+  let deleted = erasedOwn;
   for (const { id } of mailOnlyFor(sql, pubkey, owner, mailLimit)) {
     deleteEventRow(sql, id);
     deleted++;
@@ -2372,6 +2560,8 @@ export function memberCount(sql: SqlStorage): number {
 // is answered.
 function readmitFormerMember(sql: SqlStorage, pubkey: string): void {
   sql.exec(`DELETE FROM former_members WHERE pubkey = ?`, pubkey);
+  // Letting someone back in undoes a removal on purpose (addmykey).
+  clearRemovalMark(sql, pubkey);
   sql.exec(`DELETE FROM join_requests WHERE pubkey = ?`, pubkey);
 }
 
@@ -2465,17 +2655,23 @@ export function inviteSlotsUsed(sql: SqlStorage, createdBy: string, nowSec: numb
 // Bounded by `cap` (the walk stops there) and guarded against a cycle.
 export function inviteDepth(sql: SqlStorage, pubkey: string, owner: string | null, cap: number): number {
   if (owner !== null && pubkey === owner) return 0;
+  // An own key (addmykey) stands at its member's depth: that hop adds no
+  // step. 64 hops at most, like isBelow.
   let depth = 1;
   let current = pubkey;
   const seen = new Set<string>([pubkey]);
-  while (depth < cap) {
-    const parent = sql
-      .exec<{ invited_by: string | null }>(`SELECT invited_by FROM allowed_pubkeys WHERE pubkey = ?`, current)
-      .toArray()[0]?.invited_by;
+  for (let hop = 0; depth < cap && hop < 64; hop++) {
+    const row = sql
+      .exec<{ invited_by: string | null; source: string }>(
+        `SELECT invited_by, source FROM allowed_pubkeys WHERE pubkey = ?`,
+        current,
+      )
+      .toArray()[0];
+    const parent = row?.invited_by;
     if (!parent || parent === owner || seen.has(parent) || !isPubkeyAllowed(sql, parent)) return depth;
     seen.add(parent);
     current = parent;
-    depth++;
+    if (row.source !== "own") depth++;
   }
   return depth;
 }

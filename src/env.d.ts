@@ -93,6 +93,9 @@ interface Env {
   // how many keys it may hold. A positive number.
   NETWORK_MAX_KEYS?: string;
   INVITES_PER_MEMBER?: string;
+  // Own keys a member may add (limits.ts ownKeysPerMember, nip86.ts
+  // addmykey). A positive number, or "off" to turn addmykey off.
+  OWN_KEYS_PER_MEMBER?: string;
   INVITE_DEPTH?: string;
   PHOTO_STORAGE_BYTES?: string;
   PHOTO_MAX_BYTES?: string;

@@ -27,6 +27,10 @@ import {
   homeMemberPubkeys,
   getRelaySettings,
   eraseMember,
+  addOwnKey,
+  clearRemovalMark,
+  markRemovedOnPurpose,
+  ownKeysOf,
   mailTimes,
   memberKeys,
   deleteFcmToken,
@@ -94,6 +98,7 @@ import {
   HOME_STATS_DAYS,
   HOME_STATS_WEEKS,
   photoStorageBytes,
+  ownKeysPerMember,
 } from "./limits";
 import { sqlitePhotoStore } from "./photos";
 import { deleteVaultRow, isVaultHash, listVaultRows, parseVaultPut, storeVaultRow } from "./vault";
@@ -225,6 +230,10 @@ export const SUPPORTED_METHODS = [
   "vaultdelete",
   "vaultchallenge",
   "vaultopen",
+  // bothy's own: a member letting in another key of their own, and the
+  // owner forgetting that someone was removed on purpose.
+  "addmykey",
+  "forgetremoval",
 ] as const;
 
 // The methods a MEMBER may call, not just the owner.
@@ -260,6 +269,7 @@ export const MEMBER_CALLABLE_METHODS: readonly string[] = [
   "vaultput",
   "vaultlist",
   "vaultdelete",
+  "addmykey",
 ];
 
 // The methods that take NO signature, an exception to NIP-86's NIP-98
@@ -735,7 +745,8 @@ export function handleManagementCall(
       // Nobody but the owner removes an admin, directly or as part of a
       // subtree: admins are the owner's to give and take away.
       if (signer !== owner) {
-        const affected = choice === "remove" ? invitedSubtree(sql, pubkey, owner) : [pubkey];
+        const affected =
+          choice === "remove" ? invitedSubtree(sql, pubkey, owner) : [pubkey, ...ownKeysOf(sql, pubkey)];
         if (affected.some((member) => isAdmin(sql, member))) {
           return err(
             affected[0] !== undefined && isAdmin(sql, affected[0])
@@ -744,10 +755,19 @@ export function handleManagementCall(
           );
         }
       }
+      // Their own keys (addmykey) leave with them and are not "people they
+      // invited".
       const invited = sql
-        .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM allowed_pubkeys WHERE invited_by = ?`, pubkey)
+        .exec<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM allowed_pubkeys WHERE invited_by = ? AND source != 'own'`,
+          pubkey,
+        )
         .toArray()[0]?.n ?? 0;
       const removed = removeMember(sql, pubkey, owner, choice, nowSec, newParent);
+      // The owner or an admin removing someone is on purpose: addmykey will
+      // not bring any of these keys back until they are let back in
+      // (storage.ts markRemovedOnPurpose).
+      if (!byMember) markRemovedOnPurpose(sql, removed, nowSec);
       if (removed.length === 0 || invited === 0) return { result: true };
       if (choice === "remove") {
         const others = removed.length - 1;
@@ -1240,6 +1260,40 @@ export function handleManagementCall(
       if (!isVaultHash(hash)) return err("vaultdelete: the parameter must be the row's hash");
       deleteVaultRow(sql, hash, signer);
       return { result: true };
+    }
+
+    // Another key of the caller's own (src/own-keys.ts). The Worker has
+    // checked the proof signed by that key; this decides whether it may
+    // join: not a member already, not banned, not removed on purpose, and
+    // within limits.ts ownKeysPerMember. It joins under the caller, at the
+    // caller's depth, spending no invite place.
+    case "addmykey": {
+      const cap = ownKeysPerMember(env);
+      if (cap === null) return err("addmykey: this home does not take own keys");
+      const child = pubkeyParam(params, 0);
+      if (child === null) return err("addmykey: it takes [your other key, as npub or hex, and its proof event]");
+      if (child === signer) return err("addmykey: that is the key you are signing with");
+      switch (addOwnKey(sql, signer, child, nowSec, cap)) {
+        case "added":
+          return { result: true };
+        case "already-member":
+          return err("addmykey: that key is already a member here");
+        case "banned":
+          return err("addmykey: that key is banned here");
+        case "removed-on-purpose":
+          return err("addmykey: that account was removed from this home. Ask the owner or an admin to let it back in.");
+        case "too-many":
+          return err(`addmykey: at most ${cap} own keys each`);
+      }
+    }
+
+    // The owner forgetting that someone was removed on purpose, so their
+    // key can come back through addmykey. Letting them back in does the
+    // same.
+    case "forgetremoval": {
+      const pubkey = pubkeyParam(params, 0);
+      if (pubkey === null) return err("forgetremoval takes a pubkey, as npub or 64-character hex");
+      return { result: { forgotten: clearRemovalMark(sql, pubkey) } };
     }
 
     case "homemembers": {
