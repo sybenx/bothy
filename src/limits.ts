@@ -692,6 +692,16 @@ export const HOME_STATS_DAYS = 14;
 export const HOME_STATS_WEEKS = 8;
 export const HOME_STATS_DAYS_KEPT = 30;
 
+// Who may see who else is in the home (nip86.ts homemembers). "members"
+// (the default): every member sees the list, as in a group. "hidden": only
+// the owner and admins do; members get an empty list and a note. Anything
+// else reads as the default.
+export type MemberListVisibility = "members" | "hidden";
+
+export function memberListVisibility(env: Env): MemberListVisibility {
+  return env.MEMBER_LIST?.trim().toLowerCase() === "hidden" ? "hidden" : "members";
+}
+
 // Members' own invites (nip86.ts createinvite from a member). The owner
 // and admins are not limited; a member may let in INVITES_PER_MEMBER
 // people, and only while they are fewer than INVITE_DEPTH steps from the

@@ -20,6 +20,7 @@ import {
   banPubkey,
   blockIp,
   approveJoinRequest,
+  homeMemberPubkeys,
   getRelaySettings,
   eraseMember,
   mailTimes,
@@ -85,6 +86,7 @@ import {
   mailStorageBytes,
   MEMBER_REMOVAL_GRACE_SECONDS,
   memberInviteLimits,
+  memberListVisibility,
   HOME_STATS_DAYS,
   HOME_STATS_WEEKS,
   photoStorageBytes,
@@ -204,6 +206,8 @@ export const SUPPORTED_METHODS = [
   "mymailbox",
   // bothy's own: a member deleting their own account.
   "eraseme",
+  // bothy's own: who else is in the home, for any member to see.
+  "homemembers",
 ] as const;
 
 // The methods a MEMBER may call, not just the owner.
@@ -223,6 +227,7 @@ export const SUPPORTED_METHODS = [
 // (memberInviteStanding). Owner and admins pass the same gate unlimited.
 export const MEMBER_CALLABLE_METHODS: readonly string[] = [
   "eraseme",
+  "homemembers",
   "mymailbox",
   "mailtimes",
   "subscribepush",
@@ -309,6 +314,10 @@ export function supportedMethods(env: Env): string[] {
 export const SELF_BLOCK_CONFIRMATION = "yes, block my own address";
 
 const HEX_ID_RE = /^[0-9a-f]{64}$/;
+
+// What a member hears from homemembers when the owner keeps the list
+// private (MEMBER_LIST=hidden). Stable: apps may show it as it is.
+export const MEMBER_LIST_HIDDEN_NOTE = "The owner keeps this home's member list private.";
 
 // Ids one mailtimes call may ask about: a sync's worth.
 export const MAX_MAILTIMES_IDS = 500;
@@ -1112,6 +1121,20 @@ export function handleManagementCall(
     // against each cap (limits.ts mailBytesPerMember, mailStorageBytes),
     // so an app can say "your mailbox is 80% full" before a sender hears
     // it is full. Limits are null when off.
+    // Who is in the home: every member and the owner, as hex pubkeys, and
+    // nothing else (no inviter, dates, roles or removed list; listmembers
+    // keeps those for the owner and admins). With MEMBER_LIST=hidden a
+    // plain member gets an empty list and MEMBER_LIST_HIDDEN_NOTE; the
+    // owner and admins still get it.
+    case "homemembers": {
+      const owner = getOwnerPubkey(sql, env);
+      const role = roleOf(sql, signer, owner);
+      if (memberListVisibility(env) === "hidden" && role !== "owner" && role !== "admin") {
+        return { result: { members: [], hidden: true, note: MEMBER_LIST_HIDDEN_NOTE } };
+      }
+      return { result: { members: homeMemberPubkeys(sql, owner) } };
+    }
+
     case "mymailbox": {
       const own = mailUsage(sql, signer);
       const home = mailUsage(sql, null);

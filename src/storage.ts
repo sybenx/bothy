@@ -2911,6 +2911,19 @@ export function mailTimes(sql: SqlStorage, recipient: string, ids: string[]): Re
   return Object.fromEntries(rows.map((r) => [r.id, r.ingested_at]));
 }
 
+// Who is in the home, for any member to see (nip86.ts homemembers): every
+// member and the owner, as hex pubkeys, sorted. Nothing else about them.
+export function homeMemberPubkeys(sql: SqlStorage, owner: string | null): string[] {
+  const pubkeys = new Set(
+    sql
+      .exec<{ pubkey: string }>(`SELECT pubkey FROM allowed_pubkeys`)
+      .toArray()
+      .map((r) => r.pubkey),
+  );
+  if (owner !== null) pubkeys.add(owner);
+  return [...pubkeys].sort();
+}
+
 export function listMembers(
   sql: SqlStorage,
   graceSec: number,

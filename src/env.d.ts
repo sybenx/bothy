@@ -79,6 +79,9 @@ interface Env {
   // number, or "off" to remove that cap.
   MAIL_STORAGE_BYTES?: string;
   MAIL_BYTES_PER_MEMBER?: string;
+  // Whether members can see who else is in the home (limits.ts
+  // memberListVisibility): "members" (default) or "hidden".
+  MEMBER_LIST?: string;
   INVITES_PER_MEMBER?: string;
   INVITE_DEPTH?: string;
   PHOTO_STORAGE_BYTES?: string;
