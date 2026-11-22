@@ -256,6 +256,7 @@ describe("a member's own rows", () => {
     expect(list[0]).toMatchObject({
       hash: passkey.hash,
       credentialId: toBase64url(passkey.credentialId),
+      publicKey: passkey.publicKey,
       alg: COSE_ES256,
       label: "Google Password Manager",
       lastUsedAt: null,

@@ -311,3 +311,50 @@ describe("allowpubkey keeps what is already there", () => {
     });
   });
 });
+
+describe("myinvitees", () => {
+  type Listing = { members: { pubkey: string; invitedBy: string; source: string }[]; removed: { pubkey: string }[] };
+  const listing = async (who: Keypair) => (await as(who, "myinvitees")).result as Listing;
+  const pubkeys = (rows: { pubkey: string }[]) => rows.map((r) => r.pubkey).sort();
+
+  it("lists the caller's own branch at any depth, own keys included, with listmembers' row shape", async () => {
+    const alice = await newMember();
+    const bob = await newMember(alice);
+    const carol = await newMember(bob);
+    const { child } = await addKey(alice);
+    const outsider = await newMember();
+
+    const mine = await listing(alice);
+    expect(pubkeys(mine.members)).toEqual([bob.pubkeyHex, carol.pubkeyHex, child.pubkeyHex].sort());
+    expect(pubkeys(mine.members)).not.toContain(outsider.pubkeyHex);
+    expect(pubkeys(mine.members)).not.toContain(alice.pubkeyHex);
+    const all = ((await callManagement("listmembers")).result as Listing).members;
+    expect(mine.members.find((r) => r.pubkey === carol.pubkeyHex)).toEqual(
+      all.find((r) => r.pubkey === carol.pubkeyHex),
+    );
+    expect(pubkeys((await listing(bob)).members)).toEqual([carol.pubkeyHex]);
+    expect((await listing(carol)).members).toEqual([]);
+  });
+
+  it("includes people removed from the branch while they are in the grace", async () => {
+    const alice = await newMember();
+    const bob = await newMember(alice);
+    const carol = await newMember(bob);
+    await callManagement("unallowpubkey", [bob.pubkeyHex, { invitees: "remove" }]);
+    const mine = await listing(alice);
+    expect(mine.members).toEqual([]);
+    expect(pubkeys(mine.removed)).toEqual([bob.pubkeyHex, carol.pubkeyHex].sort());
+    // Not in anyone else's branch.
+    expect((await listing(await newMember())).removed).toEqual([]);
+  });
+
+  it("gives the owner and admins their own branch; strangers get 401", async () => {
+    const alice = await newMember();
+    const owners = (await callManagement("myinvitees")).result as Listing;
+    expect(pubkeys(owners.members)).toContain(alice.pubkeyHex);
+    await callManagement("addadmin", [alice.pubkeyHex]);
+    expect((await listing(alice)).members).toEqual([]);
+    const reply = await as(randomKeypair(), "myinvitees");
+    expect([reply.status, reply.error]).toEqual([401, NOT_A_MEMBER_REASON]);
+  });
+});

@@ -27,6 +27,7 @@ import {
   homeMemberPubkeys,
   getRelaySettings,
   eraseMember,
+  listInvitees,
   addOwnKey,
   clearRemovalMark,
   markRemovedOnPurpose,
@@ -234,6 +235,8 @@ export const SUPPORTED_METHODS = [
   // owner forgetting that someone was removed on purpose.
   "addmykey",
   "forgetremoval",
+  // bothy's own: listmembers' rows for the caller's own branch.
+  "myinvitees",
 ] as const;
 
 // The methods a MEMBER may call, not just the owner.
@@ -270,6 +273,7 @@ export const MEMBER_CALLABLE_METHODS: readonly string[] = [
   "vaultlist",
   "vaultdelete",
   "addmykey",
+  "myinvitees",
 ];
 
 // The methods that take NO signature, an exception to NIP-86's NIP-98
@@ -1013,6 +1017,19 @@ export function handleManagementCall(
 
     // Members, and the removed ones whose mail has not been deleted yet.
     // Letting a removed one back in is allowpubkey, which stops the clock.
+    // listmembers for the caller's own branch (storage.ts listInvitees):
+    // the same row shape, for any member's "People you invited".
+    case "myinvitees":
+      return {
+        result: listInvitees(
+          sql,
+          MEMBER_REMOVAL_GRACE_SECONDS,
+          getOwnerPubkey(sql, env) ?? signer,
+          signer,
+          nowSec,
+        ),
+      };
+
     case "listmembers":
       return { result: listMembers(sql, MEMBER_REMOVAL_GRACE_SECONDS, getOwnerPubkey(sql, env) ?? signer) };
 

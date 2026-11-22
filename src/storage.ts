@@ -3319,6 +3319,52 @@ export function listMembers(
   return { members, removed };
 }
 
+// nip86.ts myinvitees: listMembers' rows for `caller`'s own branch only.
+// Members whose invite chain leads back to the caller, at any depth (their
+// own keys included), and people removed from that branch who are still
+// in the grace. The caller is not listed. For the owner that is everyone,
+// as listmembers shows it. Removed people are placed by the inviter saved
+// when they were removed (v0.30 on); someone removed earlier, or erased,
+// is not listed.
+export function listInvitees(
+  sql: SqlStorage,
+  graceSec: number,
+  owner: string,
+  caller: string,
+  nowSec: number,
+): { members: MemberDetails[]; removed: RemovedMember[] } {
+  const all = listMembers(sql, graceSec, owner);
+  if (caller === owner) {
+    return { members: all.members, removed: all.removed.filter((r) => r.deletesAt > nowSec) };
+  }
+  const branch = new Set(invitedSubtree(sql, caller, owner));
+  branch.delete(caller);
+  const formers = sql
+    .exec<{ pubkey: string; member_invited_by: string | null; removed_at: number; reason: string }>(
+      `SELECT pubkey, member_invited_by, removed_at, reason FROM former_members`,
+    )
+    .toArray()
+    .filter((r) => r.reason === "removed" && r.removed_at + graceSec > nowSec && r.member_invited_by !== null);
+  // Removed with their invitees ("remove"), a removed person's inviter can
+  // itself be a removed person: grow the set until it stops changing.
+  const reach = new Set<string>([caller, ...branch]);
+  const removedHere = new Set<string>();
+  for (let changed = true; changed; ) {
+    changed = false;
+    for (const r of formers) {
+      if (!removedHere.has(r.pubkey) && reach.has(r.member_invited_by!)) {
+        removedHere.add(r.pubkey);
+        reach.add(r.pubkey);
+        changed = true;
+      }
+    }
+  }
+  return {
+    members: all.members.filter((m) => branch.has(m.pubkey)),
+    removed: all.removed.filter((r) => removedHere.has(r.pubkey)),
+  };
+}
+
 // listMembers' activity fields: one query per field over everyone listed
 // (members and removed members), not one per person. Each table has one
 // row per pubkey, or a few per pubkey for push devices.

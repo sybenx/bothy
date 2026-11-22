@@ -524,6 +524,9 @@ export function storeVaultRow(
 export interface VaultListEntry {
   hash: string;
   credentialId: string;
+  // SPKI, base64url: lets a phone that restored re-lock with one passkey
+  // get instead of making a new passkey.
+  publicKey: string;
   alg: number;
   label: string | null;
   addedAt: number;
@@ -537,13 +540,14 @@ export function listVaultRows(sql: SqlStorage, signer: string): VaultListEntry[]
     .exec<{
       hash: string;
       credential_id: string;
+      public_key: string;
       alg: number;
       label: string | null;
       added_at: number;
       updated_at: number;
       last_used_at: number | null;
     }>(
-      `SELECT hash, credential_id, alg, label, added_at, updated_at, last_used_at FROM vault
+      `SELECT hash, credential_id, public_key, alg, label, added_at, updated_at, last_used_at FROM vault
         WHERE pubkey = ? ORDER BY added_at ASC, hash ASC`,
       signer,
     )
@@ -551,6 +555,7 @@ export function listVaultRows(sql: SqlStorage, signer: string): VaultListEntry[]
     .map((r) => ({
       hash: r.hash,
       credentialId: r.credential_id,
+      publicKey: r.public_key,
       alg: r.alg,
       label: r.label,
       addedAt: r.added_at,
