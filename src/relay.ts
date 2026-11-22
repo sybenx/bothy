@@ -31,6 +31,9 @@ import {
   MAX_REQUEST_JOINS_PER_IP_PER_WINDOW,
   REQUEST_JOIN_RATE_LIMIT_WINDOW_MS,
   MAX_VAULT_CALLS_PER_IP_PER_WINDOW,
+  MAX_SIGNALS_PER_SENDER_PER_WINDOW,
+  SIGNAL_MAX_BYTES,
+  SIGNAL_RATE_LIMIT_WINDOW_MS,
   MAX_VAULT_OPENS_PER_HASH_PER_WINDOW,
   VAULT_HASH_RATE_LIMIT_WINDOW_MS,
   VAULT_IP_RATE_LIMIT_WINDOW_MS,
@@ -117,6 +120,7 @@ import {
   isEphemeralKind,
   type NostrEvent,
   pTagValues,
+  SIGNAL_KIND,
   VANISH_KIND,
 } from "./nostr";
 import {
@@ -1377,6 +1381,12 @@ export class Relay extends DurableObject<Env> {
       this.handleJoin(ws, event);
       return;
     }
+    // Sealed signals: signed by a throwaway key like a gift wrap, so the
+    // writer gate cannot judge them; the sender's AUTH is the authority.
+    if (event.kind === SIGNAL_KIND) {
+      this.handleSignal(ws, event);
+      return;
+    }
 
     // Authorization before id/signature validity: schnorr is the most
     // expensive per-event step (validate.ts verifySignature), and a refused
@@ -1493,6 +1503,71 @@ export class Relay extends DurableObject<Env> {
     // it.
     this.acceptEvent(ws, sql, event, event.pubkey === owner, recipients);
   }
+
+  // A sealed signal (nostr.ts SIGNAL_KIND): typing, seen, call setup.
+  // From a connection AUTHed as the owner or a member, p-tagged to the
+  // owner or a member. NEVER stored, never pushed, never on the live feed:
+  // it goes only to the recipient's own open, AUTHed subscriptions that
+  // ask for kind 21059 addressed to them, and is gone if they have none.
+  private handleSignal(ws: WebSocket, event: NostrEvent): void {
+    const sql = this.sql;
+    const owner = getOwnerPubkey(sql, this.env);
+    const sender = getState(ws).authedPubkey;
+    if (owner === null || sender === undefined || (sender !== owner && !isMember(sql, sender))) {
+      ok(ws, event.id, false, "restricted: signals are for this home's members; authenticate first");
+      return;
+    }
+    if (isAnyGroupEvent(event)) {
+      ok(ws, event.id, false, "invalid: a signal is addressed to one person and cannot carry a group tag");
+      return;
+    }
+    if (JSON.stringify(event).length > SIGNAL_MAX_BYTES) {
+      ok(ws, event.id, false, `invalid: a signal can be at most ${SIGNAL_MAX_BYTES} bytes`);
+      return;
+    }
+    if (isCreatedAtTooFarInFuture(event, nowSeconds())) {
+      ok(ws, event.id, false, "invalid: created_at is too far in the future");
+      return;
+    }
+    const named = [...new Set(pTagValues(event.tags))];
+    const recipients = new Set(
+      named
+        .filter((pubkey) => pubkey !== owner)
+        .slice(0, MAX_WRAP_RECIPIENTS_CHECKED)
+        .filter((pubkey) => isMember(sql, pubkey)),
+    );
+    if (named.includes(owner)) recipients.add(owner);
+    if (recipients.size === 0) {
+      ok(ws, event.id, false, "restricted: signal is not addressed to this relay's owner or one of its members");
+      return;
+    }
+    if (this.windowLimited(this.signalRateLimits, sender, SIGNAL_RATE_LIMIT_WINDOW_MS, MAX_SIGNALS_PER_SENDER_PER_WINDOW)) {
+      ok(ws, event.id, false, "rate-limited: too many signals, slow down");
+      return;
+    }
+    if (!idMatchesContent(event)) {
+      ok(ws, event.id, false, "invalid: id does not match the hash of its contents");
+      return;
+    }
+    if (!verifySignature(event)) {
+      ok(ws, event.id, false, "invalid: signature verification failed");
+      return;
+    }
+    ok(ws, event.id, true, "");
+    for (const other of this.ctx.getWebSockets()) {
+      if (this.ctx.getTags(other).includes(LIVE_FEED_TAG)) continue;
+      const state = getState(other);
+      const authed = state.authedPubkey;
+      if (authed === undefined || !recipients.has(authed)) continue;
+      for (const [subId, filters] of Object.entries(state.subs)) {
+        const own = filters.filter((f) => f.kinds?.includes(SIGNAL_KIND) && readsOnlyOwnMail(f, authed));
+        if (own.length > 0 && matchesAnyFilter(event, own)) send(other, ["EVENT", subId, event]);
+      }
+    }
+  }
+
+  // Per authenticated sender (limits.ts MAX_SIGNALS_PER_SENDER_PER_WINDOW).
+  private signalRateLimits = new Map<string, { windowStart: number; count: number }>();
 
   // NIP-29 kind-9021 join request. The decision is nip29.ts
   // handleJoinRequest; this is the wire-level work before any invite code

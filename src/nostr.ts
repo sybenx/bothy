@@ -65,6 +65,12 @@ export function writeRelaysFrom(tags: string[][]): string[] {
 // authorization for this kind use the `p` tag, not `pubkey`.
 export const GIFT_WRAP_KIND = 1059;
 
+// bothy's sealed signal: a gift wrap of the same shape (a `p` tag to the
+// recipient) in the ephemeral range, for typing, seen receipts and call
+// setup. Never stored; delivered live to the recipient only (relay.ts
+// handleSignal).
+export const SIGNAL_KIND = 21059;
+
 // NIP-62 (nips/62.md) Request to Vanish.
 export const VANISH_KIND = 62;
 

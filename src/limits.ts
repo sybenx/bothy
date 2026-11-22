@@ -79,6 +79,15 @@ export function maxEventBytes(env: Env): number | null {
 export const GIFT_WRAP_RATE_LIMIT_WINDOW_MS = 60_000;
 export const MAX_GIFT_WRAPS_PER_IP_PER_WINDOW = 5;
 
+// Sealed signals (kind 21059, relay.ts handleSignal): typing, seen
+// receipts and call setup. Never stored, so they cost no rows; this
+// bounds the fan-out work. Counted per authenticated sender, apart from
+// the gift wrap limit above: 120 a minute is typing every few seconds plus
+// seen receipts in a 20-person group. Each is at most 2KB on the wire.
+export const SIGNAL_RATE_LIMIT_WINDOW_MS = 60_000;
+export const MAX_SIGNALS_PER_SENDER_PER_WINDOW = 120;
+export const SIGNAL_MAX_BYTES = 2048;
+
 // ---------------------------------------------------------------------
 // NIP-29 invites (src/nip29.ts). An invite code is a bearer token: the
 // relay cannot authenticate whoever presents it (the invitee may have no
