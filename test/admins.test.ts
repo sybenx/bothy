@@ -104,7 +104,7 @@ describe("making and unmaking admins", () => {
   it("removeadmin takes the role and leaves the membership", async () => {
     const admin = await newAdmin();
     expect((await callManagement("removeadmin", [admin.pubkeyHex])).result).toBe(true);
-    expect((await as(admin, "myrole")).result).toEqual({ role: "member" });
+    expect((await as(admin, "myrole")).result).toEqual({ role: "member", close: true });
     expect((await as(admin, "listmembers")).error).toBe(adminOnlyReason("listmembers"));
     expect((await callManagement("removeadmin", [admin.pubkeyHex])).error).toBe(
       "removeadmin: that pubkey is not an admin",
@@ -115,7 +115,7 @@ describe("making and unmaking admins", () => {
     const admin = await newAdmin();
     await callManagement("unallowpubkey", [admin.pubkeyHex]);
     expect((await callManagement("listadmins")).result).toEqual([]);
-    expect((await as(admin, "myrole")).result).toEqual({ role: "none" });
+    expect((await as(admin, "myrole")).result).toEqual({ role: "none", close: false });
   });
 
   it("keeps an existing member's membership as it was", async () => {
@@ -280,10 +280,10 @@ describe("myrole", () => {
   it("tells any signer what they are here", async () => {
     const admin = await newAdmin();
     const member = await newMember();
-    expect((await callManagement("myrole")).result).toEqual({ role: "owner" });
-    expect((await as(admin, "myrole")).result).toEqual({ role: "admin" });
-    expect((await as(member, "myrole")).result).toEqual({ role: "member" });
-    expect((await as(randomKeypair(), "myrole")).result).toEqual({ role: "none" });
+    expect((await callManagement("myrole")).result).toEqual({ role: "owner", close: true });
+    expect((await as(admin, "myrole")).result).toEqual({ role: "admin", close: true });
+    expect((await as(member, "myrole")).result).toEqual({ role: "member", close: true });
+    expect((await as(randomKeypair(), "myrole")).result).toEqual({ role: "none", close: false });
   });
 
   it("does not change the member methods' refusal", async () => {

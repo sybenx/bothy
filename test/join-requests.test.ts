@@ -276,6 +276,7 @@ describe("answering a request", () => {
         joinedAt: expect.any(Number),
         source: "request",
         role: "member",
+        close: true,
       },
     ]);
   });

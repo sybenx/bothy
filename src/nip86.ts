@@ -20,6 +20,10 @@ import {
   banPubkey,
   blockIp,
   approveJoinRequest,
+  areClose,
+  isBelow,
+  isClose,
+  setClose,
   homeMemberPubkeys,
   getRelaySettings,
   eraseMember,
@@ -208,6 +212,10 @@ export const SUPPORTED_METHODS = [
   "eraseme",
   // bothy's own: who else is in the home, for any member to see.
   "homemembers",
+  // bothy's own: location trust, set by the owner and admins and asked
+  // about by members.
+  "setclose",
+  "areclose",
 ] as const;
 
 // The methods a MEMBER may call, not just the owner.
@@ -226,6 +234,8 @@ export const SUPPORTED_METHODS = [
 // codes within their own allowance and sees and revokes only their own
 // (memberInviteStanding). Owner and admins pass the same gate unlimited.
 export const MEMBER_CALLABLE_METHODS: readonly string[] = [
+  "unallowpubkey",
+  "areclose",
   "eraseme",
   "homemembers",
   "mymailbox",
@@ -268,14 +278,17 @@ export const ANYONE_CALLABLE_METHODS: readonly string[] = ["redeeminvite", "requ
 //
 // The invite methods are not here: members may call them too
 // (MEMBER_CALLABLE_METHODS), and admins pass that gate as well.
+//
+// unallowpubkey is not here: members may call it too, within their own
+// subtree (MEMBER_CALLABLE_METHODS), and admins pass that gate as well.
 export const ADMIN_CALLABLE_METHODS: readonly string[] = [
+  "setclose",
   "homestats",
   "listjoinrequests",
   "approvejoin",
   "declinejoin",
   "listmembers",
   "allowpubkey",
-  "unallowpubkey",
 ];
 
 // The 401 a member or stranger gets for an admin method (index.ts).
@@ -315,12 +328,21 @@ export const SELF_BLOCK_CONFIRMATION = "yes, block my own address";
 
 const HEX_ID_RE = /^[0-9a-f]{64}$/;
 
+// What a plain member hears from unallowpubkey outside their reach.
+// Stable: apps may show them as they are.
+export const REMOVE_OUTSIDE_SUBTREE_MESSAGE =
+  "unallowpubkey: you can remove only people you invited, or people they invited";
+export const REMOVE_SELF_MESSAGE = "unallowpubkey: to leave this home yourself, use eraseme";
+
 // What a member hears from homemembers when the owner keeps the list
 // private (MEMBER_LIST=hidden). Stable: apps may show it as it is.
 export const MEMBER_LIST_HIDDEN_NOTE = "The owner keeps this home's member list private.";
 
 // Ids one mailtimes call may ask about: a sync's worth.
 export const MAX_MAILTIMES_IDS = 500;
+
+// Pubkeys one areclose call may ask about.
+export const MAX_ARECLOSE_PUBKEYS = 500;
 
 // A member who is neither the owner nor an admin: the caller whose view
 // of invites is limited to their own.
@@ -680,8 +702,19 @@ export function handleManagementCall(
         );
       }
       const owner = getOwnerPubkey(sql, env) ?? signer;
-      // An admin cannot remove an admin, directly or as part of a subtree:
-      // admins are the owner's to give and take away.
+      // A plain member may remove only people below them in the invite
+      // tree (people they invited, and theirs), never themselves (that is
+      // eraseme), and "keep" hangs the invitees under the member. The
+      // owner and admins act on the whole tree, and "keep" hangs them
+      // under the owner.
+      const byMember = roleOf(sql, signer, owner) === "member";
+      if (byMember) {
+        if (pubkey === signer) return err(REMOVE_SELF_MESSAGE);
+        if (!isBelow(sql, signer, pubkey, owner)) return err(REMOVE_OUTSIDE_SUBTREE_MESSAGE);
+      }
+      const newParent = byMember ? signer : owner;
+      // Nobody but the owner removes an admin, directly or as part of a
+      // subtree: admins are the owner's to give and take away.
       if (signer !== owner) {
         const affected = choice === "remove" ? invitedSubtree(sql, pubkey, owner) : [pubkey];
         if (affected.some((member) => isAdmin(sql, member))) {
@@ -695,7 +728,7 @@ export function handleManagementCall(
       const invited = sql
         .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM allowed_pubkeys WHERE invited_by = ?`, pubkey)
         .toArray()[0]?.n ?? 0;
-      const removed = removeMember(sql, pubkey, owner, choice, nowSec);
+      const removed = removeMember(sql, pubkey, owner, choice, nowSec, newParent);
       if (removed.length === 0 || invited === 0) return { result: true };
       if (choice === "remove") {
         const others = removed.length - 1;
@@ -704,12 +737,13 @@ export function handleManagementCall(
           error: `Also removed ${others === 1 ? "1 person" : `${others} people`} they invited, directly or through someone they invited.`,
         };
       }
+      const by = newParent === signer ? "you" : "the owner";
       return {
         result: true,
         error:
           invited === 1
-            ? "The 1 person they invited is still a member, now listed as invited by you."
-            : `The ${invited} people they invited are still members, now listed as invited by you.`,
+            ? `The 1 person they invited is still a member, now listed as invited by ${by}.`
+            : `The ${invited} people they invited are still members, now listed as invited by ${by}.`,
       };
     }
 
@@ -969,8 +1003,45 @@ export function handleManagementCall(
     case "listadmins":
       return { result: listAdmins(sql) };
 
-    case "myrole":
-      return { result: { role: roleOf(sql, signer, getOwnerPubkey(sql, env)) } };
+    // The caller's role, and whether they have location trust (close).
+    case "myrole": {
+      const owner = getOwnerPubkey(sql, env);
+      return { result: { role: roleOf(sql, signer, owner), close: isClose(sql, signer, owner) } };
+    }
+
+    // Location trust: the owner and admins turn it on or off for any
+    // member (schema.ts `allowed_pubkeys.close`). The owner always has it.
+    case "setclose": {
+      const pubkey = pubkeyParam(params, 0);
+      if (pubkey === null || typeof params[1] !== "boolean") {
+        return err("setclose takes a pubkey, as npub or hex, and true or false");
+      }
+      switch (setClose(sql, pubkey, params[1], getOwnerPubkey(sql, env))) {
+        case "ok":
+          return { result: true };
+        case "owner":
+          return err("setclose: the owner always sees where photos were taken");
+        case "not-member":
+          return err("setclose: that pubkey is not a member of this home");
+      }
+    }
+
+    // For each named pubkey, whether it and the caller may see each
+    // other's photo locations: true only when both are close, so a caller
+    // without the flag gets all false. Works whatever MEMBER_LIST says,
+    // since the caller names them.
+    case "areclose": {
+      const pubkeys = params[0];
+      if (
+        !Array.isArray(pubkeys) ||
+        pubkeys.length === 0 ||
+        pubkeys.length > MAX_ARECLOSE_PUBKEYS ||
+        !pubkeys.every((p) => typeof p === "string" && HEX_ID_RE.test(p))
+      ) {
+        return err(`areclose takes an array of 1 to ${MAX_ARECLOSE_PUBKEYS} pubkeys, as 64-character hex`);
+      }
+      return { result: areClose(sql, signer, pubkeys as string[], getOwnerPubkey(sql, env)) };
+    }
 
     // bothy's own; the client half is hearth's subscribeToPush. The pubkey
     // stored is `signer` and nothing else -- the parameters carry a

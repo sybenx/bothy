@@ -415,6 +415,15 @@ export const TABLES: readonly TableSpec[] = [
       // back on that exact code. NULL for every other way in, and for
       // members who joined before this column.
       col("via_code", "TEXT"),
+      // Location trust (nip86.ts setclose, areclose): whether this member
+      // may see where other close members' photos were taken. 1 for people
+      // the owner or an admin let in (their codes, allowpubkey, approved
+      // join requests, addadmin); 0 for people who came in on a member's
+      // code, and for NIP-29 group joins. Only the owner or an admin
+      // changes it, and moving in the tree never does. DEFAULT 1, so every
+      // member at the time this column arrived is on, which is the
+      // backfill. It governs location only: every member uses the box.
+      col("close", "INTEGER NOT NULL DEFAULT 1"),
     ],
   },
   // The groups this relay hosts, one row each. NIP-29 leaves creation to the

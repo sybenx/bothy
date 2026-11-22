@@ -1865,8 +1865,8 @@ export function allowPubkeyForGroup(
   nowSec: number,
 ): void {
   sql.exec(
-    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source)
-       VALUES (?, ?, ?, 'invite')
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, close)
+       VALUES (?, ?, ?, 'invite', 0)
        ON CONFLICT(pubkey) DO NOTHING`,
     pubkey,
     reason,
@@ -2126,25 +2126,49 @@ export type InviteesChoice = "keep" | "remove";
 
 // Returns everyone removed, the named pubkey first. Empty if it was not a
 // member.
+//
+// `newParent` is who "keep" re-hangs the invitees under: the owner when
+// the owner or an admin removes someone, the remover when a member removes
+// someone in their own subtree (the nearest ancestor who remains).
 export function removeMember(
   sql: SqlStorage,
   pubkey: string,
   owner: string,
   invitees: InviteesChoice,
   nowSec: number,
+  newParent: string = owner,
 ): string[] {
   if (!isPubkeyAllowed(sql, pubkey)) {
     unallowPubkey(sql, pubkey, nowSec);
     return [];
   }
   if (invitees === "keep") {
-    sql.exec(`UPDATE allowed_pubkeys SET invited_by = ? WHERE invited_by = ?`, owner, pubkey);
+    sql.exec(`UPDATE allowed_pubkeys SET invited_by = ? WHERE invited_by = ?`, newParent, pubkey);
     unallowPubkey(sql, pubkey, nowSec);
     return [pubkey];
   }
   const order = invitedSubtree(sql, pubkey, owner);
   for (const member of order) unallowPubkey(sql, member, nowSec);
   return order;
+}
+
+// Whether `pubkey` is somewhere below `ancestor` in the invite tree:
+// invited by them, or by someone they invited, and so on. Walks up from
+// `pubkey`, stopping at the owner, a missing inviter, a cycle or 64 steps.
+export function isBelow(sql: SqlStorage, ancestor: string, pubkey: string, owner: string | null): boolean {
+  const seen = new Set<string>([pubkey]);
+  let current = pubkey;
+  for (let step = 0; step < 64; step++) {
+    const parent = sql
+      .exec<{ invited_by: string | null }>(`SELECT invited_by FROM allowed_pubkeys WHERE pubkey = ?`, current)
+      .toArray()[0]?.invited_by;
+    if (!parent || seen.has(parent)) return false;
+    if (parent === ancestor) return true;
+    if (parent === owner) return false;
+    seen.add(parent);
+    current = parent;
+  }
+  return false;
 }
 
 // `pubkey` and everyone below it in the invite tree, breadth first,
@@ -2498,14 +2522,19 @@ export function redeemMemberInvite(
     code,
     nowSec,
   );
+  // Location trust: on when the owner or an admin made the code, off when
+  // a member did (schema.ts `allowed_pubkeys.close`).
+  const creator = invite.created_by ?? owner;
+  const close = creator === null || creator === owner || isAdmin(sql, creator) ? 1 : 0;
   sql.exec(
-    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, invited_by, via_code)
-       VALUES (?, 'joined with an invite', ?, 'member', ?, ?)
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, invited_by, via_code, close)
+       VALUES (?, 'joined with an invite', ?, 'member', ?, ?, ?)
        ON CONFLICT(pubkey) DO NOTHING`,
     pubkey,
     nowSec,
-    invite.created_by ?? owner,
+    creator,
     code,
+    close,
   );
   readmitFormerMember(sql, pubkey);
   return "joined";
@@ -2655,6 +2684,8 @@ export function addAdmin(sql: SqlStorage, pubkey: string, owner: string, nowSec:
   );
   readmitFormerMember(sql, pubkey);
   sql.exec(`INSERT INTO admins (pubkey, added_at) VALUES (?, ?) ON CONFLICT(pubkey) DO NOTHING`, pubkey, nowSec);
+  // An admin is close by default, as anyone the owner lets in is.
+  sql.exec(`UPDATE allowed_pubkeys SET close = 1 WHERE pubkey = ?`, pubkey);
 }
 
 // False if they were not an admin. Their membership stays.
@@ -2675,6 +2706,57 @@ export function listAdmins(sql: SqlStorage): { pubkey: string; addedAt: number }
 // myrole. "member" includes a member of the NIP-29 group `_`, as the
 // member gate always has.
 export type Role = "owner" | "admin" | "member" | "none";
+
+// ---------------------------------------------------------------------
+// Location trust (schema.ts `allowed_pubkeys.close`): who may see where
+// a member's photos were taken. On for people the owner or an admin let
+// in, and admins; off for people who came in on a member's code. The
+// owner and admins change it (setclose). It governs that one thing; every
+// member uses the box (storage, media) whatever it says.
+// ---------------------------------------------------------------------
+
+export function isClose(sql: SqlStorage, pubkey: string, owner: string | null): boolean {
+  if (owner !== null && pubkey === owner) return true;
+  return (
+    sql.exec<{ close: number }>(`SELECT close FROM allowed_pubkeys WHERE pubkey = ?`, pubkey).toArray()[0]
+      ?.close === 1
+  );
+}
+
+export type SetCloseOutcome = "ok" | "not-member" | "owner";
+
+export function setClose(sql: SqlStorage, pubkey: string, value: boolean, owner: string | null): SetCloseOutcome {
+  if (owner !== null && pubkey === owner) return "owner";
+  if (!isPubkeyAllowed(sql, pubkey)) return "not-member";
+  sql.exec(`UPDATE allowed_pubkeys SET close = ? WHERE pubkey = ?`, value ? 1 : 0, pubkey);
+  return "ok";
+}
+
+// For each asked pubkey: may the caller and it see each other's photo
+// locations? True only when both are close (the owner always is), so a
+// caller without the flag learns nothing. The asked pubkeys bind as one
+// json_each parameter.
+export function areClose(
+  sql: SqlStorage,
+  caller: string,
+  pubkeys: string[],
+  owner: string | null,
+): Record<string, boolean> {
+  const answer: Record<string, boolean> = Object.fromEntries(pubkeys.map((p) => [p, false]));
+  if (!isClose(sql, caller, owner)) return answer;
+  const close = new Set(
+    sql
+      .exec<{ pubkey: string }>(
+        `SELECT pubkey FROM allowed_pubkeys WHERE close = 1 AND pubkey IN (SELECT value FROM json_each(?))`,
+        JSON.stringify(pubkeys),
+      )
+      .toArray()
+      .map((r) => r.pubkey),
+  );
+  if (owner !== null) close.add(owner);
+  for (const p of pubkeys) answer[p] = close.has(p);
+  return answer;
+}
 
 export function roleOf(sql: SqlStorage, pubkey: string, owner: string | null): Role {
   if (owner !== null && pubkey === owner) return "owner";
@@ -2846,6 +2928,8 @@ export interface MemberDetails {
   source: string;
   // "admin" for a pubkey in `admins`, else "member".
   role: "admin" | "member";
+  // Location trust (schema.ts `allowed_pubkeys.close`).
+  close: boolean;
 }
 
 export interface RemovedMember {
@@ -2930,8 +3014,8 @@ export function listMembers(
   owner: string,
 ): { members: MemberDetails[]; removed: RemovedMember[] } {
   const rows = sql
-    .exec<{ pubkey: string; invited_by: string | null; allowed_at: number; source: string }>(
-      `SELECT pubkey, invited_by, allowed_at, source FROM allowed_pubkeys ORDER BY allowed_at DESC`,
+    .exec<{ pubkey: string; invited_by: string | null; allowed_at: number; source: string; close: number }>(
+      `SELECT pubkey, invited_by, allowed_at, source, close FROM allowed_pubkeys ORDER BY allowed_at DESC`,
     )
     .toArray();
   const present = new Set(rows.map((r) => r.pubkey));
@@ -2944,6 +3028,7 @@ export function listMembers(
     joinedAt: r.allowed_at,
     source: r.source,
     role: admins.has(r.pubkey) ? ("admin" as const) : ("member" as const),
+    close: r.close === 1,
   }));
   const removed = sql
     .exec<{ pubkey: string; removed_at: number; reason: string }>(
