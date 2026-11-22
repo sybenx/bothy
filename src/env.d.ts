@@ -63,6 +63,10 @@ interface Env {
   MAX_EVENT_BYTES?: string;
   MAX_EVENTS_PER_PUBKEY_PER_MINUTE?: string;
   NON_OWNER_STORAGE_BYTES?: string;
+  // The relay's storage budget (limits.ts storageBudget): 1GB by default,
+  // the smallest reading of the Free plan's per-object limit. Every share
+  // is a fraction of it.
+  STORAGE_BUDGET_BYTES?: string;
   // Profile photos (src/photos.ts). PHOTO_STORAGE_BYTES is the total they
   // may occupy, or exactly "off" to turn photo storage off. PHOTO_MAX_BYTES
   // is the largest one photo may be, never above limits.ts

@@ -22,7 +22,7 @@ import { generateRelayKeypair } from "./relay-identity";
 //      12 + 4T; see EVENT_BASE_ROW_COST.
 //
 // Workers Free allows 100,000 rows written and 5,000,000 rows read per day,
-// and those two ceilings shape this file (5GB of storage and 10ms of CPU
+// and those two ceilings shape this file (a 1GB storage budget, limits.ts storageBudget, and 10ms of CPU
 // per request are not close to binding). The REQ-serving indexes keep reads
 // bounded: without idx_events_kind_created_* and idx_events_pubkey_created_*,
 // `{"kinds":[1],"limit":20}` and `{"authors":[owner],"limit":20}` each read

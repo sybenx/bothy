@@ -204,7 +204,7 @@ describe("per-pubkey write throttle", () => {
   });
 });
 
-// The reserved-share threshold is 2.5GB by default, which no test is
+// The reserved-share threshold is half the 1GB budget by default, which no test is
 // going to reach by writing events. It is exercised through its own env
 // override instead -- lowering the threshold and raising the database
 // past it are the same condition from the check's point of view, and the

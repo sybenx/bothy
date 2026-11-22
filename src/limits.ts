@@ -555,10 +555,28 @@ export const UPSTREAM_VERSION_MAX_BYTES = 16 * 1024;
 // stall the whole cron invocation.
 export const BACKFILL_FETCH_TIMEOUT_MS = 8000;
 
-// Workers Free SQLite storage per Durable Object (5GB;
-// developers.cloudflare.com/durable-objects/platform/limits/, checked
-// 2026-08-25). Also served on /api/stats for the admin page's storage bar.
-export const STORAGE_BYTES_LIMIT = 5 * 1024 * 1024 * 1024;
+// How much this relay may store: its storage BUDGET, the base every share
+// below is a fraction of. Also served on /api/stats for the admin page's
+// storage bar.
+//
+// 1GB by default, the smallest reading of Cloudflare's limits page
+// (developers.cloudflare.com/durable-objects/platform/limits/, re-read
+// 2026-11-21). The page is inconsistent: its table gives 5GB of storage per
+// ACCOUNT on Workers Free and 10GB per Durable Object, and its FAQ says a
+// SQLite-backed Durable Object stops taking writes at 1GB on the Free plan.
+// The relay is one Durable Object, and the account's 5GB is shared with
+// every other Durable Object app on the account, which bothy cannot see.
+// So it assumes the least, and the owner raises it when they know better
+// (STORAGE_BUDGET_BYTES; a Workers Paid account can take 10GB). Until
+// 0.26.0 this was 5GB, five times the Free plan's per-object reading.
+//
+// Every check against it uses the database's real size
+// (`sql.databaseSize`), never an estimate.
+export const STORAGE_BYTES_LIMIT = 1024 * 1024 * 1024;
+
+export function storageBudget(env: Env): number {
+  return resolveLimit(env.STORAGE_BUDGET_BYTES, STORAGE_BYTES_LIMIT) ?? STORAGE_BYTES_LIMIT;
+}
 
 // Non-owner writes stop once the database passes this size, so at least
 // half the ceiling stays free for the owner's own archive (the same
@@ -574,7 +592,7 @@ export const STORAGE_BYTES_LIMIT = 5 * 1024 * 1024 * 1024;
 export const NON_OWNER_STORAGE_SHARE_LIMIT = STORAGE_BYTES_LIMIT / 2;
 
 export function nonOwnerStorageLimit(env: Env): number | null {
-  return resolveLimit(env.NON_OWNER_STORAGE_BYTES, NON_OWNER_STORAGE_SHARE_LIMIT);
+  return resolveLimit(env.NON_OWNER_STORAGE_BYTES, storageBudget(env) / 2);
 }
 
 // ---------------------------------------------------------------------
@@ -584,30 +602,35 @@ export function nonOwnerStorageLimit(env: Env): number | null {
 // wraps for the whole home (128MB / 64KB), which group messages, one wrap
 // per member, would fill in days.
 //
-// Where the 5GB ceiling goes, roughly: half is the owner's alone
-// (NON_OWNER_STORAGE_SHARE_LIMIT, the other half shared by everyone else);
-// of the shared half, mail may take 1GB, profile photos 250MB
-// (PHOTO_STORAGE_BYTES_DEFAULT), and follows' and members' own events the
-// rest. Payload bytes are counted here; SQLite adds its tag rows and index
-// entries on top (about a third more for a small wrap), which the 2.5GB
-// non-owner share absorbs.
+// Where the storage budget (storageBudget, 1GB by default) goes, as
+// fractions so it all scales when the owner raises it: half is the
+// owner's alone (nonOwnerStorageLimit); of the shared half, mail may take
+// 30% of the budget, profile photos 5% (photoStorageBytes), and follows'
+// and members' own events the rest. Payload bytes are counted here; SQLite
+// adds its tag rows and index entries on top (about a third more for a
+// small wrap), which the non-owner half absorbs.
 // ---------------------------------------------------------------------
 
-// All mail together, payload bytes. MAIL_STORAGE_BYTES overrides; "off"
-// removes this cap and leaves the non-owner share as the backstop.
-export const MAIL_STORAGE_BYTES_DEFAULT = 1024 * 1024 * 1024;
+// All mail together, payload bytes: 30% of the budget (about 307MB at
+// 1GB). MAIL_STORAGE_BYTES overrides; "off" removes this cap and leaves
+// the non-owner share as the backstop.
+const MAIL_SHARE_OF_BUDGET = 0.3;
+export const MAIL_STORAGE_BYTES_DEFAULT = Math.floor(STORAGE_BYTES_LIMIT * MAIL_SHARE_OF_BUDGET);
 
 export function mailStorageBytes(env: Env): number | null {
-  return resolveLimit(env.MAIL_STORAGE_BYTES, MAIL_STORAGE_BYTES_DEFAULT);
+  return resolveLimit(env.MAIL_STORAGE_BYTES, Math.floor(storageBudget(env) * MAIL_SHARE_OF_BUDGET));
 }
 
 // One recipient's mail, the owner's included, so no one person (or a
-// stranger mailing them) can fill the home. 100MB is about 30,000 wraps
-// of a typical 3KB. MAIL_BYTES_PER_MEMBER overrides; "off" removes it.
-export const MAIL_BYTES_PER_MEMBER_DEFAULT = 100 * 1024 * 1024;
+// stranger mailing them) can fill the home: a tenth of the mail total
+// (about 31MB at the default budget, some 10,000 wraps of a typical 3KB).
+// MAIL_BYTES_PER_MEMBER overrides; "off" removes it.
+const MAIL_SHARES = 10;
+export const MAIL_BYTES_PER_MEMBER_DEFAULT = Math.floor(MAIL_STORAGE_BYTES_DEFAULT / MAIL_SHARES);
 
 export function mailBytesPerMember(env: Env): number | null {
-  return resolveLimit(env.MAIL_BYTES_PER_MEMBER, MAIL_BYTES_PER_MEMBER_DEFAULT);
+  const total = Math.floor(storageBudget(env) * MAIL_SHARE_OF_BUDGET);
+  return resolveLimit(env.MAIL_BYTES_PER_MEMBER, Math.floor(total / MAIL_SHARES));
 }
 
 // Gift wraps one signing key may have stored here. NIP-59 signs every wrap
@@ -731,13 +754,18 @@ export function photoMaxBytes(env: Env): number {
   return Math.min(Math.floor(raw), PHOTO_MAX_BYTES_CEILING);
 }
 
-// All photos together: 250MB, 5% of the storage ceiling. At the cap new
-// uploads are refused and nothing else changes. "off" turns photos off:
-// no uploads, nothing served, and no `blossom` on NIP-11.
-export const PHOTO_STORAGE_BYTES_DEFAULT = 250 * 1024 * 1024;
+// All photos together. At the cap new uploads are refused and nothing
+// else changes. "off" turns photos off: no uploads, nothing served, and
+// no `blossom` on NIP-11.
+//
+// 5% of the storage budget (about 51MB at the default 1GB: some 500
+// photos at the 100KB cap, ten times what a home of fifty needs). It was a
+// fixed 250MB, 5% of the 5GB the relay used to assume.
+const PHOTO_SHARE_OF_BUDGET = 0.05;
+export const PHOTO_STORAGE_BYTES_DEFAULT = Math.floor(STORAGE_BYTES_LIMIT * PHOTO_SHARE_OF_BUDGET);
 
 export function photoStorageBytes(env: Env): number | null {
-  return resolveLimit(env.PHOTO_STORAGE_BYTES, PHOTO_STORAGE_BYTES_DEFAULT);
+  return resolveLimit(env.PHOTO_STORAGE_BYTES, Math.floor(storageBudget(env) * PHOTO_SHARE_OF_BUDGET));
 }
 
 // Uploads one pubkey may make in a UTC day. Each replaces their one photo,

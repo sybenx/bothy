@@ -69,7 +69,7 @@ import {
   nonOwnerStorageLimit,
   PUBKEY_RATE_LIMIT_MAX_TRACKED,
   PUBKEY_RATE_LIMIT_WINDOW_MS,
-  STORAGE_BYTES_LIMIT,
+  storageBudget,
   utcDayStartSeconds,
 } from "./limits";
 import {
@@ -951,7 +951,7 @@ export class Relay extends DurableObject<Env> {
       ingested24h: ingest.ingested24h - ingest.ingestedGroup24h,
       storageBytes: sql.databaseSize,
       rowsWrittenToday: ingest.rowsWrittenToday,
-      storageBytesLimit: STORAGE_BYTES_LIMIT,
+      storageBytesLimit: storageBudget(this.env),
       dailyRowsWrittenLimit: DAILY_ROWS_WRITTEN_LIMIT,
       dailyRowsReadLimit: DAILY_ROWS_READ_LIMIT,
       // Read live: one row per relay in the owner's kind-10002 list

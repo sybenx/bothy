@@ -139,7 +139,7 @@
     <div class="stat"><div class="n" id="stat-total">-</div><div class="label" id="stat-total-label">events stored</div></div>
     <div class="stat"><div class="n" id="stat-ingested">-</div><div class="label">events received, last 24h</div></div>
     <div class="stat">
-      <div class="n" id="stat-storage">-</div><div class="label">storage used (5 GB free limit)</div>
+      <div class="n" id="stat-storage">-</div><div class="label" id="stat-storage-label">storage used</div>
       <div class="bar"><div id="bar-storage"></div></div>
     </div>
     <div class="stat">
@@ -331,6 +331,7 @@ async function main() {
     document.getElementById("stat-ingested").textContent = stats.ingested24h;
 
     setBar("stat-storage", "bar-storage", stats.storageBytes, STORAGE_LIMIT, formatBytes(stats.storageBytes) + " used");
+    document.getElementById("stat-storage-label").textContent = "storage used (" + formatBytes(STORAGE_LIMIT) + " limit)";
     // No longer "(est.)": this was a SUM over the stamped per-event cost
     // of storing events, blind to deletions, tombstones, the follow
     // rebuild and every other write. It is measured now -- every cursor's

@@ -194,3 +194,37 @@ describe("an erased account's leftover mail", () => {
     });
   });
 });
+
+describe("the storage budget", () => {
+  it("is 1GB by default, and every share follows it when the owner raises it", async () => {
+    const { mailBytesPerMember, mailStorageBytes, nonOwnerStorageLimit, photoStorageBytes, storageBudget } =
+      await import("../src/limits");
+    const gib = 1024 * 1024 * 1024;
+    const base = {} as Env;
+    expect(storageBudget(base)).toBe(gib);
+    expect(nonOwnerStorageLimit(base)).toBe(gib / 2);
+    expect(mailStorageBytes(base)).toBe(Math.floor(gib * 0.3));
+    expect(mailBytesPerMember(base)).toBe(Math.floor(Math.floor(gib * 0.3) / 10));
+    expect(photoStorageBytes(base)).toBe(Math.floor(gib * 0.05));
+
+    const paid = { STORAGE_BUDGET_BYTES: String(10 * gib) } as unknown as Env;
+    expect(nonOwnerStorageLimit(paid)).toBe(5 * gib);
+    expect(mailStorageBytes(paid)).toBe(Math.floor(10 * gib * 0.3));
+    expect(photoStorageBytes(paid)).toBe(Math.floor(10 * gib * 0.05));
+    // An explicit setting still wins over the share.
+    expect(mailStorageBytes({ ...paid, MAIL_STORAGE_BYTES: "1000" } as unknown as Env)).toBe(1000);
+
+    mutableEnv.STORAGE_BUDGET_BYTES = String(2 * gib);
+    try {
+      const { exports } = await import("cloudflare:workers");
+      const stats = (await (
+        await exports.default.fetch(new Request("https://example.com/api/stats"))
+      ).json()) as {
+        storageBytesLimit: number;
+      };
+      expect(stats.storageBytesLimit).toBe(2 * gib);
+    } finally {
+      delete mutableEnv.STORAGE_BUDGET_BYTES;
+    }
+  });
+});
