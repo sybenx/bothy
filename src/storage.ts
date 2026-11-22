@@ -2156,16 +2156,58 @@ export function createMemberInvite(
 
 // Redeemable now: uses left, unrevoked, unexpired. Keep these conditions
 // identical to listUnusedMemberInvites and redeemMemberInvite's UPDATE.
-export function countOutstandingMemberInvites(sql: SqlStorage, nowSec: number): number {
+//
+// Per creator: one person's outstanding codes, so members' codes cannot
+// crowd out the owner's.
+export function countOutstandingMemberInvites(sql: SqlStorage, nowSec: number, createdBy: string): number {
   return (
     sql
       .exec<{ n: number }>(
         `SELECT COUNT(*) AS n FROM member_invites
-          WHERE uses < uses_allowed AND revoked_at IS NULL AND expires_at > ?`,
+          WHERE uses < uses_allowed AND revoked_at IS NULL AND expires_at > ? AND created_by = ?`,
         nowSec,
+        createdBy,
       )
       .toArray()[0]?.n ?? 0
   );
+}
+
+// How many of a member's invite slots are taken (limits.ts
+// memberInviteLimits): every use of a live code, used or not, and only the
+// used ones of a revoked or expired code, so revoking a code, or letting
+// it lapse, gives its unused slots back.
+export function inviteSlotsUsed(sql: SqlStorage, createdBy: string, nowSec: number): number {
+  return (
+    sql
+      .exec<{ n: number }>(
+        `SELECT COALESCE(SUM(CASE WHEN revoked_at IS NULL AND expires_at > ? THEN uses_allowed ELSE uses END), 0) AS n
+           FROM member_invites WHERE created_by = ?`,
+        nowSec,
+        createdBy,
+      )
+      .toArray()[0]?.n ?? 0
+  );
+}
+
+// Steps from the owner along `invited_by`: the owner is 0, the owner's
+// invitees 1. A member with no recorded inviter, or whose inviter is no
+// longer a member, counts as the owner's (as listMembers reports them).
+// Bounded by `cap` (the walk stops there) and guarded against a cycle.
+export function inviteDepth(sql: SqlStorage, pubkey: string, owner: string | null, cap: number): number {
+  if (owner !== null && pubkey === owner) return 0;
+  let depth = 1;
+  let current = pubkey;
+  const seen = new Set<string>([pubkey]);
+  while (depth < cap) {
+    const parent = sql
+      .exec<{ invited_by: string | null }>(`SELECT invited_by FROM allowed_pubkeys WHERE pubkey = ?`, current)
+      .toArray()[0]?.invited_by;
+    if (!parent || parent === owner || seen.has(parent) || !isPubkeyAllowed(sql, parent)) return depth;
+    seen.add(parent);
+    current = parent;
+    depth++;
+  }
+  return depth;
 }
 
 export interface UnusedMemberInvite {
@@ -2175,13 +2217,22 @@ export interface UnusedMemberInvite {
   uses_left: number;
 }
 
-export function listUnusedMemberInvites(sql: SqlStorage, nowSec: number): UnusedMemberInvite[] {
+// `createdBy` limits it to one person's codes (a member's own view);
+// null lists everyone's (the owner's and admins' view).
+export function listUnusedMemberInvites(
+  sql: SqlStorage,
+  nowSec: number,
+  createdBy: string | null = null,
+): UnusedMemberInvite[] {
   return sql
     .exec<{ code: string; created_at: number; expires_at: number; uses_left: number }>(
       `SELECT code, created_at, expires_at, uses_allowed - uses AS uses_left FROM member_invites
         WHERE uses < uses_allowed AND revoked_at IS NULL AND expires_at > ?
+          AND (? IS NULL OR created_by = ?)
         ORDER BY created_at DESC`,
       nowSec,
+      createdBy,
+      createdBy,
     )
     .toArray();
 }
@@ -2241,9 +2292,18 @@ export type RevokeMemberInviteOutcome = "revoked" | "unknown" | "used-up" | "alr
 // The member half of nip86.ts revokeinvite. A used-up code is left alone,
 // like a spent group invite: there is nothing left to revoke, and the
 // people it let in are removed one by one.
-export function revokeMemberInvite(sql: SqlStorage, code: string, nowSec: number): RevokeMemberInviteOutcome {
+//
+// `createdBy` (a member revoking) makes someone else's code "unknown": a
+// member can revoke only codes they made.
+export function revokeMemberInvite(
+  sql: SqlStorage,
+  code: string,
+  nowSec: number,
+  createdBy: string | null = null,
+): RevokeMemberInviteOutcome {
   const invite = lookupMemberInvite(sql, code);
   if (invite === null) return "unknown";
+  if (createdBy !== null && invite.created_by !== createdBy) return "unknown";
   if (invite.revoked_at !== null) return "already-revoked";
   if (invite.uses >= invite.uses_allowed) return "used-up";
   sql.exec(`UPDATE member_invites SET revoked_at = ? WHERE code = ?`, nowSec, code);

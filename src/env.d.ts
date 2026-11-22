@@ -64,6 +64,11 @@ interface Env {
   // may occupy, or exactly "off" to turn photo storage off. PHOTO_MAX_BYTES
   // is the largest one photo may be, never above limits.ts
   // PHOTO_MAX_BYTES_CEILING; it cannot be turned off.
+  // Members' own invites (limits.ts memberInviteLimits): how many people
+  // a member may let in, and how many steps from the owner invites go.
+  // A positive number, or "off" to leave invites to the owner and admins.
+  INVITES_PER_MEMBER?: string;
+  INVITE_DEPTH?: string;
   PHOTO_STORAGE_BYTES?: string;
   PHOTO_MAX_BYTES?: string;
   // Rate limit for serving photos (wrangler.jsonc), separate from

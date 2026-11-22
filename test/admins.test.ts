@@ -105,7 +105,7 @@ describe("making and unmaking admins", () => {
     const admin = await newAdmin();
     expect((await callManagement("removeadmin", [admin.pubkeyHex])).result).toBe(true);
     expect((await as(admin, "myrole")).result).toEqual({ role: "member" });
-    expect((await as(admin, "createinvite")).error).toBe(adminOnlyReason("createinvite"));
+    expect((await as(admin, "listmembers")).error).toBe(adminOnlyReason("listmembers"));
     expect((await callManagement("removeadmin", [admin.pubkeyHex])).error).toBe(
       "removeadmin: that pubkey is not an admin",
     );

@@ -1004,6 +1004,14 @@ export const INDEXES: readonly IndexSpec[] = [
   // member's mail goes to (relay.ts drainInboxPushes, storage.ts
   // hasPushSubscription), and dropping a removed member's devices. One row
   // written per subscribe.
+  // Serves the per-creator counts of member invites (storage.ts
+  // inviteSlotsUsed, countOutstandingMemberInvites) and a member's own
+  // listing. One row written per createinvite.
+  {
+    name: "idx_member_invites_created_by",
+    table: "member_invites",
+    keyColumns: ["created_by"],
+  },
   // Serves GET /<sha256> (src/photos.ts): a photo is found by its hash.
   {
     name: "idx_photos_sha256",

@@ -27,6 +27,8 @@ import {
   removeAdmin,
   removeMember,
   roleOf,
+  inviteDepth,
+  inviteSlotsUsed,
   countOutstandingMemberInvites,
   declineJoinRequest,
   giftWrapCount,
@@ -69,6 +71,7 @@ import {
   MAX_PENDING_JOIN_REQUESTS,
   maxGiftWraps,
   MEMBER_REMOVAL_GRACE_SECONDS,
+  memberInviteLimits,
 } from "./limits";
 import { GROUPS_PAUSED_MESSAGE } from "./nip29";
 import { pushConfigured } from "./push";
@@ -162,6 +165,8 @@ export const SUPPORTED_METHODS = [
   "removeadmin",
   "listadmins",
   "myrole",
+  // bothy's own: what a member's invite allowance is right now.
+  "myinvites",
   // bothy's own; the one pair a member may call, not only the owner
   // (MEMBER_CALLABLE_METHODS below).
   "subscribepush",
@@ -179,7 +184,18 @@ export const SUPPORTED_METHODS = [
 // index.ts checks membership only for a method named here, so every other
 // method stays owner-only. "Member" there is relay.ts isMember: a member
 // of the relay (storage.ts isMember), or of the group `_`.
-export const MEMBER_CALLABLE_METHODS: readonly string[] = ["subscribepush", "unsubscribepush"];
+//
+// The invite methods are member-callable too, with limits: a member makes
+// codes within their own allowance and sees and revokes only their own
+// (memberInviteStanding). Owner and admins pass the same gate unlimited.
+export const MEMBER_CALLABLE_METHODS: readonly string[] = [
+  "subscribepush",
+  "unsubscribepush",
+  "createinvite",
+  "listunusedinvites",
+  "revokeinvite",
+  "myinvites",
+];
 
 // The method ANY valid signature may call: redeeminvite, whose caller is
 // by definition not a member yet. The code is the authority, and the
@@ -199,10 +215,10 @@ export const ANYONE_CALLABLE_METHODS: readonly string[] = ["redeeminvite", "requ
 // name, description and icon, and anything else relay-level. The
 // owner-side guard against an admin removing another admin is in
 // unallowpubkey below.
+//
+// The invite methods are not here: members may call them too
+// (MEMBER_CALLABLE_METHODS), and admins pass that gate as well.
 export const ADMIN_CALLABLE_METHODS: readonly string[] = [
-  "createinvite",
-  "listunusedinvites",
-  "revokeinvite",
   "listjoinrequests",
   "approvejoin",
   "declinejoin",
@@ -247,6 +263,12 @@ export function supportedMethods(env: Env): string[] {
 export const SELF_BLOCK_CONFIRMATION = "yes, block my own address";
 
 const HEX_ID_RE = /^[0-9a-f]{64}$/;
+
+// A member who is neither the owner nor an admin: the caller whose view
+// of invites is limited to their own.
+function isPlainMember(sql: SqlStorage, env: Env, signer: string): boolean {
+  return roleOf(sql, signer, getOwnerPubkey(sql, env)) === "member";
+}
 
 // subscribepush's label: short, and from an alphabet with no room for an
 // npub (63 characters) or a sentence.
@@ -297,6 +319,45 @@ function parseJoinDetails(
   const note = field(raw.note, "note", JOIN_REQUEST_NOTE_MAX_LENGTH);
   if (typeof note === "object" && note !== null) return note.error;
   return { name, note, via };
+}
+
+// Where a caller stands on invites. The owner and admins: unlimited
+// (`left` and `limit` null). A member: limits.ts memberInviteLimits, with
+// `reason` set to the refusal createinvite would give when `canInvite` is
+// false. These strings are stable: apps may show them or match them.
+export interface InviteStanding {
+  left: number | null;
+  limit: number | null;
+  depth: number;
+  canInvite: boolean;
+  reason?: string;
+}
+
+export const INVITES_OFF_MESSAGE = "createinvite: on this relay only the owner and admins make invites";
+
+export function invitesUsedUpMessage(limit: number): string {
+  return `createinvite: you have used all ${limit} of your invites`;
+}
+
+export function inviteDepthMessage(depth: number): string {
+  return `createinvite: invites go ${depth} steps from the owner, and the people you invite would be one step further, so invites stop here`;
+}
+
+function inviteStanding(sql: SqlStorage, env: Env, signer: string, nowSec: number): InviteStanding {
+  const owner = getOwnerPubkey(sql, env);
+  const role = roleOf(sql, signer, owner);
+  const limits = memberInviteLimits(env);
+  const depth = inviteDepth(sql, signer, owner, (limits?.depth ?? 3) + 1);
+  if (role === "owner" || role === "admin") return { left: null, limit: null, depth, canInvite: true };
+  if (limits === null) return { left: 0, limit: 0, depth, canInvite: false, reason: INVITES_OFF_MESSAGE };
+  const left = Math.max(0, limits.perMember - inviteSlotsUsed(sql, signer, nowSec));
+  if (depth >= limits.depth) {
+    return { left, limit: limits.perMember, depth, canInvite: false, reason: inviteDepthMessage(limits.depth) };
+  }
+  if (left === 0) {
+    return { left, limit: limits.perMember, depth, canInvite: false, reason: invitesUsedUpMessage(limits.perMember) };
+  }
+  return { left, limit: limits.perMember, depth, canInvite: true };
 }
 
 // An optional positive integer parameter, or the default when absent.
@@ -604,14 +665,34 @@ export function handleManagementCall(
       // Only invites redeemable right now; dead ones would bury the live
       // ones. Member invites carry `uses_left`; group invites are single
       // use and do not.
+      // A member sees only their own member codes; the owner and admins
+      // see every code, group ones included.
+      if (isPlainMember(sql, env, signer)) return { result: listUnusedMemberInvites(sql, nowSec, signer) };
       return { result: [...listUnusedMemberInvites(sql, nowSec), ...listUnusedInvites(sql, nowSec)] };
+
+    case "myinvites": {
+      const standing = inviteStanding(sql, env, signer, nowSec);
+      return {
+        result: {
+          left: standing.left,
+          limit: standing.limit,
+          depth: standing.depth,
+          canInvite: standing.canInvite,
+          ...(standing.reason === undefined ? {} : { reason: standing.reason }),
+        },
+      };
+    }
 
     case "revokeinvite": {
       const code = stringParam(params, 0);
       if (code === null || code === "") return err("revokeinvite takes the invite code as a string");
       // Member codes first: they are the relay's own 32-hex strings, so a
       // group code the owner chose cannot collide with one by accident.
-      const memberOutcome = revokeMemberInvite(sql, code, nowSec);
+      // A member can revoke only their own; anything else is "never
+      // issued" to them, group codes included.
+      const plain = isPlainMember(sql, env, signer);
+      const memberOutcome = revokeMemberInvite(sql, code, nowSec, plain ? signer : null);
+      if (plain && memberOutcome === "unknown") return err("revokeinvite: you have no invite with that code");
       switch (memberOutcome) {
         case "revoked":
           return { result: true };
@@ -660,7 +741,18 @@ export function handleManagementCall(
           `createinvite: the lifetime must be a whole number of seconds from 1 to ${INVITE_MAX_TTL_SECONDS} (30 days)`,
         );
       }
-      if (countOutstandingMemberInvites(sql, nowSec) >= MAX_OUTSTANDING_INVITES) {
+      // A member makes codes within their allowance: refused outright when
+      // they have none, and a code may admit at most the people they have
+      // left.
+      const standing = inviteStanding(sql, env, signer, nowSec);
+      if (!standing.canInvite) return err(standing.reason!);
+      if (standing.left !== null && uses > standing.left) {
+        return err(
+          `createinvite: you have ${standing.left} ${standing.left === 1 ? "invite" : "invites"} left, ` +
+            `so a code can admit at most ${standing.left} ${standing.left === 1 ? "person" : "people"}`,
+        );
+      }
+      if (countOutstandingMemberInvites(sql, nowSec, signer) >= MAX_OUTSTANDING_INVITES) {
         return err(
           `createinvite: ${MAX_OUTSTANDING_INVITES} invites are already waiting to be used. ` +
             `Revoke some with revokeinvite (listunusedinvites shows them) and try again.`,
@@ -668,8 +760,8 @@ export function handleManagementCall(
       }
       const code = bytesToHex(crypto.getRandomValues(new Uint8Array(MEMBER_INVITE_CODE_BYTES)));
       const expiresAt = nowSec + ttl;
-      // The signer is the creator: always the owner today (only the owner
-      // reaches this method), and whoever redeems it hangs from them.
+      // The signer is the creator (owner, admin or member), and whoever
+      // redeems it hangs from them.
       createMemberInvite(sql, code, uses, nowSec, expiresAt, signer);
       return { result: { code, uses, expires_at: expiresAt } };
     }

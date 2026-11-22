@@ -652,6 +652,24 @@ export const GIFT_WRAP_SWEEP_BATCH_SIZE = Math.max(
 export const MEMBER_INVITE_DEFAULT_USES = 1;
 export const MEMBER_INVITE_MAX_USES = 100;
 
+// Members' own invites (nip86.ts createinvite from a member). The owner
+// and admins are not limited; a member may let in INVITES_PER_MEMBER
+// people, and only while they are fewer than INVITE_DEPTH steps from the
+// owner (the owner's own invitees are 1 step away), so the tree stays a
+// few people wide and a few deep. A slot is a person a code may admit:
+// a live code holds all its uses, a revoked or expired one only those
+// already used (storage.ts inviteSlotsUsed). "off" on either turns
+// member invites off, back to owner and admins only.
+export const INVITES_PER_MEMBER_DEFAULT = 5;
+export const INVITE_DEPTH_DEFAULT = 3;
+
+export function memberInviteLimits(env: Env): { perMember: number; depth: number } | null {
+  const perMember = resolveLimit(env.INVITES_PER_MEMBER, INVITES_PER_MEMBER_DEFAULT);
+  const depth = resolveLimit(env.INVITE_DEPTH, INVITE_DEPTH_DEFAULT);
+  if (perMember === null || depth === null) return null;
+  return { perMember: Math.floor(perMember), depth: Math.floor(depth) };
+}
+
 // Random bytes in a generated code: 128 bits, hex-encoded to 32
 // characters. The relay makes every member code itself, so unlike the
 // NIP-29 path (MIN_INVITE_CODE_LENGTH) there is no owner-chosen code to

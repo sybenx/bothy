@@ -162,7 +162,7 @@ async function sqlRows<T extends Record<string, SqlStorageValue>>(
 // ---------------------------------------------------------------------
 
 describe("invite codes", () => {
-  it("makes a code only the owner can ask for", async () => {
+  it("makes a code for the owner or a member, never a stranger", async () => {
     const reply = await callManagement("createinvite");
     const invite = reply.result as { code: string; uses: number; expires_at: number };
     expect(invite.code).toMatch(/^[0-9a-f]{32}$/);
@@ -171,11 +171,11 @@ describe("invite codes", () => {
       INVITE_DEFAULT_TTL_SECONDS - 60,
     );
 
+    // Members make their own within limits (test/member-invites.test.ts).
     const member = await newMember();
-    for (const who of [randomKeypair(), member]) {
-      const refused = await callManagement("createinvite", [], { secretKeyHex: who.secretKeyHex });
-      expect(refused.status).toBe(401);
-    }
+    expect((await callManagement("createinvite", [], { secretKeyHex: member.secretKeyHex })).result).toBeDefined();
+    const refused = await callManagement("createinvite", [], { secretKeyHex: randomKeypair().secretKeyHex });
+    expect(refused.status).toBe(401);
   });
 
   it("is single-use by default", async () => {
