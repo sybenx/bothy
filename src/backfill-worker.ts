@@ -131,12 +131,7 @@ async function discoverWriteRelays(ownerPubkey: string): Promise<string[]> {
 export async function runBackfillTick(env: Env): Promise<void> {
   const stub = relayStub(env);
   const state = await stub.getBackfillState();
-  if (state === null || state.status === "done" || state.status === "paused-budget") {
-    // Only applyBackfillPage moves status out of "paused-budget", and it
-    // is reached only past this return, so as written nothing lifts the
-    // pause after the 00:00 UTC reset.
-    return;
-  }
+  if (state === null || state.status === "done") return;
 
   if (state.status === "pending") {
     const relays = await discoverWriteRelays(state.ownerPubkey);
@@ -149,7 +144,10 @@ export async function runBackfillTick(env: Env): Promise<void> {
   if (state.nextRelay === null || state.nextUntil === null) return;
 
   // Saves a wasted fetch on a day with no headroom; the authoritative
-  // check is in applyBackfillPage (backfill.ts hasBackfillHeadroom).
+  // check is in applyBackfillPage (backfill.ts hasBackfillHeadroom). It
+  // is also what lifts "paused-budget": a paused backfill waits here
+  // until headroom returns after 00:00 UTC, then fetches as if running,
+  // and applyBackfillPage sets the status from that page.
   if (!state.canIngestNow) return;
 
   const filter = { authors: [state.ownerPubkey], until: state.nextUntil, limit: BACKFILL_PAGE_SIZE };
