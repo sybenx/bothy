@@ -29,6 +29,9 @@ Written 2026-11-21 for bothy 0.26.0.
   subscription; without one the deploy fails. That is why the binding can
   never be in upstream `wrangler.jsonc`: a sync would break every
   downstream deploy whose owner has not enabled R2.
+- **No spending cap**: Cloudflare documents no hard cap on R2 spending,
+  unlike Workers and Durable Objects, which stop at the Free plan's limits.
+  So bothy's own budget and hard stop (below) is the only protection.
 - **Request size**: a Worker on a Free or Pro zone accepts request bodies up
   to 100 MB (developers.cloudflare.com/workers/platform/limits). Uploads
   are streamed straight to R2, never buffered (the Worker has 128 MB of
