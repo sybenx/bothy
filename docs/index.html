@@ -167,7 +167,7 @@ pace 12   &lt; mail.jsonl   | nak event $NEW
 </tr>
 <tr>
 <td><code>WRITE_POLICY</code></td>
-<td>Who can publish here: <code>owner</code>, <code>inbox</code>, <code>follows</code>, <code>mentions</code> or <code>all</code> (see &quot;Who can write here&quot; below). Set here it outranks the value set through the management API. Unset, the management API&#39;s value applies, then the default, <code>follows</code>.</td>
+<td>Who can publish here: <code>owner</code>, <code>inbox</code>, <code>follows</code>, <code>mentions</code>, <code>network</code> or <code>all</code> (see &quot;Who can write here&quot; below). Set here it outranks the value set through the management API. Unset, the management API&#39;s value applies, then the default, <code>follows</code>.</td>
 </tr>
 <tr>
 <td><code>MAIL_STORAGE_BYTES</code></td>
@@ -176,6 +176,10 @@ pace 12   &lt; mail.jsonl   | nak event $NEW
 <tr>
 <td><code>MAIL_BYTES_PER_MEMBER</code></td>
 <td>How much mail any one person may have stored here, you included, in bytes. Defaults to a tenth of the mail total (about 30 MB). Set it to <code>off</code> to remove it.</td>
+</tr>
+<tr>
+<td><code>NETWORK_MAX_KEYS</code></td>
+<td>Under the <code>network</code> policy, how many of the people your follows follow the relay keeps on its list. Defaults to <code>40000</code>.</td>
 </tr>
 <tr>
 <td><code>MEMBER_LIST</code></td>
@@ -219,6 +223,7 @@ pace 12   &lt; mail.jsonl   | nak event $NEW
 <p>Members can invite people too, within limits, so a friend can bring a friend without asking you. Each member may let in 5 people, and invites go 3 steps from you: the people you invite can invite, and so can theirs, but not the people after that. A code counts for everyone it could let in, whether or not they have come yet; revoking a code, or letting it expire, gives back the places nobody used. A member sees and revokes only their own codes, and <code>myinvites</code> tells them how many they have left. You and your admins have no limit. Change the numbers with <code>INVITES_PER_MEMBER</code> and <code>INVITE_DEPTH</code>, or set either to <code>off</code> to keep invites to you and your admins.</p>
 <p>Someone who joins by asking through a member&#39;s link (see &quot;Join requests&quot; below) is listed as that member&#39;s invitee but does not use up one of their invites: you or an admin approved them, so the decision was yours.</p>
 <p>Your members are the pubkeys on your allow list, so <code>listallowedpubkeys</code> lists them and <code>unallowpubkey</code> removes one. <code>listmembers</code> shows more: who let each one in, when, and how, plus the people you removed whose mail is still waiting to be deleted, with the date it goes. Who let someone in is whoever made the code they used, or whose link their join request came through, or you; every member has one, so an app can draw the whole tree from it. A member can also publish here, as anyone you <code>allowpubkey</code> can.</p>
+<p>Each <code>listmembers</code> row, current or removed, also says how alive the person looks, from what bothy already keeps for other reasons and nothing new: <code>lastSeen</code>, the last day they signed in here (NIP-42), as a UTC day number (days since 1970-01-01, so <code>lastSeen * 86400</code> is that day&#39;s midnight in Unix seconds), or <code>null</code> if never; <code>push</code>, <code>true</code> if they have any push registration (web push or the Android app); and <code>waiting</code>, how many sealed messages (kind 1059 gift wraps) addressed to them are stored here. Removing someone deletes their sign-in day and push registrations, so a removed member shows <code>null</code> and <code>false</code>, and only <code>waiting</code> still counts down as their mail goes. On current members, <code>inviterUnknown</code> is <code>true</code> when <code>invitedBy</code> names you only because nobody else could be named: no inviter was recorded (members from before v0.19.0), or the inviter is no longer a member. It is <code>false</code> when the inviter is on record, you included.</p>
 <p>Members can see who else is in your home, as in a group, so their app can suggest the people they could message: <code>homemembers</code> lists every member and you, and nothing more about them (not who invited whom, when they joined, or who was removed; that stays with you and your admins). To keep the list to yourself and your admins, set <code>MEMBER_LIST</code> to <code>hidden</code>.</p>
 <p>Some members may see where each other&#39;s photos were taken. That trust is on for everyone you or an admin let in yourselves (with your own invite, <code>allowpubkey</code>, an approved request, or by making them an admin), and off for people who came in on another member&#39;s invite. You and your admins can turn it on or off for anyone with <code>setclose</code> and their pubkey and <code>true</code> or <code>false</code>; moving around the tree never changes it. Members&#39; apps ask <code>areclose</code> whether the people they are writing to may see a photo&#39;s location, and are told yes only when both sides have it. <code>listmembers</code> and <code>myrole</code> show it. It is about location only: every member uses the home&#39;s storage and media alike.</p>
 <h3 id="admins">Admins<a class="anchor" href="#admins" aria-label="Link to this section">#</a></h3>
@@ -286,6 +291,10 @@ pace 12   &lt; mail.jsonl   | nak event $NEW
 <td>Everything above, plus anyone whose event mentions or replies to you. An event from someone you don&#39;t follow may carry at most 32 indexed tags.</td>
 </tr>
 <tr>
+<td><code>network</code></td>
+<td>Everything above, plus the people your follows follow.</td>
+</tr>
+<tr>
 <td><code>all</code></td>
 <td>Anyone, any event.</td>
 </tr>
@@ -305,6 +314,7 @@ bothy_rpc https://your-relay.workers.dev/ changewritepolicy &#39;[&quot;mentions
 bothy_rpc https://your-relay.workers.dev/ getwritepolicy
 </code></pre>
 <p>The URL must be the relay&#39;s own <code>https://</code> address, because the signature covers it. It takes effect immediately. <code>getwritepolicy</code> reads back the policy in force and where it was set. An empty string clears the stored policy and returns to the default. <code>all</code> asks you to confirm: the first call refuses and tells you the exact confirmation string to pass as a second parameter. If <code>WRITE_POLICY</code> is set in the Cloudflare dashboard it outranks the management API, and <code>changewritepolicy</code> tells you so.</p>
+<p>Under <code>network</code>, the relay gathers your follows&#39; own contact lists, a few each hour, from three public relays, checks every signature, and keeps the people they name on a list of up to 40,000. Nobody can see the list, or which follow brought someone onto it; the admin page shows only how many are on it. It costs about 2 rows written to add a person and 1 a week to keep them, at most a tenth of the day&#39;s write allowance: filling the list takes about a week after you switch, and it is rebuilt every week, so someone a follow stops following drops off within about a week. Nothing is gathered under any other policy.</p>
 <p>Under <code>all</code>, NIP-11 advertises <code>restricted_writes: false</code>; under every other policy it is <code>true</code>.</p>
 <p>By default, then, bothy accepts events from two kinds of author: you (the owner), and the people you follow. Not strangers. It works by reading the follow list (kind 3) you&#39;ve already published — bothy doesn&#39;t ask you to maintain a separate allowlist, it just uses the one your nostr client already keeps.</p>
 <p>Why this is the default rather than a limitation: bothy is meant to be one of the 2-4 relays your NIP-65 relay list already tells clients to keep, not your only relay. Pair it with a permissive public relay and you get both — your own filtered archive of people you actually follow, plus a general-purpose inbox that already does the spam filtering you&#39;d otherwise have to build yourself. A reply from someone you don&#39;t follow isn&#39;t lost; it still lands on your other relay, and on the sender&#39;s own.</p>

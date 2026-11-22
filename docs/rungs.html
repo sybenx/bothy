@@ -54,13 +54,19 @@ must reference or address the owner. Bounded by: how many people
 mention the owner.</p>
 </li>
 </ol>
+<p>4a. <strong>Follows of follows may write</strong> (<code>network</code>). Adds any event signed by
+   a pubkey the owner&#39;s follows follow: the outer wall. Bounded by: a
+   capped list (limits.ts NETWORK_MAX_KEYS, 40,000 keys by default) built
+   from the follows&#39; own contact lists, paced at a tenth of the day&#39;s
+   writes. Still a list of people chosen through the owner, so it sits on
+   this side of the cliff.</p>
 <p>--- the cliff ---</p>
 <ol start="5">
 <li><strong>Open relay.</strong> Accepts anything from anyone.
 Bounded by: nothing.</li>
 </ol>
 <h2 id="why-the-cliff-sits-between-4-and-5">Why the cliff sits between 4 and 5<a class="anchor" href="#why-the-cliff-sits-between-4-and-5" aria-label="Link to this section">#</a></h2>
-<p>Rungs 1-4 each have a bound tied to a real-world quantity. Rung 5 has
+<p>Rungs 1-4a each have a bound tied to a real-world quantity. Rung 5 has
 none. That is a difference in kind, not degree: rungs 1-4 all sit in a
 similar, bounded cost regime, while rung 5&#39;s resource use is unbounded.
 The ladder is not a smooth gradient of expense — it is a run of bounded
