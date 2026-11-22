@@ -20,6 +20,8 @@ import {
   banPubkey,
   blockIp,
   approveJoinRequest,
+  deleteFcmToken,
+  upsertFcmToken,
   addAdmin,
   invitedSubtree,
   isAdmin,
@@ -63,6 +65,7 @@ import {
   INVITE_MAX_TTL_SECONDS,
   MAX_OUTSTANDING_INVITES,
   MAX_PUSH_SUBSCRIPTIONS_PER_PUBKEY,
+  MAX_FCM_TOKENS_PER_PUBKEY,
   MEMBER_INVITE_CODE_BYTES,
   MEMBER_INVITE_DEFAULT_USES,
   MEMBER_INVITE_MAX_USES,
@@ -80,6 +83,7 @@ import {
 import { sqlitePhotoStore } from "./photos";
 import { GROUPS_PAUSED_MESSAGE } from "./nip29";
 import { pushConfigured } from "./push";
+import { fcmConfigured } from "./fcm";
 import { joinRequestMessage, oneLine } from "./join-requests";
 import type { NostrEvent } from "./nostr";
 import { getOwnerPubkey } from "./ownership";
@@ -178,6 +182,9 @@ export const SUPPORTED_METHODS = [
   // (MEMBER_CALLABLE_METHODS below).
   "subscribepush",
   "unsubscribepush",
+  // bothy's own: the same for an Android app, with an FCM token (src/fcm.ts).
+  "subscribefcm",
+  "unsubscribefcm",
 ] as const;
 
 // The methods a MEMBER may call, not just the owner.
@@ -198,6 +205,8 @@ export const SUPPORTED_METHODS = [
 export const MEMBER_CALLABLE_METHODS: readonly string[] = [
   "subscribepush",
   "unsubscribepush",
+  "subscribefcm",
+  "unsubscribefcm",
   "createinvite",
   "listunusedinvites",
   "revokeinvite",
@@ -281,6 +290,11 @@ function isPlainMember(sql: SqlStorage, env: Env, signer: string): boolean {
 // subscribepush's label: short, and from an alphabet with no room for an
 // npub (63 characters) or a sentence.
 const PUSH_LABEL_RE = /^[A-Za-z0-9_-]{1,16}$/;
+
+// An FCM registration token: Google's own format, base64url-ish with ":"
+// and usually about 160 characters. Bounded so the column cannot be used
+// as storage.
+const FCM_TOKEN_RE = /^[A-Za-z0-9_:.-]{20,4096}$/;
 
 // The label, null for none, undefined when the parameter is malformed.
 function parsePushLabel(value: unknown): string | null | undefined {
@@ -942,6 +956,39 @@ export function handleManagementCall(
         MAX_PUSH_SUBSCRIPTIONS_PER_PUBKEY,
         nowSec,
       );
+      return { result: true };
+    }
+
+    // Android's subscribepush: an FCM registration token instead of a web
+    // push subscription, and the same optional label. Refused without a
+    // service account, as subscribepush is without a VAPID key.
+    case "subscribefcm": {
+      if (!fcmConfigured(env)) {
+        return err(
+          "subscribefcm: this relay has no FCM service account, so it cannot send Android notifications and " +
+            "will not keep a token it can never use",
+        );
+      }
+      const token = stringParam(params, 0);
+      if (token === null || !FCM_TOKEN_RE.test(token)) {
+        return err("subscribefcm takes the app's FCM registration token as a string");
+      }
+      const label = parsePushLabel(params[1]);
+      if (label === undefined) {
+        return err(
+          'subscribefcm: the second parameter is optional, {"label": "..."} with 1 to 16 letters, digits, "_" or "-"',
+        );
+      }
+      upsertFcmToken(sql, { token, pubkey: signer, label }, MAX_FCM_TOKENS_PER_PUBKEY, nowSec);
+      return { result: true };
+    }
+
+    // `true` whether or not a row went, and only the signer's, as
+    // unsubscribepush.
+    case "unsubscribefcm": {
+      const token = stringParam(params, 0);
+      if (token === null || token === "") return err("unsubscribefcm takes the FCM registration token as a string");
+      deleteFcmToken(sql, signer, token);
       return { result: true };
     }
 

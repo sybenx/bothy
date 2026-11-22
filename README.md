@@ -192,6 +192,20 @@ npx wrangler secret put VAPID_PRIVATE_KEY
 
 Without it everything above still works, with no notifications. A notification says only that there is a new message: not who sent it, not what it says, and not which conversation it belongs to. It passes through Apple's or Google's push service, and none of that is theirs to see. The relay could not add it anyway, because the mail is sealed.
 
+#### Android notifications
+
+That key covers browsers and home-screen web apps. An Android app that is not a browser gets its notifications through Google's Firebase Cloud Messaging instead, which needs a second, separate setup, and only if you use such an app:
+
+1. In the [Firebase console](https://console.firebase.google.com), open the Firebase project the Android app was built with. It has to be that app's own project: Google delivers only to apps in the project that sends.
+2. Go to **Project settings**, then **Service accounts**, and press **Generate new private key**. A JSON file downloads.
+3. Store the whole file as a secret, then delete the download:
+
+```bash
+npx wrangler secret put FCM_SERVICE_ACCOUNT < path/to/the-key.json
+```
+
+The relay information document then shows `"fcm": {"project_id": "..."}`, and the app registers each phone with `subscribefcm`. Each member can register up to 4 Android devices, on top of up to 4 for web push. The message carries the same as a web notification: that there is a new message, and the app's own label for the account, never who or what. Keep the key secret: anyone holding it can send notifications to everyone who uses that app. Without it, nothing changes.
+
 ### Profile photos
 
 Members, and you, can keep a profile photo here, so the people in your home load each other's faces from it. It is a [Blossom](https://github.com/hzrd149/blossom) server for that one thing: JPEG, PNG or WebP, up to 100 KB, one photo each (a new one replaces the old), a few uploads a day. Anyone can fetch a stored photo by its hash; nothing lists them. A removed member's photo goes with their mail, after 14 days.
@@ -250,9 +264,9 @@ The tool to send them with is [`nak`](https://github.com/fiatjaf/nak), whose `ad
 nak admin supportedmethods --sec <your nsec> your-relay.workers.dev
 ```
 
-Start there. `supportedmethods` returns exactly what this relay implements, which is the honest answer to what you can do with it, and `nak admin --help` lists the flags each method takes. Every request is authenticated with a [NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md) event signed by the relay owner's key, the same key you claimed the relay with. Nothing else is accepted, and an unsigned or wrongly signed request gets a 401. The exceptions are a member's own notification settings (`subscribepush` and `unsubscribepush`, signed by the member) `redeeminvite` and `requestjoin` (signed by whoever is joining), `myrole` (any key), the invite methods and `myinvites` for members (within their limits), and the member methods an admin may call (see "Admins" above).
+Start there. `supportedmethods` returns exactly what this relay implements, which is the honest answer to what you can do with it, and `nak admin --help` lists the flags each method takes. Every request is authenticated with a [NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md) event signed by the relay owner's key, the same key you claimed the relay with. Nothing else is accepted, and an unsigned or wrongly signed request gets a 401. The exceptions are a member's own notification settings (`subscribepush`, `unsubscribepush`, `subscribefcm` and `unsubscribefcm`, signed by the member) `redeeminvite` and `requestjoin` (signed by whoever is joining), `myrole` (any key), the invite methods and `myinvites` for members (within their limits), and the member methods an admin may call (see "Admins" above).
 
-What this relay implements: `banevent` and `allowevent` and `listbannedevents`; `banpubkey`, `unbanpubkey` and `listbannedpubkeys`; `allowpubkey`, `unallowpubkey` and `listallowedpubkeys`; `blockip` and `unblockip` and `listblockedips`; `changerelayname`, `changerelaydescription` and `changerelayicon`; and, bothy's own, `changewritepolicy` and `getwritepolicy` (see "Who can write here" above), `createinvite`, `redeeminvite`, `listunusedinvites`, `revokeinvite`, `requestjoin`, `listjoinrequests`, `approvejoin`, `declinejoin`, `listmembers`, `addadmin`, `removeadmin`, `listadmins`, `myrole`, `myinvites` and `homestats` (see "Members" above), and `subscribepush` and `unsubscribepush`. What it does not: the kind allowlist, because bothy stores every kind on purpose; and the moderation queue, because bothy has nothing to report events into.
+What this relay implements: `banevent` and `allowevent` and `listbannedevents`; `banpubkey`, `unbanpubkey` and `listbannedpubkeys`; `allowpubkey`, `unallowpubkey` and `listallowedpubkeys`; `blockip` and `unblockip` and `listblockedips`; `changerelayname`, `changerelaydescription` and `changerelayicon`; and, bothy's own, `changewritepolicy` and `getwritepolicy` (see "Who can write here" above), `createinvite`, `redeeminvite`, `listunusedinvites`, `revokeinvite`, `requestjoin`, `listjoinrequests`, `approvejoin`, `declinejoin`, `listmembers`, `addadmin`, `removeadmin`, `listadmins`, `myrole`, `myinvites` and `homestats` (see "Members" above), and `subscribepush`, `unsubscribepush`, `subscribefcm` and `unsubscribefcm`. What it does not: the kind allowlist, because bothy stores every kind on purpose; and the moderation queue, because bothy has nothing to report events into.
 
 The endpoint answers cross-origin requests, so a client hosted somewhere other than the relay can call it from a browser.
 

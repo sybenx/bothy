@@ -865,6 +865,10 @@ export const MAX_PUSH_ENDPOINTS_PER_NOTIFICATION = MAX_PUSHES_PER_TICK * PUSH_MA
 // and dead rows would otherwise lock a member out of notifications.
 export const MAX_PUSH_SUBSCRIPTIONS_PER_PUBKEY = 4;
 
+// Android push tokens one pubkey may register (src/fcm.ts), separate from
+// the web push devices above: oldest evicted, as there.
+export const MAX_FCM_TOKENS_PER_PUBKEY = 4;
+
 // How long a push service may hold an undeliverable notification (RFC
 // 8030 TTL). A message stays true for the hour; "somebody is in the call"
 // stops being true when they leave, so a voice notification older than

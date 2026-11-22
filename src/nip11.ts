@@ -12,6 +12,7 @@ import {
 } from "./limits";
 import { PHOTO_TYPES } from "./photos";
 import { pushPublicKey } from "./push";
+import { serviceAccount } from "./fcm";
 import type { RelaySettings } from "./storage";
 import { resolveWritePolicy } from "./write-policy";
 import { version } from "../package.json";
@@ -162,6 +163,14 @@ export function buildRelayInfo(
   const pushKey = pushPublicKey(env);
   if (pushKey) {
     info.push_key = pushKey;
+  }
+  // Android push (src/fcm.ts), bothy's own field: present only when the
+  // relay can send it, carrying the Firebase project it sends from. An app
+  // registers (nip86.ts subscribefcm) only if that is its own project; a
+  // token from another project would be refused by Google.
+  const fcm = serviceAccount(env);
+  if (fcm) {
+    info.fcm = { project_id: fcm.projectId };
   }
   // How many people this relay keeps an inbox for besides the owner
   // (storage.ts memberCount). bothy's own field. A client deciding whether

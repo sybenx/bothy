@@ -34,6 +34,9 @@ interface Env {
   // public half is derived, so the two cannot disagree. Unset (or
   // invalid) means no push_key on NIP-11 and no push, a supported state.
   VAPID_PRIVATE_KEY?: string;
+  // Android push (src/fcm.ts): a Google service-account JSON, the whole
+  // file, as a secret. Unset means no Android push.
+  FCM_SERVICE_ACCOUNT?: string;
   // The upstream update check (upstream-version.ts). On unless this is
   // exactly "off", the same shape as the write caps below.
   UPDATE_CHECK?: string;

@@ -534,6 +534,23 @@ export const TABLES: readonly TableSpec[] = [
     tableConstraints: ["PRIMARY KEY (endpoint, pubkey)"],
   },
   {
+    // Android push tokens (src/fcm.ts, nip86.ts subscribefcm). One row per
+    // (token, pubkey), like `push_subscriptions` and for the same reason:
+    // two accounts in one app share one token. Counted separately from web
+    // push devices (limits.ts MAX_FCM_TOKENS_PER_PUBKEY), since a phone
+    // with the app and a browser tab are two devices. `pubkey` is the
+    // NIP-98 signer, never the body. Dropped on removal, and on a 404 or
+    // UNREGISTERED from Google.
+    name: "fcm_tokens",
+    columns: [
+      col("token", "TEXT NOT NULL"),
+      col("pubkey", "TEXT NOT NULL"),
+      col("label", "TEXT"),
+      col("created_at", "INTEGER NOT NULL"),
+    ],
+    tableConstraints: ["PRIMARY KEY (token, pubkey)"],
+  },
+  {
     // The push fan-out queue: one row per REASON ("message", "voice"), so at
     // most two. Messages arriving before the alarm fires fold into the queued
     // row (an upsert, 1 row written) rather than adding a row each; hearth's
@@ -1034,6 +1051,12 @@ export const INDEXES: readonly IndexSpec[] = [
     name: "idx_photos_sha256",
     table: "photos",
     keyColumns: ["sha256"],
+  },
+  // Serves a member's own Android tokens (storage.ts fcmTokensFor).
+  {
+    name: "idx_fcm_tokens_pubkey",
+    table: "fcm_tokens",
+    keyColumns: ["pubkey"],
   },
   {
     name: "idx_push_subscriptions_pubkey",

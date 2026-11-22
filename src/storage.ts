@@ -2052,6 +2052,7 @@ export function unallowPubkey(sql: SqlStorage, pubkey: string, nowSec: number): 
   sql.exec(`DELETE FROM admins WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM member_seen WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM push_subscriptions WHERE pubkey = ?`, pubkey);
+  sql.exec(`DELETE FROM fcm_tokens WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM inbox_push WHERE pubkey = ?`, pubkey);
   sql.exec(
     `INSERT INTO former_members (pubkey, removed_at) VALUES (?, ?)
@@ -2403,8 +2404,9 @@ export function homeStats(sql: SqlStorage, nowSec: number, days: number, weeks: 
     pushSubscribers:
       sql
         .exec<{ n: number }>(
-          `SELECT COUNT(DISTINCT p.pubkey) AS n FROM push_subscriptions p
-             JOIN allowed_pubkeys a ON a.pubkey = p.pubkey`,
+          `SELECT COUNT(*) AS n FROM allowed_pubkeys a
+            WHERE EXISTS (SELECT 1 FROM push_subscriptions p WHERE p.pubkey = a.pubkey)
+               OR EXISTS (SELECT 1 FROM fcm_tokens f WHERE f.pubkey = a.pubkey)`,
         )
         .toArray()[0]?.n ?? 0,
   };
@@ -2891,9 +2893,66 @@ export function pushSubscriptionsFor(sql: SqlStorage, pubkey: string): PushFanou
 }
 
 // Asked on the gift wrap write path before queuing, so mail for a member
-// with no devices writes no queue row and wakes no alarm.
-export function hasPushSubscription(sql: SqlStorage, pubkey: string): boolean {
-  return sql.exec(`SELECT 1 FROM push_subscriptions WHERE pubkey = ? LIMIT 1`, pubkey).toArray().length > 0;
+// with no devices writes no queue row and wakes no alarm. Web push or
+// Android, whichever this relay can send.
+export function hasPushSubscription(sql: SqlStorage, pubkey: string, web = true, fcm = false): boolean {
+  if (web && sql.exec(`SELECT 1 FROM push_subscriptions WHERE pubkey = ? LIMIT 1`, pubkey).toArray().length > 0) {
+    return true;
+  }
+  return fcm && sql.exec(`SELECT 1 FROM fcm_tokens WHERE pubkey = ? LIMIT 1`, pubkey).toArray().length > 0;
+}
+
+// ---------------------------------------------------------------------
+// Android push tokens (schema.ts `fcm_tokens`, src/fcm.ts). The pubkey is
+// always the NIP-98 signer.
+// ---------------------------------------------------------------------
+
+export interface FcmTokenRow {
+  token: string;
+  pubkey: string;
+  label: string | null;
+}
+
+// Upsert on (token, pubkey), the label replaced every time, then this
+// pubkey's oldest beyond the cap evicted (rowid DESC as the tie-break,
+// as for web push).
+export function upsertFcmToken(sql: SqlStorage, row: FcmTokenRow, cap: number, nowSec: number): void {
+  sql.exec(
+    `INSERT INTO fcm_tokens (token, pubkey, label, created_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(token, pubkey) DO UPDATE SET label = excluded.label, created_at = excluded.created_at`,
+    row.token,
+    row.pubkey,
+    row.label,
+    nowSec,
+  );
+  sql.exec(
+    `DELETE FROM fcm_tokens
+       WHERE pubkey = ?
+         AND token NOT IN (
+           SELECT token FROM fcm_tokens WHERE pubkey = ? ORDER BY created_at DESC, rowid DESC LIMIT ?
+         )`,
+    row.pubkey,
+    row.pubkey,
+    cap,
+  );
+}
+
+export function deleteFcmToken(sql: SqlStorage, pubkey: string, token: string): void {
+  sql.exec(`DELETE FROM fcm_tokens WHERE token = ? AND pubkey = ?`, token, pubkey);
+}
+
+// Every account on a token Google says is dead.
+export function forgetFcmToken(sql: SqlStorage, token: string): void {
+  sql.exec(`DELETE FROM fcm_tokens WHERE token = ?`, token);
+}
+
+export function fcmTokensFor(sql: SqlStorage, pubkey: string): FcmTokenRow[] {
+  return sql
+    .exec<{ token: string; pubkey: string; label: string | null }>(
+      `SELECT token, pubkey, label FROM fcm_tokens WHERE pubkey = ? ORDER BY token ASC`,
+      pubkey,
+    )
+    .toArray();
 }
 
 // ---------------------------------------------------------------------
