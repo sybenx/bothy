@@ -18,7 +18,7 @@ Each rung is defined by *who may write* and *what bounds the volume*.
    mention the owner.
 
 4a. **Follows of follows may write** (`network`). Adds any event signed by
-   a pubkey the owner's follows follow: the outer wall. Bounded by: a
+   a pubkey the owner's follows follow. Bounded by: a
    capped list (limits.ts NETWORK_MAX_KEYS, 40,000 keys by default) built
    from the follows' own contact lists, paced at a tenth of the day's
    writes. Still a list of people chosen through the owner, so it sits on

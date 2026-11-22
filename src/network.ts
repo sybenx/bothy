@@ -1,5 +1,5 @@
-// The `network` write policy's second ring: everyone the owner's follows
-// follow ("the outer wall"). Built from the follows' own contact lists
+// The `network` write policy's second ring: the people the owner's
+// follows follow. Built from the follows' own contact lists
 // (kind 3), which the relay does not otherwise hold: the hourly tick
 // fetches a few follows' lists at a time from limits.ts NETWORK_RELAYS
 // (network-worker.ts, in the Worker, never here: an outbound socket pins a
