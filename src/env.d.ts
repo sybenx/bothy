@@ -79,6 +79,13 @@ interface Env {
   // number, or "off" to remove that cap.
   MAIL_STORAGE_BYTES?: string;
   MAIL_BYTES_PER_MEMBER?: string;
+  // The restore vault (limits.ts vaultStorageBytes): bytes all locked
+  // copies may take. A positive number, or "off" to remove that cap.
+  VAULT_STORAGE_BYTES?: string;
+  // The restore vault's passkey origins (src/vault.ts): a comma-separated
+  // list ADDED to the defaults (https://dms.aaro.cc and the DMs Android
+  // apps). Never needed for DMs itself.
+  PASSKEY_ORIGINS?: string;
   // Whether members can see who else is in the home (limits.ts
   // memberListVisibility): "members" (default) or "hidden".
   MEMBER_LIST?: string;

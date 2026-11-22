@@ -1,4 +1,5 @@
 import { buildFilterQuery, compareEvents, expandFilter, type FilterQueryOptions } from "./filters";
+import { deleteVaultRowsOf } from "./vault";
 import {
   groupIdOf,
   GROUP_METADATA_KIND,
@@ -2291,6 +2292,8 @@ export function eraseMember(
   sql.exec(`DELETE FROM photo_uploads WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM join_requests WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM group_membership WHERE pubkey = ?`, pubkey);
+  // Their restore vault rows (src/vault.ts).
+  deleteVaultRowsOf(sql, pubkey);
   unallowPubkey(sql, pubkey, nowSec, "erased");
   return deleted;
 }
@@ -3226,6 +3229,8 @@ export function sweepFormerMembers(
       // Their profile photo goes with their mail (src/photos.ts).
       sql.exec(`DELETE FROM photos WHERE pubkey = ?`, pubkey);
       sql.exec(`DELETE FROM photo_uploads WHERE pubkey = ?`, pubkey);
+      // So do their restore vault rows, read-only until now (src/vault.ts).
+      deleteVaultRowsOf(sql, pubkey);
       finished++;
     }
   }

@@ -30,6 +30,10 @@ import {
   photoStorageBytes,
   MAX_REQUEST_JOINS_PER_IP_PER_WINDOW,
   REQUEST_JOIN_RATE_LIMIT_WINDOW_MS,
+  MAX_VAULT_CALLS_PER_IP_PER_WINDOW,
+  MAX_VAULT_OPENS_PER_HASH_PER_WINDOW,
+  VAULT_HASH_RATE_LIMIT_WINDOW_MS,
+  VAULT_IP_RATE_LIMIT_WINDOW_MS,
   MEMBER_REMOVAL_GRACE_SECONDS,
   FORMER_MEMBER_SWEEP_PUBKEYS,
   FORMER_MEMBER_SWEEP_BATCH_SIZE,
@@ -81,6 +85,18 @@ import {
   JOIN_REQUEST_KIND,
 } from "./nip29";
 import { handleManagementCall, type ManagementResponse } from "./nip86";
+import {
+  importVaultKey,
+  isVaultHash,
+  issueChallenge,
+  openVault,
+  parseVaultPut,
+  sweepSpentChallenges,
+  VAULT_CHALLENGE_KEY_LABEL,
+  VAULT_NOT_FOUND,
+  VAULT_RATE_LIMITED,
+} from "./vault";
+import { relayDerivedKey } from "./relay-identity";
 import { resolveIcon, resolveName, type OwnerProfile } from "./nip11";
 import {
   CALL_PRESENCE_KIND,
@@ -659,6 +675,16 @@ export class Relay extends DurableObject<Env> {
     if (method === "requestjoin" && this.isRequestJoinRateLimited(callerIp)) {
       return { error: "requestjoin: too many requests from this address. Try again in a few minutes." };
     }
+    // vaultput's public key must import as its algorithm, which takes
+    // WebCrypto (async); handleManagementCall is synchronous, so it is
+    // checked here first (src/vault.ts).
+    if (method === "vaultput") {
+      const input = parseVaultPut(params, signer);
+      if (typeof input === "string") return { error: input };
+      if ((await importVaultKey(input.publicKey, input.alg)) === null) {
+        return { error: "vaultput: publicKey is not a public key of that alg" };
+      }
+    }
     const response = await this.metered(async () => {
       const answer = withReadPath("management", () => {
         const sql = this.sql;
@@ -682,6 +708,71 @@ export class Relay extends DurableObject<Env> {
     // methods invalidate it will eventually be wrong about one.
     this.cachedWritePolicy = undefined;
     return response;
+  }
+
+  // ------------------------------------------------------------------
+  // The restore vault's two unsigned methods (src/vault.ts). index.ts
+  // reaches these without a signature and holds vaultopen's time floor.
+  // ------------------------------------------------------------------
+
+  // The challenge MAC key, derived once per wake (relay-identity.ts).
+  private vaultChallengeKey: Uint8Array | null = null;
+
+  private challengeKey(): Uint8Array {
+    this.vaultChallengeKey ??= relayDerivedKey(this.sql, VAULT_CHALLENGE_KEY_LABEL);
+    return this.vaultChallengeKey;
+  }
+
+  // {challenge}: single use, two minutes. Takes no credential id, so it
+  // cannot answer differently for one.
+  async vaultChallenge(callerIp: string): Promise<ManagementResponse> {
+    if (this.windowLimited(this.vaultChallengeIpLimits, normalizeIp(callerIp), VAULT_IP_RATE_LIMIT_WINDOW_MS, MAX_VAULT_CALLS_PER_IP_PER_WINDOW)) {
+      return { error: VAULT_RATE_LIMITED };
+    }
+    return this.metered(() =>
+      withReadPath("management", () => ({ result: { challenge: issueChallenge(this.challengeKey(), nowSeconds()) } })),
+    );
+  }
+
+  // {blob}, or VAULT_NOT_FOUND for every failure. The per-hash limit is
+  // counted for any well-formed hash, stored or not.
+  async vaultOpen(params: unknown[], callerIp: string): Promise<ManagementResponse> {
+    if (this.windowLimited(this.vaultOpenIpLimits, normalizeIp(callerIp), VAULT_IP_RATE_LIMIT_WINDOW_MS, MAX_VAULT_CALLS_PER_IP_PER_WINDOW)) {
+      return { error: VAULT_RATE_LIMITED };
+    }
+    const [hash, assertion] = params;
+    if (!isVaultHash(hash)) return { error: VAULT_NOT_FOUND };
+    if (this.windowLimited(this.vaultHashLimits, hash, VAULT_HASH_RATE_LIMIT_WINDOW_MS, MAX_VAULT_OPENS_PER_HASH_PER_WINDOW)) {
+      return { error: VAULT_RATE_LIMITED };
+    }
+    return this.metered(async () => {
+      const blob = await openVault(this.sql, this.env, this.challengeKey(), hash, assertion, nowSeconds());
+      return blob === null ? { error: VAULT_NOT_FOUND } : { result: { blob } };
+    });
+  }
+
+  private vaultChallengeIpLimits = new Map<string, { windowStart: number; count: number }>();
+  private vaultOpenIpLimits = new Map<string, { windowStart: number; count: number }>();
+  private vaultHashLimits = new Map<string, { windowStart: number; count: number }>();
+
+  // A fixed-window counter in memory. An evicted object forgets, which
+  // costs at most one more window's worth of calls; a full map is cleared
+  // rather than grown.
+  private windowLimited(
+    limits: Map<string, { windowStart: number; count: number }>,
+    key: string,
+    windowMs: number,
+    max: number,
+  ): boolean {
+    const now = Date.now();
+    const entry = limits.get(key);
+    if (!entry || now - entry.windowStart >= windowMs) {
+      if (limits.size >= 4096) limits.clear();
+      limits.set(key, { windowStart: now, count: 1 });
+      return false;
+    }
+    entry.count++;
+    return entry.count > max;
   }
 
   // See limits.ts REQUEST_JOIN_RATE_LIMIT_WINDOW_MS. In memory, like the
@@ -1080,6 +1171,8 @@ export class Relay extends DurableObject<Env> {
         withReadPath("giftWrapSweep", () => this.sweepFormerMemberMail(sql, now));
         // Join requests past their 30 days, answered or not.
         sweepExpiredJoinRequests(sql, now);
+        // Restore vault challenges spent and since expired (src/vault.ts).
+        sweepSpentChallenges(sql, now);
         pruneHomeStats(sql, utcDay(now), HOME_STATS_DAYS_KEPT);
         // Last: see the comment on runCron.
         this.drainPendingVanishes(sql);

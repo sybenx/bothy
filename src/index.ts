@@ -6,6 +6,7 @@ import {
   photoMaxBytes,
   photoStorageBytes,
   secondsUntilUtcMidnight,
+  VAULT_OPEN_FLOOR_MS,
 } from "./limits";
 import { extensionFor, sha256Hex, sniffPhotoType, verifyBlossomAuth } from "./photos";
 import {
@@ -16,8 +17,11 @@ import {
   NOT_A_MEMBER_REASON,
   STORAGE_CALLABLE_METHODS,
   STORAGE_ONLY_REASON,
+  UNSIGNED_METHODS,
   adminOnlyReason,
+  type ManagementResponse,
 } from "./nip86";
+import { VAULT_NOT_FOUND } from "./vault";
 import { nip11Response } from "./nip11";
 import { verifyClaimAuthEvent } from "./nip42";
 import { ownerReason, verifyNip98 } from "./nip98";
@@ -243,6 +247,8 @@ async function handleClaimStatus(request: Request, env: Env): Promise<Response> 
 // Never consults `blocked_ips`, so an operator who blocks their own
 // address can still call unblockip.
 async function handleManagement(request: Request, env: Env): Promise<Response> {
+  // vaultopen's time floor counts from here (handleUnsignedVault).
+  const arrivedAt = Date.now();
   const limited = await rateLimited(env.RATE_LIMIT_API, request);
   if (limited !== null) return limited;
 
@@ -250,6 +256,11 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
   // tag binds the SHA256 of exactly these bytes, so they are hashed
   // as-sent, before any decoding or parsing can normalize them.
   const body = new Uint8Array(await request.arrayBuffer());
+
+  // The restore vault's unsigned methods (nip86.ts UNSIGNED_METHODS) take
+  // no NIP-98 header at all, and any header sent is ignored.
+  const unsigned = unsignedVaultCall(body);
+  if (unsigned !== null) return handleUnsignedVault(request, env, unsigned, arrivedAt);
 
   // Verify BEFORE touching the Durable Object. Otherwise a POST with no
   // valid header still wakes the DO and spends one of the day's 100,000
@@ -327,6 +338,45 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
     auth.pubkey,
   );
   return managementResponse(result);
+}
+
+// The method and params of a vaultchallenge or vaultopen call, or null for
+// anything else (which then goes through NIP-98 as usual).
+function unsignedVaultCall(body: Uint8Array): { method: string; params: unknown[] } | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(body));
+  } catch {
+    return null;
+  }
+  const call = parsed as { method?: unknown; params?: unknown } | null;
+  if (typeof call?.method !== "string" || !UNSIGNED_METHODS.includes(call.method)) return null;
+  return { method: call.method, params: Array.isArray(call.params) ? (call.params as unknown[]) : [] };
+}
+
+// vaultchallenge and vaultopen (src/vault.ts). Every vaultopen answer,
+// found or not, rate limited or not, leaves no sooner than
+// VAULT_OPEN_FLOOR_MS after the request arrived, so the row lookup and
+// the signature check behind it cannot be timed.
+async function handleUnsignedVault(
+  request: Request,
+  env: Env,
+  call: { method: string; params: unknown[] },
+  arrivedAt: number,
+): Promise<Response> {
+  const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+  if (call.method === "vaultchallenge") {
+    return managementResponse(await relayStub(env).vaultChallenge(ip));
+  }
+  let reply: ManagementResponse;
+  try {
+    reply = await relayStub(env).vaultOpen(call.params, ip);
+  } catch {
+    reply = { error: VAULT_NOT_FOUND };
+  }
+  const wait = VAULT_OPEN_FLOOR_MS - (Date.now() - arrivedAt);
+  if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+  return managementResponse(reply);
 }
 
 // ---------------------------------------------------------------------

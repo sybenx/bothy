@@ -13,6 +13,8 @@
 // /api/stats, NIP-86 or a log line.
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
+import { hmac } from "@noble/hashes/hmac.js";
+import { sha256 } from "@noble/hashes/sha2.js";
 import { conversationKey } from "./nip44";
 
 export function generateRelayKeypair(): { secretKeyHex: string; publicKeyHex: string } {
@@ -20,7 +22,7 @@ export function generateRelayKeypair(): { secretKeyHex: string; publicKeyHex: st
   return { secretKeyHex: bytesToHex(secretKey), publicKeyHex: bytesToHex(publicKey) };
 }
 
-// The public key only. signAsRelay and relayConversationKey are the only
+// The public key only. signAsRelay, relayConversationKey and relayDerivedKey are the only
 // readers of the secret key column, and neither returns it.
 export function getRelayPubkey(sql: SqlStorage): string {
   const row = sql.exec<{ public_key: string }>(`SELECT public_key FROM relay_identity LIMIT 1`).toArray()[0];
@@ -49,4 +51,16 @@ export function relayConversationKey(sql: SqlStorage, pubkey: string): Uint8Arra
     throw new Error("relay_identity has no row -- initSchema seeds it unconditionally on every wake");
   }
   return conversationKey(row.secret_key, pubkey);
+}
+
+// A 32-byte key derived from this relay's secret key for one named use
+// (HMAC-SHA256(secret, label)), so a feature needing its own secret, like
+// the restore vault's challenge MAC (src/vault.ts), gets one without
+// another stored row, and the secret key still has one reader.
+export function relayDerivedKey(sql: SqlStorage, label: string): Uint8Array {
+  const row = sql.exec<{ secret_key: string }>(`SELECT secret_key FROM relay_identity LIMIT 1`).toArray()[0];
+  if (!row) {
+    throw new Error("relay_identity has no row -- initSchema seeds it unconditionally on every wake");
+  }
+  return hmac(sha256, hexToBytes(row.secret_key), new TextEncoder().encode(label));
 }

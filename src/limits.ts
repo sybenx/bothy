@@ -823,6 +823,56 @@ export function photoStorageBytes(env: Env): number | null {
 // someone changing their mind, not a script.
 export const PHOTO_UPLOADS_PER_DAY = 5;
 
+// ---------------------------------------------------------------------
+// The restore vault (src/vault.ts): each member's passkey-locked copy of
+// their key, which this relay stores and cannot open.
+// ---------------------------------------------------------------------
+
+// All vault rows together: 1% of the storage budget (about 10MB at the
+// default 1GB, some 5,000 rows at the row cap; real use is a few hundred
+// bytes a person). Taken from the part no other share claims: the owner's
+// half, mail's 30% and photos' 5% leave about 15% unassigned.
+// VAULT_STORAGE_BYTES overrides; "off" removes this cap and leaves the
+// non-owner share as the backstop, like the mail cap.
+const VAULT_SHARE_OF_BUDGET = 0.01;
+export const VAULT_STORAGE_BYTES_DEFAULT = Math.floor(STORAGE_BYTES_LIMIT * VAULT_SHARE_OF_BUDGET);
+
+export function vaultStorageBytes(env: Env): number | null {
+  return resolveLimit(env.VAULT_STORAGE_BYTES, Math.floor(storageBudget(env) * VAULT_SHARE_OF_BUDGET));
+}
+
+// Rows one person may have: one per passkey. Usually one synced passkey
+// covers every phone; ten is room for a few passkey apps and rotations.
+export const VAULT_ROWS_PER_MEMBER = 10;
+
+// The locked copy (about 200 bytes in practice), and the whole row:
+// credential id, public key, copy and label together.
+export const VAULT_BLOB_MAX_BYTES = 1024;
+export const VAULT_ROW_MAX_BYTES = 2048;
+
+// A row's label, e.g. the passkey app's name, in characters.
+export const VAULT_LABEL_MAX_LENGTH = 64;
+
+// How long a vaultchallenge stays good. Spent by the first vaultopen that
+// names it, found or not.
+export const VAULT_CHALLENGE_TTL_SECONDS = 120;
+
+// Every vaultopen answer, success or not, leaves the Worker no sooner than
+// this after the request arrived, so a row lookup or a signature check
+// against a real key cannot be told from one against the dummy key.
+export const VAULT_OPEN_FLOOR_MS = 300;
+
+// Per address, per method (vaultchallenge and vaultopen each): ten a
+// minute is a person retrying a fingerprint. In memory, like the other
+// per-address throttles.
+export const VAULT_IP_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+export const MAX_VAULT_CALLS_PER_IP_PER_WINDOW = 10;
+
+// Per row hash, counted whether the row exists or not: twenty opens an
+// hour. In memory too.
+export const VAULT_HASH_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
+export const MAX_VAULT_OPENS_PER_HASH_PER_WINDOW = 20;
+
 // How far ahead of now a kind-24242 auth event's `created_at` may be,
 // matching nip98.ts HTTP_AUTH_MAX_DRIFT_SECONDS. Its expiry is its own
 // `expiration` tag (BUD-01).

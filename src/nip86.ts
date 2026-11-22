@@ -96,6 +96,7 @@ import {
   photoStorageBytes,
 } from "./limits";
 import { sqlitePhotoStore } from "./photos";
+import { deleteVaultRow, isVaultHash, listVaultRows, parseVaultPut, storeVaultRow } from "./vault";
 import { GROUPS_PAUSED_MESSAGE } from "./nip29";
 import { pushConfigured } from "./push";
 import { fcmConfigured } from "./fcm";
@@ -216,6 +217,14 @@ export const SUPPORTED_METHODS = [
   // about by members.
   "setclose",
   "areclose",
+  // bothy's own: the restore vault (src/vault.ts). The first three are a
+  // member's own rows; vaultchallenge and vaultopen are UNSIGNED
+  // (UNSIGNED_METHODS below).
+  "vaultput",
+  "vaultlist",
+  "vaultdelete",
+  "vaultchallenge",
+  "vaultopen",
 ] as const;
 
 // The methods a MEMBER may call, not just the owner.
@@ -248,7 +257,17 @@ export const MEMBER_CALLABLE_METHODS: readonly string[] = [
   "listunusedinvites",
   "revokeinvite",
   "myinvites",
+  "vaultput",
+  "vaultlist",
+  "vaultdelete",
 ];
+
+// The methods that take NO signature, an exception to NIP-86's NIP-98
+// rule: a new phone restoring with a passkey has no key yet, and the
+// passkey assertion is the credential (src/vault.ts). index.ts routes them
+// before NIP-98 verification, to relay.ts vaultChallenge and vaultOpen;
+// they never reach handleManagementCall.
+export const UNSIGNED_METHODS: readonly string[] = ["vaultchallenge", "vaultopen"];
 
 // The method ANY valid signature may call: redeeminvite, whose caller is
 // by definition not a member yet. The code is the authority, and the
@@ -1204,6 +1223,25 @@ export function handleManagementCall(
     // keeps those for the owner and admins). With MEMBER_LIST=hidden a
     // plain member gets an empty list and MEMBER_LIST_HIDDEN_NOTE; the
     // owner and admins still get it.
+    // The restore vault (src/vault.ts), a member's own rows. vaultput's key
+    // was imported by relay.ts manage before this ran.
+    case "vaultput": {
+      const input = parseVaultPut(params, signer);
+      if (typeof input === "string") return err(input);
+      const refusal = storeVaultRow(sql, env, input, signer, nowSec);
+      return refusal === null ? { result: true } : err(refusal);
+    }
+
+    case "vaultlist":
+      return { result: listVaultRows(sql, signer) };
+
+    case "vaultdelete": {
+      const [hash] = params;
+      if (!isVaultHash(hash)) return err("vaultdelete: the parameter must be the row's hash");
+      deleteVaultRow(sql, hash, signer);
+      return { result: true };
+    }
+
     case "homemembers": {
       const owner = getOwnerPubkey(sql, env);
       const role = roleOf(sql, signer, owner);
