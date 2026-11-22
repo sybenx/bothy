@@ -205,6 +205,7 @@ export function getOwnerProfile(sql: SqlStorage, env: Env): OwnerProfile {
 export type WriteRejection =
   | "unclaimed"
   | "not-follow"
+  | "not-network"
   | "owner-only"
   | "banned"
   | "not-mention"
@@ -262,15 +263,21 @@ export function isAllowedWriter(
     const row = sql.exec(`SELECT 1 FROM follows WHERE pubkey = ?`, pubkey).toArray();
     if (row.length > 0) return { allowed: true, isOwner: false };
   }
+  // The second ring (network.ts): someone a follow follows. One PK seek,
+  // only under `network`.
+  if (admitsAtLeast(policy, "network")) {
+    const row = sql.exec(`SELECT 1 FROM network_keys WHERE pubkey = ?`, pubkey).toArray();
+    if (row.length > 0) return { allowed: true, isOwner: false };
+  }
   if (isPubkeyAllowed(sql, pubkey)) return { allowed: true, isOwner: false };
-  if (policy === "mentions" && context.tags !== undefined) {
+  if (admitsAtLeast(policy, "mentions") && context.tags !== undefined) {
     const event = { tags: context.tags };
     if (mentionsPubkey(event, owner)) {
       return exceedsMentionTagCap(event)
         ? { allowed: false, reason: "too-many-tags" }
         : { allowed: true, isOwner: false };
     }
-    return { allowed: false, reason: "not-mention" };
+    return { allowed: false, reason: policy === "network" ? "not-network" : "not-mention" };
   }
   return { allowed: false, reason: admitsAtLeast(policy, "follows") ? "not-follow" : "owner-only" };
 }

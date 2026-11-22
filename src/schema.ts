@@ -748,6 +748,34 @@ export const TABLES: readonly TableSpec[] = [
     columns: [col("id", "TEXT PRIMARY KEY"), col("expiration", "INTEGER NOT NULL")],
   },
   {
+    // The `network` write policy's second ring (src/network.ts): everyone
+    // the owner's follows follow, as keys only. Never shown to anyone: not
+    // which follow brought a key in, not the list; only its size reaches
+    // /api/stats. `gen` is the rebuild that last saw the key; a rebuild
+    // ends by dropping keys from older ones.
+    name: "network_keys",
+    columns: [col("pubkey", "TEXT PRIMARY KEY"), col("gen", "INTEGER NOT NULL")],
+  },
+  {
+    // Where the network list's rebuild stands: one row. `cursor` is the
+    // last follow whose list was taken in this rebuild (NULL between
+    // rebuilds); `found`/`seen` count lists found against follows asked
+    // about, for limits.ts NETWORK_MIN_COVERAGE; `key_count` is maintained
+    // so nothing counts the table.
+    name: "network_state",
+    columns: [
+      col("id", "INTEGER PRIMARY KEY"),
+      col("gen", "INTEGER NOT NULL DEFAULT 0"),
+      col("cursor", "TEXT"),
+      col("started_at", "INTEGER"),
+      col("completed_at", "INTEGER"),
+      col("found", "INTEGER NOT NULL DEFAULT 0"),
+      col("seen", "INTEGER NOT NULL DEFAULT 0"),
+      col("key_count", "INTEGER NOT NULL DEFAULT 0"),
+      col("capped", "INTEGER NOT NULL DEFAULT 0"),
+    ],
+  },
+  {
     // Members the owner removed (nip86.ts unallowpubkey), kept for
     // limits.ts MEMBER_REMOVAL_GRACE_SECONDS so the mail already stored for
     // them stays readable while their app moves house. After that the cron
@@ -1629,6 +1657,7 @@ export function initSchema(sql: SqlStorage): void {
   seedMaintainedCounts(sql);
   seedIngestCounts(sql);
   seedMailUsage(sql);
+  sql.exec(`INSERT INTO network_state (id) SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM network_state)`);
   seedWrapSeq(sql);
   seedRelayIdentity(sql);
   seedTopLevelGroup(sql);

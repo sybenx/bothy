@@ -21,6 +21,12 @@
 //             because "anyone" can choose that number, by
 //             MAX_MENTION_EVENT_INDEXED_TAGS on top of the per-event
 //             caps every non-owner write already pays.
+//   network   + any event signed by someone the owner's follows follow
+//             (network.ts, the `network_keys` table). Bounded by
+//             limits.ts NETWORK_MAX_KEYS and the per-writer caps. After
+//             `mentions`, not before it: the levels are cumulative, and
+//             slotting it below `mentions` would have widened every relay
+//             already on `mentions`.
 //   all       + anything from anyone. Bounded only by the per-writer
 //             caps (limits.ts MAX_EVENT_BYTES, MAX_EVENTS_PER_PUBKEY_PER_
 //             WINDOW, NON_OWNER_STORAGE_BYTES). This is the open relay
@@ -43,7 +49,7 @@ import { MAX_MENTION_EVENT_INDEXED_TAGS } from "./limits";
 
 // The five names, in order from most closed to most open. This array IS
 // the ordering: a policy admits everything every policy before it admits.
-export const WRITE_POLICIES = ["owner", "inbox", "follows", "mentions", "all"] as const;
+export const WRITE_POLICIES = ["owner", "inbox", "follows", "mentions", "network", "all"] as const;
 export type WritePolicy = (typeof WRITE_POLICIES)[number];
 
 export const DEFAULT_WRITE_POLICY: WritePolicy = "follows";
@@ -55,6 +61,8 @@ export const POLICY_DESCRIPTIONS: Readonly<Record<WritePolicy, string>> = {
   inbox: "Only you can publish here. Anyone can send you encrypted mail.",
   follows: "You and the people you follow can publish here.",
   mentions: "You, the people you follow, and anyone who mentions or replies to you can publish here.",
+  network:
+    "You, the people you follow, the people they follow, and anyone who mentions or replies to you can publish here.",
   all: "Anyone can publish here.",
 };
 

@@ -439,6 +439,15 @@ function renderWritePolicyStatus(stats) {
     case "all":
       text = "Anyone can publish here.";
       break;
+    case "network": {
+      // The second ring's size only, never who is in it (src/network.ts).
+      const ring = stats.networkCount + (stats.networkCount === 1 ? " person they follow" : " people they follow");
+      text = stats.networkUpdatedAt === null && stats.networkCount === 0
+        ? "You, the " + follows + ", the people they follow, and anyone who mentions or replies to you can publish here. The list of people they follow is still being gathered."
+        : "You, the " + follows + ", the " + ring + ", and anyone who mentions or replies to you can publish here." +
+          (stats.networkCapped ? " That list is at its limit, so some people they follow are not on it." : "");
+      break;
+    }
     case "mentions":
       text = stats.followCount === 0
         ? "You, and anyone who mentions or replies to you, can publish here. Your follow list is empty, so nobody is admitted as a follow until your contact list is stored on this relay."

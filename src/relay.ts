@@ -133,6 +133,7 @@ import {
 } from "./read-metrics";
 import { getRelayPubkey } from "./relay-identity";
 import { type PhotoType, sqlitePhotoStore, takeUploadAllowance } from "./photos";
+import { ingestNetwork, networkSummary, networkWork } from "./network";
 import {
   accessToken,
   fcmData,
@@ -341,6 +342,8 @@ function writeRejectionMessage(reason: WriteRejection): string {
     // accept.
     case "not-mention":
       return "restricted: only the owner, people they follow, and events that mention the owner can publish here";
+    case "not-network":
+      return "restricted: only the owner, people they follow, people those follow, and events that mention the owner can publish here";
     case "too-many-tags":
       return `restricted: an event from someone the owner does not follow may carry at most ${MAX_MENTION_EVENT_INDEXED_TAGS} indexed tags`;
   }
@@ -842,6 +845,12 @@ export class Relay extends DurableObject<Env> {
     // From the same `maintained_counts` row as `totalEvents`; ownership.ts
     // refreshFollows is the only writer of `follows` and moves it.
     followCount: number;
+    // The `network` policy's second ring (src/network.ts): how many keys it
+    // holds, whether it stopped at its cap, and when it was last rebuilt.
+    // A count only, never the keys.
+    networkCount: number;
+    networkCapped: boolean;
+    networkUpdatedAt: number | null;
     // Members (storage.ts memberCount): the people this relay keeps an
     // inbox for besides the owner. The same figure as NIP-11
     // `member_count`.
@@ -967,6 +976,10 @@ export class Relay extends DurableObject<Env> {
       groupPolicy: groupsEnabled(this.env) ? "on" : "paused",
       chatPolicy: chatMode(this.env),
       followCount: counts.follows,
+      ...(() => {
+        const n = networkSummary(sql);
+        return { networkCount: n.count, networkCapped: n.capped, networkUpdatedAt: n.updatedAt };
+      })(),
       memberCount: memberCount(sql),
       pushPolicy: pushConfigured(this.env) ? "on" : "off",
       photoBytes: sqlitePhotoStore(sql).usedBytes(),
@@ -1110,6 +1123,24 @@ export class Relay extends DurableObject<Env> {
   // fetchPage); see backfill.ts applyBackfillPage for the checks and their
   // order. Null when unclaimed, which the Worker's prior getBackfillState
   // call should already have ruled out.
+  // The `network` policy's list (src/network.ts), Worker-side tick's two
+  // RPCs: which follows' lists to fetch now (null unless the policy in
+  // force is `network` and a rebuild has work), and taking in what came
+  // back.
+  async getNetworkWork(): Promise<{ authors: string[] } | null> {
+    return this.metered(() =>
+      withReadPath("backfillState", () =>
+        this.writePolicy().policy === "network" ? networkWork(this.sql, nowSeconds()) : null,
+      ),
+    );
+  }
+
+  async ingestNetworkLists(authors: string[], rawEvents: unknown[]): Promise<{ taken: number; rowsWritten: number }> {
+    return this.metered(() =>
+      withReadPath("backfillIngest", () => ingestNetwork(this.sql, this.env, authors, rawEvents)),
+    );
+  }
+
   async ingestBackfillPage(
     relayUrl: string,
     rawEvents: unknown[],

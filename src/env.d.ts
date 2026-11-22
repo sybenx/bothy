@@ -82,6 +82,9 @@ interface Env {
   // Whether members can see who else is in the home (limits.ts
   // memberListVisibility): "members" (default) or "hidden".
   MEMBER_LIST?: string;
+  // The `network` write policy's list of follows' follows (network.ts):
+  // how many keys it may hold. A positive number.
+  NETWORK_MAX_KEYS?: string;
   INVITES_PER_MEMBER?: string;
   INVITE_DEPTH?: string;
   PHOTO_STORAGE_BYTES?: string;

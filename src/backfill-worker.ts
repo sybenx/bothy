@@ -30,7 +30,7 @@ const MAX_REFUSAL_LENGTH = 300;
 // Collects every EVENT for one REQ until EOSE, CLOSED, an error or the
 // timeout, then closes the socket. Same shape as profile-lookup.ts
 // queryOne, but collecting a page rather than the first result.
-function fetchPage(relayUrl: string, filter: Record<string, unknown>, timeoutMs: number): Promise<FetchPageResult> {
+export function fetchPage(relayUrl: string, filter: Record<string, unknown>, timeoutMs: number): Promise<FetchPageResult> {
   return new Promise((resolve) => {
     const events: unknown[] = [];
     const refusals: string[] = [];

@@ -17,6 +17,13 @@ Each rung is defined by *who may write* and *what bounds the volume*.
    must reference or address the owner. Bounded by: how many people
    mention the owner.
 
+4a. **Follows of follows may write** (`network`). Adds any event signed by
+   a pubkey the owner's follows follow: the outer wall. Bounded by: a
+   capped list (limits.ts NETWORK_MAX_KEYS, 20,000 keys by default) built
+   from the follows' own contact lists, paced at a tenth of the day's
+   writes. Still a list of people chosen through the owner, so it sits on
+   this side of the cliff.
+
 --- the cliff ---
 
 5. **Open relay.** Accepts anything from anyone.
@@ -24,7 +31,7 @@ Each rung is defined by *who may write* and *what bounds the volume*.
 
 ## Why the cliff sits between 4 and 5
 
-Rungs 1-4 each have a bound tied to a real-world quantity. Rung 5 has
+Rungs 1-4a each have a bound tied to a real-world quantity. Rung 5 has
 none. That is a difference in kind, not degree: rungs 1-4 all sit in a
 similar, bounded cost regime, while rung 5's resource use is unbounded.
 The ladder is not a smooth gradient of expense — it is a run of bounded

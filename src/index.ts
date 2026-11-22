@@ -1,4 +1,5 @@
 import { runBackfillTick } from "./backfill-worker";
+import { runNetworkTick } from "./network-worker";
 import { logExhaustion } from "./exhaustion";
 import {
   HTTP_RATE_LIMIT_PERIOD_SECONDS,
@@ -630,6 +631,11 @@ export default {
       await runBackfillTick(env);
     } catch (err) {
       logExhaustion("scheduled: runBackfillTick", err);
+    }
+    try {
+      await runNetworkTick(env);
+    } catch (err) {
+      logExhaustion("scheduled: runNetworkTick", err);
     }
   },
 } satisfies ExportedHandler<Env>;

@@ -118,9 +118,10 @@ The deploy button only asks for a project name. Everything else is an optional v
 | `MAX_EVENTS_PER_PUBKEY_PER_MINUTE` | How fast any one non-owner pubkey may publish. Defaults to `20`/minute — far above human posting rates, slow enough that a runaway follow takes hours rather than minutes to spend the daily write budget. You are never throttled. Raise it to a number, or set it to `off`. |
 | `STORAGE_BUDGET_BYTES` | How much the relay may store, in bytes: the base every share below is a part of. Defaults to `1073741824` (1 GB), the smallest reading of Cloudflare's free-plan limit for one Durable Object; the account's 5 GB is shared with anything else on it. Raise it on a paid plan, up to `10737418240` (10 GB). The admin page shows use against it. |
 | `NON_OWNER_STORAGE_BYTES` | Point at which writes from anyone but you are refused, reserving the rest of the storage budget for your own archive. Defaults to half of `STORAGE_BUDGET_BYTES`. Raise it to a number, or set it to `off`. |
-| `WRITE_POLICY` | Who can publish here: `owner`, `inbox`, `follows`, `mentions` or `all` (see "Who can write here" below). Set here it outranks the value set through the management API. Unset, the management API's value applies, then the default, `follows`. |
+| `WRITE_POLICY` | Who can publish here: `owner`, `inbox`, `follows`, `mentions`, `network` or `all` (see "Who can write here" below). Set here it outranks the value set through the management API. Unset, the management API's value applies, then the default, `follows`. |
 | `MAIL_STORAGE_BYTES` | How much all stored mail may take, in bytes. Defaults to 30% of `STORAGE_BUDGET_BYTES` (about 300 MB). Set it to `off` to remove this cap; the share reserved for you (`NON_OWNER_STORAGE_BYTES`) still applies. |
 | `MAIL_BYTES_PER_MEMBER` | How much mail any one person may have stored here, you included, in bytes. Defaults to a tenth of the mail total (about 30 MB). Set it to `off` to remove it. |
+| `NETWORK_MAX_KEYS` | Under the `network` policy, how many of the people your follows follow the relay keeps on its list. Defaults to `20000`. |
 | `MEMBER_LIST` | Whether members can see who else is in your home. `members` (the default) lets every member see the list; `hidden` keeps it to you and your admins. |
 | `INVITES_PER_MEMBER` | How many people each member may invite. Defaults to `5`. Set it to `off` so only you and your admins make invites. You and your admins are never limited. |
 | `INVITE_DEPTH` | How many steps from you invites reach: your own invitees are one step away, and a member this many steps away cannot invite. Defaults to `3`. `off` also keeps invites to you and your admins. |
@@ -248,6 +249,7 @@ Your relay has one write policy, and you choose it:
 | `inbox` | You, and anyone sending you or a member encrypted mail (see "Inbox mode" and "Members" above). |
 | `follows` | Everything above, plus the people you follow. **The default.** |
 | `mentions` | Everything above, plus anyone whose event mentions or replies to you. An event from someone you don't follow may carry at most 32 indexed tags. |
+| `network` | Everything above, plus the people your follows follow. |
 | `all` | Anyone, any event. |
 
 Each policy includes everything the one above it allows. Whatever the policy, a pubkey you `allowpubkey` can always publish and a pubkey you `banpubkey` never can (see "Relay management API" below).
@@ -269,6 +271,8 @@ bothy_rpc https://your-relay.workers.dev/ getwritepolicy
 ```
 
 The URL must be the relay's own `https://` address, because the signature covers it. It takes effect immediately. `getwritepolicy` reads back the policy in force and where it was set. An empty string clears the stored policy and returns to the default. `all` asks you to confirm: the first call refuses and tells you the exact confirmation string to pass as a second parameter. If `WRITE_POLICY` is set in the Cloudflare dashboard it outranks the management API, and `changewritepolicy` tells you so.
+
+Under `network`, the relay gathers your follows' own contact lists, a few each hour, from two public relays, checks every signature, and keeps the people they name on a list of up to 20,000. Nobody can see the list, or which follow brought someone onto it; the admin page shows only how many are on it. It costs about 2 rows written to add a person and 1 a week to keep them, at most a tenth of the day's write allowance: filling the list takes about four days after you switch, and it is rebuilt every week, so someone a follow stops following drops off within about a week. Nothing is gathered under any other policy.
 
 Under `all`, NIP-11 advertises `restricted_writes: false`; under every other policy it is `true`.
 

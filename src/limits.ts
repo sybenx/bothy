@@ -702,6 +702,37 @@ export function memberListVisibility(env: Env): MemberListVisibility {
   return env.MEMBER_LIST?.trim().toLowerCase() === "hidden" ? "hidden" : "members";
 }
 
+// The `network` write policy (src/network.ts): the people the owner's
+// follows follow, built from the follows' own contact lists, which the
+// hourly tick fetches from WELL_KNOWN_RELAYS and verifies.
+//
+// Keys it may hold. Each costs 2 rows written to add and 1 to keep on each
+// weekly refresh, so 20,000 is about 40,000 rows once and 20,000 a week.
+// Past the cap, further keys are not added and /api/stats says so.
+// NETWORK_MAX_KEYS overrides.
+export const NETWORK_MAX_KEYS_DEFAULT = 20_000;
+
+export function networkMaxKeys(env: Env): number {
+  return resolveLimit(env.NETWORK_MAX_KEYS, NETWORK_MAX_KEYS_DEFAULT) ?? NETWORK_MAX_KEYS_DEFAULT;
+}
+
+// Rows one tick may write to the list: a tenth of the day's 100,000,
+// spread over the 24 hourly ticks. Filling 20,000 keys takes about four
+// days; a refresh of them about two.
+export const NETWORK_ROWS_PER_TICK = Math.floor(100_000 / 10 / 24);
+
+// Follows whose contact lists one tick fetches, in one REQ per relay.
+export const NETWORK_AUTHORS_PER_TICK = 25;
+
+// How often the whole list is rebuilt from the follows' current lists, so
+// someone a follow stops following drops out.
+export const NETWORK_REFRESH_SECONDS = 7 * 24 * 60 * 60;
+
+// A rebuild only drops keys nobody re-listed when at least this share of
+// follows' lists were actually found: a relay that answered for few of
+// them must not empty the list.
+export const NETWORK_MIN_COVERAGE = 0.8;
+
 // Members' own invites (nip86.ts createinvite from a member). The owner
 // and admins are not limited; a member may let in INVITES_PER_MEMBER
 // people, and only while they are fewer than INVITE_DEPTH steps from the
