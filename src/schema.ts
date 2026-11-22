@@ -334,7 +334,8 @@ export const TABLES: readonly TableSpec[] = [
       // 'pending' until the owner's relay list has been discovered,
       // 'running' while any backfill_relays row is unexhausted,
       // 'paused-budget' when a cron tick's ingest hit the daily
-      // rows-written ceiling and stopped without finishing its page,
+      // rows-written ceiling and stopped without finishing its page
+      // (lifted by the first tick with headroom, backfill-worker.ts),
       // 'done' once every relay is exhausted.
       col("status", "TEXT NOT NULL DEFAULT 'pending'"),
       col("total_stored", "INTEGER NOT NULL DEFAULT 0"),

@@ -4,7 +4,7 @@
 // -- see test/follows.test.ts for the same pattern.
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   applyBackfillPage,
   getBackfillStatus,
@@ -13,6 +13,7 @@ import {
   purgeSelfRelay,
   seedBackfillRelays,
 } from "../src/backfill";
+import { runBackfillTick } from "../src/backfill-worker";
 import { GROUP_MEMBERS_KIND, isGroupEvent, TOP_LEVEL_GROUP_ID } from "../src/groups";
 import { recordHost } from "../src/host";
 import { getRelayPubkey } from "../src/relay-identity";
@@ -914,6 +915,133 @@ describe("backfill ingest", () => {
       status = getBackfillStatus(sql);
       expect(status.exhaustedCount).toBe(1);
       expect(status.status).toBe("running");
+    });
+  });
+});
+
+// The whole cron tick (backfill-worker.ts runBackfillTick), not just the
+// DO-side half: whether a "paused-budget" backfill fetches is decided on
+// the Worker side. The tick reads the real clock, so "before" and "after"
+// the 00:00 UTC reset are set up by dating the spent budget today or
+// yesterday rather than by moving time.
+describe("backfill budget pause", () => {
+  const RELAY_URL = "wss://relay-a.example";
+
+  // Stands in for the global WebSocket that fetchPage opens: answers the
+  // REQ with `page` and an EOSE, and records every URL it was opened for.
+  function stubRelaySockets(page: unknown[]): { opened: string[] } {
+    const opened: string[] = [];
+    class FakeRelaySocket extends EventTarget {
+      constructor(url: string) {
+        super();
+        opened.push(url);
+        queueMicrotask(() => this.dispatchEvent(new Event("open")));
+      }
+      send(data: string): void {
+        const [, subId] = JSON.parse(data) as [string, string];
+        const frames = [...page.map((e) => ["EVENT", subId, e]), ["EOSE", subId]];
+        queueMicrotask(() => {
+          for (const frame of frames) {
+            this.dispatchEvent(Object.assign(new Event("message"), { data: JSON.stringify(frame) }));
+          }
+        });
+      }
+      close(): void {}
+    }
+    vi.stubGlobal("WebSocket", FakeRelaySocket);
+    return { opened };
+  }
+
+  // An env whose Relay stub records each RPC the tick makes, so "no
+  // ingest" is asserted directly rather than inferred from storage.
+  function recordingEnv(calls: string[]): Env {
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    const recorded = new Proxy(stub, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop);
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          calls.push(String(prop));
+          // Not value.apply: on an RPC stub that is itself a remote call.
+          return Reflect.apply(value, target, args);
+        };
+      },
+    });
+    const relay = { idFromName: (name: string) => env.RELAY.idFromName(name), get: () => recorded };
+    return { RELAY: relay } as unknown as Env;
+  }
+
+  async function pausedOnBudget(now: number, spentAt: number): Promise<void> {
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      seedBackfillRelays(sql, [RELAY_URL], now);
+      // More than backfill's whole share, as live traffic would spend it.
+      const rows = Math.floor(BACKFILL_ROWS_SHARE_LIMIT / eventRowCost(0)) + 100;
+      insertSyntheticLiveRows(sql, "spent", rows, spentAt);
+      sql.exec(`UPDATE backfill_meta SET status = 'paused-budget'`);
+    });
+  }
+
+  it("resumes a backfill paused on budget at the first tick with headroom", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    // The budget was spent before the last reset.
+    await pausedOnBudget(now, utcDayStartSeconds(now * 1000) - 3600);
+    const note = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 1,
+      content: "imported after the reset",
+      created_at: now - 1000,
+    });
+
+    const calls: string[] = [];
+    const sockets = stubRelaySockets([note]);
+    try {
+      await runBackfillTick(recordingEnv(calls));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(sockets.opened).toEqual([RELAY_URL]);
+    expect(calls).toEqual(["getBackfillState", "ingestBackfillPage"]);
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      const status = getBackfillStatus(sql);
+      expect(status.status).toBe("running");
+      expect(status.totalStored).toBe(1);
+      expect(status.nextUntil).toBe(note.created_at - 1);
+      expect(eventRows(sql, `WHERE id = '${note.id}'`)).toHaveLength(1);
+    });
+  });
+
+  it("stays paused, with no fetch and no ingest, while today's budget is still spent", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    await pausedOnBudget(now, now);
+    const note = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 1,
+      content: "must wait for the reset",
+      created_at: now - 1000,
+    });
+
+    const calls: string[] = [];
+    const sockets = stubRelaySockets([note]);
+    try {
+      await runBackfillTick(recordingEnv(calls));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(sockets.opened).toEqual([]);
+    expect(calls).toEqual(["getBackfillState"]);
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      const status = getBackfillStatus(sql);
+      expect(status.status).toBe("paused-budget");
+      expect(status.totalStored).toBe(0);
+      expect(status.lastRunAt).toBeNull();
+      expect(status.nextUntil).toBe(now);
+      expect(eventRows(sql, `WHERE id = '${note.id}'`)).toHaveLength(0);
     });
   });
 });

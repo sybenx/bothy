@@ -13,8 +13,9 @@ export interface BackfillStatus {
   totalStored: number;
   relayCount: number;
   exhaustedCount: number;
-  // Null unless status is "running" and a relay remains. The Worker uses
-  // these directly so "what's next" is decided on one side of the RPC.
+  // Null unless status is "running" or "paused-budget" and a relay
+  // remains. The Worker uses these directly so "what's next" is decided
+  // on one side of the RPC.
   nextRelay: string | null;
   nextUntil: number | null;
   // Set on every ingest call, even one that stores nothing. Stale against
