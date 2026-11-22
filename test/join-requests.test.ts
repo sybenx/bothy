@@ -277,6 +277,10 @@ describe("answering a request", () => {
         source: "request",
         role: "member",
         close: true,
+        inviterUnknown: false,
+        lastSeen: null,
+        push: true,
+        waiting: 0,
       },
     ]);
   });
@@ -345,7 +349,14 @@ describe("the member screen", () => {
     screen = (await callManagement("listmembers")).result as typeof screen;
     expect(screen.members.map((m) => m.pubkey)).toEqual([viaAllow.pubkeyHex]);
     expect(screen.removed).toEqual([
-      { pubkey: viaInvite.pubkeyHex, removedAt: expect.any(Number), deletesAt: expect.any(Number) },
+      {
+        pubkey: viaInvite.pubkeyHex,
+        removedAt: expect.any(Number),
+        deletesAt: expect.any(Number),
+        lastSeen: null,
+        push: false,
+        waiting: 0,
+      },
     ]);
     expect(screen.removed[0]!.deletesAt - screen.removed[0]!.removedAt).toBe(MEMBER_REMOVAL_GRACE_SECONDS);
 

@@ -2941,7 +2941,7 @@ export function sweepExpiredJoinRequests(sql: SqlStorage, nowSec: number): void 
 // is still waiting to be deleted.
 // ---------------------------------------------------------------------
 
-export interface MemberDetails {
+export interface MemberDetails extends MemberActivity {
   pubkey: string;
   invitedBy: string | null;
   joinedAt: number;
@@ -2950,9 +2950,27 @@ export interface MemberDetails {
   role: "admin" | "member";
   // Location trust (schema.ts `allowed_pubkeys.close`).
   close: boolean;
+  // invitedBy is the owner by default, not by record (see listMembers).
+  inviterUnknown: boolean;
 }
 
-export interface RemovedMember {
+// Activity, from what bothy already keeps; nothing new is recorded for
+// it. On members and removed members alike.
+export interface MemberActivity {
+  // The last UTC day they completed NIP-42 auth (schema.ts `member_seen`),
+  // as a day number: days since 1970-01-01, i.e. floor(unix seconds /
+  // 86400). null if never. Removal deletes the row, so a removed member's
+  // is null.
+  lastSeen: number | null;
+  // Any push registration: web push (`push_subscriptions`) or an Android
+  // FCM token (`fcm_tokens`). Removal deletes both, so false once removed.
+  push: boolean;
+  // Stored gift wraps (kind 1059) p-tagged to them (schema.ts
+  // `mail_usage.n`), waiting until they delete them or they expire.
+  waiting: number;
+}
+
+export interface RemovedMember extends MemberActivity {
   pubkey: string;
   removedAt: number;
   // When their stored mail is deleted (removedAt + grace). The sweep
@@ -3060,6 +3078,7 @@ export function listMembers(
   const admins = new Set(
     sql.exec<{ pubkey: string }>(`SELECT pubkey FROM admins`).toArray().map((r) => r.pubkey),
   );
+  const activity = memberActivity(sql);
   const members = rows.map((r) => ({
     pubkey: r.pubkey,
     invitedBy: r.invited_by !== null && r.invited_by !== r.pubkey && present.has(r.invited_by) ? r.invited_by : owner,
@@ -3067,6 +3086,15 @@ export function listMembers(
     source: r.source,
     role: admins.has(r.pubkey) ? ("admin" as const) : ("member" as const),
     close: r.close === 1,
+    // True when invitedBy above is the owner only by default: the stored
+    // inviter is NULL (rows from before v0.19.0), the member's own key, or
+    // a key no longer a member. invitedBy itself is unchanged, so clients
+    // that build the tree from it keep working.
+    inviterUnknown:
+      r.invited_by === null ||
+      r.invited_by === r.pubkey ||
+      (!present.has(r.invited_by) && r.invited_by !== owner),
+    ...activity(r.pubkey),
   }));
   const removed = sql
     .exec<{ pubkey: string; removed_at: number; reason: string }>(
@@ -3078,8 +3106,42 @@ export function listMembers(
       pubkey: r.pubkey,
       removedAt: r.removed_at,
       deletesAt: r.reason === "erased" ? r.removed_at : r.removed_at + graceSec,
+      ...activity(r.pubkey),
     }));
   return { members, removed };
+}
+
+// listMembers' activity fields: one query per field over everyone listed
+// (members and removed members), not one per person. Each table has one
+// row per pubkey, or a few per pubkey for push devices.
+function memberActivity(sql: SqlStorage): (pubkey: string) => MemberActivity {
+  const listed = `SELECT pubkey FROM allowed_pubkeys UNION SELECT pubkey FROM former_members`;
+  const seen = new Map(
+    sql
+      .exec<{ pubkey: string; day: number }>(`SELECT pubkey, day FROM member_seen WHERE pubkey IN (${listed})`)
+      .toArray()
+      .map((r) => [r.pubkey, r.day] as const),
+  );
+  const push = new Set(
+    sql
+      .exec<{ pubkey: string }>(
+        `SELECT pubkey FROM push_subscriptions WHERE pubkey IN (${listed})
+         UNION SELECT pubkey FROM fcm_tokens WHERE pubkey IN (${listed})`,
+      )
+      .toArray()
+      .map((r) => r.pubkey),
+  );
+  const waiting = new Map(
+    sql
+      .exec<{ pubkey: string; n: number }>(`SELECT pubkey, n FROM mail_usage WHERE pubkey IN (${listed})`)
+      .toArray()
+      .map((r) => [r.pubkey, r.n] as const),
+  );
+  return (pubkey) => ({
+    lastSeen: seen.get(pubkey) ?? null,
+    push: push.has(pubkey),
+    waiting: waiting.get(pubkey) ?? 0,
+  });
 }
 
 export interface FormerMemberSweep {
