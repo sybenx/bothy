@@ -13,7 +13,7 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
 import { GROUP_SCOPE, PUBLIC_SCOPE, TOP_LEVEL_GROUP_ID } from "../src/groups";
-import { GIFT_WRAP_SWEEP_BATCH_SIZE, maxGiftWraps } from "../src/limits";
+import { GIFT_WRAP_SWEEP_BATCH_SIZE } from "../src/limits";
 import type { Relay } from "../src/relay";
 import { giftWrapCount, isDeleted, storeEvent, sweepExpiredGiftWraps } from "../src/storage";
 import { signEvent, type NostrEvent } from "./helpers/event";
@@ -122,75 +122,31 @@ describe("NIP-59 gift wrap accept path", () => {
     conn.close();
   });
 
-  it("rejects a gift wrap once the total storage cap is reached", async () => {
-    const id = env.RELAY.idFromName("relay");
-    const stub = env.RELAY.get(id);
-    const cap = maxGiftWraps(env);
-    // Seed directly via SQL -- signing `cap` real events just to fill it
-    // would make this test needlessly slow, and the cap check
-    // (storage.ts giftWrapCount) only cares about row count.
-    await runInDurableObject(stub, async (_instance, state) => {
-      for (let i = 0; i < cap; i++) {
-        state.storage.sql.exec(
-          `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-          i.toString(16).padStart(64, "0"),
-          "f".repeat(64),
-          1700000000 + i,
-          1059,
-          JSON.stringify([["p", OWNER_PUBKEY_HEX]]),
-          "seeded",
-          "0".repeat(128),
-          null,
-        );
-      }
-    });
-
-    const conn = await connectRelay();
-    const giftWrap = signEvent(randomKeypair().secretKeyHex, {
-      kind: 1059,
-      tags: [["p", OWNER_PUBKEY_HEX]],
-      content: "one too many",
-    });
-    const [, , ok, message] = await publish(conn, giftWrap);
-
-    expect(ok).toBe(false);
-    expect(message.startsWith("blocked:")).toBe(true);
-    conn.close();
+  it("rejects a gift wrap once the home's mailbox is full", async () => {
+    // The mailbox is counted in bytes (storage.ts mail_usage); filling the
+    // counter is enough, and test/mailbox.test.ts covers the rest.
+    mutableEnv.MAIL_STORAGE_BYTES = "100000";
+    try {
+      await runInDurableObject(env.RELAY.get(env.RELAY.idFromName("relay")), async (_instance, state) => {
+        state.storage.sql.exec(`UPDATE mail_usage SET bytes = 99999 WHERE pubkey = '*'`);
+      });
+      const conn = await connectRelay();
+      const giftWrap = signEvent(randomKeypair().secretKeyHex, {
+        kind: 1059,
+        tags: [["p", OWNER_PUBKEY_HEX]],
+        content: "one too many",
+      });
+      const [, , ok, message] = await publish(conn, giftWrap);
+      expect(ok).toBe(false);
+      expect(message).toBe("blocked: this home's mailbox is full");
+      conn.close();
+    } finally {
+      delete mutableEnv.MAIL_STORAGE_BYTES;
+    }
   });
 });
 
-// maxGiftWraps prices the gift wrap inbox against a fixed byte SHARE of
-// total storage, not a fixed event COUNT -- so it has to move when the
-// per-event byte cap does, or an operator who raises MAX_EVENT_BYTES
-// blows past the share silently. mutableEnv follows the same
-// env-mutation pattern as write-limits.test.ts's non-owner storage suite.
 const mutableEnv = env as unknown as Record<string, string | undefined>;
-
-describe("maxGiftWraps derivation", () => {
-  afterEach(() => {
-    delete mutableEnv.MAX_EVENT_BYTES;
-  });
-
-  it("shrinks as the per-event byte cap grows, keeping the storage share fixed", () => {
-    const atDefault = maxGiftWraps(env);
-    mutableEnv.MAX_EVENT_BYTES = String(1024 * 1024); // 1MB
-    const atOneMB = maxGiftWraps(env);
-    expect(atOneMB).toBeLessThan(atDefault);
-    // ~128MB share / 1MB per event.
-    expect(atOneMB).toBe(128);
-  });
-
-  it("falls back to the compile-time default when the byte cap is disabled, rather than becoming unbounded", () => {
-    const atDefault = maxGiftWraps(env);
-    mutableEnv.MAX_EVENT_BYTES = "off";
-    // No real per-event size to derive a count from once the cap is
-    // "off" -- priced at the compile-time default instead of resolving
-    // to Infinity, so this cap stays meaningful. The real backstop in
-    // that state is NON_OWNER_STORAGE_BYTES, not this count.
-    expect(maxGiftWraps(env)).toBe(atDefault);
-  });
-});
 
 // relay.ts handleGiftWrap also rejects with "restricted: relay has not
 // been claimed yet" when getOwnerPubkey returns null. Not tested here at
@@ -440,48 +396,39 @@ describe("what the gift wrap sweep costs", () => {
     return cursors.reduce((total, cursor) => total + cursor.rowsRead, 0);
   }
 
-  it("costs five rows to remove a one-tag wrap, against twelve to store it", async () => {
+  it("costs eight rows to remove an expiring wrap, against seventeen to store it", async () => {
     await runInDurableObject(wrapStub(), async (_instance: Relay, state) => {
       const sql = state.storage.sql;
       const now = Math.floor(Date.now() / 1000);
+      // A first wrap creates the mailbox counter rows; the measured one
+      // after it is the steady state.
+      storeEvent(sql, wrap(now - 5000, now - 1, 19), now);
       const lapsed = wrap(now - 4000, now - 1, 20);
 
-      // 9 base + 3 for the one indexed `p` tag. `expiration` is a
-      // multi-character tag name, so event_tags never sees it -- which is
-      // why a wrap costs the same 12 whether or not it carries one.
+      //   the event itself: 9 base + 3 for its one indexed `p` tag   12
+      //   the mailbox's bytes, the home's row and the recipient's     2
+      //   the expiry row, its key and its expiration index            3
+      //                                                              ---
+      //                                                               17
+      // A wrap with no expiration (the usual NIP-17 case) skips the
+      // last line: 14.
       const stored = measureRowsWritten(sql, (metered) => storeEvent(metered, lapsed, now));
-      expect(stored).toBe(12);
+      expect(stored).toBe(17);
 
       const removed = measureRowsWritten(sql, (metered) =>
         sweepExpiredGiftWraps(metered, now, GIFT_WRAP_SWEEP_BATCH_SIZE),
       );
-
-      //   the `p` tag row                                 1
-      //   the event row                                   1
-      //   the three maintained counters                   3
-      //   a tombstone                        deliberately  0
-      //                                                  ---
-      //                                                    5
-      //
-      // Removing costs less than storing, which is what makes a per-day
-      // share unnecessary here: a day's sweeping cannot exceed a day's
-      // gift wrap ingest. See limits.ts GIFT_WRAP_SWEEP_BATCH_SIZE.
-      expect(removed).toBe(5);
+      //   per wrap: the `p` tag row, the event row and the three
+      //   maintained counters (5), the two mailbox rows (2) and the
+      //   expiry row (1); no tombstone.                                8
+      expect(removed).toBe(16);
     });
   });
 
-  it("reads the inbox once to find nothing, and stops early once the batch fills", async () => {
-    // The one cost of this sweep worth watching, stated as a measurement.
-    // A tick with nothing to do has to walk the kind-1059 range to
-    // establish that -- there is no index on `expiration`, and adding one
-    // would cost every stored event a row written forever to serve a
-    // sweep that runs once an hour. The walk is bounded by maxGiftWraps,
-    // so this is a bounded cost and not one that grows with the table.
-    //
-    // A tick with work to do stops the moment the batch fills, which is
-    // what keeps a real backlog cheap: ORDER BY created_at ASC is served
-    // by idx_events_kind_created_pub rather than sorted, so the scan ends
-    // at the LIMIT instead of running to the end of the range.
+  it("reads only what is due, however many wraps are stored", async () => {
+    // The sweep reads wrap_expiry by expiration (schema.ts), not the
+    // kind-1059 range, so an hour with nothing due reads next to nothing
+    // whether the mailbox holds forty wraps or forty thousand.
     await runInDurableObject(wrapStub(), async (_instance: Relay, state) => {
       const sql = state.storage.sql;
       const now = Math.floor(Date.now() / 1000);
@@ -490,22 +437,16 @@ describe("what the gift wrap sweep costs", () => {
         storeEvent(sql, wrap(now - 5000 + i, now - 1, 30 + i), now);
       }
 
-      // Nothing to do: the whole range is walked, once per partition, and
-      // the group half is empty so it contributes nothing.
       const nothing = measureRowsRead(sql, (metered) =>
         sweepExpiredGiftWraps(metered, now - 100_000, GIFT_WRAP_SWEEP_BATCH_SIZE),
       );
-      expect(nothing).toBeGreaterThanOrEqual(inbox);
-      expect(nothing).toBeLessThan(inbox * 2);
+      expect(nothing).toBeLessThanOrEqual(2);
 
-      // Work to do, batch of 5: the scan stops at the fifth match rather
-      // than reading the other 35.
+      // Work to do, batch of 5: five read, not forty.
       const some = measureRowsRead(sql, (metered) => {
         const found = metered
           .exec<{ id: string }>(
-            `SELECT id FROM events
-               WHERE kind = 1059 AND is_group = 0 AND expiration IS NOT NULL AND expiration <= ?
-               ORDER BY created_at ASC LIMIT 5`,
+            `SELECT id FROM wrap_expiry WHERE expiration <= ? ORDER BY expiration ASC LIMIT 5`,
             now,
           )
           .toArray();

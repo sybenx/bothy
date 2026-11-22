@@ -577,38 +577,52 @@ export function nonOwnerStorageLimit(env: Env): number | null {
   return resolveLimit(env.NON_OWNER_STORAGE_BYTES, NON_OWNER_STORAGE_SHARE_LIMIT);
 }
 
-// Storage the gift wrap inbox may occupy: 1/40 of the ceiling, ~128MB.
-// Kind 1059 is accepted from any author (under `inbox` and above), so it
-// gets its own bound on top of NON_OWNER_STORAGE_SHARE_LIMIT.
-const GIFT_WRAP_STORAGE_SHARE = STORAGE_BYTES_LIMIT / 40;
-
-// Gift wraps held at once. New ones are refused at the cap until the owner
-// deletes or vanishes old ones or storage.ts sweepExpiredGiftWraps removes
-// expired ones (which keeps this a count of mail rather than of hidden
-// rows). The smaller of two bounds:
+// ---------------------------------------------------------------------
+// The mailbox: stored gift wraps, bounded in BYTES as actually stored
+// (storage.ts `mail_usage`, maintained on every insert and delete), not by
+// a count priced at the worst-case event size. Until 0.26.0 this was 2,048
+// wraps for the whole home (128MB / 64KB), which group messages, one wrap
+// per member, would fill in days.
 //
-// - Storage: GIFT_WRAP_STORAGE_SHARE over the byte cap IN EFFECT
-//   (maxEventBytes(env)), so raising MAX_EVENT_BYTES lowers the count
-//   instead of multiplying the worst case. With the byte cap "off" it is
-//   priced at the compile-time default, and NON_OWNER_STORAGE_SHARE_LIMIT
-//   is the real backstop. 2,048 at the defaults.
-// - Reads: unauthenticated reads omit gift wraps (filters.ts
-//   excludeGiftWraps), and omitting a row still reads it, so an
-//   `authors`-pinned filter on a pubkey that authored only wraps skips
-//   every one (measured at 2,000 wraps: 41 rows without the exclusion,
-//   2,002 with it). The inbox size is therefore a per-filter read cost and
-//   must fit inside MAX_FILTER_ROWS_READ / ROWS_READ_PER_MATCH. Binds only
-//   if MAX_EVENT_BYTES is lowered below ~26KB.
-export function maxGiftWraps(env: Env): number {
-  const perEventBytes = maxEventBytes(env) ?? MAX_EVENT_BYTES;
-  return Math.max(
-    1,
-    Math.min(
-      Math.floor(MAX_FILTER_ROWS_READ / ROWS_READ_PER_MATCH),
-      Math.floor(GIFT_WRAP_STORAGE_SHARE / perEventBytes),
-    ),
-  );
+// Where the 5GB ceiling goes, roughly: half is the owner's alone
+// (NON_OWNER_STORAGE_SHARE_LIMIT, the other half shared by everyone else);
+// of the shared half, mail may take 1GB, profile photos 250MB
+// (PHOTO_STORAGE_BYTES_DEFAULT), and follows' and members' own events the
+// rest. Payload bytes are counted here; SQLite adds its tag rows and index
+// entries on top (about a third more for a small wrap), which the 2.5GB
+// non-owner share absorbs.
+// ---------------------------------------------------------------------
+
+// All mail together, payload bytes. MAIL_STORAGE_BYTES overrides; "off"
+// removes this cap and leaves the non-owner share as the backstop.
+export const MAIL_STORAGE_BYTES_DEFAULT = 1024 * 1024 * 1024;
+
+export function mailStorageBytes(env: Env): number | null {
+  return resolveLimit(env.MAIL_STORAGE_BYTES, MAIL_STORAGE_BYTES_DEFAULT);
 }
+
+// One recipient's mail, the owner's included, so no one person (or a
+// stranger mailing them) can fill the home. 100MB is about 30,000 wraps
+// of a typical 3KB. MAIL_BYTES_PER_MEMBER overrides; "off" removes it.
+export const MAIL_BYTES_PER_MEMBER_DEFAULT = 100 * 1024 * 1024;
+
+export function mailBytesPerMember(env: Env): number | null {
+  return resolveLimit(env.MAIL_BYTES_PER_MEMBER, MAIL_BYTES_PER_MEMBER_DEFAULT);
+}
+
+// Gift wraps one signing key may have stored here. NIP-59 signs every wrap
+// with a fresh key, so a real sender never comes near it; what it bounds
+// is reads. Unauthenticated reads omit gift wraps (filters.ts
+// excludeGiftWraps), and an `authors`-pinned filter on a key that signed
+// only wraps reads every one of them to skip it (2 rows each). That was
+// why the whole inbox used to be capped by MAX_FILTER_ROWS_READ; a cap per
+// key bounds the same read at 2 x 100 rows, whatever the inbox holds.
+export const MAX_WRAPS_PER_AUTHOR = 100;
+
+// Wraps eraseme deletes in its own call (storage.ts eraseMember); the rest
+// go on the hourly sweep. Deleting costs about 5 rows written a wrap, so a
+// large mailbox erased in one call could spend the day's 100,000.
+export const ERASE_MAIL_BATCH = 1000;
 
 // Workers Free daily rows-written ceiling (the same limits page as
 // DAILY_ROWS_READ_LIMIT). Every write-side share below is a fraction of
@@ -621,17 +635,14 @@ export const DAILY_ROWS_WRITTEN_LIMIT = 100_000;
 const TAGS_PER_GIFT_WRAP = 1;
 
 // Expired gift wraps one cron tick may remove (storage.ts
-// sweepExpiredGiftWraps). maxGiftWraps already bounds the largest possible
-// backlog (2,048 at the defaults, ~32,000 charged rows), so this is
-// insurance for many wraps expiring in the same hour: they drain across
-// ticks, and the remainder needs no checkpoint because the sweep takes the
-// oldest first. Five percent of the day per tick, as CHAT_SWEEP_BATCH_SIZE:
-// ~312 wraps.
+// sweepExpiredGiftWraps). Insurance for many wraps expiring in the same
+// hour: they drain across ticks, and the remainder needs no checkpoint
+// because the sweep takes the soonest expiry first. Five percent of the
+// day per tick, as CHAT_SWEEP_BATCH_SIZE: ~312 wraps.
 //
 // No daily share: every wrap removed was first written here at a higher
 // cost (12 rows to store, 5 to remove), so a day's sweeping cannot exceed
-// a day's gift wrap ingest, which MAX_GIFT_WRAPS_PER_IP_PER_WINDOW and
-// maxGiftWraps already bound.
+// a day's gift wrap ingest, which the daily rows-written ceiling bounds.
 const GIFT_WRAP_SWEEP_TICK_SHARE = DAILY_ROWS_WRITTEN_LIMIT / 20;
 export const GIFT_WRAP_SWEEP_BATCH_SIZE = Math.max(
   1,

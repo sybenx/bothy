@@ -13,7 +13,7 @@ import {
   scopeOf,
   TOP_LEVEL_GROUP_ID,
 } from "./groups";
-import { CHAT_BACKLOG_SECONDS, CONVERSATION_IDLE_SECONDS } from "./limits";
+import { CHAT_BACKLOG_SECONDS, CONVERSATION_IDLE_SECONDS, MAX_WRAP_RECIPIENTS_CHECKED } from "./limits";
 import {
   EVENT_BASE_ROW_COST,
   EVENT_BASE_ROW_COST_MEASURED,
@@ -22,6 +22,7 @@ import {
   TAG_ROW_COST,
   TAG_ROW_COST_MEASURED,
   TOMBSTONE_ROW_COST,
+  WRAP_FIXED_BYTES,
 } from "./schema";
 import { addRowsWritten, takeRowsWritten, unlandedRowsWritten, withReadPath } from "./read-metrics";
 import { normalizeIp } from "./ip";
@@ -122,6 +123,14 @@ function insertEventRow(
   // top of the event row's own cost (schema.ts eventRowCostMeasured; the
   // guards use the deliberately higher eventRowCost).
   bumpEventCounters(sql, event.created_at, 1, scope);
+  // The mailbox's bytes (schema.ts `mail_usage`) and the expiry index
+  // (`wrap_expiry`), for gift wraps only. 2 to 3 rows written.
+  if (event.kind === GIFT_WRAP_KIND) {
+    bumpMailUsage(sql, wrapRecipients(event.tags), wrapBytes(event.content, JSON.stringify(event.tags)), 1);
+    if (expiration !== null) {
+      sql.exec(`INSERT OR REPLACE INTO wrap_expiry (id, expiration) VALUES (?, ?)`, event.id, expiration);
+    }
+  }
   for (const tag of indexedTags) {
     sql.exec(
       `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at, is_group, group_id)
@@ -196,19 +205,42 @@ function deleteEventRow(sql: SqlStorage, id: string): void {
   // ids that may never have been stored: the counters must move only for a
   // row that existed, by its own `created_at`. `undefined` means nothing
   // to remove. Rows read: 1 (the same PK seek the DELETE does).
+  // `content` and `tags` only for a gift wrap, whose mailbox charge is
+  // refunded below; no other kind pays to read them.
   const row = sql
     .exec<{
       created_at: number;
       ingested_at: number | null;
       row_cost: number | null;
       is_group: number;
-    }>(`SELECT created_at, ingested_at, row_cost, is_group FROM events WHERE id = ?`, id)
+      kind: number;
+      wrap_content: string | null;
+      wrap_tags: string | null;
+    }>(
+      `SELECT created_at, ingested_at, row_cost, is_group, kind,
+              CASE WHEN kind = ? THEN content END AS wrap_content,
+              CASE WHEN kind = ? THEN tags END AS wrap_tags
+         FROM events WHERE id = ?`,
+      GIFT_WRAP_KIND,
+      GIFT_WRAP_KIND,
+      id,
+    )
     .toArray()[0];
   sql.exec(`DELETE FROM event_tags WHERE event_id = ?`, id);
   sql.exec(`DELETE FROM events WHERE id = ?`, id);
   // After the DELETEs, so a statement that throws cannot leave the
   // counters describing fewer events than are stored.
   if (row === undefined) return;
+  if (row.kind === GIFT_WRAP_KIND && row.wrap_content !== null && row.wrap_tags !== null) {
+    let tags: string[][] = [];
+    try {
+      tags = JSON.parse(row.wrap_tags) as string[][];
+    } catch {
+      tags = [];
+    }
+    bumpMailUsage(sql, wrapRecipients(tags), wrapBytes(row.wrap_content, row.wrap_tags), -1);
+    sql.exec(`DELETE FROM wrap_expiry WHERE id = ?`, id);
+  }
   // The partition the row was actually in, read from the row.
   const scope: GroupScope = row.is_group === 1 ? GROUP_SCOPE : PUBLIC_SCOPE;
   bumpEventCounters(sql, row.created_at, -1, scope);
@@ -954,6 +986,88 @@ export function giftWrapCount(sql: SqlStorage): number {
   ).reduce((total, row) => total + row.n, 0);
 }
 
+// ---------------------------------------------------------------------
+// The mailbox's bytes (schema.ts `mail_usage`, limits.ts
+// mailStorageBytes and mailBytesPerMember).
+// ---------------------------------------------------------------------
+
+const MAIL_TOTAL = "*";
+
+// What a stored wrap is charged: its content and serialized tags as
+// stored, plus schema.ts WRAP_FIXED_BYTES. The same function on insert
+// and delete, from the same stored strings, so the two always cancel.
+export function wrapBytes(content: string, tagsJson: string): number {
+  return content.length + tagsJson.length + WRAP_FIXED_BYTES;
+}
+
+// Who a wrap is charged to: its distinct `p` values, as many as
+// relay.ts handleGiftWrap looks at (limits.ts MAX_WRAP_RECIPIENTS_CHECKED).
+function wrapRecipients(tags: string[][]): string[] {
+  return [...new Set(pTagValues(tags))].slice(0, MAX_WRAP_RECIPIENTS_CHECKED);
+}
+
+function bumpMailUsage(sql: SqlStorage, recipients: string[], bytes: number, sign: 1 | -1): void {
+  for (const key of [MAIL_TOTAL, ...recipients]) {
+    sql.exec(
+      `INSERT INTO mail_usage (pubkey, bytes, n) VALUES (?, MAX(?, 0), MAX(?, 0))
+         ON CONFLICT(pubkey) DO UPDATE SET bytes = MAX(bytes + ?, 0), n = MAX(n + ?, 0)`,
+      key,
+      sign * bytes,
+      sign,
+      sign * bytes,
+      sign,
+    );
+  }
+}
+
+export interface MailUsage {
+  bytes: number;
+  messages: number;
+}
+
+export function mailUsage(sql: SqlStorage, pubkey: string | null): MailUsage {
+  const row = sql
+    .exec<{ bytes: number; n: number }>(`SELECT bytes, n FROM mail_usage WHERE pubkey = ?`, pubkey ?? MAIL_TOTAL)
+    .toArray()[0];
+  return { bytes: row?.bytes ?? 0, messages: row?.n ?? 0 };
+}
+
+// Whether a wrap of `bytes` fits: the home's total first, then each
+// recipient's share. Two or three PK reads.
+export type MailRoom = "ok" | "home-full" | "share-full";
+
+export function mailRoom(
+  sql: SqlStorage,
+  recipients: readonly string[],
+  bytes: number,
+  homeCap: number | null,
+  perMemberCap: number | null,
+): MailRoom {
+  if (homeCap !== null && mailUsage(sql, null).bytes + bytes > homeCap) return "home-full";
+  if (perMemberCap !== null) {
+    for (const pubkey of recipients) {
+      if (mailUsage(sql, pubkey).bytes + bytes > perMemberCap) return "share-full";
+    }
+  }
+  return "ok";
+}
+
+// Wraps this key has signed that are stored here, counted up to `limit`
+// and no further (idx_events_pubkey_kind_created_pub), for
+// limits.ts MAX_WRAPS_PER_AUTHOR.
+export function wrapsSignedBy(sql: SqlStorage, pubkey: string, limit: number): number {
+  return (
+    sql
+      .exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM (SELECT 1 FROM events WHERE pubkey = ? AND kind = ? AND is_group = 0 LIMIT ?)`,
+        pubkey,
+        GIFT_WRAP_KIND,
+        limit,
+      )
+      .toArray()[0]?.n ?? 0
+  );
+}
+
 export interface GiftWrapSweep {
   // How many wraps this tick actually removed.
   removed: number;
@@ -987,26 +1101,18 @@ export function sweepExpiredGiftWraps(
   nowSec: number,
   limit: number,
 ): GiftWrapSweep {
-  const targets = acrossScopes((scope) =>
-    sql
-      .exec<{ id: string }>(
-        `SELECT id FROM events
-           WHERE kind = ? AND is_group = ? AND expiration IS NOT NULL AND expiration <= ?
-           ORDER BY created_at ASC LIMIT ?`,
-        GIFT_WRAP_KIND,
-        scope,
-        nowSec,
-        limit,
-      )
-      .toArray(),
-  );
-
-  // Fewer than `limit` in total means neither partition filled its own
-  // limit, so nothing is left. Exactly `limit` counts as not done, since
-  // either partition might hold more.
+  // From `wrap_expiry`, soonest first (idx_wrap_expiry_expiration), so a
+  // tick reads only what is due, however many wraps are stored.
+  const targets = sql
+    .exec<{ id: string }>(
+      `SELECT id FROM wrap_expiry WHERE expiration <= ? ORDER BY expiration ASC LIMIT ?`,
+      nowSec,
+      limit,
+    )
+    .toArray();
   const done = targets.length < limit;
-  for (const target of targets.slice(0, limit)) deleteEventRow(sql, target.id);
-  return { removed: Math.min(targets.length, limit), done };
+  for (const target of targets) deleteEventRow(sql, target.id);
+  return { removed: targets.length, done };
 }
 
 interface StoreResult {
@@ -2858,6 +2964,12 @@ export interface FormerMemberSweep {
 // Per former member: one indexed range over `event_tags` for their `p`,
 // per partition, at most `limit` rows. A former member with no wraps left
 // is deleted, which ends the work for them. Called from the cron tick.
+// How many wraps are still waiting to be deleted for someone who left,
+// counted up to `limit` (eraseme's answer, messagesLeft).
+export function mailLeftFor(sql: SqlStorage, pubkey: string, owner: string | null, limit: number): number {
+  return mailOnlyFor(sql, pubkey, owner, limit).length;
+}
+
 // Gift wraps addressed to `pubkey` and to nobody else still entitled to
 // them (the owner, a current member), up to `limit` per partition. What
 // leaves with a person who leaves: the grace sweep below and eraseMember.
@@ -2894,7 +3006,8 @@ export function sweepFormerMembers(
 ): FormerMemberSweep {
   const due = sql
     .exec<{ pubkey: string }>(
-      `SELECT pubkey FROM former_members WHERE removed_at <= ? ORDER BY removed_at ASC LIMIT ?`,
+      `SELECT pubkey FROM former_members WHERE removed_at <= ? OR reason = 'erased'
+        ORDER BY removed_at ASC LIMIT ?`,
       nowSec - graceSec,
       pubkeyLimit,
     )

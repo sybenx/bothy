@@ -107,7 +107,7 @@ describe("eraseme", () => {
     await as(alice, "subscribepush", [{ endpoint: device.endpoint, keys: device.keys }]);
 
     const reply = await as(alice, "eraseme");
-    expect(reply.result).toEqual({ erased: true, messagesDeleted: 1 });
+    expect(reply.result).toEqual({ erased: true, messagesDeleted: 1, messagesLeft: 0 });
 
     expect(await rows(`SELECT id FROM events WHERE id = ?`, own.id)).toEqual([]);
     // Mail that is also the owner's stays.
@@ -161,7 +161,7 @@ describe("eraseme", () => {
   it("takes an admin's role with the account", async () => {
     const admin = randomKeypair();
     await callManagement("addadmin", [admin.pubkeyHex]);
-    expect((await as(admin, "eraseme")).result).toEqual({ erased: true, messagesDeleted: 0 });
+    expect((await as(admin, "eraseme")).result).toEqual({ erased: true, messagesDeleted: 0, messagesLeft: 0 });
     expect((await callManagement("listadmins")).result).toEqual([]);
   });
 

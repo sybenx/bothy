@@ -70,6 +70,11 @@ interface Env {
   // Members' own invites (limits.ts memberInviteLimits): how many people
   // a member may let in, and how many steps from the owner invites go.
   // A positive number, or "off" to leave invites to the owner and admins.
+  // The mailbox (limits.ts mailStorageBytes, mailBytesPerMember): bytes
+  // of stored gift wraps for the whole home and per recipient. A positive
+  // number, or "off" to remove that cap.
+  MAIL_STORAGE_BYTES?: string;
+  MAIL_BYTES_PER_MEMBER?: string;
   INVITES_PER_MEMBER?: string;
   INVITE_DEPTH?: string;
   PHOTO_STORAGE_BYTES?: string;

@@ -32,7 +32,7 @@ import {
   MAX_FILTER_COMBINATIONS,
   MAX_FILTER_LIMIT,
   MAX_FILTER_ROWS_READ,
-  maxGiftWraps,
+  MAX_WRAPS_PER_AUTHOR,
   TAG_ROWS_READ_PER_MATCH,
 } from "../src/limits";
 import type { Filter } from "../src/nostr";
@@ -1067,18 +1067,13 @@ describe("gift wrap exclusion cost", () => {
     });
   });
 
-  it("bounds the gift wrap inbox so that overshoot cannot exceed the per-filter cap", async () => {
+  it("bounds the overshoot per signing key, whatever the mailbox holds", async () => {
     // Two rows per skipped wrap: the index entry and the table row behind
-    // it. limits.ts maxGiftWraps is bounded by MAX_FILTER_ROWS_READ for
-    // this reason and not by the storage share alone -- the share is a
-    // write-path cap, and this is the read cost it turned out to carry.
-    expect(maxGiftWraps({} as Env) * 2).toBeLessThanOrEqual(MAX_FILTER_ROWS_READ);
-    // The bound binds only under a configuration that would otherwise
-    // lift the inbox far past it: a 1KB event cap prices ~131,000 wraps
-    // into the same storage share.
-    expect(maxGiftWraps({ MAX_EVENT_BYTES: "1024" } as unknown as Env) * 2).toBeLessThanOrEqual(
-      MAX_FILTER_ROWS_READ,
-    );
+    // it. The overshoot is the wraps ONE author signed, so the cap that
+    // bounds it is per key (limits.ts MAX_WRAPS_PER_AUTHOR, enforced in
+    // relay.ts handleGiftWrap), not the size of the mailbox. NIP-59 uses a
+    // fresh key per wrap, so real mail is one wrap per key.
+    expect(MAX_WRAPS_PER_AUTHOR * 2).toBeLessThanOrEqual(MAX_FILTER_ROWS_READ);
   });
 });
 

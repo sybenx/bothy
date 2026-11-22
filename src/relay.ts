@@ -52,7 +52,9 @@ import {
   MAX_FILTERS_PER_REQ,
   maxEventBytes,
   maxEventsPerPubkeyPerWindow,
-  maxGiftWraps,
+  MAX_WRAPS_PER_AUTHOR,
+  mailBytesPerMember,
+  mailStorageBytes,
   MAX_GIFT_WRAPS_PER_IP_PER_WINDOW,
   MAX_LIVE_FEED_CONNECTIONS,
   MAX_MENTION_EVENT_INDEXED_TAGS,
@@ -184,7 +186,9 @@ import {
   migrateToMultiGroup,
   getRelaySettings,
   getStoredWritePolicy,
-  giftWrapCount,
+  mailRoom,
+  wrapBytes,
+  wrapsSignedBy,
   sweepExpiredGiftWraps,
   hasNonOwnerStorageHeadroom,
   isDeleted,
@@ -347,6 +351,13 @@ function writeRejectionMessage(reason: WriteRejection): string {
 // than the owner may read kind 1059 (handleReqInner, broadcast). NIP-17
 // clients already ask for their inbox exactly this way
 // (`{"kinds":[1059],"#p":[me]}`).
+// The refusals the mailbox gives a sender, as OK false. Stable: apps match
+// them to say "their mailbox is full" or "this home is full" plainly.
+export const HOME_MAILBOX_FULL_MESSAGE = "blocked: this home's mailbox is full";
+export const RECIPIENT_MAILBOX_FULL_MESSAGE = "blocked: the recipient's mailbox on this home is full";
+export const WRAPS_PER_KEY_MESSAGE =
+  "rate-limited: this key has signed too many gift wraps here; NIP-59 uses a new key for every wrap";
+
 function readsOnlyOwnMail(filter: Filter, pubkey: string): boolean {
   const recipients = filter["#p"];
   return Array.isArray(recipients) && recipients.length > 0 && recipients.every((value) => value === pubkey);
@@ -1049,7 +1060,7 @@ export class Relay extends DurableObject<Env> {
         }
         // Expired gift wraps (storage.ts sweepExpiredGiftWraps): deleted,
         // not just hidden, because kind 1059 is capped by count (limits.ts
-        // maxGiftWraps) and a hidden row would still hold a slot.
+        // mailStorageBytes) and a hidden row would still hold its bytes.
         withReadPath("giftWrapSweep", () => this.sweepExpiredWraps(sql, now));
         // Removed members' mail, once their grace period is over
         // (storage.ts sweepFormerMembers). Free while nobody is waiting.
@@ -1329,8 +1340,26 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
-    if (giftWrapCount(sql) >= maxGiftWraps(this.env)) {
-      ok(ws, event.id, false, "blocked: gift wrap inbox storage is full");
+    // One key, many wraps: NIP-59 senders use a fresh key per wrap, so
+    // this only stops a key that is being used to make reads expensive
+    // (limits.ts MAX_WRAPS_PER_AUTHOR). An index count that stops early.
+    if (wrapsSignedBy(sql, event.pubkey, MAX_WRAPS_PER_AUTHOR) >= MAX_WRAPS_PER_AUTHOR) {
+      ok(ws, event.id, false, WRAPS_PER_KEY_MESSAGE);
+      return;
+    }
+
+    // The mailbox, in bytes (storage.ts mailRoom): the home's total, then
+    // each recipient's share. Stable strings, so a sender's app can say
+    // which one plainly.
+    const room = mailRoom(
+      sql,
+      recipients,
+      wrapBytes(event.content, JSON.stringify(event.tags)),
+      mailStorageBytes(this.env),
+      mailBytesPerMember(this.env),
+    );
+    if (room !== "ok") {
+      ok(ws, event.id, false, room === "home-full" ? HOME_MAILBOX_FULL_MESSAGE : RECIPIENT_MAILBOX_FULL_MESSAGE);
       return;
     }
 

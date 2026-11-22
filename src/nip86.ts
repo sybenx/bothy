@@ -37,7 +37,10 @@ import {
   inviteSlotsUsed,
   countOutstandingMemberInvites,
   declineJoinRequest,
-  giftWrapCount,
+  mailRoom,
+  mailLeftFor,
+  mailUsage,
+  wrapBytes,
   isMember,
   isPubkeyBanned,
   listJoinRequests,
@@ -76,7 +79,9 @@ import {
   JOIN_REQUEST_NOTE_MAX_LENGTH,
   JOIN_REQUEST_TTL_SECONDS,
   MAX_PENDING_JOIN_REQUESTS,
-  maxGiftWraps,
+  ERASE_MAIL_BATCH,
+  mailBytesPerMember,
+  mailStorageBytes,
   MEMBER_REMOVAL_GRACE_SECONDS,
   memberInviteLimits,
   HOME_STATS_DAYS,
@@ -193,6 +198,8 @@ export const SUPPORTED_METHODS = [
   "setstorage",
   "memberkeys",
   "mailtimes",
+  // bothy's own: how full the signer's mailbox and the home's are.
+  "mymailbox",
   // bothy's own: a member deleting their own account.
   "eraseme",
 ] as const;
@@ -214,6 +221,7 @@ export const SUPPORTED_METHODS = [
 // (memberInviteStanding). Owner and admins pass the same gate unlimited.
 export const MEMBER_CALLABLE_METHODS: readonly string[] = [
   "eraseme",
+  "mymailbox",
   "mailtimes",
   "subscribepush",
   "unsubscribepush",
@@ -876,8 +884,15 @@ export function handleManagementCall(
           // admin. Each is its own wrap, sealed to that person.
           const outbox: NostrEvent[] = [];
           for (const recipient of [owner, ...listAdmins(sql).map((a) => a.pubkey)]) {
-            if (giftWrapCount(sql) >= maxGiftWraps(env)) break;
             const { wrap } = joinRequestMessage(sql, recipient, signer, details.name, details.note, nowSec);
+            const fits = mailRoom(
+              sql,
+              [recipient],
+              wrapBytes(wrap.content, JSON.stringify(wrap.tags)),
+              mailStorageBytes(env),
+              mailBytesPerMember(env),
+            );
+            if (fits !== "ok") continue;
             const stored = storeEvent(sql, wrap, nowSec);
             if (stored.stored) outbox.push(stored.stored);
           }
@@ -1071,8 +1086,30 @@ export function handleManagementCall(
       if (signer === owner) {
         return err("eraseme: the relay owner cannot erase themselves; the relay itself is your account here");
       }
-      const deleted = eraseMember(sql, signer, owner, nowSec, maxGiftWraps(env));
-      return { result: { erased: true, messagesDeleted: deleted } };
+      // A first batch now; any rest goes on the hourly sweep at once (no
+      // grace), since one call deleting a large mailbox could spend the
+      // day's rows written (limits.ts ERASE_MAIL_BATCH).
+      const deleted = eraseMember(sql, signer, owner, nowSec, ERASE_MAIL_BATCH);
+      const left = mailLeftFor(sql, signer, owner, ERASE_MAIL_BATCH);
+      return { result: { erased: true, messagesDeleted: deleted, messagesLeft: left } };
+    }
+
+    // The signer's own mailbox here, and the home's: how much is stored
+    // against each cap (limits.ts mailBytesPerMember, mailStorageBytes),
+    // so an app can say "your mailbox is 80% full" before a sender hears
+    // it is full. Limits are null when off.
+    case "mymailbox": {
+      const own = mailUsage(sql, signer);
+      const home = mailUsage(sql, null);
+      return {
+        result: {
+          messages: own.messages,
+          usedBytes: own.bytes,
+          limitBytes: mailBytesPerMember(env),
+          homeUsedBytes: home.bytes,
+          homeLimitBytes: mailStorageBytes(env),
+        },
+      };
     }
 
     case "unsubscribepush": {

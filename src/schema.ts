@@ -706,6 +706,28 @@ export const TABLES: readonly TableSpec[] = [
     columns: [col("day", "INTEGER PRIMARY KEY"), col("n", "INTEGER NOT NULL")],
   },
   {
+    // The mailbox's bytes (limits.ts mailStorageBytes, mailBytesPerMember):
+    // one row per recipient, plus `*` for the whole home, holding the bytes
+    // and count of stored gift wraps addressed to them. Maintained by
+    // storage.ts insertEventRow and deleteEventRow, the two places every
+    // event row passes, so no delete path can forget it; seeded once from
+    // the wraps already stored (seedMailUsage). A wrap naming several
+    // recipients is charged to each.
+    name: "mail_usage",
+    columns: [
+      col("pubkey", "TEXT PRIMARY KEY"),
+      col("bytes", "INTEGER NOT NULL"),
+      col("n", "INTEGER NOT NULL"),
+    ],
+  },
+  {
+    // Gift wraps that carry a NIP-40 expiration, by when: the expiry sweep
+    // (storage.ts sweepExpiredGiftWraps) reads this rather than walking
+    // every stored wrap each hour. Written and deleted with the wrap.
+    name: "wrap_expiry",
+    columns: [col("id", "TEXT PRIMARY KEY"), col("expiration", "INTEGER NOT NULL")],
+  },
+  {
     // Members the owner removed (nip86.ts unallowpubkey), kept for
     // limits.ts MEMBER_REMOVAL_GRACE_SECONDS so the mail already stored for
     // them stays readable while their app moves house. After that the cron
@@ -1051,6 +1073,12 @@ export const INDEXES: readonly IndexSpec[] = [
   // member's mail goes to (relay.ts drainInboxPushes, storage.ts
   // hasPushSubscription), and dropping a removed member's devices. One row
   // written per subscribe.
+  // Serves the expiry sweep's "soonest first" (schema.ts `wrap_expiry`).
+  {
+    name: "idx_wrap_expiry_expiration",
+    table: "wrap_expiry",
+    keyColumns: ["expiration"],
+  },
   // Serves the per-creator counts of member invites (storage.ts
   // inviteSlotsUsed, countOutstandingMemberInvites) and a member's own
   // listing. One row written per createinvite.
@@ -1429,6 +1457,39 @@ function seedRelayIdentity(sql: SqlStorage): void {
   sql.exec(`INSERT INTO relay_identity (secret_key, public_key) VALUES (?, ?)`, secretKeyHex, publicKeyHex);
 }
 
+// What a stored gift wrap is charged beyond its content and tags (limits.ts
+// mailStorageBytes): the id, pubkey and sig (256 characters as hex) and
+// the rest of the row, rounded up. Fixed, so the charge on insert and the
+// refund on delete always match (storage.ts wrapBytes). Here rather than
+// in limits.ts, which imports this file.
+export const WRAP_FIXED_BYTES = 300;
+
+// Seeds `mail_usage` and `wrap_expiry` from the gift wraps already stored,
+// once: guarded on the `*` row, which exists from then on. The charge is
+// the same as storage.ts wrapBytes (content, tags, limits.ts
+// WRAP_FIXED_BYTES), in SQL. Rows read: the stored wraps, once.
+function seedMailUsage(sql: SqlStorage): void {
+  if (sql.exec(`SELECT 1 FROM mail_usage WHERE pubkey = '*' LIMIT 1`).toArray().length > 0) return;
+  sql.exec(
+    `INSERT INTO mail_usage (pubkey, bytes, n)
+       SELECT '*', COALESCE(SUM(LENGTH(content) + LENGTH(tags) + ?), 0), COUNT(*) FROM events WHERE kind = 1059`,
+    WRAP_FIXED_BYTES,
+  );
+  sql.exec(
+    `INSERT INTO mail_usage (pubkey, bytes, n)
+       SELECT t.tag_value, SUM(LENGTH(e.content) + LENGTH(e.tags) + ?), COUNT(*)
+         FROM events e JOIN event_tags t ON t.event_id = e.id
+        WHERE e.kind = 1059 AND t.tag_name = 'p'
+        GROUP BY t.tag_value
+       ON CONFLICT(pubkey) DO NOTHING`,
+    WRAP_FIXED_BYTES,
+  );
+  sql.exec(
+    `INSERT OR IGNORE INTO wrap_expiry (id, expiration)
+       SELECT id, expiration FROM events WHERE kind = 1059 AND expiration IS NOT NULL`,
+  );
+}
+
 // Ensures group `_` has a row. Every relay hosted `_` before groups were
 // rows, so seeding it unconditionally keeps existing group events, members
 // and invites (whose group_id defaults to `_`) attached to a hosted group,
@@ -1526,6 +1587,7 @@ export function initSchema(sql: SqlStorage): void {
   sql.exec(`INSERT INTO chat_state (last_occupied_at) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM chat_state)`);
   seedMaintainedCounts(sql);
   seedIngestCounts(sql);
+  seedMailUsage(sql);
   seedRelayIdentity(sql);
   seedTopLevelGroup(sql);
 
