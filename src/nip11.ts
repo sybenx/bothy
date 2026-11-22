@@ -193,6 +193,12 @@ export function buildRelayInfo(
       max_bytes: photoCap,
     };
   }
+  // The home's file server (nip86.ts setstorage), bothy's own field and a
+  // separate one from `blossom`, which is this relay's own photo server:
+  // media and history backups go here. Omitted while unset or unclaimed.
+  if (ownerPubkey && stored.storageUrl) {
+    info.storage = { url: stored.storageUrl };
+  }
   const contact = resolveContact(profile);
   if (contact) {
     info.contact = contact;

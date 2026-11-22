@@ -20,6 +20,8 @@ import {
   banPubkey,
   blockIp,
   approveJoinRequest,
+  mailTimes,
+  memberKeys,
   deleteFcmToken,
   upsertFcmToken,
   addAdmin,
@@ -185,6 +187,11 @@ export const SUPPORTED_METHODS = [
   // bothy's own: the same for an Android app, with an FCM token (src/fcm.ts).
   "subscribefcm",
   "unsubscribefcm",
+  // bothy's own: the home's file server (owner sets it; its key reads the
+  // member list), and when this relay stored a member's mail.
+  "setstorage",
+  "memberkeys",
+  "mailtimes",
 ] as const;
 
 // The methods a MEMBER may call, not just the owner.
@@ -203,6 +210,7 @@ export const SUPPORTED_METHODS = [
 // codes within their own allowance and sees and revokes only their own
 // (memberInviteStanding). Owner and admins pass the same gate unlimited.
 export const MEMBER_CALLABLE_METHODS: readonly string[] = [
+  "mailtimes",
   "subscribepush",
   "unsubscribepush",
   "subscribefcm",
@@ -223,6 +231,13 @@ export const MEMBER_CALLABLE_METHODS: readonly string[] = [
 //
 // myrole answers any signer with their own role, so an app can decide what
 // to show without trying a method and reading the 401.
+// The one method the storage service's key may call (setstorage), and the
+// only key that may call it: not the owner, not a member. index.ts checks
+// the signer against the stored pubkey before dispatch.
+export const STORAGE_CALLABLE_METHODS: readonly string[] = ["memberkeys"];
+
+export const STORAGE_ONLY_REASON = "memberkeys is only for this relay's storage service";
+
 export const ANYONE_CALLABLE_METHODS: readonly string[] = ["redeeminvite", "requestjoin", "myrole"];
 
 // The methods an ADMIN may call besides the member's own: running the
@@ -280,6 +295,9 @@ export function supportedMethods(env: Env): string[] {
 export const SELF_BLOCK_CONFIRMATION = "yes, block my own address";
 
 const HEX_ID_RE = /^[0-9a-f]{64}$/;
+
+// Ids one mailtimes call may ask about: a sync's worth.
+export const MAX_MAILTIMES_IDS = 500;
 
 // A member who is neither the owner nor an admin: the caller whose view
 // of invites is limited to their own.
@@ -990,6 +1008,53 @@ export function handleManagementCall(
       if (token === null || token === "") return err("unsubscribefcm takes the FCM registration token as a string");
       deleteFcmToken(sql, signer, token);
       return { result: true };
+    }
+
+    // The home's file server: its URL (advertised as NIP-11 `storage`)
+    // and the pubkey its memberkeys calls are signed with. Owner only.
+    // An empty URL clears both.
+    case "setstorage": {
+      const url = stringParam(params, 0);
+      if (url === "") {
+        setRelaySetting(sql, "storage_url", "");
+        setRelaySetting(sql, "storage_pubkey", "");
+        return { result: true };
+      }
+      let valid = false;
+      try {
+        valid = url !== null && url.length <= 512 && new URL(url).protocol === "https:";
+      } catch {
+        valid = false;
+      }
+      if (!valid) {
+        return err('setstorage takes the storage server\'s https URL and its pubkey; "" as the URL clears both');
+      }
+      const pubkey = pubkeyParam(params, 1);
+      if (pubkey === null) return err("setstorage: the second parameter is the storage service's pubkey, as npub or hex");
+      setRelaySetting(sql, "storage_url", url!);
+      setRelaySetting(sql, "storage_pubkey", pubkey);
+      return { result: true };
+    }
+
+    // For the storage service alone (STORAGE_CALLABLE_METHODS): who may
+    // upload and who has left. Pubkeys only.
+    case "memberkeys":
+      return { result: memberKeys(sql, getOwnerPubkey(sql, env), MEMBER_REMOVAL_GRACE_SECONDS) };
+
+    // When this relay stored each of the signer's own gift wraps, for
+    // ordering ties. Up to 500 ids; ids that are not the signer's mail are
+    // left out of the answer.
+    case "mailtimes": {
+      const ids = params[0];
+      if (
+        !Array.isArray(ids) ||
+        ids.length === 0 ||
+        ids.length > MAX_MAILTIMES_IDS ||
+        !ids.every((id) => typeof id === "string" && HEX_ID_RE.test(id))
+      ) {
+        return err(`mailtimes takes an array of 1 to ${MAX_MAILTIMES_IDS} event ids, as 64-character hex`);
+      }
+      return { result: mailTimes(sql, signer, ids as string[]) };
     }
 
     case "unsubscribepush": {

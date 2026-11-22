@@ -168,6 +168,18 @@ bothy_rpc https://your-relay.workers.dev/ addadmin '["<their npub>"]'
 
 Any key can call `myrole` to learn what it is here: `owner`, `admin`, `member` or `none`. The list of admins is not published in the relay information document, because it would tie your second key to your relay for anyone to read.
 
+### A file server for your home
+
+If your home has a separate file server for media and history backups (a Blossom server such as Keykin Storage), tell the relay about it, with its address and the key it signs with:
+
+```bash
+bothy_rpc https://your-relay.workers.dev/ setstorage '["https://storage.example/", "<the server'"'"'s npub>"]'
+```
+
+Apps then find it in the relay information document as `storage`, beside `blossom`, which stays this relay's own profile photo server. The file server keeps itself in step with your members by calling `memberkeys`, which only its key can call: it answers who may upload (you and your members) and who has left and when, and nothing else, so someone who joins can upload at once and someone removed cannot. `setstorage` with an empty address forgets it.
+
+Members' apps can also ask `mailtimes` when this relay stored each of their messages, which they use to order messages that carry the same time.
+
 ### How your home is used
 
 `homestats` answers, for you and your admins, how much your home is being used, in counts only: members seen today, this week and this month, encrypted messages that arrived each day for two weeks, how many people joined each week for eight weeks and how many of them by invite, how many members get notifications, and what profile photos take. It never says who: not who was seen, not who messaged whom. The admin page shows the same, after you sign a request with your browser signer; without one, use the `bothy_rpc` function below or an app.
@@ -266,7 +278,7 @@ nak admin supportedmethods --sec <your nsec> your-relay.workers.dev
 
 Start there. `supportedmethods` returns exactly what this relay implements, which is the honest answer to what you can do with it, and `nak admin --help` lists the flags each method takes. Every request is authenticated with a [NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md) event signed by the relay owner's key, the same key you claimed the relay with. Nothing else is accepted, and an unsigned or wrongly signed request gets a 401. The exceptions are a member's own notification settings (`subscribepush`, `unsubscribepush`, `subscribefcm` and `unsubscribefcm`, signed by the member) `redeeminvite` and `requestjoin` (signed by whoever is joining), `myrole` (any key), the invite methods and `myinvites` for members (within their limits), and the member methods an admin may call (see "Admins" above).
 
-What this relay implements: `banevent` and `allowevent` and `listbannedevents`; `banpubkey`, `unbanpubkey` and `listbannedpubkeys`; `allowpubkey`, `unallowpubkey` and `listallowedpubkeys`; `blockip` and `unblockip` and `listblockedips`; `changerelayname`, `changerelaydescription` and `changerelayicon`; and, bothy's own, `changewritepolicy` and `getwritepolicy` (see "Who can write here" above), `createinvite`, `redeeminvite`, `listunusedinvites`, `revokeinvite`, `requestjoin`, `listjoinrequests`, `approvejoin`, `declinejoin`, `listmembers`, `addadmin`, `removeadmin`, `listadmins`, `myrole`, `myinvites` and `homestats` (see "Members" above), and `subscribepush`, `unsubscribepush`, `subscribefcm` and `unsubscribefcm`. What it does not: the kind allowlist, because bothy stores every kind on purpose; and the moderation queue, because bothy has nothing to report events into.
+What this relay implements: `banevent` and `allowevent` and `listbannedevents`; `banpubkey`, `unbanpubkey` and `listbannedpubkeys`; `allowpubkey`, `unallowpubkey` and `listallowedpubkeys`; `blockip` and `unblockip` and `listblockedips`; `changerelayname`, `changerelaydescription` and `changerelayicon`; and, bothy's own, `changewritepolicy` and `getwritepolicy` (see "Who can write here" above), `createinvite`, `redeeminvite`, `listunusedinvites`, `revokeinvite`, `requestjoin`, `listjoinrequests`, `approvejoin`, `declinejoin`, `listmembers`, `addadmin`, `removeadmin`, `listadmins`, `myrole`, `myinvites`, `homestats`, `setstorage`, `memberkeys` and `mailtimes` (see "Members" above), and `subscribepush`, `unsubscribepush`, `subscribefcm` and `unsubscribefcm`. What it does not: the kind allowlist, because bothy stores every kind on purpose; and the moderation queue, because bothy has nothing to report events into.
 
 The endpoint answers cross-origin requests, so a client hosted somewhere other than the relay can call it from a browser.
 

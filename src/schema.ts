@@ -357,7 +357,8 @@ export const TABLES: readonly TableSpec[] = [
   },
   {
     // NIP-86 changerelayname/changerelaydescription/changerelayicon
-    // (nip86.ts). One row per set key ('name', 'description', 'icon').
+    // (nip86.ts). One row per set key ('name', 'description', 'icon',
+    // 'write_policy', and 'storage_url'/'storage_pubkey' from setstorage).
     // Clearing deletes the row rather than storing "", so nip11.ts's
     // resolution chain can tell "unset" from "set to empty".
     name: "relay_settings",
@@ -707,7 +708,14 @@ export const TABLES: readonly TableSpec[] = [
     // Re-admitting the pubkey deletes the row, so nothing of a returning
     // member's is swept.
     name: "former_members",
-    columns: [col("pubkey", "TEXT PRIMARY KEY"), col("removed_at", "INTEGER NOT NULL")],
+    columns: [
+      col("pubkey", "TEXT PRIMARY KEY"),
+      col("removed_at", "INTEGER NOT NULL"),
+      // Why they left, for the storage service (nip86.ts memberkeys):
+      // 'removed' by the owner or an admin. Room for a member erasing
+      // their own account, which will write 'erased'.
+      col("reason", "TEXT NOT NULL DEFAULT 'removed'"),
+    ],
   },
   {
     // Call presence (push.ts CALL_PRESENCE_KIND): one row per pubkey, holding

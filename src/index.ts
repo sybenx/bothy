@@ -13,6 +13,8 @@ import {
   MANAGEMENT_CONTENT_TYPE,
   MEMBER_CALLABLE_METHODS,
   NOT_A_MEMBER_REASON,
+  STORAGE_CALLABLE_METHODS,
+  STORAGE_ONLY_REASON,
   adminOnlyReason,
 } from "./nip86";
 import { nip11Response } from "./nip11";
@@ -276,6 +278,17 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
   // signature still had to verify, so the pubkey it joins is the signer's.
   const method = typeof call?.method === "string" ? call.method : null;
   const anyoneCallable = method !== null && ANYONE_CALLABLE_METHODS.includes(method);
+
+  // memberkeys answers the storage service's key and no other, the owner
+  // included: it is a machine's read of the member list, not a person's.
+  if (method !== null && STORAGE_CALLABLE_METHODS.includes(method)) {
+    if (!(await relayStub(env).isStorageService(auth.pubkey))) {
+      return managementResponse({ error: STORAGE_ONLY_REASON }, 401);
+    }
+    return managementResponse(
+      await relayStub(env).manage(call?.method, params, request.headers.get("CF-Connecting-IP") ?? "unknown", auth.pubkey),
+    );
+  }
 
   // The first DO round trip of the request.
   const denial = anyoneCallable ? null : ownerReason(auth.pubkey, await relayStub(env).getOwner());

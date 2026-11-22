@@ -202,6 +202,7 @@ import {
   queueInboxPush,
   sweepFormerMembers,
   sweepExpiredJoinRequests,
+  storagePubkey,
   countMailDay,
   noteMemberSeen,
   pruneHomeStats,
@@ -692,6 +693,12 @@ export class Relay extends DurableObject<Env> {
   // MEMBER_CALLABLE_METHODS (storage.ts roleOf). "member" includes the
   // top-level group (TOP_LEVEL_GROUP_ID), whose members a group fan-out
   // pushes to. A few PK seeks, reached only after a valid signature.
+  // For the memberkeys gate (src/index.ts): is this the storage service's
+  // key (nip86.ts setstorage)? One row.
+  async isStorageService(pubkey: string): Promise<boolean> {
+    return this.metered(() => withReadPath("management", () => storagePubkey(this.sql) === pubkey));
+  }
+
   async getRole(pubkey: string): Promise<Role> {
     return this.metered(() =>
       withReadPath("management", () => roleOf(this.sql, pubkey, getOwnerPubkey(this.sql, this.env))),

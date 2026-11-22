@@ -1612,6 +1612,11 @@ export interface RelaySettings {
   // unparseable value falls through to the default instead of refusing
   // every write.
   writePolicy: string | null;
+  // The home's file server (nip86.ts setstorage): its URL, advertised on
+  // NIP-11 as `storage`, and the pubkey it signs memberkeys calls with.
+  // Both or neither.
+  storageUrl?: string | null;
+  storagePubkey?: string | null;
 }
 
 export function getRelaySettings(sql: SqlStorage): RelaySettings {
@@ -1622,6 +1627,8 @@ export function getRelaySettings(sql: SqlStorage): RelaySettings {
     description: byKey.get("description") ?? null,
     icon: byKey.get("icon") ?? null,
     writePolicy: byKey.get("write_policy") ?? null,
+    storageUrl: byKey.get("storage_url") ?? null,
+    storagePubkey: byKey.get("storage_pubkey") ?? null,
   };
 }
 
@@ -1638,7 +1645,16 @@ export function getStoredWritePolicy(sql: SqlStorage): string | null {
 // An empty string clears the stored value: NIP-86 has no unset operation,
 // so this is bothy's convention (README.md "Relay management API"). A
 // stored "" would shadow the kind-0 and default rungs forever.
-export type RelaySettingKey = "name" | "description" | "icon" | "write_policy";
+export type RelaySettingKey = "name" | "description" | "icon" | "write_policy" | "storage_url" | "storage_pubkey";
+
+// The storage service's pubkey alone, for the memberkeys gate.
+export function storagePubkey(sql: SqlStorage): string | null {
+  return (
+    sql
+      .exec<{ value: string }>(`SELECT value FROM relay_settings WHERE key = 'storage_pubkey'`)
+      .toArray()[0]?.value ?? null
+  );
+}
 
 export function setRelaySetting(sql: SqlStorage, key: RelaySettingKey, value: string): void {
   if (value === "") {
@@ -2638,6 +2654,51 @@ export interface RemovedMember {
 // with no recorded inviter, or whose inviter is no longer a member, is
 // reported as the owner's, so every member hangs from the owner. (Removal
 // re-parents invitees itself; this covers rows from before it did.)
+// What the storage service is told (nip86.ts memberkeys): who may upload
+// (the owner and every member, admins included) and who has left, with
+// when their files should go. Pubkeys only, no names or roles.
+export function memberKeys(
+  sql: SqlStorage,
+  owner: string | null,
+  graceSec: number,
+): {
+  owner: string | null;
+  members: string[];
+  removed: { pubkey: string; removedAt: number; deletesAt: number; reason: string }[];
+} {
+  const members = sql
+    .exec<{ pubkey: string }>(`SELECT pubkey FROM allowed_pubkeys ORDER BY pubkey ASC`)
+    .toArray()
+    .map((r) => r.pubkey);
+  const removed = sql
+    .exec<{ pubkey: string; removed_at: number; reason: string }>(
+      `SELECT pubkey, removed_at, reason FROM former_members ORDER BY removed_at DESC`,
+    )
+    .toArray()
+    .map((r) => ({ pubkey: r.pubkey, removedAt: r.removed_at, deletesAt: r.removed_at + graceSec, reason: r.reason }));
+  return { owner, members, removed };
+}
+
+// When bothy stored each of these gift wraps (events.ingested_at), for
+// the ones addressed to `recipient` only; any other id is left out, so
+// the answer says nothing about anyone else's mail. The ids go in as one
+// JSON parameter (json_each), so 500 of them bind one parameter, not 500
+// (limits.ts MAX_QUERY_BOUND_PARAMS). One PK seek per id plus a tag check.
+export function mailTimes(sql: SqlStorage, recipient: string, ids: string[]): Record<string, number> {
+  const rows = sql
+    .exec<{ id: string; ingested_at: number }>(
+      `SELECT e.id AS id, e.ingested_at AS ingested_at FROM events e
+        WHERE e.id IN (SELECT value FROM json_each(?)) AND e.kind = ? AND e.ingested_at IS NOT NULL
+          AND EXISTS (SELECT 1 FROM event_tags t
+                       WHERE t.event_id = e.id AND t.tag_name = 'p' AND t.tag_value = ?)`,
+      JSON.stringify(ids),
+      GIFT_WRAP_KIND,
+      recipient,
+    )
+    .toArray();
+  return Object.fromEntries(rows.map((r) => [r.id, r.ingested_at]));
+}
+
 export function listMembers(
   sql: SqlStorage,
   graceSec: number,
