@@ -86,7 +86,10 @@ describe("getstorage", () => {
     expect((await callManagement("getstorage")).result).toBeNull();
     const service = randomKeypair();
     await callManagement("setstorage", [STORAGE_URL, service.pubkeyHex]);
-    expect((await callManagement("getstorage")).result).toEqual({ url: STORAGE_URL, pubkey: service.pubkeyHex });
+    expect((await callManagement("getstorage")).result).toEqual({
+      url: STORAGE_URL,
+      pubkey: service.pubkeyHex,
+    });
     expect((await as(await member(), "getstorage")).status).toBe(401);
     await callManagement("setstorage", [""]);
     expect((await callManagement("getstorage")).result).toBeNull();
@@ -109,7 +112,7 @@ describe("memberkeys", () => {
       members: string[];
       removed: { pubkey: string; removedAt: number; deletesAt: number; reason: string }[];
     };
-    expect(Object.keys(result).sort()).toEqual(["members", "owner", "removed"]);
+    expect(Object.keys(result).sort()).toEqual(["admins", "members", "owner", "removed"]);
     expect(result.owner).toBe(OWNER_PUBKEY_HEX);
     expect(result.members).toEqual([alice.pubkeyHex, admin.pubkeyHex].sort());
     expect(result.removed).toEqual([
@@ -120,6 +123,25 @@ describe("memberkeys", () => {
         reason: "removed",
       },
     ]);
+  });
+
+  it("lists the admins, sorted, for the storage key alone", async () => {
+    const service = randomKeypair();
+    await callManagement("setstorage", [STORAGE_URL, service.pubkeyHex]);
+    const first = randomKeypair();
+    const second = randomKeypair();
+    await callManagement("addadmin", [first.pubkeyHex]);
+    await callManagement("addadmin", [second.pubkeyHex]);
+    const result = (await as(service, "memberkeys")).result as { admins: string[]; members: string[] };
+    expect(result.admins).toEqual([first.pubkeyHex, second.pubkeyHex].sort());
+    // Admins are members too.
+    expect(result.members).toEqual(expect.arrayContaining(result.admins));
+    await callManagement("removeadmin", [first.pubkeyHex]);
+    expect(((await as(service, "memberkeys")).result as { admins: string[] }).admins).toEqual([
+      second.pubkeyHex,
+    ]);
+    // Still nobody else's to read.
+    expect((await as(first, "memberkeys")).status).toBe(401);
   });
 
   it("answers no other key, the owner's included", async () => {

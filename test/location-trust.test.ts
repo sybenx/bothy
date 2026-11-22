@@ -187,6 +187,6 @@ describe("memberkeys", () => {
     const service = randomKeypair();
     await callManagement("setstorage", ["https://storage.example/", service.pubkeyHex]);
     const result = (await as(service, "memberkeys")).result as Record<string, unknown>;
-    expect(Object.keys(result).sort()).toEqual(["members", "owner", "removed"]);
+    expect(Object.keys(result).sort()).toEqual(["admins", "members", "owner", "removed"]);
   });
 });

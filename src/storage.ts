@@ -2954,6 +2954,7 @@ export function memberKeys(
 ): {
   owner: string | null;
   members: string[];
+  admins: string[];
   removed: { pubkey: string; removedAt: number; deletesAt: number; reason: string }[];
 } {
   const members = sql
@@ -2972,7 +2973,14 @@ export function memberKeys(
       deletesAt: r.reason === "erased" ? r.removed_at : r.removed_at + graceSec,
       reason: r.reason,
     }));
-  return { owner, members, removed };
+  // Admins, sorted, for the account page's owner and admin views of disk
+  // use. Only ever seen by the storage service's key (memberkeys), so the
+  // admin list is still never public.
+  const admins = sql
+    .exec<{ pubkey: string }>(`SELECT pubkey FROM admins ORDER BY pubkey ASC`)
+    .toArray()
+    .map((r) => r.pubkey);
+  return { owner, members, admins, removed };
 }
 
 // When bothy stored each of these gift wraps (events.ingested_at), for
