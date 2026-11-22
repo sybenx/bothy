@@ -1167,7 +1167,14 @@ export function handleManagementCall(
       ) {
         return err(`mailtimes takes an array of 1 to ${MAX_MAILTIMES_IDS} event ids, as 64-character hex`);
       }
-      return { result: mailTimes(sql, signer, ids as string[]) };
+      // Optional {"seq": true}: each value becomes {storedAt, seq}, adding
+      // the home's sequence number for the wrap (schema.ts events.seq).
+      // Without it the answer stays a number per id, as before.
+      const option = params[1] as { seq?: unknown } | undefined | null;
+      if (option !== undefined && option !== null && (typeof option !== "object" || Array.isArray(option))) {
+        return err('mailtimes: the second parameter is optional, {"seq": true}');
+      }
+      return { result: mailTimes(sql, signer, ids as string[], option?.seq === true) };
     }
 
     // A member deleting their own account (storage.ts eraseMember): the

@@ -98,9 +98,17 @@ function insertEventRow(
   // NULL exactly when the row is public, including kinds 39000/39001,
   // which are public group state (groups.ts isPubliclyReadableGroupKind).
   const groupId = scope === GROUP_SCOPE ? groupIdOf(event) : null;
+  // A gift wrap takes the home's next sequence number (schema.ts
+  // events.seq): one row read here, and the counter moves in the mailbox
+  // UPDATE below, which every stored wrap already pays.
+  const seq =
+    event.kind === GIFT_WRAP_KIND
+      ? (sql.exec<{ seq: number }>(`SELECT seq FROM mail_usage WHERE pubkey = ?`, MAIL_TOTAL).toArray()[0]?.seq ??
+          0) + 1
+      : null;
   sql.exec(
-    `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost, is_group, group_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost, is_group, group_id, seq)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     event.id,
     event.pubkey,
     event.created_at,
@@ -113,6 +121,7 @@ function insertEventRow(
     eventRowCost(indexedTags.length),
     scope,
     groupId,
+    seq,
   );
   // After the INSERT, so a duplicate id (which throws, and which
   // backfill.ts applyBackfillPage catches and continues past) leaves the
@@ -126,7 +135,7 @@ function insertEventRow(
   // The mailbox's bytes (schema.ts `mail_usage`) and the expiry index
   // (`wrap_expiry`), for gift wraps only. 2 to 3 rows written.
   if (event.kind === GIFT_WRAP_KIND) {
-    bumpMailUsage(sql, wrapRecipients(event.tags), wrapBytes(event.content, JSON.stringify(event.tags)), 1);
+    bumpMailUsage(sql, wrapRecipients(event.tags), wrapBytes(event.content, JSON.stringify(event.tags)), 1, seq);
     if (expiration !== null) {
       sql.exec(`INSERT OR REPLACE INTO wrap_expiry (id, expiration) VALUES (?, ?)`, event.id, expiration);
     }
@@ -1006,14 +1015,25 @@ function wrapRecipients(tags: string[][]): string[] {
   return [...new Set(pTagValues(tags))].slice(0, MAX_WRAP_RECIPIENTS_CHECKED);
 }
 
-function bumpMailUsage(sql: SqlStorage, recipients: string[], bytes: number, sign: 1 | -1): void {
+// `seq`, on a stored wrap, moves the `*` row's sequence counter to it in
+// the same statement (schema.ts mail_usage.seq); deletes never move it.
+function bumpMailUsage(
+  sql: SqlStorage,
+  recipients: string[],
+  bytes: number,
+  sign: 1 | -1,
+  seq: number | null = null,
+): void {
   for (const key of [MAIL_TOTAL, ...recipients]) {
+    const counter = key === MAIL_TOTAL && seq !== null ? seq : 0;
     sql.exec(
-      `INSERT INTO mail_usage (pubkey, bytes, n) VALUES (?, MAX(?, 0), MAX(?, 0))
-         ON CONFLICT(pubkey) DO UPDATE SET bytes = MAX(bytes + ?, 0), n = MAX(n + ?, 0)`,
+      `INSERT INTO mail_usage (pubkey, bytes, n, seq) VALUES (?, MAX(?, 0), MAX(?, 0), ?)
+         ON CONFLICT(pubkey) DO UPDATE SET bytes = MAX(bytes + ?, 0), n = MAX(n + ?, 0),
+                                           seq = MAX(seq, excluded.seq)`,
       key,
       sign * bytes,
       sign,
+      counter,
       sign * bytes,
       sign,
     );
@@ -2988,10 +3008,18 @@ export function memberKeys(
 // the answer says nothing about anyone else's mail. The ids go in as one
 // JSON parameter (json_each), so 500 of them bind one parameter, not 500
 // (limits.ts MAX_QUERY_BOUND_PARAMS). One PK seek per id plus a tag check.
-export function mailTimes(sql: SqlStorage, recipient: string, ids: string[]): Record<string, number> {
+//
+// With `withSeq`, each value is {storedAt, seq} instead of a number: the
+// home's sequence number too (schema.ts events.seq).
+export function mailTimes(
+  sql: SqlStorage,
+  recipient: string,
+  ids: string[],
+  withSeq = false,
+): Record<string, number | { storedAt: number; seq: number | null }> {
   const rows = sql
-    .exec<{ id: string; ingested_at: number }>(
-      `SELECT e.id AS id, e.ingested_at AS ingested_at FROM events e
+    .exec<{ id: string; ingested_at: number; seq: number | null }>(
+      `SELECT e.id AS id, e.ingested_at AS ingested_at, e.seq AS seq FROM events e
         WHERE e.id IN (SELECT value FROM json_each(?)) AND e.kind = ? AND e.ingested_at IS NOT NULL
           AND EXISTS (SELECT 1 FROM event_tags t
                        WHERE t.event_id = e.id AND t.tag_name = 'p' AND t.tag_value = ?)`,
@@ -3000,7 +3028,9 @@ export function mailTimes(sql: SqlStorage, recipient: string, ids: string[]): Re
       recipient,
     )
     .toArray();
-  return Object.fromEntries(rows.map((r) => [r.id, r.ingested_at]));
+  return Object.fromEntries(
+    rows.map((r) => [r.id, withSeq ? { storedAt: r.ingested_at, seq: r.seq } : r.ingested_at]),
+  );
 }
 
 // Who is in the home, for any member to see (nip86.ts homemembers): every

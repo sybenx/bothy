@@ -1,6 +1,9 @@
 // The home's file server (nip86.ts setstorage, memberkeys, NIP-11
 // `storage`) and when this relay stored a member's mail (mailtimes).
-import { exports } from "cloudflare:workers";
+import { env, exports } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
+import { initSchema } from "../src/schema";
+import type { Relay } from "../src/relay";
 import { describe, expect, it } from "vitest";
 import { MEMBER_REMOVAL_GRACE_SECONDS } from "../src/limits";
 import { MAX_MAILTIMES_IDS, STORAGE_ONLY_REASON } from "../src/nip86";
@@ -209,5 +212,87 @@ describe("mailtimes", () => {
 
   it("is refused to somebody who is not a member", async () => {
     expect((await as(randomKeypair(), "mailtimes", [["a".repeat(64)]])).status).toBe(401);
+  });
+});
+
+describe("the home's sequence number for sealed messages", () => {
+  it("numbers each stored wrap in order, and mailtimes gives it on request", async () => {
+    const alice = await member();
+    const first = await wrapTo(alice.pubkeyHex);
+    const second = await wrapTo(alice.pubkeyHex);
+    const third = await wrapTo(alice.pubkeyHex);
+    const ids = [first.id, second.id, third.id];
+
+    // Without the option, a number per id, as before.
+    const plain = (await as(alice, "mailtimes", [ids])).result as Record<string, unknown>;
+    expect(Object.values(plain).every((v) => typeof v === "number")).toBe(true);
+
+    const withSeq = (await as(alice, "mailtimes", [ids, { seq: true }])).result as Record<
+      string,
+      { storedAt: number; seq: number }
+    >;
+    const seqs = ids.map((id) => withSeq[id]!.seq);
+    expect(seqs[1]).toBe(seqs[0]! + 1);
+    expect(seqs[2]).toBe(seqs[1]! + 1);
+    expect(withSeq[first.id]!.storedAt).toBe(plain[first.id]);
+
+    expect((await as(alice, "mailtimes", [ids, "seq"])).error).toBe(
+      'mailtimes: the second parameter is optional, {"seq": true}',
+    );
+  });
+
+  it("never hands a number out twice, even after the newest wrap is deleted", async () => {
+    const alice = await member();
+    const doomed = await wrapTo(alice.pubkeyHex);
+    const before = (
+      (await as(alice, "mailtimes", [[doomed.id], { seq: true }])).result as Record<string, { seq: number }>
+    )[doomed.id]!.seq;
+    await runInDurableObject(env.RELAY.get(env.RELAY.idFromName("relay")), (_i: Relay, state) => {
+      state.storage.sql.exec(`DELETE FROM events WHERE id = ?`, doomed.id);
+    });
+    const next = await wrapTo(alice.pubkeyHex);
+    const after = (
+      (await as(alice, "mailtimes", [[next.id], { seq: true }])).result as Record<string, { seq: number }>
+    )[next.id]!.seq;
+    expect(after).toBe(before + 1);
+  });
+
+  it("numbers wraps stored before it existed, in the order they were stored", async () => {
+    await runInDurableObject(env.RELAY.get(env.RELAY.idFromName("relay")), (_i: Relay, state) => {
+      const sql = state.storage.sql;
+      const insert = (id: string, ingestedAt: number | null) =>
+        sql.exec(
+          `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, ingested_at)
+           VALUES (?, ?, 1, 1059, '[]', 'x', 'sig', ?)`,
+          id,
+          "e".repeat(64),
+          ingestedAt,
+        );
+      insert("3".padStart(64, "0"), 200);
+      insert("1".padStart(64, "0"), 100);
+      insert("2".padStart(64, "0"), 100);
+      insert("0".padStart(64, "0"), null);
+      sql.exec(`DELETE FROM schema_meta`);
+      initSchema(sql);
+      const numbered = sql
+        .exec<{ id: string; seq: number }>(`SELECT id, seq FROM events WHERE kind = 1059 ORDER BY seq`)
+        .toArray()
+        .map((r) => r.id.slice(-1));
+      expect(numbered).toEqual(["0", "1", "2", "3"]);
+      const counter = sql.exec<{ seq: number }>(`SELECT seq FROM mail_usage WHERE pubkey = '*'`).toArray()[0]!
+        .seq;
+      expect(counter).toBe(
+        sql.exec<{ m: number }>(`SELECT MAX(seq) AS m FROM events WHERE kind = 1059`).toArray()[0]!.m,
+      );
+    });
+  });
+
+  it("is not given to other kinds", async () => {
+    await runInDurableObject(env.RELAY.get(env.RELAY.idFromName("relay")), (_i: Relay, state) => {
+      const rows = state.storage.sql
+        .exec(`SELECT 1 FROM events WHERE kind != 1059 AND seq IS NOT NULL`)
+        .toArray();
+      expect(rows).toEqual([]);
+    });
   });
 });

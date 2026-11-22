@@ -145,6 +145,13 @@ export const TABLES: readonly TableSpec[] = [
       // the 39000-series names its group in `d` rather than `h` (groups.ts
       // groupIdOf).
       col("group_id", "TEXT"),
+      // Gift wraps only: the home's sequence number for the wrap, 1, 2, 3,
+      // in the order this relay stored them ("the box numbers sealed
+      // messages"). Exact and clock-free, unlike `ingested_at`; never
+      // reused, since the counter (`mail_usage.seq` on the `*` row) only
+      // goes up. NULL for every other kind. Read by nip86.ts mailtimes.
+      // No index: it is read by id.
+      col("seq", "INTEGER"),
     ],
   },
   {
@@ -727,6 +734,10 @@ export const TABLES: readonly TableSpec[] = [
       col("pubkey", "TEXT PRIMARY KEY"),
       col("bytes", "INTEGER NOT NULL"),
       col("n", "INTEGER NOT NULL"),
+      // On the `*` row only: the last gift wrap sequence number handed out
+      // (events.seq). Bumped in the same UPDATE that already counts each
+      // stored wrap, so numbering costs no extra row written.
+      col("seq", "INTEGER NOT NULL DEFAULT 0"),
     ],
   },
   {
@@ -1499,6 +1510,27 @@ function seedMailUsage(sql: SqlStorage): void {
   );
 }
 
+// Numbers the gift wraps stored before events.seq existed, in the order
+// they were stored (ingested_at, then id; wraps from before ingested_at
+// first), after any number already handed out, and moves the counter past
+// them. Guarded on there being an unnumbered wrap. Rows read: the stored
+// wraps, once.
+function seedWrapSeq(sql: SqlStorage): void {
+  if (sql.exec(`SELECT 1 FROM events WHERE kind = 1059 AND seq IS NULL LIMIT 1`).toArray().length === 0) return;
+  const base = sql.exec<{ seq: number }>(`SELECT seq FROM mail_usage WHERE pubkey = '*'`).toArray()[0]?.seq ?? 0;
+  sql.exec(
+    `UPDATE events SET seq = ? + r.rn
+       FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY COALESCE(ingested_at, 0), id) AS rn
+               FROM events WHERE kind = 1059 AND seq IS NULL) AS r
+      WHERE events.id = r.id`,
+    base,
+  );
+  sql.exec(
+    `UPDATE mail_usage SET seq = MAX(seq, (SELECT COALESCE(MAX(seq), 0) FROM events WHERE kind = 1059))
+      WHERE pubkey = '*'`,
+  );
+}
+
 // Ensures group `_` has a row. Every relay hosted `_` before groups were
 // rows, so seeding it unconditionally keeps existing group events, members
 // and invites (whose group_id defaults to `_`) attached to a hosted group,
@@ -1597,6 +1629,7 @@ export function initSchema(sql: SqlStorage): void {
   seedMaintainedCounts(sql);
   seedIngestCounts(sql);
   seedMailUsage(sql);
+  seedWrapSeq(sql);
   seedRelayIdentity(sql);
   seedTopLevelGroup(sql);
 

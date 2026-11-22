@@ -188,7 +188,7 @@ bothy_rpc https://your-relay.workers.dev/ setstorage '["https://storage.example/
 
 Apps then find it in the relay information document as `storage`, beside `blossom`, which stays this relay's own profile photo server. The file server keeps itself in step with your members by calling `memberkeys`, which only its key can call: it answers who may upload (you and your members) and who has left and when, and nothing else, so someone who joins can upload at once and someone removed cannot. `setstorage` with an empty address forgets it, and `getstorage` shows what is set. With a browser signer you can do the same on the admin page, under **File server**: it shows the key you are about to register, so you can check it against the one your file server shows before you sign.
 
-Members' apps can also ask `mailtimes` when this relay stored each of their messages, which they use to order messages that carry the same time.
+Members' apps can also ask `mailtimes` when this relay stored each of their messages, and with `{"seq": true}` the relay's own running number for each (1, 2, 3, in the order it stored them, never reused), which they use to order messages that carry the same time.
 
 ### How your home is used
 
