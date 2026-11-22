@@ -260,3 +260,54 @@ describe("removed on purpose", () => {
     expect(reply.status).toBe(401);
   });
 });
+
+describe("allowpubkey keeps what is already there", () => {
+  const rowOf = (pubkey: string) =>
+    runInDurableObject(stub(), (_i: Relay, state) =>
+      state.storage.sql.exec(`SELECT * FROM allowed_pubkeys WHERE pubkey = ?`, pubkey).toArray(),
+    );
+
+  it("leaves a current member's row byte for byte as it was", async () => {
+    const alice = await newMember();
+    const bob = await newMember(alice);
+    const before = JSON.stringify(await rowOf(bob.pubkeyHex));
+    expect((await callManagement("allowpubkey", [bob.pubkeyHex, "again"])).result).toBe(true);
+    expect((await callManagement("allowpubkey", [bob.pubkeyHex])).result).toBe(true);
+    expect(JSON.stringify(await rowOf(bob.pubkeyHex))).toBe(before);
+  });
+
+  it("puts a removed member back in their place in the tree during the grace", async () => {
+    const alice = await newMember();
+    const bob = await newMember(alice);
+    const before = JSON.stringify(await rowOf(bob.pubkeyHex));
+    await callManagement("unallowpubkey", [bob.pubkeyHex]);
+    expect((await callManagement("allowpubkey", [bob.pubkeyHex])).result).toBe(true);
+    expect(JSON.stringify(await rowOf(bob.pubkeyHex))).toBe(before);
+    const row = (await memberRows()).find((r) => r.pubkey === bob.pubkeyHex)!;
+    expect(row).toMatchObject({ invitedBy: alice.pubkeyHex, source: "member" });
+    const former = await runInDurableObject(stub(), (_i: Relay, state) =>
+      state.storage.sql.exec(`SELECT * FROM former_members WHERE pubkey = ?`, bob.pubkeyHex).toArray(),
+    );
+    expect(former).toEqual([]);
+  });
+
+  it("brings back an own key as an own key", async () => {
+    const alice = await newMember();
+    const { child } = await addKey(alice);
+    await callManagement("unallowpubkey", [child.pubkeyHex]);
+    await callManagement("allowpubkey", [child.pubkeyHex]);
+    expect((await memberRows()).find((r) => r.pubkey === child.pubkeyHex)).toMatchObject({
+      invitedBy: alice.pubkeyHex,
+      source: "own",
+    });
+  });
+
+  it("adds a new key with the caller as inviter", async () => {
+    const stranger = randomKeypair();
+    expect((await callManagement("allowpubkey", [stranger.pubkeyHex])).result).toBe(true);
+    expect((await memberRows()).find((r) => r.pubkey === stranger.pubkeyHex)).toMatchObject({
+      invitedBy: OWNER_PUBKEY_HEX,
+      source: "owner",
+    });
+  });
+});

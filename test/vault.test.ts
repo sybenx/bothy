@@ -138,7 +138,7 @@ async function assert(passkey: Passkey, challenge: string, opts: AssertionOption
       : signer.alg === COSE_EDDSA
         ? { name: "Ed25519" }
         : { name: "RSASSA-PKCS1-v1_5" };
-  let signature = new Uint8Array(await crypto.subtle.sign(algorithm, signer.privateKey, signed));
+  let signature: Uint8Array = new Uint8Array(await crypto.subtle.sign(algorithm, signer.privateKey, signed));
   if (signer.alg === COSE_ES256) signature = rawToDer(signature);
   return {
     id: toBase64url(passkey.credentialId),

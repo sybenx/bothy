@@ -1865,7 +1865,16 @@ export function allowPubkey(
   // A current member: nothing changes, not their place in the tree, how
   // they came in or when (an app calling allowpubkey for someone already
   // in must not rewrite them).
-  if (isPubkeyAllowed(sql, pubkey)) return "unchanged";
+  //
+  // One exception, unchanged from before: a row only a NIP-29 group join
+  // made (source 'invite') becomes the owner's grant, so a group
+  // remove-user no longer takes away the relay-wide access the owner just
+  // gave by hand. Nothing else about it changes. Groups are paused unless
+  // GROUPS=on, so a DMs home never has such rows.
+  if (isPubkeyAllowed(sql, pubkey)) {
+    sql.exec(`UPDATE allowed_pubkeys SET source = 'owner' WHERE pubkey = ? AND source = 'invite'`, pubkey);
+    return "unchanged";
+  }
   // Removed and still in the grace ("Let back in"): their old row comes
   // back as it was. The rest of the removal (devices, admin role) stays
   // undone, and their invitees stay where removal put them.
