@@ -81,6 +81,18 @@ describe("setstorage", () => {
   });
 });
 
+describe("getstorage", () => {
+  it("tells the owner what is set, or null, and nobody else", async () => {
+    expect((await callManagement("getstorage")).result).toBeNull();
+    const service = randomKeypair();
+    await callManagement("setstorage", [STORAGE_URL, service.pubkeyHex]);
+    expect((await callManagement("getstorage")).result).toEqual({ url: STORAGE_URL, pubkey: service.pubkeyHex });
+    expect((await as(await member(), "getstorage")).status).toBe(401);
+    await callManagement("setstorage", [""]);
+    expect((await callManagement("getstorage")).result).toBeNull();
+  });
+});
+
 describe("memberkeys", () => {
   it("tells the storage service who may upload and who has left, and nothing else", async () => {
     const service = randomKeypair();

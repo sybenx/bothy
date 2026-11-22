@@ -20,6 +20,7 @@ import {
   banPubkey,
   blockIp,
   approveJoinRequest,
+  getRelaySettings,
   eraseMember,
   mailTimes,
   memberKeys,
@@ -196,6 +197,7 @@ export const SUPPORTED_METHODS = [
   // bothy's own: the home's file server (owner sets it; its key reads the
   // member list), and when this relay stored a member's mail.
   "setstorage",
+  "getstorage",
   "memberkeys",
   "mailtimes",
   // bothy's own: how full the signer's mailbox and the home's are.
@@ -1053,6 +1055,18 @@ export function handleManagementCall(
       setRelaySetting(sql, "storage_url", url!);
       setRelaySetting(sql, "storage_pubkey", pubkey);
       return { result: true };
+    }
+
+    // Owner only: what setstorage last stored, for the admin page's File
+    // server section. {url, pubkey}, or null when none is set.
+    case "getstorage": {
+      const settings = getRelaySettings(sql);
+      return {
+        result:
+          settings.storageUrl && settings.storagePubkey
+            ? { url: settings.storageUrl, pubkey: settings.storagePubkey }
+            : null,
+      };
     }
 
     // For the storage service alone (STORAGE_CALLABLE_METHODS): who may

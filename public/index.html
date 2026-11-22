@@ -160,6 +160,26 @@
     <p id="activity-error" class="live-status"></p>
     <dl id="activity-list" hidden></dl>
   </div>
+  <!-- The home's file server (NIP-86 setstorage/getstorage), owner only,
+       signed with the browser signer like the section above. -->
+  <div id="fileserver" hidden>
+    <button type="button" id="fileserver-btn">File server</button>
+    <div id="fileserver-panel" hidden>
+      <p id="fileserver-current"></p>
+      <form id="fileserver-form">
+        <input type="url" id="fileserver-url" placeholder="https://..." autocomplete="off" />
+        <input type="text" id="fileserver-key" placeholder="the file server's npub1... or hex key" autocomplete="off" />
+        <button type="submit">Check</button>
+      </form>
+      <div id="fileserver-confirm" hidden>
+        <p>This will register the key <code id="fileserver-npub"></code> (<code id="fileserver-hex"></code>).</p>
+        <p>Check this matches the key shown by your file server (<code>home key</code> on the box).</p>
+        <button type="button" id="fileserver-connect">Connect</button>
+      </div>
+      <button type="button" id="fileserver-disconnect" hidden>Disconnect</button>
+      <p id="fileserver-error" class="live-status"></p>
+    </div>
+  </div>
 
   <p id="backfill-status" hidden></p>
   <p id="backfill-refusal" class="refusal" hidden></p>
@@ -344,6 +364,7 @@ async function main() {
     renderMembersStatus(stats);
     renderPhotosStatus(stats);
     offerActivity(stats);
+    offerFileServer(stats);
     renderBackfillStatus(stats.backfill);
     renderDiagnostics(stats);
     wireLiveFeed();
@@ -448,6 +469,168 @@ function renderMembersStatus(stats) {
 
 // Members' profile photos (/api/stats `photoBytes` against
 // `photoStorageLimit`), hidden when photo storage is off.
+// One NIP-86 call signed with the browser signer (NIP-07): a NIP-98 event
+// over this exact body. Resolves to the HTTP status and the parsed reply;
+// throws if the signer declines.
+async function signedCall(method, params) {
+  const body = JSON.stringify({ method, params });
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body)));
+  const payload = Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
+  const signed = await window.nostr.signEvent({
+    kind: 27235,
+    created_at: Math.floor(Date.now() / 1000),
+    tags: [["u", location.origin + "/"], ["method", "POST"], ["payload", payload]],
+    content: "",
+  });
+  const res = await fetch("/", {
+    method: "POST",
+    headers: { "Content-Type": "application/nostr+json+rpc", Authorization: "Nostr " + btoa(JSON.stringify(signed)) },
+    body,
+  });
+  return { status: res.status, reply: JSON.parse(new TextDecoder().decode(await res.arrayBuffer())) };
+}
+
+// npub <-> hex (BIP-173 bech32), for showing the file server's key both
+// ways before it is registered.
+const BECH32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+function bech32Polymod(values) {
+  const gen = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+  let chk = 1;
+  for (const v of values) {
+    const top = chk >>> 25;
+    chk = ((chk & 0x1ffffff) << 5) ^ v;
+    for (let i = 0; i < 5; i++) if ((top >>> i) & 1) chk ^= gen[i];
+  }
+  return chk;
+}
+function hrpExpand(hrp) {
+  return [...[...hrp].map((c) => c.charCodeAt(0) >> 5), 0, ...[...hrp].map((c) => c.charCodeAt(0) & 31)];
+}
+function convertBits(data, from, to, pad) {
+  let acc = 0, bits = 0;
+  const out = [];
+  for (const v of data) {
+    acc = (acc << from) | v;
+    bits += from;
+    while (bits >= to) { bits -= to; out.push((acc >> bits) & ((1 << to) - 1)); }
+  }
+  if (pad && bits > 0) out.push((acc << (to - bits)) & ((1 << to) - 1));
+  else if (!pad && (bits >= from || ((acc << (to - bits)) & ((1 << to) - 1)))) return null;
+  return out;
+}
+function npubToHex(npub) {
+  const s = npub.trim().toLowerCase();
+  if (!s.startsWith("npub1")) return null;
+  const data = [...s.slice(5)].map((c) => BECH32.indexOf(c));
+  if (data.some((d) => d < 0) || bech32Polymod([...hrpExpand("npub"), ...data]) !== 1) return null;
+  const bytes = convertBits(data.slice(0, -6), 5, 8, false);
+  return bytes && bytes.length === 32 ? bytes.map((b) => b.toString(16).padStart(2, "0")).join("") : null;
+}
+function hexToNpub(hex) {
+  const words = convertBits(hex.match(/../g).map((h) => parseInt(h, 16)), 8, 5, true);
+  const mod = bech32Polymod([...hrpExpand("npub"), ...words, 0, 0, 0, 0, 0, 0]) ^ 1;
+  const check = [0, 1, 2, 3, 4, 5].map((i) => (mod >> (5 * (5 - i))) & 31);
+  return "npub1" + [...words, ...check].map((w) => BECH32[w]).join("");
+}
+function keyToHex(value) {
+  const v = value.trim();
+  if (/^[0-9a-f]{64}$/i.test(v)) return v.toLowerCase();
+  return npubToHex(v);
+}
+function shortHex(hex) {
+  return hex.slice(0, 8) + "\u2026" + hex.slice(-8);
+}
+
+// The home's file server: shows what is connected (getstorage), checks a
+// new key with the owner before registering it, then setstorage.
+function offerFileServer(stats) {
+  const box = document.getElementById("fileserver");
+  const show = () => {
+    if (stats.claimed && window.nostr && typeof window.nostr.signEvent === "function") box.hidden = false;
+  };
+  show();
+  setTimeout(show, 500);
+  const openBtn = document.getElementById("fileserver-btn");
+  if (openBtn.dataset.wired) return;
+  openBtn.dataset.wired = "1";
+  const errorEl = document.getElementById("fileserver-error");
+  const panel = document.getElementById("fileserver-panel");
+  const current = document.getElementById("fileserver-current");
+  const confirmBox = document.getElementById("fileserver-confirm");
+  const disconnect = document.getElementById("fileserver-disconnect");
+  let pending = null;
+
+  const failure = (status, reply) =>
+    status === 401 ? "Only the owner can change this." : reply.error || "That did not work.";
+
+  async function refresh() {
+    const { status, reply } = await signedCall("getstorage", []);
+    if (status !== 200 || reply.error) {
+      errorEl.textContent = failure(status, reply);
+      return false;
+    }
+    const s = reply.result;
+    current.textContent = s
+      ? "Connected to " + s.url + " with the key " + hexToNpub(s.pubkey) + " (" + shortHex(s.pubkey) + ")."
+      : "No file server is connected.";
+    disconnect.hidden = !s;
+    return true;
+  }
+
+  openBtn.addEventListener("click", async () => {
+    errorEl.textContent = "";
+    try {
+      if (await refresh()) {
+        panel.hidden = false;
+        openBtn.hidden = true;
+      }
+    } catch {
+      errorEl.textContent = "Your signer did not sign the request.";
+    }
+  });
+
+  document.getElementById("fileserver-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    errorEl.textContent = "";
+    confirmBox.hidden = true;
+    const url = document.getElementById("fileserver-url").value.trim();
+    let ok = false;
+    try { ok = new URL(url).protocol === "https:"; } catch { ok = false; }
+    if (!ok) { errorEl.textContent = "The address has to start with https://"; return; }
+    const hex = keyToHex(document.getElementById("fileserver-key").value);
+    if (!hex) { errorEl.textContent = "That key is not an npub or a 64-character hex key."; return; }
+    pending = { url, hex };
+    document.getElementById("fileserver-npub").textContent = hexToNpub(hex);
+    document.getElementById("fileserver-hex").textContent = shortHex(hex);
+    confirmBox.hidden = false;
+  });
+
+  document.getElementById("fileserver-connect").addEventListener("click", async () => {
+    if (!pending) return;
+    errorEl.textContent = "";
+    try {
+      const { status, reply } = await signedCall("setstorage", [pending.url, pending.hex]);
+      if (status !== 200 || reply.error) { errorEl.textContent = failure(status, reply); return; }
+      confirmBox.hidden = true;
+      pending = null;
+      await refresh();
+    } catch {
+      errorEl.textContent = "Your signer did not sign the request.";
+    }
+  });
+
+  disconnect.addEventListener("click", async () => {
+    errorEl.textContent = "";
+    try {
+      const { status, reply } = await signedCall("setstorage", [""]);
+      if (status !== 200 || reply.error) { errorEl.textContent = failure(status, reply); return; }
+      await refresh();
+    } catch {
+      errorEl.textContent = "Your signer did not sign the request.";
+    }
+  });
+}
+
 // Home activity. Signs a NIP-98 event over a homestats call with the
 // browser signer (NIP-07) and shows the counts. Owner or admin only; the
 // relay refuses anyone else.
@@ -465,23 +648,9 @@ function offerActivity(stats) {
     const errorEl = document.getElementById("activity-error");
     errorEl.textContent = "";
     try {
-      const body = JSON.stringify({ method: "homestats", params: [] });
-      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body)));
-      const payload = Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
-      const signed = await window.nostr.signEvent({
-        kind: 27235,
-        created_at: Math.floor(Date.now() / 1000),
-        tags: [["u", location.origin + "/"], ["method", "POST"], ["payload", payload]],
-        content: "",
-      });
-      const res = await fetch("/", {
-        method: "POST",
-        headers: { "Content-Type": "application/nostr+json+rpc", Authorization: "Nostr " + btoa(JSON.stringify(signed)) },
-        body,
-      });
-      const reply = JSON.parse(new TextDecoder().decode(await res.arrayBuffer()));
+      const { status, reply } = await signedCall("homestats", []);
       if (!reply.result) {
-        errorEl.textContent = res.status === 401 ? "Only the owner or an admin can see this." : reply.error || "That did not work.";
+        errorEl.textContent = status === 401 ? "Only the owner or an admin can see this." : reply.error || "That did not work.";
         return;
       }
       renderActivity(reply.result);
