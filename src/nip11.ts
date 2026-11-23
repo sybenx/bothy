@@ -2,6 +2,7 @@
 // implemented and enforced, never ahead of it.
 
 import {
+  CALL_ICE_SERVERS,
   groupsEnabled,
   MAX_CREATED_AT_FUTURE_SECONDS,
   MAX_FILTER_LIMIT,
@@ -207,6 +208,11 @@ export function buildRelayInfo(
     // Sealed signals (relay.ts handleSignal, kind 21059), bothy's own
     // field: typing, seen and call setup, delivered live, never stored.
     info.signals = { v: 1 };
+    // 1:1 calls, bothy's own field: rings are accepted (relay.ts
+    // handleGiftWrap) and the ICE servers the apps build their call from
+    // (limits.ts CALL_ICE_SERVERS). Copied, so no caller can change the
+    // constant through the document.
+    info.calls = { v: 1, ice: CALL_ICE_SERVERS.map((server) => ({ urls: [...server.urls] })) };
   }
   const contact = resolveContact(profile);
   if (contact) {

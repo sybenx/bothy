@@ -2404,6 +2404,7 @@ export function unallowPubkey(
   sql.exec(`DELETE FROM push_subscriptions WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM fcm_tokens WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM inbox_push WHERE pubkey = ?`, pubkey);
+  sql.exec(`DELETE FROM call_push WHERE pubkey = ?`, pubkey);
   sql.exec(
     `INSERT INTO former_members (pubkey, removed_at, reason, member_reason, member_allowed_at, member_source,
                                  member_invited_by, member_via_code, member_close)
@@ -3725,6 +3726,28 @@ export function pendingInboxPushes(sql: SqlStorage, limit: number): string[] {
 
 export function clearInboxPush(sql: SqlStorage, pubkey: string): void {
   sql.exec(`DELETE FROM inbox_push WHERE pubkey = ?`, pubkey);
+}
+
+// The ring push queue (schema.ts `call_push`), the same three calls. Two
+// rings to one person before the alarm runs are one push: the phone
+// fetches every ring waiting for it when it wakes.
+export function queueCallPush(sql: SqlStorage, pubkey: string, nowSec: number): void {
+  sql.exec(
+    `INSERT INTO call_push (pubkey, queued_at) VALUES (?, ?) ON CONFLICT(pubkey) DO NOTHING`,
+    pubkey,
+    nowSec,
+  );
+}
+
+export function pendingCallPushes(sql: SqlStorage, limit: number): string[] {
+  return sql
+    .exec<{ pubkey: string }>(`SELECT pubkey FROM call_push ORDER BY queued_at ASC, pubkey ASC LIMIT ?`, limit)
+    .toArray()
+    .map((row) => row.pubkey);
+}
+
+export function clearCallPush(sql: SqlStorage, pubkey: string): void {
+  sql.exec(`DELETE FROM call_push WHERE pubkey = ?`, pubkey);
 }
 
 export function markPushEndpointOk(sql: SqlStorage, endpoint: string, nowSec: number): void {

@@ -38,10 +38,12 @@ export { GROUP_CHAT_KIND } from "./groups";
 // notification. See limits.ts PRESENCE_WRITE_INTERVAL_SECONDS.
 export const CALL_PRESENCE_KIND = 25051;
 
-// The two things worth waking a phone for, and the exact strings hearth's
-// service worker switches on: "voice" renders as "somebody is at the
-// fire", anything else as "there's a message".
-export type PushReason = "message" | "voice";
+// The things worth waking a phone for, and the exact strings the apps
+// switch on: hearth's service worker renders "voice" as "somebody is at
+// the fire" and anything else as "there's a message"; "call" is a ring
+// (relay.ts handleGiftWrap), which the DMs apps answer by fetching the
+// ring wrap and ringing.
+export type PushReason = "message" | "voice" | "call";
 
 // What a push carries, and deliberately all it carries: no message content
 // and no sender. The payload travels through Apple's or Google's push
@@ -422,6 +424,9 @@ export async function sendPush(
         // RFC 8030: how long the push service may hold this if the device
         // is offline. See limits.ts PUSH_TTL_SECONDS.
         TTL: String(PUSH_TTL_SECONDS[payload.kind]),
+        // RFC 8030 Urgency: a ring must wake a device in power saving at
+        // once. Everything else keeps the default (normal).
+        ...(payload.kind === "call" ? { Urgency: "high" } : {}),
       },
       body,
     });

@@ -32,6 +32,10 @@ import {
   REQUEST_JOIN_RATE_LIMIT_WINDOW_MS,
   MAX_VAULT_CALLS_PER_IP_PER_WINDOW,
   MAX_SIGNALS_PER_SENDER_PER_WINDOW,
+  MAX_RINGS_PER_IP_PER_WINDOW,
+  MAX_RINGS_PER_RECIPIENT_PER_WINDOW,
+  RING_MAX_TTL_SECONDS,
+  RING_RATE_LIMIT_WINDOW_MS,
   SIGNAL_MAX_BYTES,
   SIGNAL_RATE_LIMIT_WINDOW_MS,
   MAX_VAULT_OPENS_PER_HASH_PER_WINDOW,
@@ -118,6 +122,7 @@ import {
   type Filter,
   GIFT_WRAP_KIND,
   isEphemeralKind,
+  isRing,
   type NostrEvent,
   pTagValues,
   SIGNAL_KIND,
@@ -216,14 +221,17 @@ import {
   isGroupMember,
   isMember,
   listMemberGroups,
+  clearCallPush,
   clearInboxPush,
   hasPushSubscription,
   memberCount,
+  pendingCallPushes,
   pendingInboxPushes,
   pushSubscriptionsFor,
   fcmTokensFor,
   forgetFcmToken,
   type FcmTokenRow,
+  queueCallPush,
   queueInboxPush,
   sweepFormerMembers,
   sweepExpiredJoinRequests,
@@ -444,6 +452,10 @@ export class Relay extends DurableObject<Env> {
   // otherwise have to become async for a call unrelated to storing the
   // event.
   private pushAlarmWanted = false;
+
+  // Set beside pushAlarmWanted when a ring was queued: the alarm is set
+  // for now rather than PUSH_ALARM_DELAY_MS ahead.
+  private pushAlarmNow = false;
 
   // Every storage access in this object goes through this handle rather
   // than `ctx.storage.sql`. read-metrics.ts uses it to attribute rows read
@@ -1469,8 +1481,15 @@ export class Relay extends DurableObject<Env> {
     }
 
     // Size is capped for every writer at the top of acceptEvent
-    // (limits.ts MAX_EVENT_BYTES).
-    if (this.isGiftWrapRateLimited(getState(ws).ip)) {
+    // (limits.ts MAX_EVENT_BYTES). A ring has its own expiry rule and
+    // limits in place of the gift wrap limit (ringRefusal).
+    if (isRing(event)) {
+      const refusal = this.ringRefusal(ws, event, recipients);
+      if (refusal !== null) {
+        ok(ws, event.id, false, refusal);
+        return;
+      }
+    } else if (this.isGiftWrapRateLimited(getState(ws).ip)) {
       ok(ws, event.id, false, "rate-limited: too many gift wraps from this connection, slow down");
       return;
     }
@@ -1503,6 +1522,36 @@ export class Relay extends DurableObject<Env> {
     // it.
     this.acceptEvent(ws, sql, event, event.pubkey === owner, recipients);
   }
+
+  // Why a ring (nostr.ts isRing) is refused, or null. A ring is a call
+  // invite, so it must say when it stops ringing: a NIP-40 expiration in
+  // the future and at most RING_MAX_TTL_SECONDS ahead, which the
+  // wrap_expiry sweep then honours. Then two limits in place of the gift
+  // wrap one (limits.ts MAX_RINGS_*): per address, and per recipient, so a
+  // stranger cannot ring one phone in a loop from many addresses. Like the
+  // gift wrap limit, both count before schnorr: they bound its cost too.
+  private ringRefusal(ws: WebSocket, event: NostrEvent, recipients: readonly string[]): string | null {
+    const expiration = expirationOf(event);
+    const now = nowSeconds();
+    if (expiration === null || expiration <= now || expiration > now + RING_MAX_TTL_SECONDS) {
+      return `invalid: a ring must expire within ${RING_MAX_TTL_SECONDS} seconds`;
+    }
+    if (
+      this.windowLimited(this.ringIpLimits, getState(ws).ip, RING_RATE_LIMIT_WINDOW_MS, MAX_RINGS_PER_IP_PER_WINDOW)
+    ) {
+      return "rate-limited: too many rings from this connection, slow down";
+    }
+    const overRung = recipients.some((pubkey) =>
+      this.windowLimited(this.ringRecipientLimits, pubkey, RING_RATE_LIMIT_WINDOW_MS, MAX_RINGS_PER_RECIPIENT_PER_WINDOW),
+    );
+    if (overRung) return "rate-limited: too many rings to this person, try again in a minute";
+    return null;
+  }
+
+  // Per address and per recipient (limits.ts MAX_RINGS_*). The recipient
+  // map is bounded by membership, since a ring must name a member.
+  private ringIpLimits = new Map<string, { windowStart: number; count: number }>();
+  private ringRecipientLimits = new Map<string, { windowStart: number; count: number }>();
 
   // A sealed signal (nostr.ts SIGNAL_KIND): typing, seen, call setup.
   // From a connection AUTHed as the owner or a member, p-tagged to the
@@ -2028,13 +2077,22 @@ export class Relay extends DurableObject<Env> {
     // Mail: queued per recipient who has a device registered (one indexed
     // read each), so mail for someone without push writes nothing. Web
     // push or Android (src/fcm.ts), whichever this relay can send.
+    //
+    // A ring (nostr.ts isRing) goes to its own queue instead, never to
+    // the mail queue as well: one "call" push, at once.
     if (event.kind === GIFT_WRAP_KIND) {
       if (!web && !android) return;
+      const ring = isRing(event);
       withReadPath("push", () => {
         const now = nowSeconds();
         for (const pubkey of wrapRecipients) {
           if (!hasPushSubscription(sql, pubkey, web, android)) continue;
-          queueInboxPush(sql, pubkey, now);
+          if (ring) {
+            queueCallPush(sql, pubkey, now);
+            this.pushAlarmNow = true;
+          } else {
+            queueInboxPush(sql, pubkey, now);
+          }
           this.pushAlarmWanted = true;
         }
       });
@@ -2116,11 +2174,14 @@ export class Relay extends DurableObject<Env> {
   // moves the alarm sooner, like scheduleLiveFeedAlarm: there is one alarm
   // shared with the live feed, and setAlarm is a row write.
   // PUSH_ALARM_DELAY_MS is also the coalescing window: a message inside it
-  // finds an alarm already due sooner and writes nothing.
+  // finds an alarm already due sooner and writes nothing. A ring wants the
+  // alarm now, not after that delay; whatever mail is queued then goes out
+  // with it.
   private async settlePushAlarm(): Promise<void> {
     if (!this.pushAlarmWanted) return;
     this.pushAlarmWanted = false;
-    const desired = Date.now() + PUSH_ALARM_DELAY_MS;
+    const desired = Date.now() + (this.pushAlarmNow ? 0 : PUSH_ALARM_DELAY_MS);
+    this.pushAlarmNow = false;
     const existing = await this.ctx.storage.getAlarm();
     if (existing === null || existing > desired) {
       await this.ctx.storage.setAlarm(desired);
@@ -2158,23 +2219,46 @@ export class Relay extends DurableObject<Env> {
   // Each recipient's web push endpoints AND Android tokens (src/fcm.ts),
   // counted together against the budget: each is one subrequest. Minting
   // an FCM access token is one more, set aside first when it is due.
-  private async drainInboxPushes(budget: number): Promise<{ spent: number; more: boolean }> {
+  private drainInboxPushes(budget: number): Promise<{ spent: number; more: boolean }> {
+    return this.drainPersonalPushes(budget, "message", pendingInboxPushes, clearInboxPush);
+  }
+
+  // Announces rings (schema.ts `call_push`), the same way with two
+  // differences: the kind is "call", and a recipient with a socket open is
+  // pushed anyway, because that socket may belong to an app Android has
+  // frozen, which would never ring. Same payload otherwise: the room and
+  // the app's label, never the caller.
+  private drainCallPushes(budget: number): Promise<{ spent: number; more: boolean }> {
+    return this.drainPersonalPushes(budget, "call", pendingCallPushes, clearCallPush);
+  }
+
+  // The body of both drains above: a queue keyed by recipient, each
+  // served whole to their own devices.
+  private async drainPersonalPushes(
+    budget: number,
+    kind: "message" | "call",
+    pendingOf: (sql: SqlStorage, limit: number) => string[],
+    clear: (sql: SqlStorage, pubkey: string) => void,
+  ): Promise<{ spent: number; more: boolean }> {
     const keys = vapidKeys(this.env);
     const account = serviceAccount(this.env);
     if (keys === null && account === null) return { spent: 0, more: false };
     const sql = this.sql;
+    // Rings took every subrequest this time: come back for the rest.
+    if (budget <= 0) return { spent: 0, more: withReadPath("push", () => pendingOf(sql, 1).length > 0) };
     const nowSec = nowSeconds();
-    const online = this.onlinePubkeys();
+    // Who is online only matters for mail: a ring is pushed regardless.
+    const online = kind === "call" ? new Set<string>() : this.onlinePubkeys();
     const mint = account !== null && needsAccessToken(account, nowSec) ? 1 : 0;
 
     const plan = withReadPath("push", () => {
       // One more than could possibly be served, so "more" is known without
       // a second query.
-      const pending = pendingInboxPushes(sql, budget + 1);
+      const pending = pendingOf(sql, budget + 1);
       if (pending.length === 0) return null;
       const payload: PushPayload = {
         room: resolveName(this.env, getRelaySettings(sql), getOwnerProfile(sql, this.env)),
-        kind: "message",
+        kind,
       };
       const subject = pushSubject(getOwnHost(sql));
       let left = budget - mint;
@@ -2230,7 +2314,7 @@ export class Relay extends DurableObject<Env> {
 
     let spent = wantsFcm && mint ? 1 : 0;
     withReadPath("push", () => {
-      for (const pubkey of plan.skip) clearInboxPush(sql, pubkey);
+      for (const pubkey of plan.skip) clear(sql, pubkey);
       for (const { entry, outcomes, fcm } of results) {
         spent += outcomes.length + (bearer === null ? 0 : fcm.length);
         outcomes.forEach((outcome, index) => this.settlePushOutcome(sql, entry.targets[index]!, outcome, nowSec));
@@ -2240,7 +2324,7 @@ export class Relay extends DurableObject<Env> {
           // The access token was refused: mint a fresh one next time.
           if (outcome === "auth" && account !== null) forgetAccessToken(account);
         });
-        clearInboxPush(sql, entry.pubkey);
+        clear(sql, entry.pubkey);
       }
     });
     return { spent, more: plan.more };
@@ -2792,15 +2876,18 @@ export class Relay extends DurableObject<Env> {
   }
 
   private async alarmInner(): Promise<void> {
-    // Push first: it is the one with a deadline. Mail before group
-    // traffic: it is for one person, and it is the reason most members
-    // have push at all. The two share one invocation's subrequests.
-    const inbox = await this.drainInboxPushes(MAX_PUSHES_PER_TICK);
-    const moreGroupPushes = await this.drainPushOutbox(MAX_PUSHES_PER_TICK - inbox.spent);
+    // Push first: it is the one with a deadline. Rings before anything,
+    // since a ring is stale in seconds. Mail before group traffic: it is
+    // for one person, and it is the reason most members have push at all.
+    // All three share one invocation's subrequests.
+    const calls = await this.drainCallPushes(MAX_PUSHES_PER_TICK);
+    const inbox = await this.drainInboxPushes(MAX_PUSHES_PER_TICK - calls.spent);
+    const moreGroupPushes = await this.drainPushOutbox(MAX_PUSHES_PER_TICK - calls.spent - inbox.spent);
     const morePushes = inbox.more || moreGroupPushes;
 
     const now = Date.now();
-    let next: number | null = morePushes ? now + PUSH_ALARM_DELAY_MS : null;
+    // Rings left over come back at once; anything else after the delay.
+    let next: number | null = calls.more ? now : morePushes ? now + PUSH_ALARM_DELAY_MS : null;
     for (const ws of this.ctx.getWebSockets(LIVE_FEED_TAG)) {
       const expiresAt = getLiveFeedState(ws).connectedAt + LIVE_FEED_MAX_LIFETIME_MS;
       if (expiresAt <= now) {
