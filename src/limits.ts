@@ -1163,6 +1163,39 @@ export const VANISH_BATCH_SIZE = Math.max(
 );
 
 // ---------------------------------------------------------------------
+// Mailbox retention (storage.ts sweepRetention, nip86.ts setretention and
+// backedup). Off by default. When the owner turns it on, the hourly tick
+// deletes a stored gift wrap once it is older than MAIL_RETENTION_SECONDS
+// AND every recipient's app has verified a history backup that holds it
+// (their `backedup` watermark). Every number the sweep uses is here.
+// ---------------------------------------------------------------------
+
+// How old mail must be before retention may delete it, by when this relay
+// stored it (`events.ingested_at`): more than 30 days.
+export const MAIL_RETENTION_SECONDS = 30 * 24 * 60 * 60;
+
+// Retention's share of the daily rows-written ceiling, a quarter, as the
+// vanish drain's. A first run on a full home has months of mail to clear,
+// so unlike the expiry sweep (GIFT_WRAP_SWEEP_BATCH_SIZE) it cannot lean on
+// "never more than a day's ingest": it gets a share and drains across days.
+export const RETENTION_ROWS_SHARE_LIMIT = DAILY_ROWS_WRITTEN_LIMIT / 4;
+
+// Wraps one tick may delete: the share spread over the day's ticks, paced
+// against the pessimistic removal figure (schema.ts eventRemovalBudget),
+// about 57 a tick or 1,380 a day at the defaults. Never zero, so a tick
+// always makes progress.
+export const RETENTION_SWEEP_BATCH_SIZE = Math.max(
+  1,
+  Math.floor(RETENTION_ROWS_SHARE_LIMIT / (eventRemovalBudget(TAGS_PER_GIFT_WRAP) * CRON_TICKS_PER_DAY)),
+);
+
+// Retention never spends the second half of a day's rows written: a tick
+// that finds this many already written since 00:00 UTC deletes nothing
+// and waits for the next, so new mail always has room. The same half
+// backfill leaves for live traffic (BACKFILL_ROWS_SHARE_LIMIT).
+export const RETENTION_PAUSE_AT_ROWS_WRITTEN = DAILY_ROWS_WRITTEN_LIMIT / 2;
+
+// ---------------------------------------------------------------------
 // Ephemeral group chat (storage.ts sweepChat, relay.ts runCron). Kind-9
 // chat in the group partition is deleted (not hidden or archived) once its
 // conversation is over. Four rules, one constant each:

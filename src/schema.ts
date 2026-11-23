@@ -741,6 +741,17 @@ export const TABLES: readonly TableSpec[] = [
     ],
   },
   {
+    // History backup (nip86.ts backedup): per person, the latest stored
+    // time (`events.ingested_at`) of mail their app has verified its backup
+    // holds. Only ever moves forward, and never past the call's own time.
+    // Mailbox retention (storage.ts sweepRetention) deletes a member's mail
+    // only at or below it. Deleted by eraseme, and when the grace sweep
+    // finishes a removed member (storage.ts eraseMember, sweepFormerMembers);
+    // letting someone back in keeps it.
+    name: "backup_watermarks",
+    columns: [col("pubkey", "TEXT PRIMARY KEY"), col("mail_through", "INTEGER NOT NULL")],
+  },
+  {
     // "Removed on purpose" (storage.ts markRemovedOnPurpose): people the
     // owner or an admin removed, so nip86.ts addmykey will not bring them
     // back as someone's own key. Outlives the grace period, unlike

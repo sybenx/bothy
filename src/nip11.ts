@@ -219,6 +219,10 @@ export function buildRelayInfo(
     // publishes its profile here, and only here, when it sees this; an
     // older bothy would serve it to anyone.
     info.profiles = "members";
+    // History backup (nip86.ts backedup), bothy's own field: this home
+    // takes a member's "my backup holds my mail up to here", which mailbox
+    // retention waits for before deleting anything of theirs.
+    info.backup = { v: 1 };
   }
   const contact = resolveContact(profile);
   if (contact) {

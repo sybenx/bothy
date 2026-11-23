@@ -28,6 +28,10 @@ import {
   getRelaySettings,
   eraseMember,
   listInvitees,
+  backedUpMemberCount,
+  hasBackRoom,
+  mailRetentionOn,
+  recordBackedUp,
   addOwnKey,
   clearRemovalMark,
   markRemovedOnPurpose,
@@ -91,6 +95,7 @@ import {
   JOIN_REQUEST_TTL_SECONDS,
   MAX_PENDING_JOIN_REQUESTS,
   ERASE_MAIL_BATCH,
+  MAIL_RETENTION_SECONDS,
   mailBytesPerMember,
   mailStorageBytes,
   MEMBER_REMOVAL_GRACE_SECONDS,
@@ -237,6 +242,12 @@ export const SUPPORTED_METHODS = [
   "forgetremoval",
   // bothy's own: listmembers' rows for the caller's own branch.
   "myinvitees",
+  // bothy's own: history backup and mailbox retention. backedup is a
+  // member's app saying its verified backup holds their mail up to a
+  // stored time; setretention and getretention are the owner's switch.
+  "backedup",
+  "setretention",
+  "getretention",
 ] as const;
 
 // The methods a MEMBER may call, not just the owner.
@@ -274,6 +285,7 @@ export const MEMBER_CALLABLE_METHODS: readonly string[] = [
   "vaultdelete",
   "addmykey",
   "myinvitees",
+  "backedup",
 ];
 
 // The methods that take NO signature, an exception to NIP-86's NIP-98
@@ -376,6 +388,16 @@ export const MAX_MAILTIMES_IDS = 500;
 
 // Pubkeys one areclose call may ask about.
 export const MAX_ARECLOSE_PUBKEYS = 500;
+
+// What backedup and setretention answer to a call they cannot take.
+// Stable: apps may show them or match them, and every refusal the two
+// give starts with the method's name.
+export const BACKEDUP_PARAM_MESSAGE =
+  "backedup: it takes [mailThrough], the latest stored time your backup holds, as whole unix seconds";
+export const SETRETENTION_PARAM_MESSAGE = "setretention: it takes true or false";
+export const RETENTION_NEEDS_STORAGE_MESSAGE =
+  "setretention: this home has no file server for your members' history backups, and old messages " +
+  "are deleted only once a backup holds them. Connect one with setstorage first.";
 
 // A member who is neither the owner nor an admin: the caller whose view
 // of invites is limited to their own.
@@ -1315,6 +1337,45 @@ export function handleManagementCall(
       if (pubkey === null) return err("forgetremoval takes a pubkey, as npub or 64-character hex");
       return { result: { forgotten: clearRemovalMark(sql, pubkey) } };
     }
+
+    // History backup (storage.ts recordBackedUp): the caller's app has
+    // verified a backup that holds their mail up to `mailThrough`, a stored
+    // time (mailtimes' storedAt). The watermark moves forward only, never
+    // past now, and the answer is what is stored after the call. The owner
+    // may call it too: it is stored like anyone's, and changes nothing,
+    // since the owner's mail is never deleted.
+    case "backedup": {
+      const [mailThrough] = params;
+      if (typeof mailThrough !== "number" || !Number.isSafeInteger(mailThrough) || mailThrough < 0) {
+        return err(BACKEDUP_PARAM_MESSAGE);
+      }
+      return { result: { watermark: recordBackedUp(sql, signer, mailThrough, nowSec) } };
+    }
+
+    // Owner only: mailbox retention on or off (storage.ts sweepRetention).
+    // Off by default. On is refused while the home has nowhere for
+    // backups to go (storage.ts hasBackRoom). Clearing the file server
+    // later leaves the switch on but stops the deleting, at the next tick.
+    case "setretention": {
+      const [on] = params;
+      if (typeof on !== "boolean") return err(SETRETENTION_PARAM_MESSAGE);
+      if (on && !hasBackRoom(sql)) return err(RETENTION_NEEDS_STORAGE_MESSAGE);
+      setRelaySetting(sql, "mail_retention", on ? "on" : "");
+      return { result: true };
+    }
+
+    // Owner only: the switch, whether a file server is set (deleting
+    // happens only with both), how many members' apps have reported a
+    // backup, and after how many days.
+    case "getretention":
+      return {
+        result: {
+          on: mailRetentionOn(sql),
+          storage: hasBackRoom(sql),
+          backedUp: backedUpMemberCount(sql),
+          days: MAIL_RETENTION_SECONDS / 86400,
+        },
+      };
 
     case "homemembers": {
       const owner = getOwnerPubkey(sql, env);
