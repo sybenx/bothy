@@ -257,7 +257,7 @@ describe("home groups", () => {
       as(ben),
     );
     expect(stale.error).toBe("groupchange: the group changed while you were changing it");
-    expect(stale.version).toBe(3);
+    expect((stale as { version?: number }).version).toBe(3);
     // Rebuilt on 3, it lands.
     const retry = await callManagement(
       "groupchange",
