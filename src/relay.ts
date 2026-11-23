@@ -1607,6 +1607,13 @@ export class Relay extends DurableObject<Env> {
     // Not yet authenticated is NIP-42's "auth-required", so a client authenticates and sends it
     // again (a call's first offer and candidates often go out before the AUTH answer lands).
     if (sender === undefined) {
+      // A challenge with the refusal, so the client can AUTH and send again (as for group messages).
+      const state = getState(ws);
+      if (!state.challenge) {
+        state.challenge = crypto.randomUUID();
+        setState(ws, state);
+      }
+      send(ws, ["AUTH", state.challenge]);
       ok(ws, event.id, false, "auth-required: signals are for this home's members");
       return;
     }
