@@ -468,6 +468,28 @@ describe("home groups", () => {
       return { epoch, keys: [...people, box].map((p) => ({ to: p.pubkeyHex, blob: `sealed-${epoch}-${p.pubkeyHex.slice(0, 8)}` })) };
     }
 
+    it("wakes the box's own socket for every group's messages and changes, and nobody else's", async () => {
+      const ana = await newMember();
+      const ben = await newMember();
+      const gid = newGid();
+      const boxConn = await connectAs(box);
+      boxConn.send(["REQ", "keeper", { kinds: [GROUP_MESSAGE_KIND, GROUP_CHANGE_KIND] }]);
+      expect(await boxConn.nextMessage()).toEqual(["EOSE", "keeper"]);
+      const stranger = randomKeypair();
+      const strangerConn = await connectAs(stranger);
+      strangerConn.send(["REQ", "peek", { kinds: [GROUP_MESSAGE_KIND, GROUP_CHANGE_KIND] }]);
+      expect(await strangerConn.nextMessage()).toEqual(["EOSE", "peek"]);
+      const create = change(ana, gid, 0, "create", [ben.pubkeyHex]);
+      await callManagement("groupcreate", [gid, create, keyed(1, [ana, ben])], as(ana));
+      expect(await boxConn.nextMessage()).toEqual(["EVENT", "keeper", create]);
+      const anaConn = await connectAs(ana);
+      const m = message(gid);
+      expect((await publish(anaConn, m))[2]).toBe(true);
+      expect(await boxConn.nextMessage()).toEqual(["EVENT", "keeper", m]);
+      await expect(strangerConn.nextMessage(300)).rejects.toThrow(/no message/);
+      for (const c of [boxConn, strangerConn, anaConn]) c.close();
+    });
+
     it("names the box as keeper, and every key change must include it", async () => {
       const doc = (await (
         await exports.default.fetch(new Request("https://example.com/", { headers: { Accept: "application/nostr+json" } }))
