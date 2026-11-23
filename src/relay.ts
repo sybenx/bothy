@@ -1608,6 +1608,13 @@ export class Relay extends DurableObject<Env> {
       return;
     }
     if (sender === undefined) {
+      // A challenge with the refusal, so the client can AUTH and send again.
+      const state = getState(ws);
+      if (!state.challenge) {
+        state.challenge = crypto.randomUUID();
+        setState(ws, state);
+      }
+      send(ws, ["AUTH", state.challenge]);
       ok(ws, event.id, false, "auth-required: group messages are for the group's members; authenticate first");
       return;
     }

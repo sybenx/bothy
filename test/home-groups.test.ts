@@ -221,7 +221,9 @@ describe("home groups", () => {
     const gid = await create(ana, [ben]);
     const anonymous = await connectAs(null);
     const a = message(gid);
-    expect((await publish(anonymous, a))[3]).toBe(
+    anonymous.send(["EVENT", a]);
+    expect((await anonymous.nextMessage())[0]).toBe("AUTH");
+    expect((await anonymous.nextMessage())[3]).toBe(
       "auth-required: group messages are for the group's members; authenticate first",
     );
     const carolConn = await connectAs(carol);
