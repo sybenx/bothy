@@ -247,7 +247,13 @@ Someone who uses more than one key, such as a Keykin account that makes one key 
 
 ### Typing, seen and call setup
 
-Members' apps can send each other short sealed signals: kind 21059, shaped like a gift wrap (a `p` tag to the recipient, content only they can open), for "typing…", "seen" and setting up a call. The relay never stores them. It passes each one, at once, to the recipient's own open connection if they have one signed in and asking for them, and otherwise drops it: no notification, no copy kept. Only a connection signed in (NIP-42) as you or a member may send one, to you or a member; each is at most 2 KB, and each person may send 120 a minute, apart from the limit on messages. The relay information document shows `"signals": {"v": 1}`.
+Members' apps can send each other short sealed signals: kind 21059, shaped like a gift wrap (a `p` tag to the recipient, content only they can open), for "typing…", "seen" and setting up a call. The relay never stores them. It passes each one, at once, to the recipient's own open connection if they have one signed in and asking for them, and otherwise drops it: no notification, no copy kept. Only a connection signed in (NIP-42) as you or a member may send one, to you or a member; each is at most 16 KB, and each person may send 120 a minute, apart from the limit on messages. The relay information document shows `"signals": {"v": 1}`.
+
+### Calls
+
+A call starts with a ring: an ordinary gift wrap (kind 1059) to you or a member, from any key, with one extra plain tag, `["ring"]`, and a NIP-40 `expiration` no more than 120 seconds ahead (without one, or with one further out or already past, it is refused with `invalid: a ring must expire within 120 seconds`). The relay keeps it until it expires, so the phone being rung can fetch it like mail, and sends that person's devices a notification of kind `"call"` at once, even if they have the app open, since Android may have frozen it. It is the same notification as for mail, the home's name and the app's label, and replaces it: a ring never also sends a "message" notification. On Android it goes at high priority and lives 30 seconds; on the web it is marked urgent and lives 30 seconds. Rings do not count against the limit on mail; instead an address may send 10 a minute and a person may be rung 6 times a minute. Everything else in the call (answer, connection details, hang up) travels as signals, above. The relay information document shows `"calls": {"v": 1, "ice": [...]}`, the STUN servers the apps use to find a way through (Google's and Cloudflare's for now; a TURN server of the home's own is a later step).
+
+Who can see what: the home learns that a connection sent a ring to a member, and when. It never learns what is in it or which key signed it, and the notification carries neither.
 
 ### Fingerprint restore
 

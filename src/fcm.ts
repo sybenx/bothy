@@ -15,15 +15,14 @@
 // token, and keeps that token until shortly before it expires. Unset is a
 // supported state: no `fcm` on NIP-11, subscribefcm refused, nothing sent.
 
+import { PUSH_TTL_SECONDS } from "./limits";
+
 const FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging";
 const DEFAULT_TOKEN_URI = "https://oauth2.googleapis.com/token";
 
 // How long a minted access token is reused: Google issues them for an
 // hour; this stops a minute short so one never expires mid-send.
 const TOKEN_REUSE_MARGIN_SECONDS = 60;
-
-// The same hour web push gives a message (limits.ts PUSH_TTL_SECONDS).
-const FCM_TTL = "3600s";
 
 export interface ServiceAccount {
   projectId: string;
@@ -154,8 +153,12 @@ export function needsAccessToken(account: ServiceAccount, nowSec: number): boole
 // is "failed" and keeps the token, as web push does.
 export type FcmOutcome = "sent" | "gone" | "auth" | "failed";
 
+// The TTL is the one web push gives the same kind (limits.ts
+// PUSH_TTL_SECONDS): an hour for a message, 30 seconds for a ring.
 export function fcmMessage(token: string, data: Record<string, string>): unknown {
-  return { message: { token, data, android: { priority: "HIGH", ttl: FCM_TTL } } };
+  const kind = data.kind as keyof typeof PUSH_TTL_SECONDS;
+  const ttl = PUSH_TTL_SECONDS[kind] ?? PUSH_TTL_SECONDS.message;
+  return { message: { token, data, android: { priority: "HIGH", ttl: `${ttl}s` } } };
 }
 
 export async function sendFcm(

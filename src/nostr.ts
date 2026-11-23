@@ -71,6 +71,14 @@ export const GIFT_WRAP_KIND = 1059;
 // handleSignal).
 export const SIGNAL_KIND = 21059;
 
+// A ring: a gift wrap (kind 1059) carrying the outer, plain tag
+// `["ring"]`, the invite to a call. Its content stays sealed like any
+// wrap's; the tag only tells the relay to keep it briefly, limit it as a
+// ring and push it at once (relay.ts handleGiftWrap).
+export function isRing(event: NostrEvent): boolean {
+  return event.kind === GIFT_WRAP_KIND && event.tags.some((tag) => tag[0] === "ring");
+}
+
 // NIP-62 (nips/62.md) Request to Vanish.
 export const VANISH_KIND = 62;
 

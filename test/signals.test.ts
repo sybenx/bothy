@@ -122,7 +122,12 @@ describe("sealed signals", () => {
     const conn = await connectAs(alice);
     const nobody = signal(randomKeypair().pubkeyHex);
     expect((await publish(conn, nobody))[2]).toBe(false);
-    const big = signal(alice.pubkeyHex, "x".repeat(SIGNAL_MAX_BYTES));
+    // Exactly at the cap goes through: call setup carries SDP.
+    const overhead = JSON.stringify(signal(alice.pubkeyHex, "")).length;
+    const full = signal(alice.pubkeyHex, "x".repeat(SIGNAL_MAX_BYTES - overhead));
+    expect(JSON.stringify(full).length).toBe(SIGNAL_MAX_BYTES);
+    expect(await publish(conn, full)).toEqual(["OK", full.id, true, ""]);
+    const big = signal(alice.pubkeyHex, "x".repeat(SIGNAL_MAX_BYTES - overhead + 1));
     expect(await publish(conn, big)).toEqual([
       "OK",
       big.id,

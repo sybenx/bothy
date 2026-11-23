@@ -612,6 +612,16 @@ export const TABLES: readonly TableSpec[] = [
     columns: [col("pubkey", "TEXT PRIMARY KEY"), col("queued_at", "INTEGER NOT NULL")],
   },
   {
+    // Rings waiting to be announced (relay.ts drainCallPushes), one row
+    // per RECIPIENT, the same shape as `inbox_push` but a queue of its
+    // own: a ring is pushed at once rather than after the message
+    // coalescing delay, even to someone with a socket open, and must not
+    // be folded into (or delay) a message notification. Nothing about the
+    // ring is recorded, only who it is for and when it was queued.
+    name: "call_push",
+    columns: [col("pubkey", "TEXT PRIMARY KEY"), col("queued_at", "INTEGER NOT NULL")],
+  },
+  {
     // Member invite codes (nip86.ts createinvite/redeeminvite). Separate
     // from `group_invites`: those admit to a NIP-29 group, are created by a
     // signed kind-9009 and are single-use by construction; these make
