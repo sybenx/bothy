@@ -6,6 +6,8 @@ import { runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { GROUP_CHANGE_KIND, GROUP_DECISIONS, GROUP_MESSAGE_KIND } from "../src/home-groups";
 import { verifySignature } from "../src/validate";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import type { Relay } from "../src/relay";
 import { signEvent, type NostrEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
@@ -69,7 +71,7 @@ async function info(who: Keypair, gid: string): Promise<{
   epoch: number;
   needsKey: boolean;
   settings: { onlyAdminsAdd: boolean; history: boolean };
-  members: { pubkey: string; role: string; fromSeq: number }[];
+  members: { pubkey: string; role: string; fromSeq: number; pendingKey?: boolean }[];
   chain: { version: number; seq: number; event: NostrEvent }[];
 }> {
   const reply = await callManagement("groupinfo", [gid], as(who));
@@ -451,5 +453,102 @@ describe("home groups", () => {
     const ben = await newMember();
     const gid = await create(owner, [ben]);
     expect((await info(ben, gid)).members.find((m) => m.role === "admin")?.pubkey).toBe(OWNER_PUBKEY_HEX);
+  });
+
+  describe("with a box keeping the keys", () => {
+    const box = randomKeypair();
+    beforeEach(async () => {
+      expect((await callManagement("setstorage", ["https://box.example", box.pubkeyHex])).result).toBe(true);
+    });
+    afterEach(async () => {
+      await callManagement("setstorage", [""]);
+    });
+
+    function keyed(epoch: number, people: Keypair[]) {
+      return { epoch, keys: [...people, box].map((p) => ({ to: p.pubkeyHex, blob: `sealed-${epoch}-${p.pubkeyHex.slice(0, 8)}` })) };
+    }
+
+    it("names the box as keeper, and every key change must include it", async () => {
+      const doc = (await (
+        await exports.default.fetch(new Request("https://example.com/", { headers: { Accept: "application/nostr+json" } }))
+      ).json()) as { groups?: unknown };
+      expect(doc.groups).toEqual({ v: 1, keeper: box.pubkeyHex });
+      const ana = await newMember();
+      const ben = await newMember();
+      const gid = newGid();
+      const without = await callManagement(
+        "groupcreate",
+        [gid, change(ana, gid, 0, "create", [ben.pubkeyHex]), envelopes(1, [ana, ben])],
+        as(ana),
+      );
+      expect(without.error).toBe("groupcreate: envelopes must be epoch 1, one for each person in the group");
+      const made = await callManagement("groupcreate", [gid, change(ana, gid, 0, "create", [ben.pubkeyHex]), keyed(1, [ana, ben])], as(ana));
+      expect(made.result).toMatchObject({ version: 1, epoch: 1 });
+      expect((await callManagement("groupkeys", [gid, 0], as(box))).result).toEqual([
+        { epoch: 1, from: ana.pubkeyHex, blob: `sealed-1-${box.pubkeyHex.slice(0, 8)}` },
+      ]);
+    });
+
+    it("lets new members read everything, and the box seal them the earlier keys", async () => {
+      const ana = await newMember();
+      const ben = await newMember();
+      const carol = await newMember();
+      const gid = newGid();
+      await callManagement("groupcreate", [gid, change(ana, gid, 0, "create", [ben.pubkeyHex]), keyed(1, [ana, ben])], as(ana));
+      const anaConn = await connectAs(ana);
+      const early = message(gid);
+      expect((await publish(anaConn, early))[2]).toBe(true);
+      anaConn.close();
+      await callManagement("groupchange", [gid, 1, change(ana, gid, 1, "add", [carol.pubkeyHex]), keyed(2, [ana, ben, carol])], as(ana));
+      expect((await since(carol, gid)).map((r) => r.event.id)).toContain(early.id);
+      const owed = (await callManagement("keepergroups", [], as(box))).result as { gid: string; owed: { pubkey: string; epochs: number[] }[] }[];
+      expect(owed.find((g) => g.gid === gid)?.owed).toEqual([{ pubkey: carol.pubkeyHex, epochs: [1] }]);
+      const sealed = await callManagement("groupseal", [gid, [{ to: carol.pubkeyHex, epoch: 1, blob: "from-box" }]], as(box));
+      expect(sealed.result).toEqual({ sealed: 1 });
+      expect(((await callManagement("groupkeys", [gid, 0], as(carol))).result as { epoch: number; from: string }[]).map((k) => [k.epoch, k.from]))
+        .toEqual([[1, box.pubkeyHex], [2, ana.pubkeyHex]]);
+      // Only the box asks keepergroups or reports what it kept.
+      expect((await callManagement("keepergroups", [], as(ana))).status).toBe(401);
+      expect((await callManagement("groupkept", [gid, 5], as(box))).result).toMatchObject({ kept: 5 });
+    });
+
+    it("rotates the key after a leave, signed by the box", async () => {
+      const ana = await newMember();
+      const ben = await newMember();
+      const carol = await newMember();
+      const gid = newGid();
+      await callManagement("groupcreate", [gid, change(ana, gid, 0, "create", [ben.pubkeyHex, carol.pubkeyHex]), keyed(1, [ana, ben, carol])], as(ana));
+      await callManagement("groupleave", [gid], as(carol));
+      const v = (await info(ana, gid)).version;
+      expect((await callManagement("groupchange", [gid, v, change(box, gid, v, "remove", [ben.pubkeyHex])], as(box))).error)
+        .toBe("groupchange: the box may only change the key");
+      const keyedNow = await callManagement("groupchange", [gid, v, change(box, gid, v, "key"), keyed(2, [ana, ben])], as(box));
+      expect(keyedNow.result).toMatchObject({ epoch: 2, needsKey: false });
+    });
+
+    it("joins someone from an admin's link, waiting for their key until it is sealed", async () => {
+      const ana = await newMember();
+      const ben = await newMember();
+      const joiner = randomKeypair();
+      const gid = newGid();
+      await callManagement("groupcreate", [gid, change(ana, gid, 0, "create", [ben.pubkeyHex]), keyed(1, [ana, ben])], as(ana));
+      const code = "c0de".repeat(8);
+      const hash = bytesToHex(sha256(new TextEncoder().encode(code)));
+      expect((await callManagement("groupchange", [gid, 1, signEvent(ben.secretKeyHex, { kind: GROUP_CHANGE_KIND, tags: [["h", gid], ["v", "1"], ["op", "link"], ["code-hash", hash]] })], as(ben))).error)
+        .toBe("groupchange: only admins can make or stop join links");
+      const link = signEvent(ana.secretKeyHex, { kind: GROUP_CHANGE_KIND, tags: [["h", gid], ["v", "1"], ["op", "link"], ["code-hash", hash]] });
+      expect((await callManagement("groupchange", [gid, 1, link], as(ana))).result).toMatchObject({ version: 2 });
+      expect((await callManagement("groupjoin", [gid, "f".repeat(32)], as(joiner))).error).toBe("groupjoin: this link cannot be used. Ask whoever sent it for a new one.");
+      expect((await callManagement("groupjoin", [gid, code], as(joiner))).result).toEqual({ version: 2, members: 2 });
+      const join = signEvent(joiner.secretKeyHex, { kind: GROUP_CHANGE_KIND, tags: [["h", gid], ["v", "2"], ["op", "join"], ["code", code]] });
+      expect((await callManagement("groupjoin", [gid, code, join], as(joiner))).result).toMatchObject({ version: 3, pendingKey: true });
+      expect((await info(ana, gid)).members.find((m) => m.pubkey === joiner.pubkeyHex)).toMatchObject({ pendingKey: true });
+      await callManagement("groupseal", [gid, [{ to: joiner.pubkeyHex, epoch: 1, blob: "for-you" }]], as(box));
+      expect((await info(ana, gid)).members.find((m) => m.pubkey === joiner.pubkeyHex)).toMatchObject({ pendingKey: false });
+      // Stopping the link stops joins.
+      const unlink = signEvent(ana.secretKeyHex, { kind: GROUP_CHANGE_KIND, tags: [["h", gid], ["v", "3"], ["op", "unlink"], ["code-hash", hash]] });
+      expect((await callManagement("groupchange", [gid, 3, unlink], as(ana))).result).toMatchObject({ version: 4 });
+      expect((await callManagement("groupjoin", [gid, code], as(randomKeypair()))).error).toBe("groupjoin: this link cannot be used. Ask whoever sent it for a new one.");
+    });
   });
 });

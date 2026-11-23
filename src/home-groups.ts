@@ -19,8 +19,10 @@
 // (stored, with seq) and a live-only REQ answered by relay.ts.
 import { computeEventId, verifySignature } from "./validate";
 import type { NostrEvent } from "./nostr";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import { getRelayPubkey, signAsRelay } from "./relay-identity";
-import { isPubkeyBanned, isRemovedOnPurpose, roleOf } from "./storage";
+import { isPubkeyBanned, isRemovedOnPurpose, roleOf, storagePubkey } from "./storage";
 
 export const GROUP_MESSAGE_KIND = 1490;
 export const GROUP_CHANGE_KIND = 1491;
@@ -42,10 +44,11 @@ export const GROUP_DECISIONS = {
   // not counted.
   maxMembers: 100,
   // 2 (answered 2026-11-23: the box ALWAYS holds every group's key, no
-  // opt-out) and 9. The keeper is not built yet (item 3): null means every
-  // group is basic for now. When it is set, every group on the home gets
-  // it in its envelopes (keeperPlus); no group can keep it out.
-  keeper: null as string | null,
+  // opt-out) and 9. The keeper is the home's storage service (setstorage's
+  // key): every group on the home has it in its envelopes (keeperPlus), and
+  // no group can keep it out. A home with no storage has no keeper, and its
+  // groups are basic.
+  keeperIsStorage: true,
 } as const;
 
 // 6 (open) and 1 (answered 2026-11-23: on, all of the past) are group
@@ -71,8 +74,8 @@ const FORMER_KEPT_SECONDS = 30 * 86400;
 export const GROUP_CHANGED_MESSAGE = "groupchange: the group changed while you were changing it";
 export const NOT_IN_GROUP_MESSAGE = "you are not in this group";
 
-type Op = "create" | "add" | "remove" | "admin" | "unadmin" | "settings" | "key" | "leave";
-const MEMBER_OPS: readonly Op[] = ["add", "remove", "admin", "unadmin", "settings", "key"];
+type Op = "create" | "add" | "remove" | "admin" | "unadmin" | "settings" | "key" | "leave" | "link" | "unlink" | "join";
+const MEMBER_OPS: readonly Op[] = ["add", "remove", "admin", "unadmin", "settings", "key", "link", "unlink"];
 
 export interface GroupOutboxEntry {
   gid: string;
@@ -86,6 +89,8 @@ export interface GroupReply {
   error?: string;
   version?: number;
   groupOutbox?: GroupOutboxEntry[];
+  // People to wake with no event to deliver (a key sealed to them).
+  wake?: string[];
 }
 
 type GroupRow = {
@@ -101,6 +106,8 @@ type MemberRow = {
   role: string;
   from_seq: number;
   joined_at: number;
+  join_epoch?: number;
+  pending_key?: number;
 };
 
 function err(message: string): GroupReply {
@@ -118,7 +125,7 @@ function groupRow(sql: SqlStorage, gid: string): GroupRow | null {
 function membersOf(sql: SqlStorage, gid: string): MemberRow[] {
   return sql
     .exec<MemberRow>(
-      `SELECT pubkey, role, from_seq, joined_at FROM home_group_members WHERE gid = ? ORDER BY from_seq, pubkey`,
+      `SELECT pubkey, role, from_seq, joined_at, join_epoch, pending_key FROM home_group_members WHERE gid = ? ORDER BY from_seq, pubkey`,
       gid,
     )
     .toArray();
@@ -128,7 +135,7 @@ export function memberOf(sql: SqlStorage, gid: string, pubkey: string): MemberRo
   return (
     sql
       .exec<MemberRow>(
-        `SELECT pubkey, role, from_seq, joined_at FROM home_group_members WHERE gid = ? AND pubkey = ?`,
+        `SELECT pubkey, role, from_seq, joined_at, join_epoch, pending_key FROM home_group_members WHERE gid = ? AND pubkey = ?`,
         gid,
         pubkey,
       )
@@ -166,10 +173,17 @@ function parseSettings(text: string): GroupSettings {
 }
 
 // Reads may start at a member's from_seq. On a home with a keeper and the
-// switch on they could read everything; with no keeper (every home today)
-// new members start from when they joined, whatever the switch says.
-function startsFromJoin(settings: GroupSettings): boolean {
-  return !settings.history || GROUP_DECISIONS.keeper === null;
+// switch on (the default) they read everything; with no keeper new members
+// start from when they joined, whatever the switch says.
+
+// The box that keeps every group's keys on this home (GROUP_DECISIONS), or null.
+export function keeperOf(sql: SqlStorage): string | null {
+  if (!GROUP_DECISIONS.keeperIsStorage) return null;
+  const pk = storagePubkey(sql);
+  return pk !== null && HEX64_RE.test(pk) ? pk : null;
+}
+function startsFromJoin(sql: SqlStorage, settings: GroupSettings): boolean {
+  return !settings.history || keeperOf(sql) === null;
 }
 
 // ---------------------------------------------------------------------
@@ -283,8 +297,8 @@ function parseChange(
   if (tagValue(e, "h") !== gid) return `${method}: the change's h tag must be this group`;
   if (tagValue(e, "v") !== String(baseVersion)) return `${method}: the change's v tag must be the version it was made on`;
   const op = tagValue(e, "op") as Op | undefined;
-  if (op === undefined || !(["create", ...MEMBER_OPS] as string[]).includes(op)) {
-    return `${method}: the change's op must be one of create, ${MEMBER_OPS.join(", ")}`;
+  if (op === undefined || !(["create", "join", ...MEMBER_OPS] as string[]).includes(op)) {
+    return `${method}: the change's op must be one of create, join, ${MEMBER_OPS.join(", ")}`;
   }
   const targets = [...new Set(e.tags.filter((t) => t[0] === "p").map((t) => t[1] ?? ""))];
   if (!targets.every((p) => HEX64_RE.test(p))) return `${method}: every p tag must be a 64-character hex pubkey`;
@@ -451,6 +465,7 @@ function deleteGroup(sql: SqlStorage, gid: string): void {
   sql.exec(`DELETE FROM home_group_events WHERE gid = ?`, gid);
   sql.exec(`DELETE FROM home_group_keys WHERE gid = ?`, gid);
   sql.exec(`DELETE FROM home_group_members WHERE gid = ?`, gid);
+  sql.exec(`DELETE FROM home_group_links WHERE gid = ?`, gid);
   sql.exec(`DELETE FROM home_groups WHERE gid = ?`, gid);
 }
 
@@ -522,7 +537,14 @@ export const HOME_GROUP_METHODS: readonly string[] = [
   "groupkeys",
   "groupleave",
   "groupsince",
+  "groupjoin",
+  "groupseal",
+  "keepergroups",
+  "groupkept",
 ];
+
+// The calls only the keeper (the home's storage service key) may make.
+export const KEEPER_METHODS: readonly string[] = ["keepergroups", "groupkept"];
 
 export function handleGroupCall(
   sql: SqlStorage,
@@ -547,6 +569,14 @@ export function handleGroupCall(
       return groupLeave(sql, owner, params, signer, nowSec);
     case "groupsince":
       return groupSince(sql, params, signer);
+    case "groupjoin":
+      return groupJoin(sql, owner, params, signer, nowSec);
+    case "groupseal":
+      return groupSeal(sql, params, signer);
+    case "keepergroups":
+      return keeperGroups(sql, signer);
+    case "groupkept":
+      return groupKept(sql, params, signer, nowSec);
   }
   return err(`unknown group method ${method}`);
 }
@@ -575,7 +605,7 @@ function groupCreate(sql: SqlStorage, owner: string | null, params: unknown[], s
   const envelopes = parseEnvelopes("groupcreate", params[2]);
   if (typeof envelopes === "string") return err(envelopes);
   const roster = [signer, ...others];
-  if (envelopes === null || envelopes.epoch !== 1 || !sameSet(envelopes.keys.map((k) => k.to), keeperPlus(roster))) {
+  if (envelopes === null || envelopes.epoch !== 1 || !sameSet(envelopes.keys.map((k) => k.to), keeperPlus(sql, roster))) {
     return err("groupcreate: envelopes must be epoch 1, one for each person in the group");
   }
   const settings = change.settings ?? DEFAULT_GROUP_SETTINGS;
@@ -589,7 +619,7 @@ function groupCreate(sql: SqlStorage, owner: string | null, params: unknown[], s
   const seq = storeGroupEvent(sql, gid, change.event, signer, 1, nowSec);
   for (const p of roster) {
     sql.exec(
-      `INSERT INTO home_group_members (gid, pubkey, role, from_seq, joined_at) VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO home_group_members (gid, pubkey, role, from_seq, joined_at, join_epoch) VALUES (?, ?, ?, ?, ?, 1)`,
       gid,
       p,
       p === signer ? "admin" : "member",
@@ -601,8 +631,9 @@ function groupCreate(sql: SqlStorage, owner: string | null, params: unknown[], s
   return { result: { version: 1, epoch: 1, seq }, groupOutbox: [{ gid, event: change.event, wake: others }] };
 }
 
-function keeperPlus(roster: readonly string[]): string[] {
-  return GROUP_DECISIONS.keeper === null ? [...roster] : [...roster, GROUP_DECISIONS.keeper];
+function keeperPlus(sql: SqlStorage, roster: readonly string[]): string[] {
+  const keeper = keeperOf(sql);
+  return keeper === null || roster.includes(keeper) ? [...roster] : [...roster, keeper];
 }
 
 function groupChange(sql: SqlStorage, owner: string | null, params: unknown[], signer: string, nowSec: number): GroupReply {
@@ -612,12 +643,16 @@ function groupChange(sql: SqlStorage, owner: string | null, params: unknown[], s
     return err("groupchange takes [gid, version, change, envelopes?]");
   }
   const group = groupRow(sql, gid);
-  const me = group === null ? null : memberOf(sql, gid, signer);
+  // The keeper is in no roster, and may make one change: a new key.
+  const keeping = signer === keeperOf(sql);
+  const me = group === null ? null : memberOf(sql, gid, signer) ?? (keeping ? { pubkey: signer, role: "keeper", from_seq: 0, joined_at: 0 } : null);
   if (group === null || me === null) return err(`groupchange: ${NOT_IN_GROUP_MESSAGE}`);
   if (version !== group.version) return { error: GROUP_CHANGED_MESSAGE, version: group.version };
   const change = parseChange("groupchange", params[2], gid, version, signer, nowSec);
   if (typeof change === "string") return err(change);
   if (change.op === "create") return err("groupchange: a group is created with groupcreate");
+  if (change.op === "join") return err("groupchange: joining with a link is groupjoin");
+  if (me.role === "keeper" && change.op !== "key") return err("groupchange: the box may only change the key");
   const envelopes = parseEnvelopes("groupchange", params[3]);
   if (typeof envelopes === "string") return err(envelopes);
 
@@ -673,6 +708,16 @@ function groupChange(sql: SqlStorage, owner: string | null, params: unknown[], s
     case "key":
       if (envelopes === null) return err("groupchange: a key change carries the new envelopes");
       break;
+    // A join link: the app keeps the code, the chain keeps its sha256, so
+    // every member's app can check a later join against a link an admin made.
+    case "link":
+    case "unlink": {
+      if (!isAdmin) return err("groupchange: only admins can make or stop join links");
+      const hash = tagValue(change.event, "code-hash");
+      if (hash === undefined || !HEX64_RE.test(hash)) return err("groupchange: a link change carries its code's sha256 in a code-hash tag");
+      if (change.op === "unlink" && !linkActive(sql, gid, hash)) return err("groupchange: that link is not active");
+      break;
+    }
   }
 
   // The key. A new epoch covers everyone after the change; the current
@@ -683,7 +728,7 @@ function groupChange(sql: SqlStorage, owner: string | null, params: unknown[], s
   if (envelopes !== null) {
     const to = envelopes.keys.map((k) => k.to);
     if (envelopes.epoch === group.epoch + 1) {
-      if (!sameSet(to, keeperPlus(after))) {
+      if (!sameSet(to, keeperPlus(sql, after))) {
         return err("groupchange: a new key needs exactly one envelope for each person in the group after the change");
       }
       newEpoch = envelopes.epoch;
@@ -708,11 +753,12 @@ function groupChange(sql: SqlStorage, owner: string | null, params: unknown[], s
     case "add":
       for (const p of t) {
         sql.exec(
-          `INSERT INTO home_group_members (gid, pubkey, role, from_seq, joined_at) VALUES (?, ?, 'member', ?, ?)`,
+          `INSERT INTO home_group_members (gid, pubkey, role, from_seq, joined_at, join_epoch) VALUES (?, ?, 'member', ?, ?, ?)`,
           gid,
           p,
           seq,
           nowSec,
+          newEpoch ?? group.epoch,
         );
         sql.exec(`DELETE FROM home_group_former WHERE gid = ? AND pubkey = ?`, gid, p);
       }
@@ -728,6 +774,12 @@ function groupChange(sql: SqlStorage, owner: string | null, params: unknown[], s
       break;
     case "settings":
       sql.exec(`UPDATE home_groups SET settings = ? WHERE gid = ?`, JSON.stringify(change.settings), gid);
+      break;
+    case "link":
+      sql.exec(`INSERT OR REPLACE INTO home_group_links (gid, hash, made_by, version) VALUES (?, ?, ?, ?)`, gid, tagValue(change.event, "code-hash"), signer, nextVersion);
+      break;
+    case "unlink":
+      sql.exec(`DELETE FROM home_group_links WHERE gid = ? AND hash = ?`, gid, tagValue(change.event, "code-hash"));
       break;
   }
   if (envelopes !== null) storeKeys(sql, gid, signer, envelopes);
@@ -749,7 +801,7 @@ function groupInfo(sql: SqlStorage, params: unknown[], signer: string): GroupRep
   if (gid === null) return err("groupinfo takes [gid, sinceVersion?]");
   const since = typeof params[1] === "number" ? params[1] : 0;
   const group = groupRow(sql, gid);
-  if (group === null || memberOf(sql, gid, signer) === null) return err(`groupinfo: ${NOT_IN_GROUP_MESSAGE}`);
+  if (group === null || (memberOf(sql, gid, signer) === null && signer !== keeperOf(sql))) return err(`groupinfo: ${NOT_IN_GROUP_MESSAGE}`);
   const chain = sql
     .exec<{ version: number; seq: number; stored_at: number; event: string }>(
       `SELECT version, seq, stored_at, event FROM home_group_events
@@ -766,14 +818,19 @@ function groupInfo(sql: SqlStorage, params: unknown[], signer: string): GroupRep
       epoch: group.epoch,
       needsKey: group.needs_key === 1,
       settings: parseSettings(group.settings),
-      keeper: GROUP_DECISIONS.keeper,
+      keeper: keeperOf(sql),
       relay: getRelayPubkey(sql),
       members: membersOf(sql, gid).map((m) => ({
         pubkey: m.pubkey,
         role: m.role,
         fromSeq: m.from_seq,
         joinedAt: m.joined_at,
+        joinEpoch: m.join_epoch,
+        pendingKey: m.pending_key === 1,
       })),
+      // Epochs the keeper has no envelope of (groups older than the box):
+      // a member's app that holds them seals them to it with groupseal.
+      keeperMissing: keeperMissing(sql, gid, group.epoch),
       chain,
     },
   };
@@ -817,7 +874,7 @@ function groupKeys(sql: SqlStorage, params: unknown[], signer: string): GroupRep
   const gid = gidParam(params);
   if (gid === null) return err("groupkeys takes [gid, sinceEpoch]");
   const since = typeof params[1] === "number" ? params[1] : 0;
-  if (memberOf(sql, gid, signer) === null) return err(`groupkeys: ${NOT_IN_GROUP_MESSAGE}`);
+  if (memberOf(sql, gid, signer) === null && signer !== keeperOf(sql)) return err(`groupkeys: ${NOT_IN_GROUP_MESSAGE}`);
   return {
     result: sql
       .exec<{ epoch: number; from_key: string; blob: string }>(
@@ -853,9 +910,10 @@ function groupSince(sql: SqlStorage, params: unknown[], signer: string): GroupRe
       ? Math.min(limitParam, MAX_GROUPSINCE)
       : MAX_GROUPSINCE;
   const group = groupRow(sql, gid);
+  const keeping = signer === keeperOf(sql);
   const me = group === null ? null : memberOf(sql, gid, signer);
-  if (group === null || me === null) return err(`groupsince: ${NOT_IN_GROUP_MESSAGE}`);
-  const from = startsFromJoin(parseSettings(group.settings)) ? Math.max(after, me.from_seq - 1) : after;
+  if (group === null || (me === null && !keeping)) return err(`groupsince: ${NOT_IN_GROUP_MESSAGE}`);
+  const from = me !== null && startsFromJoin(sql, parseSettings(group.settings)) ? Math.max(after, me.from_seq - 1) : after;
   return {
     result: sql
       .exec<{ seq: number; stored_at: number; event: string }>(
@@ -867,4 +925,195 @@ function groupSince(sql: SqlStorage, params: unknown[], signer: string): GroupRe
       .toArray()
       .map((r) => ({ seq: r.seq, storedAt: r.stored_at, event: JSON.parse(r.event) as NostrEvent })),
   };
+}
+
+// ---------------------------------------------------------------------
+// Join links and the keeper (groups.md 3 and 6). The box keeps every
+// group's keys (GROUP_DECISIONS): it seals the key to someone who joined
+// from a link, hands new members the earlier keys, makes the new key after
+// a leave, and backs up every message (groupkept).
+// ---------------------------------------------------------------------
+
+function linkActive(sql: SqlStorage, gid: string, hash: string): boolean {
+  return sql.exec(`SELECT 1 FROM home_group_links WHERE gid = ? AND hash = ?`, gid, hash).toArray().length > 0;
+}
+
+function sha256Hex(text: string): string {
+  return bytesToHex(sha256(new TextEncoder().encode(text)));
+}
+
+const CODE_RE = /^[0-9a-f]{32}$/;
+export const LINK_REFUSAL = "groupjoin: this link cannot be used. Ask whoever sent it for a new one.";
+
+// groupjoin [gid, code] answers {version, members} for a live link; with
+// the joiner's signed join change on that version, they are in, waiting
+// for a key (pendingKey) until the keeper or a member's app seals it.
+function groupJoin(sql: SqlStorage, owner: string | null, params: unknown[], signer: string, nowSec: number): GroupReply {
+  const gid = gidParam(params);
+  const code = params[1];
+  if (gid === null || typeof code !== "string" || !CODE_RE.test(code)) return err("groupjoin takes [gid, code, change?]");
+  const group = groupRow(sql, gid);
+  if (group === null || !linkActive(sql, gid, sha256Hex(code))) return err(LINK_REFUSAL);
+  if (memberOf(sql, gid, signer) !== null) return { result: { version: group.version, epoch: group.epoch, member: true } };
+  const why = cutOffReason(sql, owner, signer);
+  if (why !== null) return err(LINK_REFUSAL);
+  const roster = rosterPubkeys(sql, gid);
+  if (roster.length + 1 > GROUP_DECISIONS.maxMembers) return err(`groupjoin: a group can have at most ${GROUP_DECISIONS.maxMembers} people`);
+  if (params[2] === undefined || params[2] === null) return { result: { version: group.version, members: roster.length } };
+  const version = typeof (params[2] as NostrEvent)?.tags === "object" ? Number(tagValue(params[2] as NostrEvent, "v")) : NaN;
+  if (version !== group.version) return { error: GROUP_CHANGED_MESSAGE.replace("groupchange", "groupjoin"), version: group.version };
+  const change = parseChange("groupjoin", params[2], gid, group.version, signer, nowSec);
+  if (typeof change === "string") return err(change);
+  if (change.op !== "join" || tagValue(change.event, "code") !== code) return err("groupjoin: the change must be a join naming this link's code");
+  const nextVersion = group.version + 1;
+  bumpVersion(sql, gid, nextVersion);
+  const seq = storeGroupEvent(sql, gid, change.event, signer, nextVersion, nowSec);
+  sql.exec(
+    `INSERT INTO home_group_members (gid, pubkey, role, from_seq, joined_at, join_epoch, pending_key) VALUES (?, ?, 'member', ?, ?, ?, 1)`,
+    gid,
+    signer,
+    seq,
+    nowSec,
+    group.epoch,
+  );
+  sql.exec(`DELETE FROM home_group_former WHERE gid = ? AND pubkey = ?`, gid, signer);
+  return {
+    result: { version: nextVersion, epoch: group.epoch, seq, pendingKey: true },
+    groupOutbox: [{ gid, event: change.event, wake: roster }],
+  };
+}
+
+// The epochs one member may hold: all of them while new members see
+// earlier messages (on a home with a keeper), else from the one they joined in.
+function firstEpochFor(sql: SqlStorage, settings: GroupSettings, m: MemberRow): number {
+  return startsFromJoin(sql, settings) ? Math.max(1, m.join_epoch ?? 1) : 1;
+}
+
+function hasEnvelope(sql: SqlStorage, gid: string, member: string, epoch: number): boolean {
+  return sql.exec(`SELECT 1 FROM home_group_keys WHERE gid = ? AND member = ? AND epoch = ?`, gid, member, epoch).toArray().length > 0;
+}
+
+function keeperMissing(sql: SqlStorage, gid: string, epoch: number): number[] {
+  const keeper = keeperOf(sql);
+  if (keeper === null) return [];
+  const missing: number[] = [];
+  for (let e = 1; e <= epoch; e++) if (!hasEnvelope(sql, gid, keeper, e)) missing.push(e);
+  return missing;
+}
+
+// groupseal [gid, [{to, epoch, blob}]]: envelopes for people who lack one
+// (a link join, a new member's earlier keys, the keeper's keys of a group
+// older than the box). From the keeper or anyone in the group; an envelope
+// already there is kept.
+function groupSeal(sql: SqlStorage, params: unknown[], signer: string): GroupReply {
+  const gid = gidParam(params);
+  const raw = params[1];
+  if (gid === null || !Array.isArray(raw) || raw.length === 0 || raw.length > 1000) {
+    return err("groupseal takes [gid, [{to, epoch, blob}]]");
+  }
+  const group = groupRow(sql, gid);
+  const keeper = keeperOf(sql);
+  const keeping = signer === keeper;
+  if (group === null || (!keeping && memberOf(sql, gid, signer) === null)) return err(`groupseal: ${NOT_IN_GROUP_MESSAGE}`);
+  const settings = parseSettings(group.settings);
+  let sealed = 0;
+  const woken = new Set<string>();
+  for (const k of raw as unknown[]) {
+    const e = k as { to?: unknown; epoch?: unknown; blob?: unknown } | null;
+    if (
+      typeof e !== "object" || e === null || typeof e.to !== "string" || !HEX64_RE.test(e.to) ||
+      typeof e.epoch !== "number" || !Number.isInteger(e.epoch) || e.epoch < 1 || e.epoch > group.epoch ||
+      typeof e.blob !== "string" || e.blob === "" || e.blob.length > MAX_ENVELOPE_CHARS
+    ) {
+      return err('groupseal: each envelope is {"to": "<hex>", "epoch": n, "blob": "<sealed key>"} for an epoch the group has had');
+    }
+    if (e.to === keeper) {
+      if (keeping) return err("groupseal: the box does not seal to itself");
+    } else {
+      const m = memberOf(sql, gid, e.to);
+      if (m === null) return err("groupseal: someone you are sealing to is not in the group");
+      if (e.epoch < firstEpochFor(sql, settings, m)) return err("groupseal: this group starts new people from when they join");
+    }
+    if (hasEnvelope(sql, gid, e.to, e.epoch)) continue;
+    sql.exec(
+      `INSERT INTO home_group_keys (gid, epoch, member, from_key, blob) VALUES (?, ?, ?, ?, ?)`,
+      gid,
+      e.epoch,
+      e.to,
+      signer,
+      e.blob,
+    );
+    sealed++;
+    if (e.epoch === group.epoch) {
+      sql.exec(`UPDATE home_group_members SET pending_key = 0 WHERE gid = ? AND pubkey = ?`, gid, e.to);
+    }
+    if (e.to !== keeper) woken.add(e.to);
+  }
+  return { result: { sealed }, wake: [...woken] };
+}
+
+// keepergroups []: every group on the home, and what the keeper owes each.
+function keeperGroups(sql: SqlStorage, signer: string): GroupReply {
+  if (signer !== keeperOf(sql)) return err("keepergroups is only for this home's box");
+  const groups = sql
+    .exec<{ gid: string; version: number; epoch: number; needs_key: number; settings: string; kept_seq: number | null }>(
+      `SELECT gid, version, epoch, needs_key, settings, kept_seq FROM home_groups`,
+    )
+    .toArray();
+  return {
+    result: groups.map((g) => {
+      const settings = parseSettings(g.settings);
+      const members = membersOf(sql, g.gid);
+      // Envelopes the keeper could seal now: epochs it holds that a member lacks.
+      const owed = members
+        .map((m) => {
+          const epochs: number[] = [];
+          for (let e = firstEpochFor(sql, settings, m); e <= g.epoch; e++) {
+            if (!hasEnvelope(sql, g.gid, m.pubkey, e)) epochs.push(e);
+          }
+          return { pubkey: m.pubkey, epochs };
+        })
+        .filter((o) => o.epochs.length > 0);
+      return {
+        gid: g.gid,
+        version: g.version,
+        epoch: g.epoch,
+        needsKey: g.needs_key === 1,
+        lastSeq: lastSeq(sql, g.gid),
+        keptSeq: g.kept_seq ?? 0,
+        history: settings.history,
+        members: members.map((m) => ({ pubkey: m.pubkey, fromSeq: m.from_seq, joinEpoch: m.join_epoch ?? 1 })),
+        owed,
+      };
+    }),
+  };
+}
+
+// The keeper has every message through `throughSeq`: messages older than
+// GROUP_KEPT_SECONDS may go from bothy (the box serves them from then on).
+export const GROUP_KEPT_SECONDS = 30 * 86400;
+
+function groupKept(sql: SqlStorage, params: unknown[], signer: string, nowSec: number): GroupReply {
+  if (signer !== keeperOf(sql)) return err("groupkept is only for this home's box");
+  const gid = gidParam(params);
+  const through = params[1];
+  if (gid === null || typeof through !== "number" || !Number.isInteger(through) || through < 0) {
+    return err("groupkept takes [gid, throughSeq]");
+  }
+  if (groupRow(sql, gid) === null) return err(`groupkept: ${NOT_IN_GROUP_MESSAGE}`);
+  sql.exec(`UPDATE home_groups SET kept_seq = MAX(COALESCE(kept_seq, 0), ?) WHERE gid = ?`, through, gid);
+  const old = sql
+    .exec<{ seq: number; sender: string; bytes: number }>(
+      `SELECT seq, sender, bytes FROM home_group_events WHERE gid = ? AND kind = ? AND seq <= ? AND stored_at < ?`,
+      gid,
+      GROUP_MESSAGE_KIND,
+      through,
+      nowSec - GROUP_KEPT_SECONDS,
+    )
+    .toArray();
+  for (const row of old) {
+    sql.exec(`DELETE FROM home_group_events WHERE seq = ?`, row.seq);
+    chargeBytes(sql, [row.sender], -row.bytes, null);
+  }
+  return { result: { kept: through, dropped: old.length } };
 }

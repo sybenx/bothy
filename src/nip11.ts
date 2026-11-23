@@ -210,7 +210,7 @@ export function buildRelayInfo(
     info.signals = { v: 1 };
     // Home groups (src/home-groups.ts), bothy's own field. `keeper` is the
     // box's key once a box keeps every group's keys; null until then.
-    info.groups = { v: 1, keeper: GROUP_DECISIONS.keeper };
+    info.groups = { v: 1, keeper: GROUP_DECISIONS.keeperIsStorage && stored.storageUrl && stored.storagePubkey ? stored.storagePubkey : null };
   }
   const contact = resolveContact(profile);
   if (contact) {

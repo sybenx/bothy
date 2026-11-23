@@ -104,7 +104,7 @@ import {
 import { sqlitePhotoStore } from "./photos";
 import { deleteVaultRow, isVaultHash, listVaultRows, parseVaultPut, storeVaultRow } from "./vault";
 import { GROUPS_PAUSED_MESSAGE } from "./nip29";
-import { HOME_GROUP_METHODS, handleGroupCall, removeFromAllGroups, type GroupOutboxEntry } from "./home-groups";
+import { HOME_GROUP_METHODS, KEEPER_METHODS, handleGroupCall, removeFromAllGroups, type GroupOutboxEntry } from "./home-groups";
 import { pushConfigured } from "./push";
 import { fcmConfigured } from "./fcm";
 import { joinRequestMessage, oneLine } from "./join-requests";
@@ -145,6 +145,8 @@ export interface ManagementResponse {
   // Not part of the response either: group changes relay.ts manage() must
   // deliver to the group's live subscriptions and wake its members for.
   groupOutbox?: GroupOutboxEntry[];
+  // Not part of the response: people to wake with nothing to deliver.
+  wake?: string[];
 }
 
 // Exactly the methods implemented below, and the value supportedmethods
@@ -253,6 +255,10 @@ export const SUPPORTED_METHODS = [
   "groupkeys",
   "groupleave",
   "groupsince",
+  "groupjoin",
+  "groupseal",
+  "keepergroups",
+  "groupkept",
 ] as const;
 
 // The methods a MEMBER may call, not just the owner.
@@ -315,7 +321,7 @@ export const UNSIGNED_METHODS: readonly string[] = ["vaultchallenge", "vaultopen
 // The one method the storage service's key may call (setstorage), and the
 // only key that may call it: not the owner, not a member. index.ts checks
 // the signer against the stored pubkey before dispatch.
-export const STORAGE_CALLABLE_METHODS: readonly string[] = ["memberkeys"];
+export const STORAGE_CALLABLE_METHODS: readonly string[] = ["memberkeys", ...KEEPER_METHODS];
 
 export const STORAGE_ONLY_REASON = "memberkeys is only for this relay's storage service";
 
@@ -325,7 +331,7 @@ export const ANYONE_CALLABLE_METHODS: readonly string[] = [
   "myrole",
   // Home groups: each checks the signer is on that group's roster
   // (home-groups.ts), so a guest from another home can use their groups.
-  ...HOME_GROUP_METHODS.filter((m) => m !== "groupcreate"),
+  ...HOME_GROUP_METHODS.filter((m) => m !== "groupcreate" && !KEEPER_METHODS.includes(m)),
 ];
 
 // The push methods a group guest (on a home group's roster here, not a

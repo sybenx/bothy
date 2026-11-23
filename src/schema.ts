@@ -870,7 +870,21 @@ export const TABLES: readonly TableSpec[] = [
       col("settings", "TEXT NOT NULL"),
       col("created_at", "INTEGER NOT NULL"),
       col("created_by", "TEXT NOT NULL"),
+      // The keeper has every message through this home number (groupkept).
+      col("kept_seq", "INTEGER"),
     ],
+  },
+  {
+    // Live join links per group: the sha256 of each code (the app keeps
+    // the code), made by an admin's signed link change.
+    name: "home_group_links",
+    columns: [
+      col("gid", "TEXT NOT NULL"),
+      col("hash", "TEXT NOT NULL"),
+      col("made_by", "TEXT NOT NULL"),
+      col("version", "INTEGER NOT NULL"),
+    ],
+    tableConstraints: ["PRIMARY KEY (gid, hash)"],
   },
   {
     // Who is in each group now. `from_seq`: the first home number this
@@ -883,6 +897,10 @@ export const TABLES: readonly TableSpec[] = [
       col("role", "TEXT NOT NULL"),
       col("from_seq", "INTEGER NOT NULL"),
       col("joined_at", "INTEGER NOT NULL"),
+      // The key epoch when they came in, and whether they still wait for
+      // its envelope (a link join, until the keeper or a member seals it).
+      col("join_epoch", "INTEGER NOT NULL DEFAULT 1"),
+      col("pending_key", "INTEGER NOT NULL DEFAULT 0"),
     ],
     tableConstraints: ["PRIMARY KEY (gid, pubkey)"],
   },

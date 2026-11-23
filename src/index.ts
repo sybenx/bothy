@@ -297,7 +297,7 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
   // included: it is a machine's read of the member list, not a person's.
   if (method !== null && STORAGE_CALLABLE_METHODS.includes(method)) {
     if (!(await relayStub(env).isStorageService(auth.pubkey))) {
-      return managementResponse({ error: STORAGE_ONLY_REASON }, 401);
+      return managementResponse({ error: method === "memberkeys" ? STORAGE_ONLY_REASON : `${method} is only for this home's box` }, 401);
     }
     return managementResponse(
       await relayStub(env).manage(call?.method, params, request.headers.get("CF-Connecting-IP") ?? "unknown", auth.pubkey),

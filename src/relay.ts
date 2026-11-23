@@ -94,6 +94,7 @@ import {
   NOT_IN_GROUP_MESSAGE,
   groupEpoch,
   groupEventExists,
+  keeperOf,
   isInAnyGroup,
   memberOf,
   rosterPubkeys,
@@ -714,7 +715,8 @@ export class Relay extends DurableObject<Env> {
           this.broadcast(event);
         }
         for (const entry of reply.groupOutbox ?? []) this.deliverGroupEvent(sql, entry);
-        const { outbox: _delivered, groupOutbox: _groupDelivered, ...rest } = reply;
+        if (reply.wake?.length) this.wakeOnly(sql, reply.wake);
+        const { outbox: _delivered, groupOutbox: _groupDelivered, wake: _woken, ...rest } = reply;
         return rest;
       });
       await this.settlePushAlarm();
@@ -1679,7 +1681,10 @@ export class Relay extends DurableObject<Env> {
   // wake queued for `wake` (the inbox push queue: one content-free push per
   // person per burst, skipped while they have a socket open).
   private deliverGroupEvent(sql: SqlStorage, entry: GroupOutboxEntry): void {
+    // The roster, and the box that keeps the group (home-groups.ts keeperOf).
     const roster = new Set(rosterPubkeys(sql, entry.gid));
+    const keeper = keeperOf(sql);
+    if (keeper !== null) roster.add(keeper);
     for (const other of this.ctx.getWebSockets()) {
       if (this.ctx.getTags(other).includes(LIVE_FEED_TAG)) continue;
       const state = getState(other);
@@ -1690,12 +1695,17 @@ export class Relay extends DurableObject<Env> {
         if (asked.length > 0 && matchesAnyFilter(entry.event, asked)) send(other, ["EVENT", subId, entry.event]);
       }
     }
+    this.wakeOnly(sql, entry.wake);
+  }
+
+  // The content-free wake, through the inbox push queue.
+  private wakeOnly(sql: SqlStorage, pubkeys: readonly string[]): void {
     const web = pushConfigured(this.env);
     const android = fcmConfigured(this.env);
     if (!web && !android) return;
     withReadPath("push", () => {
       const now = nowSeconds();
-      for (const pubkey of entry.wake) {
+      for (const pubkey of pubkeys) {
         if (!hasPushSubscription(sql, pubkey, web, android)) continue;
         queueInboxPush(sql, pubkey, now);
         this.pushAlarmWanted = true;
@@ -2658,7 +2668,8 @@ export class Relay extends DurableObject<Env> {
       }
       const reader = state.authedPubkey;
       const named = filters.flatMap((f) => (Array.isArray(f["#h"]) ? (f["#h"] as string[]) : []));
-      if (named.some((gid) => memberOf(this.sql, gid, reader) === null)) {
+      const keeper = keeperOf(this.sql);
+      if (named.some((gid) => memberOf(this.sql, gid, reader) === null && reader !== keeper)) {
         this.refuse(ws, subId, "restricted: not allowed to read group events");
         return;
       }
