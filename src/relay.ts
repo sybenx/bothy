@@ -2844,6 +2844,18 @@ export class Relay extends DurableObject<Env> {
       }
       return;
     }
+    // Signals reach only authenticated subscriptions, so an unauthenticated REQ for them is told to
+    // authenticate (with a challenge) instead of sitting open and never hearing anything: a call's
+    // own socket only listens until the answer comes (DMs round 2 device pass).
+    if (state.authedPubkey === undefined && filters.some((f) => f.kinds?.includes(SIGNAL_KIND))) {
+      if (!state.challenge) {
+        state.challenge = crypto.randomUUID();
+        setState(ws, state);
+      }
+      send(ws, ["AUTH", state.challenge]);
+      this.refuse(ws, subId, "auth-required: authentication required to read signals");
+      return;
+    }
     if (
       !mayReadGiftWraps &&
       filters.some(

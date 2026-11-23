@@ -115,6 +115,14 @@ describe("sealed signals", () => {
     for (const conn of [stranger, anonymous]) conn.close();
   });
 
+  it("ask an unauthenticated subscription to authenticate", async () => {
+    const anonymous = await connectAs(null);
+    anonymous.send(["REQ", "s", { kinds: [SIGNAL_KIND], "#p": [randomKeypair().pubkeyHex] }]);
+    expect((await anonymous.nextMessage())[0]).toBe("AUTH");
+    expect(await anonymous.nextMessage()).toEqual(["CLOSED", "s", "auth-required: authentication required to read signals"]);
+    anonymous.close();
+  });
+
   it("are refused when addressed to nobody in the home, or too big", async () => {
     const alice = await newMember();
     const conn = await connectAs(alice);
