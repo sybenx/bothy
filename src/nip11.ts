@@ -1,6 +1,7 @@
 // NIP-11 relay information document. List only what is actually
 // implemented and enforced, never ahead of it.
 
+import { GROUP_DECISIONS } from "./home-groups";
 import {
   CALL_ICE_SERVERS,
   groupsEnabled,
@@ -223,6 +224,9 @@ export function buildRelayInfo(
     // takes a member's "my backup holds my mail up to here", which mailbox
     // retention waits for before deleting anything of theirs.
     info.backup = { v: 1 };
+    // Home groups (src/home-groups.ts), bothy's own field. `keeper` is the
+    // box's key once a box keeps every group's keys; null until then.
+    info.groups = { v: 1, keeper: GROUP_DECISIONS.keeperIsStorage && stored.storageUrl && stored.storagePubkey ? stored.storagePubkey : null };
   }
   const contact = resolveContact(profile);
   if (contact) {
