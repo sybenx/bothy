@@ -105,14 +105,13 @@ describe("sealed signals", () => {
     const bob = await newMember();
     const stranger = await connectAs(randomKeypair());
     const anonymous = await connectAs(null);
-    for (const conn of [stranger, anonymous]) {
+    for (const [conn, why] of [
+      [stranger, "restricted: signals are for this home's members"],
+      // Not authenticated yet: auth-required, so the client authenticates and sends it again.
+      [anonymous, "auth-required: signals are for this home's members"],
+    ] as const) {
       const event = signal(bob.pubkeyHex);
-      expect(await publish(conn, event)).toEqual([
-        "OK",
-        event.id,
-        false,
-        "restricted: signals are for this home's members; authenticate first",
-      ]);
+      expect(await publish(conn, event)).toEqual(["OK", event.id, false, why]);
       conn.close();
     }
   });

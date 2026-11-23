@@ -1604,8 +1604,14 @@ export class Relay extends DurableObject<Env> {
     const sql = this.sql;
     const owner = getOwnerPubkey(sql, this.env);
     const sender = getState(ws).authedPubkey;
-    if (owner === null || sender === undefined || (sender !== owner && !isMember(sql, sender))) {
-      ok(ws, event.id, false, "restricted: signals are for this home's members; authenticate first");
+    // Not yet authenticated is NIP-42's "auth-required", so a client authenticates and sends it
+    // again (a call's first offer and candidates often go out before the AUTH answer lands).
+    if (sender === undefined) {
+      ok(ws, event.id, false, "auth-required: signals are for this home's members");
+      return;
+    }
+    if (owner === null || (sender !== owner && !isMember(sql, sender))) {
+      ok(ws, event.id, false, "restricted: signals are for this home's members");
       return;
     }
     if (isAnyGroupEvent(event)) {
