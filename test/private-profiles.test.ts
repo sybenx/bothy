@@ -198,6 +198,39 @@ describe("private profiles: stored reads", () => {
   });
 });
 
+describe("private profiles: how an app signs in to read them", () => {
+  it("a profile REQ carrying an own-mail filter is asked to AUTH, then answers with members' profiles", async () => {
+    const alice = await newMember();
+    const bob = await newMember();
+    await publishProfile(alice, "Alice");
+    const conn = await connectRelay(freshIp());
+    const now = Math.floor(Date.now() / 1000);
+    const filters = [
+      { kinds: [0], authors: [alice.pubkeyHex] },
+      { kinds: [1059], "#p": [bob.pubkeyHex], since: now + 60, limit: 1 },
+    ];
+    conn.send(["REQ", "p", ...filters]);
+    const [auth, challenge] = await conn.nextMessage();
+    expect(auth).toBe("AUTH");
+    const [closed, , reason] = await conn.nextMessage();
+    expect([closed, String(reason).startsWith("auth-required")]).toEqual(["CLOSED", true]);
+    conn.send([
+      "AUTH",
+      signEvent(bob.secretKeyHex, {
+        kind: 22242,
+        tags: [
+          ["relay", "wss://example.com"],
+          ["challenge", challenge as string],
+        ],
+      }),
+    ]);
+    expect((await conn.nextMessage())[2]).toBe(true);
+    const events = await collectStored(conn, "p", filters);
+    expect(events.map((e) => e.pubkey)).toEqual([alice.pubkeyHex]);
+    conn.close();
+  });
+});
+
 describe("private profiles: live fan-out", () => {
   it("sends a member's new kind 0 to other members' open subscriptions, never a stranger's or the live feed", async () => {
     const alice = await newMember();
