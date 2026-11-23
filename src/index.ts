@@ -8,7 +8,14 @@ import {
   secondsUntilUtcMidnight,
   VAULT_OPEN_FLOOR_MS,
 } from "./limits";
-import { extensionFor, sha256Hex, sniffPhotoType, verifyBlossomAuth } from "./photos";
+import {
+  extensionFor,
+  type PhotoType,
+  SEALED_PHOTO_TYPE,
+  sha256Hex,
+  sniffPhotoType,
+  verifyBlossomAuth,
+} from "./photos";
 import {
   ADMIN_CALLABLE_METHODS,
   ANYONE_CALLABLE_METHODS,
@@ -496,18 +503,24 @@ async function routePhotos(request: Request, env: Env, url: URL): Promise<Respon
     const sha256 = await sha256Hex(bytes);
     const auth = verifyBlossomAuth(request.headers.get("Authorization"), "upload", sha256, nowSec());
     if (!auth.ok) return photoError(401, auth.reason);
-    const type = sniffPhotoType(bytes);
-    if (type === null) return photoError(415, "only JPEG, PNG and WebP photos are stored here");
+    const sniffed = sniffPhotoType(bytes);
     const claimed = request.headers.get("Content-Type")?.split(";")[0]?.trim().toLowerCase();
-    if (claimed && claimed !== "application/octet-stream" && claimed !== type) {
-      return photoError(415, `the bytes are ${type}, not ${claimed}`);
+    // Bytes that are no image are a sealed photo (photos.ts
+    // SEALED_PHOTO_TYPE) when sent as one; the Durable Object then takes
+    // them from members only.
+    const type: PhotoType | null = sniffed ?? (claimed === SEALED_PHOTO_TYPE ? SEALED_PHOTO_TYPE : null);
+    if (type === null) {
+      return photoError(415, "only JPEG, PNG and WebP photos are stored here");
+    }
+    if (sniffed !== null && claimed && claimed !== SEALED_PHOTO_TYPE && claimed !== sniffed) {
+      return photoError(415, `the bytes are ${sniffed}, not ${claimed}`);
     }
     const stored = await relayStub(env).uploadPhoto(auth.pubkey, sha256, type, bytes);
     if (stored.status !== 200) return photoError(stored.status, stored.reason);
     // BUD-02 blob descriptor.
     return new Response(
       JSON.stringify({
-        url: `${url.origin}/${sha256}.${extensionFor(type)}`,
+        url: `${url.origin}/${sha256}${extensionFor(type)}`,
         sha256,
         size: bytes.byteLength,
         type,

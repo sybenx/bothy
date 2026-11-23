@@ -260,7 +260,11 @@ function trackCursor<T extends Record<string, SqlStorageValue>>(
 const WRITE_STATEMENT = /^\s*(INSERT|UPDATE|DELETE|REPLACE|DROP|ALTER)\b/i;
 // In table position, not anywhere: `maintained_counts` has a column
 // called `events`.
-const REQ_TABLES = /\b(INTO|UPDATE|FROM|TABLE)\s+(events|event_tags)\b/i;
+// `allowed_pubkeys` and `former_members` too: the private-profile gate
+// (filters.ts FilterQueryOptions.hideMemberProfiles) reads them, so a
+// stranger's cached kind 0 answer must not outlive someone joining. They
+// change at membership pace, not per connection.
+const REQ_TABLES = /\b(INTO|UPDATE|FROM|TABLE)\s+(events|event_tags|allowed_pubkeys|former_members)\b/i;
 function changesReqResults(query: string): boolean {
   return WRITE_STATEMENT.test(query) && REQ_TABLES.test(query);
 }

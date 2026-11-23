@@ -207,6 +207,12 @@ export function buildRelayInfo(
     // Sealed signals (relay.ts handleSignal, kind 21059), bothy's own
     // field: typing, seen and call setup, delivered live, never stored.
     info.signals = { v: 1 };
+    // Private profiles (src/profiles.ts), bothy's own field: members'
+    // kind 0 is served only to this home's authenticated owner, admins and
+    // members, and members may store a sealed photo (octet-stream). An app
+    // publishes its profile here, and only here, when it sees this; an
+    // older bothy would serve it to anyone.
+    info.profiles = "members";
   }
   const contact = resolveContact(profile);
   if (contact) {

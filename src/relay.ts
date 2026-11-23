@@ -9,7 +9,7 @@ import {
   resetWronglyExhaustedRelays,
   seedBackfillRelays,
 } from "./backfill";
-import { matchesAnyFilter, parseFilter } from "./filters";
+import { matchesAnyFilter, parseFilter, PROFILE_KIND } from "./filters";
 import {
   groupIdOf,
   ALL_SCOPES,
@@ -152,7 +152,7 @@ import {
   type WriteMetricsSnapshot,
 } from "./read-metrics";
 import { getRelayPubkey } from "./relay-identity";
-import { type PhotoType, sqlitePhotoStore, takeUploadAllowance } from "./photos";
+import { type PhotoType, SEALED_PHOTO_TYPE, sqlitePhotoStore, takeUploadAllowance } from "./photos";
 import { ingestNetwork, networkSummary, networkWork } from "./network";
 import {
   accessToken,
@@ -240,6 +240,7 @@ import {
   storeEvent,
 } from "./storage";
 import { idMatchesContent, isCreatedAtTooFarInFuture, parseEventShape, verifySignature } from "./validate";
+import { filtersAllowedForProfile, gatedProfileAuthor, profileGateFor } from "./profiles";
 
 // Answers a client "ping" with "pong" inside the runtime, without waking
 // this object or billing DO duration.
@@ -837,13 +838,19 @@ export class Relay extends DurableObject<Env> {
     sha256: string,
     type: PhotoType,
     data: Uint8Array,
-  ): Promise<{ status: 200; uploadedAt: number } | { status: 403 | 429 | 507; reason: string }> {
+  ): Promise<{ status: 200; uploadedAt: number } | { status: 403 | 415 | 429 | 507; reason: string }> {
     return this.metered(() =>
       withReadPath("photos", () => {
         const sql = this.sql;
         const owner = getOwnerPubkey(sql, this.env);
         if (pubkey !== owner && !isMember(sql, pubkey)) {
           return { status: 403 as const, reason: "only this relay's members can store a photo here" };
+        }
+        // The owner's photo is public (his main identity), so it must be
+        // an image; sealed photos are for members (photos.ts
+        // SEALED_PHOTO_TYPE).
+        if (type === SEALED_PHOTO_TYPE && pubkey === owner) {
+          return { status: 415 as const, reason: "the owner's photo is public, so it must be JPEG, PNG or WebP" };
         }
         const store = sqlitePhotoStore(sql);
         const current = store.currentFor(pubkey);
@@ -2598,7 +2605,16 @@ export class Relay extends DurableObject<Env> {
       horizon = chatHorizon(readChatState(this.sql), now);
     }
 
+    // Private profiles (src/profiles.ts): members' kind 0 only for this
+    // home's own people. Resolved only when some filter can match kind 0,
+    // so every other read, the unauthenticated ones included, pays nothing
+    // for it. broadcast() applies the same gate to live events.
+    const profileGate = filters.some((f) => f.kinds === undefined || f.kinds.includes(PROFILE_KIND))
+      ? profileGateFor(this.sql, this.env, authedPubkey, getOwnerPubkey(this.sql, this.env))
+      : undefined;
+
     const events = queryFilters(this.sql, filters, now, {
+      ...(profileGate === undefined ? {} : { hideMemberProfiles: profileGate }),
       excludeGiftWraps: !mayReadGiftWraps,
       // Somebody joining a conversation sees its last few minutes, not the
       // whole of it (limits.ts CHAT_BACKLOG_SECONDS). Applied to the owner
@@ -2717,6 +2733,10 @@ export class Relay extends DurableObject<Env> {
     // traffic.
     const eventGroup = gated && !giftWrap ? groupIdOf(event) : null;
     const membership = new Map<string, boolean>();
+    // Private profiles (src/profiles.ts): a member's kind 0 goes only to
+    // the sockets handleReqInner would have answered with it.
+    const profileOwner = event.kind === PROFILE_KIND ? getOwnerPubkey(this.sql, this.env) : null;
+    const profileAuthor = gatedProfileAuthor(this.sql, event, profileOwner);
     const mayReceive = (authed: string | undefined): boolean => {
       if (authed === undefined) return false;
       if (owner !== null && authed === owner) return true;
@@ -2745,6 +2765,14 @@ export class Relay extends DurableObject<Env> {
         continue;
       }
       if (gated && !mayReceive(authed)) continue;
+      if (profileAuthor !== null) {
+        const gate = profileGateFor(this.sql, this.env, authed, profileOwner);
+        for (const [subId, filters] of Object.entries(state.subs)) {
+          const allowed = filtersAllowedForProfile(gate, profileAuthor, event, filters);
+          if (allowed.length > 0 && matchesAnyFilter(event, allowed)) send(ws, ["EVENT", subId, event]);
+        }
+        continue;
+      }
       for (const [subId, filters] of Object.entries(state.subs)) {
         if (matchesAnyFilter(event, filters)) {
           send(ws, ["EVENT", subId, event]);
@@ -2763,6 +2791,14 @@ export class Relay extends DurableObject<Env> {
   // owner or member case here: a live feed socket cannot be anybody.
   private liveBroadcast(event: NostrEvent): void {
     if (event.kind === GIFT_WRAP_KIND || isGroupEvent(event, groupHost(this.sql))) return;
+    // A member's profile change, even redacted, would time it for anyone
+    // watching (src/profiles.ts).
+    if (
+      event.kind === PROFILE_KIND &&
+      gatedProfileAuthor(this.sql, event, getOwnerPubkey(this.sql, this.env)) !== null
+    ) {
+      return;
+    }
     const live = this.ctx.getWebSockets(LIVE_FEED_TAG);
     if (live.length === 0) return;
     const notice = JSON.stringify({ kind: event.kind, created_at: event.created_at, id: event.id.slice(0, 8) });

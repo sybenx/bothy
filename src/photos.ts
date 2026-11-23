@@ -9,7 +9,8 @@
 //
 //   - members and the owner upload; anyone may fetch a stored photo by
 //     its sha256, and nothing lists them (no BUD-02 /list);
-//   - JPEG, PNG or WebP only, checked from the bytes, at most
+//   - JPEG, PNG or WebP, checked from the bytes, or from a member a
+//     sealed photo (SEALED_PHOTO_TYPE below); at most
 //     limits.ts photoMaxBytes (100KB by default);
 //   - one photo per pubkey: an upload replaces the last;
 //   - all photos together under limits.ts photoStorageBytes (250MB),
@@ -30,22 +31,32 @@ import { idMatchesContent, parseEventShape, verifySignature } from "./validate";
 // Blossom's authorization event (BUD-01).
 export const BLOSSOM_AUTH_KIND = 24242;
 
-export type PhotoType = "image/jpeg" | "image/png" | "image/webp";
-export const PHOTO_TYPES: readonly PhotoType[] = ["image/jpeg", "image/png", "image/webp"];
+export type ImageType = "image/jpeg" | "image/png" | "image/webp";
+export const PHOTO_TYPES: readonly ImageType[] = ["image/jpeg", "image/png", "image/webp"];
 
-const EXTENSIONS: Record<PhotoType, string> = {
+// A sealed photo (private profiles, src/profiles.ts): the member's app
+// encrypts the image with a key that travels only inside their kind 0, so
+// these bytes are noise to anyone else and safe to serve by hash. Nothing
+// here can sniff them, so they are accepted from members only (never the
+// owner, whose photo is public), still one per pubkey and size-capped.
+export const SEALED_PHOTO_TYPE = "application/octet-stream";
+export type PhotoType = ImageType | typeof SEALED_PHOTO_TYPE;
+
+const EXTENSIONS: Record<ImageType, string> = {
   "image/jpeg": "jpg",
   "image/png": "png",
   "image/webp": "webp",
 };
 
+// The URL suffix for a stored photo: ".jpg" and so on, nothing for a
+// sealed one.
 export function extensionFor(type: PhotoType): string {
-  return EXTENSIONS[type];
+  return type === SEALED_PHOTO_TYPE ? "" : `.${EXTENSIONS[type]}`;
 }
 
 // The type the bytes say they are, from their signature, or null. The
 // Content-Type header is a claim; this is the check.
-export function sniffPhotoType(bytes: Uint8Array): PhotoType | null {
+export function sniffPhotoType(bytes: Uint8Array): ImageType | null {
   if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
   const png = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
   if (bytes.length >= 8 && png.every((b, i) => bytes[i] === b)) return "image/png";
