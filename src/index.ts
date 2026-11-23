@@ -12,6 +12,7 @@ import { extensionFor, sha256Hex, sniffPhotoType, verifyBlossomAuth } from "./ph
 import {
   ADMIN_CALLABLE_METHODS,
   ANYONE_CALLABLE_METHODS,
+  GUEST_PUSH_METHODS,
   MANAGEMENT_CONTENT_TYPE,
   MEMBER_CALLABLE_METHODS,
   NOT_A_MEMBER_REASON,
@@ -318,7 +319,12 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
     const memberCallable = method !== null && MEMBER_CALLABLE_METHODS.includes(method);
     if (!adminCallable && !memberCallable) return managementResponse({ error: denial }, 401);
     const role = await relayStub(env).getRole(auth.pubkey);
-    const allowed = adminCallable ? role === "admin" : role === "admin" || role === "member";
+    let allowed = adminCallable ? role === "admin" : role === "admin" || role === "member";
+    // A home group's guest (on a group's roster here, not in the home) may
+    // register and drop their own devices, so the group can wake them.
+    if (!allowed && role === "none" && GUEST_PUSH_METHODS.includes(method!)) {
+      allowed = await relayStub(env).isGroupGuest(auth.pubkey);
+    }
     if (!allowed) {
       // A member's own methods refuse a non-member with their own reason:
       // this is how an app learns its user has lost their home here (a

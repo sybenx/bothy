@@ -850,6 +850,88 @@ export const TABLES: readonly TableSpec[] = [
       col("member_close", "INTEGER"),
     ],
   },
+  // ---------------------------------------------------------------------
+  // Home groups (src/home-groups.ts): the DMs app's groups with a group
+  // key. Separate from the NIP-29 tables above on purpose: their messages
+  // never enter `events`, so no public read path can ever see one, and
+  // what a reader gets is decided in one place (home-groups.ts).
+  // ---------------------------------------------------------------------
+  {
+    // One row per group: the roster's version (one per applied change),
+    // the current key epoch, and whether the key must change before the
+    // next message (a leave or a removal bothy made). `settings` is JSON
+    // {onlyAdminsAdd, history}.
+    name: "home_groups",
+    columns: [
+      col("gid", "TEXT PRIMARY KEY"),
+      col("version", "INTEGER NOT NULL"),
+      col("epoch", "INTEGER NOT NULL"),
+      col("needs_key", "INTEGER NOT NULL DEFAULT 0"),
+      col("settings", "TEXT NOT NULL"),
+      col("created_at", "INTEGER NOT NULL"),
+      col("created_by", "TEXT NOT NULL"),
+    ],
+  },
+  {
+    // Who is in each group now. `from_seq`: the first home number this
+    // member may read (the change that added them). `role` is 'admin' or
+    // 'member'.
+    name: "home_group_members",
+    columns: [
+      col("gid", "TEXT NOT NULL"),
+      col("pubkey", "TEXT NOT NULL"),
+      col("role", "TEXT NOT NULL"),
+      col("from_seq", "INTEGER NOT NULL"),
+      col("joined_at", "INTEGER NOT NULL"),
+    ],
+    tableConstraints: ["PRIMARY KEY (gid, pubkey)"],
+  },
+  {
+    // Each member's envelope of each key epoch: the key sealed by `from`
+    // to `member`. Kept while the member is in the group.
+    name: "home_group_keys",
+    columns: [
+      col("gid", "TEXT NOT NULL"),
+      col("epoch", "INTEGER NOT NULL"),
+      col("member", "TEXT NOT NULL"),
+      col("from_key", "TEXT NOT NULL"),
+      col("blob", "TEXT NOT NULL"),
+    ],
+    tableConstraints: ["PRIMARY KEY (gid, member, epoch)"],
+  },
+  {
+    // Group traffic in the home's running order: sealed messages (kind
+    // 1490, throwaway signer, `sender` = the authenticated member) and the
+    // roster's signed changes (kind 1491, `version` set). `seq` comes from
+    // the same counter as gift wraps (mail_usage `*`), so it is the home's
+    // one running number. `bytes` is what the sender was charged.
+    name: "home_group_events",
+    columns: [
+      col("seq", "INTEGER PRIMARY KEY"),
+      col("gid", "TEXT NOT NULL"),
+      col("id", "TEXT NOT NULL"),
+      col("kind", "INTEGER NOT NULL"),
+      col("sender", "TEXT NOT NULL"),
+      col("version", "INTEGER"),
+      col("stored_at", "INTEGER NOT NULL"),
+      col("bytes", "INTEGER NOT NULL"),
+      col("event", "TEXT NOT NULL"),
+    ],
+  },
+  {
+    // People who left or were removed, so their app can say "Ben removed
+    // you" (mygroups). Pruned after 30 days.
+    name: "home_group_former",
+    columns: [
+      col("gid", "TEXT NOT NULL"),
+      col("pubkey", "TEXT NOT NULL"),
+      col("by_key", "TEXT NOT NULL"),
+      col("op", "TEXT NOT NULL"),
+      col("version", "INTEGER NOT NULL"),
+      col("at", "INTEGER NOT NULL"),
+    ],
+    tableConstraints: ["PRIMARY KEY (gid, pubkey)"],
+  },
   {
     // Call presence (push.ts CALL_PRESENCE_KIND): one row per pubkey, holding
     // the second its beat was last WRITTEN, not last seen. hearth beats every
@@ -1221,6 +1303,23 @@ export const INDEXES: readonly IndexSpec[] = [
   {
     name: "idx_push_subscriptions_pubkey",
     table: "push_subscriptions",
+    keyColumns: ["pubkey"],
+  },
+  // Home groups (src/home-groups.ts): a group's traffic in order
+  // (groupsince, lastSeq), a member's groups (mygroups), a duplicate id.
+  {
+    name: "idx_home_group_events_gid",
+    table: "home_group_events",
+    keyColumns: ["gid", "seq"],
+  },
+  {
+    name: "idx_home_group_events_id",
+    table: "home_group_events",
+    keyColumns: ["id"],
+  },
+  {
+    name: "idx_home_group_members_pubkey",
+    table: "home_group_members",
     keyColumns: ["pubkey"],
   },
   {

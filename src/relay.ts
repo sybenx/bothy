@@ -89,6 +89,18 @@ import {
 } from "./nip29";
 import { handleManagementCall, type ManagementResponse } from "./nip86";
 import {
+  GROUP_KINDS,
+  GROUP_MESSAGE_KIND,
+  NOT_IN_GROUP_MESSAGE,
+  groupEpoch,
+  groupEventExists,
+  isInAnyGroup,
+  memberOf,
+  rosterPubkeys,
+  storeGroupMessage,
+  type GroupOutboxEntry,
+} from "./home-groups";
+import {
   importVaultKey,
   isVaultHash,
   issueChallenge,
@@ -701,7 +713,8 @@ export class Relay extends DurableObject<Env> {
           this.notePush(sql, event, pTagValues(event.tags));
           this.broadcast(event);
         }
-        const { outbox: _delivered, ...rest } = reply;
+        for (const entry of reply.groupOutbox ?? []) this.deliverGroupEvent(sql, entry);
+        const { outbox: _delivered, groupOutbox: _groupDelivered, ...rest } = reply;
         return rest;
       });
       await this.settlePushAlarm();
@@ -807,6 +820,12 @@ export class Relay extends DurableObject<Env> {
   // key (nip86.ts setstorage)? One row.
   async isStorageService(pubkey: string): Promise<boolean> {
     return this.metered(() => withReadPath("management", () => storagePubkey(this.sql) === pubkey));
+  }
+
+  // For the Worker's push gate (src/index.ts GUEST_PUSH_METHODS): is this
+  // signer on any home group's roster here? One indexed read.
+  async isGroupGuest(pubkey: string): Promise<boolean> {
+    return this.metered(() => withReadPath("management", () => isInAnyGroup(this.sql, pubkey)));
   }
 
   async getRole(pubkey: string): Promise<Role> {
@@ -1387,6 +1406,13 @@ export class Relay extends DurableObject<Env> {
       this.handleSignal(ws, event);
       return;
     }
+    // Home group messages (src/home-groups.ts): signed by a throwaway key,
+    // so the sender's AUTH and the group's roster are the authority.
+    // Changes (kind 1491) arrive only through groupchange.
+    if (GROUP_KINDS.includes(event.kind)) {
+      this.handleGroupMessage(ws, event);
+      return;
+    }
 
     // Authorization before id/signature validity: schnorr is the most
     // expensive per-event step (validate.ts verifySignature), and a refused
@@ -1568,6 +1594,107 @@ export class Relay extends DurableObject<Env> {
 
   // Per authenticated sender (limits.ts MAX_SIGNALS_PER_SENDER_PER_WINDOW).
   private signalRateLimits = new Map<string, { windowStart: number; count: number }>();
+
+  // A home group message (home-groups.ts, kind 1490): one sealed event for
+  // the whole group, from a connection AUTHed as someone on the group's
+  // roster. Stored with the home's next number, delivered live to the
+  // roster's own subscriptions, and a content-free wake queued for every
+  // other member, guests included.
+  private handleGroupMessage(ws: WebSocket, event: NostrEvent): void {
+    const sql = this.sql;
+    const sender = getState(ws).authedPubkey;
+    if (event.kind !== GROUP_MESSAGE_KIND) {
+      ok(ws, event.id, false, "invalid: group changes are made with groupchange, not published");
+      return;
+    }
+    if (sender === undefined) {
+      ok(ws, event.id, false, "auth-required: group messages are for the group's members; authenticate first");
+      return;
+    }
+    const gids = event.tags.filter((t) => t[0] === "h").map((t) => t[1]);
+    const gid = gids.length === 1 ? gids[0] : undefined;
+    const epochTag = event.tags.find((t) => t[0] === "epoch")?.[1];
+    if (gid === undefined || epochTag === undefined || !/^[1-9][0-9]{0,8}$/.test(epochTag)) {
+      ok(ws, event.id, false, "invalid: a group message carries one h tag and an epoch tag");
+      return;
+    }
+    const current = withReadPath("write", () => (memberOf(sql, gid, sender) === null ? null : groupEpoch(sql, gid)));
+    if (current === null) {
+      ok(ws, event.id, false, `restricted: ${NOT_IN_GROUP_MESSAGE}`);
+      return;
+    }
+    if (Number(epochTag) > current) {
+      ok(ws, event.id, false, "invalid: that key is newer than the group's; fetch the group again");
+      return;
+    }
+    const byteCap = maxEventBytes(this.env);
+    const bytes = JSON.stringify(event).length;
+    if (byteCap !== null && bytes > byteCap) {
+      ok(ws, event.id, false, `invalid: event exceeds the maximum size of ${byteCap} bytes`);
+      return;
+    }
+    if (isCreatedAtTooFarInFuture(event, nowSeconds())) {
+      ok(ws, event.id, false, "invalid: created_at is too far in the future");
+      return;
+    }
+    if (this.windowLimited(this.groupMessageRateLimits, sender, SIGNAL_RATE_LIMIT_WINDOW_MS, MAX_SIGNALS_PER_SENDER_PER_WINDOW)) {
+      ok(ws, event.id, false, "rate-limited: too many group messages, slow down");
+      return;
+    }
+    if (!idMatchesContent(event)) {
+      ok(ws, event.id, false, "invalid: id does not match the hash of its contents");
+      return;
+    }
+    if (!verifySignature(event)) {
+      ok(ws, event.id, false, "invalid: signature verification failed");
+      return;
+    }
+    if (groupEventExists(sql, event.id)) {
+      ok(ws, event.id, true, "duplicate: already have this event");
+      return;
+    }
+    // The sender's mail share and the home's total (storage.ts mailRoom).
+    const room = mailRoom(sql, [sender], bytes, mailStorageBytes(this.env), mailBytesPerMember(this.env));
+    if (room !== "ok") {
+      ok(ws, event.id, false, room === "home-full" ? HOME_MAILBOX_FULL_MESSAGE : "blocked: your share of this home's mailbox is full");
+      return;
+    }
+    const now = nowSeconds();
+    storeGroupMessage(sql, gid, event, sender, now);
+    countMailDay(sql, utcDay(now));
+    ok(ws, event.id, true, "");
+    this.deliverGroupEvent(sql, { gid, event, wake: rosterPubkeys(sql, gid).filter((p) => p !== sender) });
+  }
+
+  private groupMessageRateLimits = new Map<string, { windowStart: number; count: number }>();
+
+  // Live to the roster's own subscriptions that asked for this kind, and a
+  // wake queued for `wake` (the inbox push queue: one content-free push per
+  // person per burst, skipped while they have a socket open).
+  private deliverGroupEvent(sql: SqlStorage, entry: GroupOutboxEntry): void {
+    const roster = new Set(rosterPubkeys(sql, entry.gid));
+    for (const other of this.ctx.getWebSockets()) {
+      if (this.ctx.getTags(other).includes(LIVE_FEED_TAG)) continue;
+      const state = getState(other);
+      const authed = state.authedPubkey;
+      if (authed === undefined || !roster.has(authed)) continue;
+      for (const [subId, filters] of Object.entries(state.subs)) {
+        const asked = filters.filter((f) => f.kinds?.includes(entry.event.kind));
+        if (asked.length > 0 && matchesAnyFilter(entry.event, asked)) send(other, ["EVENT", subId, entry.event]);
+      }
+    }
+    const web = pushConfigured(this.env);
+    const android = fcmConfigured(this.env);
+    if (!web && !android) return;
+    withReadPath("push", () => {
+      const now = nowSeconds();
+      for (const pubkey of entry.wake) {
+        if (!hasPushSubscription(sql, pubkey, web, android)) continue;
+        queueInboxPush(sql, pubkey, now);
+        this.pushAlarmWanted = true;
+      }
+    });
+  }
 
   // NIP-29 kind-9021 join request. The decision is nip29.ts
   // handleJoinRequest; this is the wire-level work before any invite code
@@ -2505,6 +2632,37 @@ export class Relay extends DurableObject<Env> {
         return;
       }
       filters.push(bound.filter);
+    }
+
+    // Home groups (home-groups.ts): a REQ asking only for group kinds is
+    // LIVE ONLY, answered EOSE at once; stored traffic comes from
+    // groupsince, which carries the home's numbers. Every group it names
+    // must be one the reader is on the roster of; deliverGroupEvent checks
+    // the roster again for each event.
+    if (filters.every((f) => f.kinds !== undefined && f.kinds.length > 0 && f.kinds.every((k) => GROUP_KINDS.includes(k)))) {
+      if (state.authedPubkey === undefined) {
+        if (!state.challenge) {
+          state.challenge = crypto.randomUUID();
+          setState(ws, state);
+        }
+        send(ws, ["AUTH", state.challenge]);
+        this.refuse(ws, subId, "auth-required: authentication required to read group events");
+        return;
+      }
+      const reader = state.authedPubkey;
+      const named = filters.flatMap((f) => (Array.isArray(f["#h"]) ? (f["#h"] as string[]) : []));
+      if (named.some((gid) => memberOf(this.sql, gid, reader) === null)) {
+        this.refuse(ws, subId, "restricted: not allowed to read group events");
+        return;
+      }
+      const live: ConnState = { ...state, subs: { ...state.subs, [subId]: filters }, reqs: (state.reqs ?? 0) + 1 };
+      if (!stateFits(live)) {
+        this.refuse(ws, subId, "invalid: filters are too large to hold open");
+        return;
+      }
+      setState(ws, live);
+      send(ws, ["EOSE", subId]);
+      return;
     }
 
     // The read gates for gift wraps and groups share one rule:

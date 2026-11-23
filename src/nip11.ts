@@ -1,6 +1,7 @@
 // NIP-11 relay information document. List only what is actually
 // implemented and enforced, never ahead of it.
 
+import { GROUP_DECISIONS } from "./home-groups";
 import {
   groupsEnabled,
   MAX_CREATED_AT_FUTURE_SECONDS,
@@ -207,6 +208,9 @@ export function buildRelayInfo(
     // Sealed signals (relay.ts handleSignal, kind 21059), bothy's own
     // field: typing, seen and call setup, delivered live, never stored.
     info.signals = { v: 1 };
+    // Home groups (src/home-groups.ts), bothy's own field. `keeper` is the
+    // box's key once a box keeps every group's keys; null until then.
+    info.groups = { v: 1, keeper: GROUP_DECISIONS.keeper };
   }
   const contact = resolveContact(profile);
   if (contact) {
