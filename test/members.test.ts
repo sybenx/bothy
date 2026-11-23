@@ -298,6 +298,8 @@ describe("invite codes", () => {
       "groupkeys",
       "groupleave",
       "groupsince",
+      "groupjoin",
+      "groupseal",
     ]);
     const stranger = randomKeypair();
     for (const method of ["listallowedpubkeys", "listunusedinvites", "unallowpubkey"]) {
