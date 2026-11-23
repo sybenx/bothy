@@ -146,7 +146,36 @@ export interface FilterQueryOptions {
   // overshoot like excludeGiftWraps, bounded by the tag subquery's LIMIT
   // or by the group's chat volume.
   chatHorizon?: number;
+
+  // Private profiles (README "Private profiles"): which members' kind 0
+  // this reader may NOT see. Omitted for the owner and admins, who read
+  // every profile here, the removed-in-grace ones included.
+  //
+  //   "all"     current members AND people removed and still in grace:
+  //             a stranger, an unauthenticated socket, a removed person.
+  //   "former"  only the removed-in-grace ones: a plain member.
+  //
+  // `owner` and `self` are never hidden: the owner's profile is his
+  // public identity, and reading your own profile tells you nothing.
+  // `requireAuthors` (MEMBER_LIST=hidden, plain member) widens "former" to
+  // "all" on a filter that names no `authors`, so a member cannot list the
+  // home by asking for every kind 0.
+  //
+  // OMISSION in SQL, like excludeGiftWraps, so the answer is the same
+  // whether or not a member's profile is stored. Applied only when the
+  // filter can match kind 0. The subqueries read `allowed_pubkeys` and
+  // `former_members`, which is why read-metrics.ts clears the REQ cache
+  // on writes to them.
+  hideMemberProfiles?: {
+    hide: "all" | "former";
+    owner: string;
+    self: string;
+    requireAuthors: boolean;
+  };
 }
+
+// Kind 0, the profile (NIP-01).
+export const PROFILE_KIND = 0;
 
 export function buildFilterQuery(
   filter: Filter,
@@ -205,6 +234,17 @@ export function buildFilterQuery(
   if (options.excludeInvites) {
     conditions.push("kind != ?");
     params.push(CREATE_INVITE_KIND);
+  }
+  // See FilterQueryOptions.hideMemberProfiles.
+  const gate = options.hideMemberProfiles;
+  if (gate !== undefined && (filter.kinds === undefined || filter.kinds.includes(PROFILE_KIND))) {
+    const hide = gate.requireAuthors && filter.authors === undefined ? "all" : gate.hide;
+    const hidden =
+      hide === "all"
+        ? "(pubkey IN (SELECT pubkey FROM allowed_pubkeys) OR pubkey IN (SELECT pubkey FROM former_members))"
+        : "pubkey IN (SELECT pubkey FROM former_members)";
+    conditions.push(`NOT (kind = ? AND pubkey NOT IN (?, ?) AND ${hidden})`);
+    params.push(PROFILE_KIND, gate.owner, gate.self);
   }
   // The residual horizon, only where it could not fold into `since` (see
   // FilterQueryOptions.chatHorizon).

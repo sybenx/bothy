@@ -213,6 +213,12 @@ export function buildRelayInfo(
     // (limits.ts CALL_ICE_SERVERS). Copied, so no caller can change the
     // constant through the document.
     info.calls = { v: 1, ice: CALL_ICE_SERVERS.map((server) => ({ urls: [...server.urls] })) };
+    // Private profiles (src/profiles.ts), bothy's own field: members'
+    // kind 0 is served only to this home's authenticated owner, admins and
+    // members, and members may store a sealed photo (octet-stream). An app
+    // publishes its profile here, and only here, when it sees this; an
+    // older bothy would serve it to anyone.
+    info.profiles = "members";
   }
   const contact = resolveContact(profile);
   if (contact) {

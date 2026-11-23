@@ -1527,6 +1527,9 @@ export interface ReadOptions {
   // See FilterQueryOptions.groupIds. `undefined` is the owner, who reads
   // every group; an empty array is a reader who may read none.
   groupIds?: readonly string[];
+  // See FilterQueryOptions.hideMemberProfiles. Omitted for the owner and
+  // admins.
+  hideMemberProfiles?: FilterQueryOptions["hideMemberProfiles"];
 }
 
 export function queryFilter(
@@ -1546,6 +1549,9 @@ export function queryFilter(
     // Dropping `groupIds` lets a member of one group read every group
     // (test/nip29-groups.test.ts).
     ...(options.groupIds === undefined ? {} : { groupIds: options.groupIds }),
+    // Dropping this one hands members' profiles to strangers
+    // (test/private-profiles.test.ts).
+    ...(options.hideMemberProfiles === undefined ? {} : { hideMemberProfiles: options.hideMemberProfiles }),
     scope,
     // Split the tag scan budget across partitions, so an authorised read
     // costs what limits.ts priced, not twice it.
@@ -2488,6 +2494,8 @@ export function eraseMember(
   }
   sql.exec(`DELETE FROM photos WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM photo_uploads WHERE pubkey = ?`, pubkey);
+  // Their profile, which only the home could read (deleteProfilesOf).
+  deleteProfilesOf(sql, pubkey);
   sql.exec(`DELETE FROM join_requests WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM group_membership WHERE pubkey = ?`, pubkey);
   // Their restore vault rows (src/vault.ts).
@@ -2558,6 +2566,30 @@ export function isPubkeyAllowed(sql: SqlStorage, pubkey: string): boolean {
 // per recipient, bounded by limits.ts MAX_WRAP_RECIPIENTS_CHECKED.
 export function isMember(sql: SqlStorage, pubkey: string): boolean {
   return isPubkeyAllowed(sql, pubkey);
+}
+
+// Removed and still in the 14-day grace (or erased and not yet swept).
+// One PK seek.
+export function isFormerMember(sql: SqlStorage, pubkey: string): boolean {
+  return sql.exec(`SELECT 1 FROM former_members WHERE pubkey = ?`, pubkey).toArray().length > 0;
+}
+
+// Deletes every profile (kind 0) this pubkey has stored here, in either
+// partition. Private profiles (README "Private profiles"): a member's
+// kind 0 is readable only inside the home, so when they leave for good
+// (eraseme, or the end of the removal grace) it goes, rather than turning
+// public the moment the gate stops covering them. A replaceable kind, so
+// normally one row.
+export function deleteProfilesOf(sql: SqlStorage, pubkey: string): number {
+  // Per partition, so each half is an index seek on its own partial
+  // index (schema.ts idx_events_pubkey_kind_created_*).
+  const ids = acrossScopes((scope) =>
+    sql
+      .exec<{ id: string }>(`SELECT id FROM events WHERE pubkey = ? AND kind = 0 AND is_group = ?`, pubkey, scope)
+      .toArray(),
+  );
+  for (const { id } of ids) deleteEventRow(sql, id);
+  return ids.length;
 }
 
 // For NIP-11 and /api/stats. Reads M rows; M is the size of a friend group.
@@ -3481,6 +3513,9 @@ export function sweepFormerMembers(
       // Their profile photo goes with their mail (src/photos.ts).
       sql.exec(`DELETE FROM photos WHERE pubkey = ?`, pubkey);
       sql.exec(`DELETE FROM photo_uploads WHERE pubkey = ?`, pubkey);
+      // And their profile, before the gate stops covering it
+      // (deleteProfilesOf).
+      deleteProfilesOf(sql, pubkey);
       // So do their restore vault rows, read-only until now (src/vault.ts).
       deleteVaultRowsOf(sql, pubkey);
       finished++;
