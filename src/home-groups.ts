@@ -32,21 +32,24 @@ export const GROUP_KINDS: readonly number[] = [GROUP_MESSAGE_KIND, GROUP_CHANGE_
 // Aaron answers.
 // ---------------------------------------------------------------------
 export const GROUP_DECISIONS = {
-  // 3: people from outside this home may be added, as guests who can use
-  // only that group here.
+  // 3 (answered 2026-11-23: yes): people from outside this home may be
+  // added, as guests who can use only that group here.
   guests: true,
-  // 4: someone cut off from the home (unallowpubkey, banpubkey, eraseme)
-  // leaves every group on it, and cannot be added back while cut off.
+  // 4 (open): someone cut off from the home (unallowpubkey, banpubkey,
+  // eraseme) leaves every group on it, and cannot be added back while cut off.
   cutOffLeavesGroups: true,
-  // 7: the most people in one group, the keeper not counted.
+  // 7 (answered 2026-11-23: 100): the most people in one group, the keeper
+  // not counted.
   maxMembers: 100,
-  // 2 and 9: the box as a silent keeper holding every key. Not built (item
-  // 3); null means no group on this home has a keeper, so every group is
-  // basic: new members start from when they join, whatever the switch says.
+  // 2 (answered 2026-11-23: the box ALWAYS holds every group's key, no
+  // opt-out) and 9. The keeper is not built yet (item 3): null means every
+  // group is basic for now. When it is set, every group on the home gets
+  // it in its envelopes (keeperPlus); no group can keep it out.
   keeper: null as string | null,
 } as const;
 
-// 6 and 1 are group settings the creator's app proposes; bothy enforces
+// 6 (open) and 1 (answered 2026-11-23: on, all of the past) are group
+// settings the creator's app proposes; bothy enforces
 // whatever the roster says. These are what a group gets when its create
 // change says nothing.
 export const DEFAULT_GROUP_SETTINGS: GroupSettings = { onlyAdminsAdd: false, history: true };
@@ -115,7 +118,7 @@ function groupRow(sql: SqlStorage, gid: string): GroupRow | null {
 function membersOf(sql: SqlStorage, gid: string): MemberRow[] {
   return sql
     .exec<MemberRow>(
-      `SELECT pubkey, role, from_seq, joined_at FROM home_group_members WHERE gid = ? ORDER BY joined_at, pubkey`,
+      `SELECT pubkey, role, from_seq, joined_at FROM home_group_members WHERE gid = ? ORDER BY from_seq, pubkey`,
       gid,
     )
     .toArray();
@@ -414,7 +417,8 @@ function recordFormer(sql: SqlStorage, gid: string, pubkey: string, by: string, 
   );
 }
 
-// After people leave: if no admin is left, the longest-standing member
+// After people leave: if no admin is left, the longest-standing member (added
+// earliest, then by key: from_seq, pubkey)
 // becomes one (bothy-signed); if nobody is left, the group goes.
 function settleAfterLeaving(sql: SqlStorage, gid: string, nowSec: number, outbox: GroupOutboxEntry[]): void {
   const members = membersOf(sql, gid);
