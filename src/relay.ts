@@ -40,6 +40,8 @@ import {
   MEMBER_REMOVAL_GRACE_SECONDS,
   FORMER_MEMBER_SWEEP_PUBKEYS,
   FORMER_MEMBER_SWEEP_BATCH_SIZE,
+  RETENTION_PAUSE_AT_ROWS_WRITTEN,
+  RETENTION_SWEEP_BATCH_SIZE,
   MAX_PUSH_ENDPOINTS_PER_NOTIFICATION,
   PRESENCE_MAX_TRACKED,
   PRESENCE_STALE_SECONDS,
@@ -226,6 +228,8 @@ import {
   type FcmTokenRow,
   queueInboxPush,
   sweepFormerMembers,
+  mailRetentionOn,
+  sweepRetention,
   sweepExpiredJoinRequests,
   storagePubkey,
   countMailDay,
@@ -1174,6 +1178,9 @@ export class Relay extends DurableObject<Env> {
         // Removed members' mail, once their grace period is over
         // (storage.ts sweepFormerMembers). Free while nobody is waiting.
         withReadPath("giftWrapSweep", () => this.sweepFormerMemberMail(sql, now));
+        // Mailbox retention (storage.ts sweepRetention): nothing unless the
+        // owner turned it on and a file server is set, checked every tick.
+        withReadPath("giftWrapSweep", () => this.sweepRetainedMail(sql, now));
         // Join requests past their 30 days, answered or not.
         sweepExpiredJoinRequests(sql, now);
         // Restore vault challenges spent and since expired (src/vault.ts).
@@ -1998,6 +2005,23 @@ export class Relay extends DurableObject<Env> {
     console.log(
       `member sweep: removed ${result.removed} gift wrap(s) held for removed members; ` +
         `${result.finished} removed member(s) now have nothing left here`,
+    );
+  }
+
+  // One cron tick of mailbox retention (storage.ts sweepRetention). Free
+  // while retention is off: one settings row. While on, it first reads the
+  // day's rows written and skips the tick once half the day's allowance is
+  // spent, so retention never takes the room new mail needs; then at most
+  // limits.ts RETENTION_SWEEP_BATCH_SIZE wraps. Logs counts only.
+  private sweepRetainedMail(sql: SqlStorage, nowSec: number): void {
+    if (!mailRetentionOn(sql)) return;
+    const written = readIngestCounts(sql, nowSec, utcDayStartSeconds(nowSec * 1000)).rowsWrittenToday;
+    if (written >= RETENTION_PAUSE_AT_ROWS_WRITTEN) return;
+    const result = sweepRetention(sql, nowSec, getOwnerPubkey(sql, this.env), RETENTION_SWEEP_BATCH_SIZE);
+    if (result.removed === 0) return;
+    console.log(
+      `mailbox retention: removed ${result.removed} old, backed-up gift wrap(s)` +
+        `${result.done ? "" : ", more to come next tick"}`,
     );
   }
 

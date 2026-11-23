@@ -178,6 +178,11 @@
       </div>
       <button type="button" id="fileserver-disconnect" hidden>Disconnect</button>
       <p id="fileserver-error" class="live-status"></p>
+      <!-- Mailbox retention (NIP-86 getretention/setretention), here
+           because it needs the file server above. -->
+      <p id="retention-status"></p>
+      <button type="button" id="retention-toggle" hidden></button>
+      <p id="retention-error" class="live-status"></p>
     </div>
   </div>
 
@@ -583,8 +588,55 @@ function offerFileServer(stats) {
       ? "Connected to " + s.url + " with the key " + hexToNpub(s.pubkey) + " (" + shortHex(s.pubkey) + ")."
       : "No file server is connected.";
     disconnect.hidden = !s;
+    await refreshRetention();
     return true;
   }
+
+  // Old messages: whether members' mail older than the retention period
+  // is deleted once their backup holds it. Turning it on needs a file
+  // server; the relay refuses otherwise, and the button is not offered.
+  const retentionStatus = document.getElementById("retention-status");
+  const retentionToggle = document.getElementById("retention-toggle");
+  const retentionError = document.getElementById("retention-error");
+  let retentionOn = false;
+
+  async function refreshRetention() {
+    const { status, reply } = await signedCall("getretention", []);
+    if (status !== 200 || reply.error) {
+      retentionError.textContent = failure(status, reply);
+      return;
+    }
+    const r = reply.result;
+    retentionOn = r.on;
+    const members = typeof stats.memberCount === "number" ? stats.memberCount : null;
+    const backedUp = members === null
+      ? r.backedUp + (r.backedUp === 1 ? " member has" : " members have") + " a backup so far."
+      : r.backedUp + " of " + members + " members " + (r.backedUp === 1 ? "has" : "have") + " a backup so far.";
+    const rule = "each member's messages are deleted here after " + r.days +
+      " days, once their app has backed them up to the file server. Your own are always kept.";
+    if (r.on && r.storage) {
+      retentionStatus.textContent = "Old messages: " + rule + " " + backedUp;
+    } else if (r.on) {
+      retentionStatus.textContent = "Old messages: deleting is on, but nothing is deleted while no file server is connected.";
+    } else if (r.storage) {
+      retentionStatus.textContent = "Old messages are kept here until a mailbox is full. You can have " + rule + " " + backedUp;
+    } else {
+      retentionStatus.textContent = "Old messages are kept here until a mailbox is full. Connect a file server to have them deleted once members have backed them up.";
+    }
+    retentionToggle.textContent = r.on ? "Keep all messages" : "Delete old messages once backed up";
+    retentionToggle.hidden = !r.on && !r.storage;
+  }
+
+  retentionToggle.addEventListener("click", async () => {
+    retentionError.textContent = "";
+    try {
+      const { status, reply } = await signedCall("setretention", [!retentionOn]);
+      if (status !== 200 || reply.error) { retentionError.textContent = failure(status, reply); return; }
+      await refreshRetention();
+    } catch {
+      retentionError.textContent = "Your signer did not sign the request.";
+    }
+  });
 
   openBtn.addEventListener("click", async () => {
     errorEl.textContent = "";

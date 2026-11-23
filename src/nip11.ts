@@ -207,6 +207,10 @@ export function buildRelayInfo(
     // Sealed signals (relay.ts handleSignal, kind 21059), bothy's own
     // field: typing, seen and call setup, delivered live, never stored.
     info.signals = { v: 1 };
+    // History backup (nip86.ts backedup), bothy's own field: this home
+    // takes a member's "my backup holds my mail up to here", which mailbox
+    // retention waits for before deleting anything of theirs.
+    info.backup = { v: 1 };
   }
   const contact = resolveContact(profile);
   if (contact) {
