@@ -1744,8 +1744,10 @@ export class Relay extends DurableObject<Env> {
   // wake queued for `wake` (the inbox push queue: one content-free push per
   // person per burst, skipped while they have a socket open).
   private deliverGroupEvent(sql: SqlStorage, entry: GroupOutboxEntry): void {
-    // The roster, and the box that keeps the group (home-groups.ts keeperOf).
-    const roster = new Set(rosterPubkeys(sql, entry.gid));
+    // The roster, and the box that keeps the group (home-groups.ts keeperOf). Also everyone the
+    // event affects (`wake`): someone just removed gets the change that removed them live, as
+    // a member, instead of learning it only at their next catch-up.
+    const roster = new Set([...rosterPubkeys(sql, entry.gid), ...entry.wake]);
     const keeper = keeperOf(sql);
     if (keeper !== null) roster.add(keeper);
     for (const other of this.ctx.getWebSockets()) {

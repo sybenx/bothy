@@ -279,6 +279,24 @@ describe("home groups", () => {
     expect((await callManagement("groupkeys", [gid, 0], as(carol))).error).toBe("groupkeys: you are not in this group");
   });
 
+  it("send the change that removes someone to their own open socket", async () => {
+    const ana = await newMember();
+    const ben = await newMember();
+    const carol = await newMember();
+    const gid = await create(ana, [ben, carol]);
+    const carolConn = await connectAs(carol);
+    carolConn.send(["REQ", "g", { kinds: [GROUP_MESSAGE_KIND, GROUP_CHANGE_KIND], "#h": [gid] }]);
+    expect(await carolConn.nextMessage()).toEqual(["EOSE", "g"]);
+    const remove = change(ana, gid, 1, "remove", [carol.pubkeyHex]);
+    expect((await callManagement("groupchange", [gid, 1, remove, envelopes(2, [ana, ben])], as(ana))).result).toMatchObject({ version: 2 });
+    expect(await carolConn.nextMessage()).toEqual(["EVENT", "g", remove]);
+    // Out now: the next message does not reach her.
+    const anaConn = await connectAs(ana);
+    expect((await publish(anaConn, message(gid, 2, "after")))[2]).toBe(true);
+    await expect(carolConn.nextMessage(300)).rejects.toThrow(/no message/);
+    for (const c of [carolConn, anaConn]) c.close();
+  });
+
   it("enforce who may do what, and the settings", async () => {
     const ana = await newMember();
     const ben = await newMember();
