@@ -5,7 +5,7 @@ import type { Profile } from "./profile-lookup";
 import { acrossScopes } from "./groups";
 import { normalizeHost } from "./host";
 import { CLAIM_NONCE_TTL_SECONDS, MAX_OUTSTANDING_CLAIM_NONCES } from "./limits";
-import { RELAY_LIST_KIND } from "./nostr";
+import { DRAFT_KIND, RELAY_LIST_KIND } from "./nostr";
 import { normalizePubkey } from "./pubkey";
 import { getStoredWritePolicy, isPubkeyAllowed, isPubkeyBanned, setFollowCount } from "./storage";
 import {
@@ -224,6 +224,7 @@ export type WriteAuthorization =
 export interface WriterContext {
   policy?: WritePolicy;
   tags?: string[][];
+  kind?: number;
 }
 
 // The write policy (write-policy.ts), enforced. Gift wraps (the `inbox`
@@ -270,7 +271,10 @@ export function isAllowedWriter(
     if (row.length > 0) return { allowed: true, isOwner: false };
   }
   if (isPubkeyAllowed(sql, pubkey)) return { allowed: true, isOwner: false };
-  if (admitsAtLeast(policy, "mentions") && context.tags !== undefined) {
+  // A NIP-37 draft is private to its author, so p-tagging the owner says
+  // nothing about the owner wanting it kept: `mentions` does not admit one.
+  // Drafts are stored for the owner and for people already admitted above.
+  if (admitsAtLeast(policy, "mentions") && context.tags !== undefined && context.kind !== DRAFT_KIND) {
     const event = { tags: context.tags };
     if (mentionsPubkey(event, owner)) {
       return exceedsMentionTagCap(event)

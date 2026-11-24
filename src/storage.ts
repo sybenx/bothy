@@ -1532,6 +1532,8 @@ export interface ReadOptions {
   // See FilterQueryOptions.hideMemberProfiles. Omitted for the owner and
   // admins.
   hideMemberProfiles?: FilterQueryOptions["hideMemberProfiles"];
+  // See FilterQueryOptions.draftReader. Omitted hides every draft.
+  draftReader?: string;
 }
 
 export function queryFilter(
@@ -1554,6 +1556,9 @@ export function queryFilter(
     // Dropping this one hands members' profiles to strangers
     // (test/private-profiles.test.ts).
     ...(options.hideMemberProfiles === undefined ? {} : { hideMemberProfiles: options.hideMemberProfiles }),
+    // Dropping this one fails closed (no drafts for anyone, their author
+    // included; test/nip37-drafts.test.ts).
+    ...(options.draftReader === undefined ? {} : { draftReader: options.draftReader }),
     scope,
     // Split the tag scan budget across partitions, so an authorised read
     // costs what limits.ts priced, not twice it.

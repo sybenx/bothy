@@ -1,4 +1,4 @@
-import { GIFT_WRAP_KIND, type Filter, type NostrEvent, tagFilterEntries } from "./nostr";
+import { DRAFT_KIND, GIFT_WRAP_KIND, type Filter, type NostrEvent, tagFilterEntries } from "./nostr";
 import {
   GROUP_SCOPE, CREATE_INVITE_KIND, GROUP_CHAT_KIND, type GroupScope, PUBLIC_SCOPE } from "./groups";
 
@@ -166,6 +166,19 @@ export interface FilterQueryOptions {
   // filter can match kind 0. The subqueries read `allowed_pubkeys` and
   // `former_members`, which is why read-metrics.ts clears the REQ cache
   // on writes to them.
+  // NIP-37 drafts (nostr.ts DRAFT_KIND): the authenticated pubkey whose
+  // own drafts this reader may see. Every other kind-31234 row is omitted.
+  //
+  // ON BY DEFAULT: leaving it out hides every draft, so a read path that
+  // forgets to pass it fails closed. relay.ts passes the socket's
+  // authenticated pubkey; the owner gets no exception.
+  //
+  // OMISSION, like excludeInvites and whatever `kinds` says, for the same
+  // reason: a refusal that depended on what is stored would leak it.
+  // Applied only when the filter can match kind 31234, so other reads pay
+  // nothing.
+  draftReader?: string;
+
   hideMemberProfiles?: {
     hide: "all" | "former";
     owner: string;
@@ -234,6 +247,11 @@ export function buildFilterQuery(
   if (options.excludeInvites) {
     conditions.push("kind != ?");
     params.push(CREATE_INVITE_KIND);
+  }
+  // See FilterQueryOptions.draftReader (on unless the filter cannot match).
+  if (filter.kinds === undefined || filter.kinds.includes(DRAFT_KIND)) {
+    conditions.push("NOT (kind = ? AND pubkey != ?)");
+    params.push(DRAFT_KIND, options.draftReader ?? "");
   }
   // See FilterQueryOptions.hideMemberProfiles.
   const gate = options.hideMemberProfiles;
@@ -336,6 +354,9 @@ export function filterParamCount(filter: Filter): number {
   if (filter.ids !== undefined && filter.ids.length > 0) count += filter.ids.length;
   if (filter.authors !== undefined && filter.authors.length > 0) count += 1;
   if (filter.kinds !== undefined && filter.kinds.length > 0) count += 1;
+  // The draft gate, on by default whenever the filter can match kind 31234
+  // (FilterQueryOptions.draftReader).
+  if (filter.kinds === undefined || filter.kinds.includes(DRAFT_KIND)) count += 2;
   if (filter.since !== undefined) count += 1;
   if (filter.until !== undefined) count += 1;
   for (const [, values] of tagFilterEntries(filter)) {

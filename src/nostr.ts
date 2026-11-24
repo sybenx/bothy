@@ -65,6 +65,14 @@ export function writeRelaysFrom(tags: string[][]): string[] {
 // authorization for this kind use the `p` tag, not `pubkey`.
 export const GIFT_WRAP_KIND = 1059;
 
+// NIP-37 (nips/37.md) draft wrap: an author's private draft, encrypted to
+// themselves. Served only to its author, authenticated (NIP-42), on every
+// read path (filters.ts FilterQueryOptions.draftReader, relay.ts broadcast
+// and liveBroadcast). Not the owner's to read either: a member's drafts are
+// theirs. Even the ciphertext stays home, since its existence, `d` tag and
+// timestamps say what someone is writing and when.
+export const DRAFT_KIND = 31234;
+
 // bothy's sealed signal: a gift wrap of the same shape (a `p` tag to the
 // recipient) in the ephemeral range, for typing, seen receipts and call
 // setup. Never stored; delivered live to the recipient only (relay.ts

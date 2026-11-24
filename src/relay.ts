@@ -138,6 +138,7 @@ import { getOwnHost, recordHost } from "./host";
 import { version } from "../package.json";
 import {
   type Filter,
+  DRAFT_KIND,
   GIFT_WRAP_KIND,
   isEphemeralKind,
   isRing,
@@ -1506,6 +1507,7 @@ export class Relay extends DurableObject<Env> {
     const auth = isAllowedWriter(sql, this.env, event.pubkey, {
       policy: this.writePolicy().policy,
       tags: event.tags,
+      kind: event.kind,
     });
     if (!auth.allowed) {
       ok(ws, event.id, false, writeRejectionMessage(auth.reason));
@@ -3014,6 +3016,8 @@ export class Relay extends DurableObject<Env> {
 
     const events = queryFilters(this.sql, filters, now, {
       ...(profileGate === undefined ? {} : { hideMemberProfiles: profileGate }),
+      // NIP-37 drafts: only this socket's own (nostr.ts DRAFT_KIND).
+      ...(authedPubkey === undefined ? {} : { draftReader: authedPubkey }),
       excludeGiftWraps: !mayReadGiftWraps,
       // Somebody joining a conversation sees its last few minutes, not the
       // whole of it (limits.ts CHAT_BACKLOG_SECONDS). Applied to the owner
@@ -3148,12 +3152,16 @@ export class Relay extends DurableObject<Env> {
       }
       return member;
     };
+    // NIP-37 draft: to its author's own authenticated sockets and nobody
+    // else, the owner included (filters.ts FilterQueryOptions.draftReader).
+    const draftAuthor = event.kind === DRAFT_KIND ? event.pubkey : null;
     for (const ws of this.ctx.getWebSockets()) {
       // getWebSockets() with no tag includes live feed sockets, which carry
       // a LiveFeedState, not a ConnState; liveBroadcast serves them.
       if (this.ctx.getTags(ws).includes(LIVE_FEED_TAG)) continue;
       const state = getState(ws);
       const authed = state.authedPubkey;
+      if (draftAuthor !== null && authed !== draftAuthor) continue;
       if (giftWrap && authed !== undefined && authed !== owner) {
         // Their own mail, on a subscription that asked for it, and nothing
         // else: matchesAnyFilter then checks the wrap's `p` is theirs.
@@ -3190,6 +3198,8 @@ export class Relay extends DurableObject<Env> {
   // owner or member case here: a live feed socket cannot be anybody.
   private liveBroadcast(event: NostrEvent): void {
     if (event.kind === GIFT_WRAP_KIND || isGroupEvent(event, groupHost(this.sql))) return;
+    // A draft's redacted notice would still time someone's writing.
+    if (event.kind === DRAFT_KIND) return;
     // A member's profile change, even redacted, would time it for anyone
     // watching (src/profiles.ts).
     if (
