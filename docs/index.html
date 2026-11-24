@@ -132,7 +132,7 @@ pace 12   &lt; mail.jsonl   | nak event $NEW
 <p>Things to know:</p>
 <ul>
 <li><strong>Order matters.</strong> Your own events go first because they include your follow list (kind 3). The new relay accepts your follows&#39; events only once it has that list.</li>
-<li><strong>Strangers are refused by default.</strong> Mentions from people you don&#39;t follow come back <code>restricted:</code> under the default <code>follows</code> policy. To keep them, switch the new relay to <code>mentions</code> for the import (see &quot;Who can write here&quot;) and back afterwards.</li>
+<li><strong>Strangers&#39; other posts are refused.</strong> Under the default <code>mentions</code> policy, a post from someone you don&#39;t follow is kept only if it mentions or replies to you; anything else of theirs comes back <code>restricted:</code>.</li>
 <li><strong>Spread it over days.</strong> Each event costs about 30 of the 100,000 rows the free plan lets you write per day. Past roughly 2,000 events, split the files (<code>split -l 2000 others.jsonl others-</code>) and import one part a day.</li>
 <li><strong>It&#39;s safe to re-run.</strong> An event the new relay already has is acknowledged and not stored twice, so you can simply run a step again.</li>
 <li><strong>Mail is slow.</strong> At 5 a minute, a full inbox takes hours.</li>
@@ -185,7 +185,7 @@ pace 12   &lt; mail.jsonl   | nak event $NEW
 </tr>
 <tr>
 <td><code>WRITE_POLICY</code></td>
-<td>Who can publish here: <code>owner</code>, <code>inbox</code>, <code>follows</code>, <code>mentions</code>, <code>network</code> or <code>all</code> (see &quot;Who can write here&quot; below). Set here it outranks the value set through the management API. Unset, the management API&#39;s value applies, then the default, <code>follows</code>.</td>
+<td>Who can publish here: <code>owner</code>, <code>inbox</code>, <code>follows</code>, <code>mentions</code>, <code>network</code> or <code>all</code> (see &quot;Who can write here&quot; below). Set here it outranks the value set through the management API. Unset, the management API&#39;s value applies, then the default, <code>mentions</code>.</td>
 </tr>
 <tr>
 <td><code>MAIL_STORAGE_BYTES</code></td>
@@ -321,11 +321,11 @@ pace 12   &lt; mail.jsonl   | nak event $NEW
 </tr>
 <tr>
 <td><code>follows</code></td>
-<td>Everything above, plus the people you follow. <strong>The default.</strong></td>
+<td>Everything above, plus the people you follow.</td>
 </tr>
 <tr>
 <td><code>mentions</code></td>
-<td>Everything above, plus anyone whose event mentions or replies to you. An event from someone you don&#39;t follow may carry at most 32 indexed tags.</td>
+<td>Everything above, plus anyone whose event mentions or replies to you. An event from someone you don&#39;t follow may carry at most 32 indexed tags. <strong>The default.</strong></td>
 </tr>
 <tr>
 <td><code>network</code></td>
@@ -353,9 +353,9 @@ bothy_rpc https://your-relay.workers.dev/ getwritepolicy
 <p>The URL must be the relay&#39;s own <code>https://</code> address, because the signature covers it. It takes effect immediately. <code>getwritepolicy</code> reads back the policy in force and where it was set. An empty string clears the stored policy and returns to the default. <code>all</code> asks you to confirm: the first call refuses and tells you the exact confirmation string to pass as a second parameter. If <code>WRITE_POLICY</code> is set in the Cloudflare dashboard it outranks the management API, and <code>changewritepolicy</code> tells you so.</p>
 <p>Under <code>network</code>, the relay gathers your follows&#39; own contact lists, a few each hour, from three public relays, checks every signature, and keeps the people they name on a list of up to 40,000. Nobody can see the list, or which follow brought someone onto it; the admin page shows only how many are on it. It costs about 2 rows written to add a person and 1 a week to keep them, at most a tenth of the day&#39;s write allowance: filling the list takes about a week after you switch, and it is rebuilt every week, so someone a follow stops following drops off within about a week. Nothing is gathered under any other policy.</p>
 <p>Under <code>all</code>, NIP-11 advertises <code>restricted_writes: false</code>; under every other policy it is <code>true</code>.</p>
-<p>By default, then, bothy accepts events from two kinds of author: you (the owner), and the people you follow. Not strangers. It works by reading the follow list (kind 3) you&#39;ve already published — bothy doesn&#39;t ask you to maintain a separate allowlist, it just uses the one your nostr client already keeps.</p>
-<p>Why this is the default rather than a limitation: bothy is meant to be one of the 2-4 relays your NIP-65 relay list already tells clients to keep, not your only relay. Pair it with a permissive public relay and you get both — your own filtered archive of people you actually follow, plus a general-purpose inbox that already does the spam filtering you&#39;d otherwise have to build yourself. A reply from someone you don&#39;t follow isn&#39;t lost; it still lands on your other relay, and on the sender&#39;s own.</p>
-<p>Following someone is not unlimited trust. Anyone writing here is capped at 64KB per event and 20 events a minute, and writes from anyone but you stop once the relay is half full — so an account that gets compromised or goes haywire slows to something you&#39;ll notice and can revoke (unfollow, or <code>banpubkey</code> through the management API) long before it can fill your storage or spend a day&#39;s write budget. All three limits are adjustable; see &quot;Configuration&quot; above. The same caps are all that bounds a stranger under <code>all</code>.</p>
+<p>By default, then, bothy accepts events from you, your members, the people you follow, and anyone whose event mentions or replies to you. It knows who you follow from the follow list (kind 3) you&#39;ve already published, so there is no separate allowlist to keep.</p>
+<p>This is the default because bothy is meant to be in your NIP-65 relay list, which makes it your inbox. A client sending you a reply delivers it to the relays you read from, so if bothy refused strangers, their replies would never reach you here. Posts from strangers that are not about you are still refused.</p>
+<p>Following someone is not unlimited trust. Anyone writing here is capped at 64KB per event and 20 events a minute, and writes from anyone but you stop once the relay is half full — so an account that gets compromised or goes haywire slows to something you&#39;ll notice and can revoke (unfollow, or <code>banpubkey</code> through the management API) long before it can fill your storage or spend a day&#39;s write budget. All three limits are adjustable; see &quot;Configuration&quot; above. The same caps apply to strangers, but they are per pubkey, and new keys cost nothing, so they don&#39;t stop someone spamming you from many throwaway keys. For that, <code>banpubkey</code> each one through the management API.</p>
 <p>The admin page at your relay&#39;s URL is public — anyone with the link can see relay stats and your follow count. Never the follow list itself, only the count.</p>
 <h2 id="relay-management-api">Relay management API<a class="anchor" href="#relay-management-api" aria-label="Link to this section">#</a></h2>
 <p>bothy implements <a href="https://github.com/nostr-protocol/nips/blob/master/86.md">NIP-86</a>, the relay management API. It lets you ban an event, block an IP address, or change the relay&#39;s name, description and icon, without redeploying and without touching the Cloudflare dashboard. There is no web interface for it, deliberately: the admin page stays a read-only status page that is safe to leave public, and every management command is a signed request you send from the command line.</p>
