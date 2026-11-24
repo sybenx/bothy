@@ -5,6 +5,8 @@
 // read, live fan-out or the live feed. The `mentions` policy does not admit
 // a stranger's draft for p-tagging the owner.
 import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
+import { applyBackfillPage, seedBackfillRelays } from "../src/backfill";
 import { afterEach, describe, expect, it } from "vitest";
 import { signEvent, type NostrEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
@@ -154,6 +156,26 @@ describe("NIP-37 draft read gate", () => {
     expect((await feed.nextMessage()).kind).toBe(1);
     for (const conn of [author, anon, other, pub]) conn.close();
     feed.close();
+  });
+});
+
+describe("NIP-37 drafts stored by the owner backfill", () => {
+  // backfill-worker.ts asks the owner's write relays for `authors: [owner]`
+  // with no kind restriction, so their public relays' copies of their
+  // drafts arrive this way, not over a socket. The gate is on the read,
+  // so they get exactly the same treatment.
+  it("serves a backfilled draft only to the owner, signed in", async () => {
+    const event = draft(OWNER, "backfilled");
+    const now = Math.floor(Date.now() / 1000);
+    await runInDurableObject(env.RELAY.get(env.RELAY.idFromName("relay")), async (_i, state) => {
+      const sql = state.storage.sql;
+      seedBackfillRelays(sql, ["wss://relay-a"], now);
+      expect(applyBackfillPage(sql, OWNER_PUBKEY_HEX, "wss://relay-a", [event], true, now).stored).toBe(1);
+    });
+    expect(await readable(OWNER, event)).toEqual(ALL);
+    expect(await readable(null, event)).toEqual(NONE);
+    expect(await readable(await newMember(), event)).toEqual(NONE);
+    expect(await readable(randomKeypair(), event)).toEqual(NONE);
   });
 });
 
