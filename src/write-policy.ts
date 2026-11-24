@@ -14,9 +14,13 @@
 //             gift wrap storage share and the per-IP wrap throttle
 //             (limits.ts).
 //   follows   + any event signed by a pubkey in the owner's kind-3
-//             contact list (ownership.ts refreshFollows). The default.
+//             contact list (ownership.ts refreshFollows).
 //             Bounded by the size of that list.
 //   mentions  + any event, from any author, that p-tags the owner.
+//             The default: bothy is meant to sit in the owner's NIP-65
+//             list, so it is their inbox, and senders deliver replies to
+//             read relays. Spam is handled with NIP-86 banpubkey, since
+//             per-pubkey caps do not bound many throwaway keys.
 //             Bounded by how many people mention the owner -- and,
 //             because "anyone" can choose that number, by
 //             MAX_MENTION_EVENT_INDEXED_TAGS on top of the per-event
@@ -42,7 +46,7 @@
 // Where the value lives: `WRITE_POLICY` in the environment pins it from
 // the dashboard, where a stored value cannot override it; the stored value
 // (NIP-86 changewritepolicy, relay_settings) lets the owner change it from
-// a client without a redeploy; otherwise `follows`.
+// a client without a redeploy; otherwise `mentions`.
 
 import { pTagValues, isIndexedTag, type NostrEvent } from "./nostr";
 import { MAX_MENTION_EVENT_INDEXED_TAGS } from "./limits";
@@ -52,7 +56,7 @@ import { MAX_MENTION_EVENT_INDEXED_TAGS } from "./limits";
 export const WRITE_POLICIES = ["owner", "inbox", "follows", "mentions", "network", "all"] as const;
 export type WritePolicy = (typeof WRITE_POLICIES)[number];
 
-export const DEFAULT_WRITE_POLICY: WritePolicy = "follows";
+export const DEFAULT_WRITE_POLICY: WritePolicy = "mentions";
 
 // One plain sentence per policy, written for the owner reading their own
 // relay's status: the admin page and getwritepolicy both use these.

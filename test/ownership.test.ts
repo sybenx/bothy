@@ -1,10 +1,12 @@
 // Owner-gated writes (src/ownership.ts isAllowedWriter): every event is
 // signature-verified, and only the owner or, under the default write
-// policy, one of the owner's follows may write.
+// policy, one of the owner's follows or an event mentioning the owner
+// may write.
 //
 // The global test env sets no WRITE_POLICY (vitest.config.ts), and the
-// default policy is "follows" -- a non-owner stranger here is rejected
-// for not being a follow, not for a blanket owner-only rule. See
+// default policy is "mentions" -- a non-owner stranger whose event does
+// not mention the owner is rejected for that, not for a blanket
+// owner-only rule. See
 // test/follows.test.ts for the owner-only case.
 //
 // The OWNER_PUBKEY fixture here is injected as a miniflare binding in
@@ -50,7 +52,7 @@ describe("ownership write gate", () => {
     expect(id).toBe(event.id);
     expect(ok).toBe(false);
     expect(message).toBe(
-      "restricted: only the owner and people they follow can publish here",
+      "restricted: only the owner, people they follow, and events that mention the owner can publish here",
     );
     conn.close();
   });
@@ -82,7 +84,7 @@ describe("ownership write gate", () => {
 
     expect(ok).toBe(false);
     expect(message).toBe(
-      "restricted: only the owner and people they follow can publish here",
+      "restricted: only the owner, people they follow, and events that mention the owner can publish here",
     );
     // Schnorr verification (src/validate.ts verifySignature) is the most
     // expensive per-event operation -- a non-owner write is rejected on the

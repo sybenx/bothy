@@ -63,7 +63,7 @@ describe("GET /api/stats", () => {
     expect(body.events24h).toBeGreaterThanOrEqual(1);
   });
 
-  it("reports follows write policy and a zeroed follow count before any list is stored", async () => {
+  it("reports the default mentions write policy and a zeroed follow count before any list is stored", async () => {
     const response = await exports.default.fetch("https://example.com/api/stats");
     const body = (await response.json()) as {
       writePolicy: string;
@@ -72,9 +72,9 @@ describe("GET /api/stats", () => {
     };
 
     // The global test env sets no WRITE_POLICY (vitest.config.ts) and the
-    // default is "follows", so this is "follows" here even with an empty
+    // default is "mentions", so this is "mentions" here even with an empty
     // follow list -- see follows.test.ts for the owner-only case.
-    expect(body.writePolicy).toBe("follows");
+    expect(body.writePolicy).toBe("mentions");
     expect(body.followCount).toBe(0);
     expect(body.followsListAt).toBeNull();
   });

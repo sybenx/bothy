@@ -27,8 +27,8 @@ export const MAX_EVENTS_PER_REQ = 500;
 
 // ---------------------------------------------------------------------
 // Write-path abuse caps: what a writer who IS allowed to write can cost.
-// Under the default `follows` policy that is every pubkey the owner
-// follows; under `mentions`/`all` it is strangers. Without these, one such
+// Under `follows` that is every pubkey the owner follows; under the
+// default `mentions` and under `all` it is strangers too. Without these, one such
 // writer is bounded only by the per-IP message throttle (relay.ts
 // RATE_LIMIT_MAX_MESSAGES, ~300 events/minute): the daily rows-written
 // ceiling goes in under half an hour, and the 5GB storage ceiling, which

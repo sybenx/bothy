@@ -100,7 +100,7 @@ pace 12   < mail.jsonl   | nak event $NEW
 Things to know:
 
 - **Order matters.** Your own events go first because they include your follow list (kind 3). The new relay accepts your follows' events only once it has that list.
-- **Strangers are refused by default.** Mentions from people you don't follow come back `restricted:` under the default `follows` policy. To keep them, switch the new relay to `mentions` for the import (see "Who can write here") and back afterwards.
+- **Strangers' other posts are refused.** Under the default `mentions` policy, a post from someone you don't follow is kept only if it mentions or replies to you; anything else of theirs comes back `restricted:`.
 - **Spread it over days.** Each event costs about 30 of the 100,000 rows the free plan lets you write per day. Past roughly 2,000 events, split the files (`split -l 2000 others.jsonl others-`) and import one part a day.
 - **It's safe to re-run.** An event the new relay already has is acknowledged and not stored twice, so you can simply run a step again.
 - **Mail is slow.** At 5 a minute, a full inbox takes hours.
@@ -121,7 +121,7 @@ The deploy button only asks for a project name. Everything else is an optional v
 | `MAX_SIGNALS_PER_MEMBER_PER_MINUTE` | How many signals ("typing…", "seen", call setup; see "Signals" below) you or any one member may send a minute. Defaults to `600`: an app sends one per other person, so typing and seen receipts in a 20-person group come to about that. They are never stored. Raise it to a number, or set it to `off`. |
 | `STORAGE_BUDGET_BYTES` | How much the relay may store, in bytes: the base every share below is a part of. Defaults to `1073741824` (1 GB), the smallest reading of Cloudflare's free-plan limit for one Durable Object; the account's 5 GB is shared with anything else on it. Raise it on a paid plan, up to `10737418240` (10 GB). The admin page shows use against it. |
 | `NON_OWNER_STORAGE_BYTES` | Point at which writes from anyone but you are refused, reserving the rest of the storage budget for your own archive. Defaults to half of `STORAGE_BUDGET_BYTES`. Raise it to a number, or set it to `off`. |
-| `WRITE_POLICY` | Who can publish here: `owner`, `inbox`, `follows`, `mentions`, `network` or `all` (see "Who can write here" below). Set here it outranks the value set through the management API. Unset, the management API's value applies, then the default, `follows`. |
+| `WRITE_POLICY` | Who can publish here: `owner`, `inbox`, `follows`, `mentions`, `network` or `all` (see "Who can write here" below). Set here it outranks the value set through the management API. Unset, the management API's value applies, then the default, `mentions`. |
 | `MAIL_STORAGE_BYTES` | How much all stored mail may take, in bytes. Defaults to 30% of `STORAGE_BUDGET_BYTES` (about 300 MB). Set it to `off` to remove this cap; the share reserved for you (`NON_OWNER_STORAGE_BYTES`) still applies. |
 | `MAIL_BYTES_PER_MEMBER` | How much mail any one person may have stored here, you included, in bytes. Defaults to a tenth of the mail total (about 30 MB). Set it to `off` to remove it. |
 | `NETWORK_MAX_KEYS` | Under the `network` policy, how many of the people your follows follow the relay keeps on its list. Defaults to `40000`. |
@@ -290,8 +290,8 @@ Your relay has one write policy, and you choose it:
 |---|---|
 | `owner` | Only you. |
 | `inbox` | You, and anyone sending you or a member encrypted mail (see "Inbox mode" and "Members" above). |
-| `follows` | Everything above, plus the people you follow. **The default.** |
-| `mentions` | Everything above, plus anyone whose event mentions or replies to you. An event from someone you don't follow may carry at most 32 indexed tags. |
+| `follows` | Everything above, plus the people you follow. |
+| `mentions` | Everything above, plus anyone whose event mentions or replies to you. An event from someone you don't follow may carry at most 32 indexed tags. **The default.** |
 | `network` | Everything above, plus the people your follows follow. |
 | `all` | Anyone, any event. |
 
@@ -319,11 +319,11 @@ Under `network`, the relay gathers your follows' own contact lists, a few each h
 
 Under `all`, NIP-11 advertises `restricted_writes: false`; under every other policy it is `true`.
 
-By default, then, bothy accepts events from two kinds of author: you (the owner), and the people you follow. Not strangers. It works by reading the follow list (kind 3) you've already published — bothy doesn't ask you to maintain a separate allowlist, it just uses the one your nostr client already keeps.
+By default, then, bothy accepts events from you, your members, the people you follow, and anyone whose event mentions or replies to you. It knows who you follow from the follow list (kind 3) you've already published, so there is no separate allowlist to keep.
 
-Why this is the default rather than a limitation: bothy is meant to be one of the 2-4 relays your NIP-65 relay list already tells clients to keep, not your only relay. Pair it with a permissive public relay and you get both — your own filtered archive of people you actually follow, plus a general-purpose inbox that already does the spam filtering you'd otherwise have to build yourself. A reply from someone you don't follow isn't lost; it still lands on your other relay, and on the sender's own.
+This is the default because bothy is meant to be in your NIP-65 relay list, which makes it your inbox. A client sending you a reply delivers it to the relays you read from, so if bothy refused strangers, their replies would never reach you here. Posts from strangers that are not about you are still refused.
 
-Following someone is not unlimited trust. Anyone writing here is capped at 64KB per event and 20 events a minute, and writes from anyone but you stop once the relay is half full — so an account that gets compromised or goes haywire slows to something you'll notice and can revoke (unfollow, or `banpubkey` through the management API) long before it can fill your storage or spend a day's write budget. All three limits are adjustable; see "Configuration" above. The same caps are all that bounds a stranger under `all`.
+Following someone is not unlimited trust. Anyone writing here is capped at 64KB per event and 20 events a minute, and writes from anyone but you stop once the relay is half full — so an account that gets compromised or goes haywire slows to something you'll notice and can revoke (unfollow, or `banpubkey` through the management API) long before it can fill your storage or spend a day's write budget. All three limits are adjustable; see "Configuration" above. The same caps apply to strangers, but they are per pubkey, and new keys cost nothing, so they don't stop someone spamming you from many throwaway keys. For that, `banpubkey` each one through the management API.
 
 The admin page at your relay's URL is public — anyone with the link can see relay stats and your follow count. Never the follow list itself, only the count.
 

@@ -47,9 +47,9 @@ interface Env {
   // it off is the act that must be spelled out; here, deleting is.
   EPHEMERAL_CHAT?: string;
   // Write policy by name (write-policy.ts): owner, inbox, follows,
-  // mentions or all. Outranks the value stored by NIP-86
+  // mentions, network or all. Outranks the value stored by NIP-86
   // changewritepolicy; unset means the stored value, then the default
-  // (follows). A malformed value is logged and ignored. ALLOW_FOLLOWS is
+  // (mentions). A malformed value is logged and ignored. ALLOW_FOLLOWS is
   // no longer read.
   WRITE_POLICY?: string;
   // NIP-29 groups (limits.ts groupsEnabled). Paused unless exactly "on":

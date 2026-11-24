@@ -84,9 +84,9 @@ describe("parsePolicy", () => {
 });
 
 describe("resolveWritePolicy", () => {
-  it("defaults to follows with nothing set anywhere", () => {
-    expect(resolveWritePolicy(BASE_ENV, null)).toEqual({ policy: "follows", source: "default" });
-    expect(DEFAULT_WRITE_POLICY).toBe("follows");
+  it("defaults to mentions with nothing set anywhere", () => {
+    expect(resolveWritePolicy(BASE_ENV, null)).toEqual({ policy: "mentions", source: "default" });
+    expect(DEFAULT_WRITE_POLICY).toBe("mentions");
   });
 
   it("uses the stored value when WRITE_POLICY is unset", () => {
@@ -104,14 +104,14 @@ describe("resolveWritePolicy", () => {
   it("ignores a malformed WRITE_POLICY or stored value rather than reading it as any policy", () => {
     const bad = { ...BASE_ENV, WRITE_POLICY: "everyone" } as unknown as Env;
     expect(resolveWritePolicy(bad, "inbox")).toEqual({ policy: "inbox", source: "stored" });
-    expect(resolveWritePolicy(bad, null)).toEqual({ policy: "follows", source: "default" });
-    expect(resolveWritePolicy(BASE_ENV, "3")).toEqual({ policy: "follows", source: "default" });
+    expect(resolveWritePolicy(bad, null)).toEqual({ policy: "mentions", source: "default" });
+    expect(resolveWritePolicy(BASE_ENV, "3")).toEqual({ policy: "mentions", source: "default" });
     expect(envOverridesPolicy(bad)).toBe(false);
   });
 
   it("no longer reads ALLOW_FOLLOWS", () => {
     const legacy = { ...BASE_ENV, ALLOW_FOLLOWS: "false" } as unknown as Env;
-    expect(resolveWritePolicy(legacy, null)).toEqual({ policy: "follows", source: "default" });
+    expect(resolveWritePolicy(legacy, null)).toEqual({ policy: "mentions", source: "default" });
   });
 });
 
@@ -324,7 +324,7 @@ describe("changewritepolicy / getwritepolicy over the wire", () => {
 
   it("reports the default before anything is stored, with no numbers anywhere", async () => {
     const reply = await callManagement("getwritepolicy");
-    expect(reply.result).toMatchObject({ policy: "follows", source: "default" });
+    expect(reply.result).toMatchObject({ policy: "mentions", source: "default" });
     const policies = (reply.result as { policies: { name: string; description: string }[] }).policies;
     expect(policies.map((p) => p.name)).toEqual([...WRITE_POLICIES]);
     expect(JSON.stringify(reply.result)).not.toMatch(/rung|\b[1-5]\b/);
@@ -334,16 +334,22 @@ describe("changewritepolicy / getwritepolicy over the wire", () => {
     const stranger = randomKeypair();
     const conn = await connectRelay();
 
-    // Default (follows): a stranger mentioning the owner is refused.
+    // Default (mentions): a stranger mentioning the owner is stored.
+    expect((await publish(conn, mentionOwner(stranger.secretKeyHex)))[2]).toBe(true);
+
+    // Down to follows: the next mention is refused. No redeploy, no cron.
+    const down = await callManagement("changewritepolicy", ["follows"]);
+    expect(down.result).toBe(true);
+    expect(down.error).toContain('now in force is "follows"');
+    expect(down.error).not.toMatch(/rung/i);
     const refused = await publish(conn, mentionOwner(stranger.secretKeyHex));
     expect(refused[2]).toBe(false);
     expect(refused[3]).toContain("restricted:");
 
-    // Open to mentions: the next mention is stored. No redeploy, no cron.
+    // Back up to mentions, stored this time: the next mention is stored.
     const up = await callManagement("changewritepolicy", ["mentions"]);
     expect(up.result).toBe(true);
     expect(up.error).toContain('now in force is "mentions"');
-    expect(up.error).not.toMatch(/rung/i);
     expect((await publish(conn, mentionOwner(stranger.secretKeyHex)))[2]).toBe(true);
     // Still not open: an event that does not mention the owner is
     // refused, and the refusal says what would have been accepted.
@@ -398,13 +404,13 @@ describe("changewritepolicy / getwritepolicy over the wire", () => {
   });
 
   it("an empty string clears the stored policy and falls back to the default", async () => {
-    await callManagement("changewritepolicy", ["mentions"]);
-    expect((await callManagement("getwritepolicy")).result).toMatchObject({ policy: "mentions", source: "stored" });
+    await callManagement("changewritepolicy", ["follows"]);
+    expect((await callManagement("getwritepolicy")).result).toMatchObject({ policy: "follows", source: "stored" });
     const cleared = await callManagement("changewritepolicy", [""]);
     expect(cleared.result).toBe(true);
     expect(cleared.error).toContain("Cleared");
-    expect(cleared.error).toContain('now in force is "follows"');
-    expect((await callManagement("getwritepolicy")).result).toMatchObject({ policy: "follows", source: "default" });
+    expect(cleared.error).toContain('now in force is "mentions"');
+    expect((await callManagement("getwritepolicy")).result).toMatchObject({ policy: "mentions", source: "default" });
   });
 
   it("refuses anything but a policy name, and lists the names", async () => {
@@ -436,7 +442,7 @@ describe("changewritepolicy / getwritepolicy over the wire", () => {
 
   it("/api/stats carries the policy by name and its source", async () => {
     const before = (await stub().getStats()) as { writePolicy: string; writePolicySource: string };
-    expect(before).toMatchObject({ writePolicy: "follows", writePolicySource: "default" });
+    expect(before).toMatchObject({ writePolicy: "mentions", writePolicySource: "default" });
     expect("writeRung" in before).toBe(false);
     await callManagement("changewritepolicy", ["owner"]);
     const after = (await stub().getStats()) as { writePolicy: string; writePolicySource: string };
