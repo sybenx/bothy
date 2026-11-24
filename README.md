@@ -2,11 +2,11 @@
 
 [![Release](https://img.shields.io/github/v/tag/sybenx/bothy?style=for-the-badge)](../../tags)
 
-A single-user nostr relay that runs on the Cloudflare free tier and deploys in one click.
+A personal Nostr relay that runs as a Cloudflare Worker with Durable Object storage, inside the free tier. It has one owner, who can invite members.
 
-A bothy is a shelter in the Scottish highlands that someone built and left unlocked for whoever needs it. Cloudflare's free tier is a bit like that, and this is a relay that runs in it.
+It deploys from the button below into the deployer's own Cloudflare account, and the owner claims it by pasting an `npub`. The result is a `wss://` URL. No server, domain or dashboard configuration is involved.
 
-You click the button, paste your `npub`, and get a `wss://` URL for your own relay. There is no terminal to use, no VPS to rent, no domain to register, and no always-on machine to keep running at home. The relay lives in your own Cloudflare account.
+The name is the Scottish word for an unlocked shelter left for whoever needs it.
 
 **Requires a Cloudflare account** (free, no card) **and a GitHub account** (also free) — Cloudflare puts a copy of the code in your Git account and deploys from there.
 
