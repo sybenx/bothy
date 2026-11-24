@@ -70,33 +70,83 @@ export function maxEventBytes(env: Env): number | null {
   return resolveLimit(env.MAX_EVENT_BYTES, MAX_EVENT_BYTES);
 }
 
-// Per-IP gift wrap write throttle, separate from relay.ts's general
-// per-message limit (which counts every frame type and is tuned for
-// connection spam). Generous for real DM traffic. A stored wrap costs 12
-// rows written (schema.ts eventRowCostMeasured(1)), so one address at this
-// rate could still write ~86,000 rows a day; what bounds the total is the
-// inbox cap, maxGiftWraps.
+// Gift wrap write throttle (relay.ts giftWrapRefusal), separate from
+// relay.ts's general per-message limit (which counts every frame type and
+// is tuned for connection spam). Two counters, because a wrap is signed by
+// a throwaway key and says nothing about who sent it:
+//
+// - A connection signed in (NIP-42) as the owner or a member is counted per
+//   signed-in pubkey: two members behind one home Wi-Fi do not share an
+//   allowance, and one member on two connections shares their own. 120 a
+//   minute, because a messenger spends wraps fast: a one-to-one message is
+//   two (theirs and the sender's own copy), a message in an old-style group
+//   one per person plus one, and reactions, edits, pins, themes and name
+//   cards are wraps too. Thirty messages and thirty reactions in a minute
+//   is 120.
+// - Everyone else (strangers writing to someone's inbox, and a member's app
+//   that has not signed in on this connection) is counted per IP, 5 a
+//   minute. Over it, a connection that has not signed in is sent an AUTH
+//   challenge and refused with `auth-required:`, so a member's app signs in
+//   and sends again under its own allowance; one that has signed in as
+//   someone else is refused with `rate-limited:`.
+//
+// Rows: a stored wrap costs 12 rows written (schema.ts
+// eventRowCostMeasured(1)). One address at 5 a minute could write ~86,000
+// rows a day. One member at 120 a minute writes 1,440 rows a minute, so a
+// member sending flat out spends the Workers Free 100,000 rows written a
+// day in about 70 minutes; a busy real day (a thousand messages, two wraps
+// each) is ~24,000. A member is someone the owner let in and can remove,
+// and what bounds stored mail in total is the mailbox (mailStorageBytes,
+// mailBytesPerMember), not these rates.
+//
+// Both are env-overridable (MAX_GIFT_WRAPS_PER_IP_PER_MINUTE,
+// MAX_GIFT_WRAPS_PER_MEMBER_PER_MINUTE): a positive number, or "off".
 export const GIFT_WRAP_RATE_LIMIT_WINDOW_MS = 60_000;
 export const MAX_GIFT_WRAPS_PER_IP_PER_WINDOW = 5;
+export const MAX_GIFT_WRAPS_PER_MEMBER_PER_WINDOW = 120;
+
+export function maxGiftWrapsPerIp(env: Env): number | null {
+  return resolveLimit(env.MAX_GIFT_WRAPS_PER_IP_PER_MINUTE, MAX_GIFT_WRAPS_PER_IP_PER_WINDOW);
+}
+
+export function maxGiftWrapsPerMember(env: Env): number | null {
+  return resolveLimit(env.MAX_GIFT_WRAPS_PER_MEMBER_PER_MINUTE, MAX_GIFT_WRAPS_PER_MEMBER_PER_WINDOW);
+}
 
 // Sealed signals (kind 21059, relay.ts handleSignal): typing, seen
 // receipts and call setup. Never stored, so they cost no rows; this
-// bounds the fan-out work. Counted per authenticated sender, apart from
-// the gift wrap limit above: 120 a minute is typing every few seconds plus
-// seen receipts in a 20-person group. Each is at most 16KB on the wire,
-// because call setup carries an SDP answer or an ICE restart offer.
+// bounds the fan-out work (a schnorr check and one send each). Counted per
+// authenticated sender, apart from the gift wrap limit above. An app sends
+// one signal per other person: in a 20-person group, typing (one every 6
+// seconds) is 190 a minute and a seen receipt for each of 20 incoming
+// messages is 380 more, so 600 a minute. Env-overridable
+// (MAX_SIGNALS_PER_MEMBER_PER_MINUTE): a positive number, or "off". Each is
+// at most 16KB on the wire, because call setup carries an SDP answer or an
+// ICE restart offer.
 export const SIGNAL_RATE_LIMIT_WINDOW_MS = 60_000;
-export const MAX_SIGNALS_PER_SENDER_PER_WINDOW = 120;
+export const MAX_SIGNALS_PER_SENDER_PER_WINDOW = 600;
 export const SIGNAL_MAX_BYTES = 16 * 1024;
+
+export function maxSignalsPerMember(env: Env): number | null {
+  return resolveLimit(env.MAX_SIGNALS_PER_MEMBER_PER_MINUTE, MAX_SIGNALS_PER_SENDER_PER_WINDOW);
+}
+
+// Home group messages (kind 1490, relay.ts handleGroupMessage), per
+// authenticated sender. One stored event reaches the whole group, so a
+// lively group of any size costs each sender one a message: 120 a minute
+// is two a second from one person. Was the signal limit's constant until
+// that was raised; stored events keep this one.
+export const GROUP_MESSAGE_RATE_LIMIT_WINDOW_MS = 60_000;
+export const MAX_GROUP_MESSAGES_PER_SENDER_PER_WINDOW = 120;
 
 // Rings (relay.ts handleGiftWrap): a kind 1059 wrap with an outer
 // `["ring"]` tag, the call invite. Stored like any wrap, so the callee's
 // phone can fetch it after the push wakes it, but short-lived: it must
 // carry a NIP-40 expiration no more than RING_MAX_TTL_SECONDS ahead, and
-// the wrap_expiry sweep removes it. Rings skip the 5-a-minute gift wrap
-// limit above (a call that rings, is cancelled and rings again is normal)
-// and have their own two limits instead: per address, and per recipient,
-// which is what stops a stranger from waking one phone in a loop. Size is
+// the wrap_expiry sweep removes it. Rings skip both gift wrap limits above
+// (a call that rings, is cancelled and rings again is normal) and have
+// their own two limits instead: per address, and per recipient, which is
+// what stops a stranger from waking one phone in a loop. Size is
 // MAX_EVENT_BYTES like any wrap: an SDP offer sealed twice is well under it.
 export const RING_MAX_TTL_SECONDS = 120;
 export const RING_RATE_LIMIT_WINDOW_MS = 60_000;

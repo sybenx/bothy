@@ -49,8 +49,9 @@ repository's issues, not here.
   registers device pubkeys over NIP-86 in a table separate from
   `allowed_pubkeys` (which grants writes). `handleGiftWrap` accepts wraps
   addressed to them; a kind-1059 filter is admitted only when every `#p` is the
-  authenticated pubkey; mirror the gate in `broadcast()`. Revisit
-  `MAX_GIFT_WRAPS_PER_IP_PER_WINDOW` (5) against a real device count. Carry
+  authenticated pubkey; mirror the gate in `broadcast()`. Revisit the gift
+  wrap limits (5 a minute per address, 120 per signed-in member) against a
+  real device count. Carry
   control traffic only: signing rounds as gift wraps cost ~32 charged rows each
   and occupy the inbox for 30 days.
 - **README note** on the "relay the user controls" role: not written, because

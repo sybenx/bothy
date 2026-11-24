@@ -31,7 +31,9 @@ import {
   MAX_REQUEST_JOINS_PER_IP_PER_WINDOW,
   REQUEST_JOIN_RATE_LIMIT_WINDOW_MS,
   MAX_VAULT_CALLS_PER_IP_PER_WINDOW,
-  MAX_SIGNALS_PER_SENDER_PER_WINDOW,
+  GROUP_MESSAGE_RATE_LIMIT_WINDOW_MS,
+  MAX_GROUP_MESSAGES_PER_SENDER_PER_WINDOW,
+  maxSignalsPerMember,
   MAX_RINGS_PER_IP_PER_WINDOW,
   MAX_RINGS_PER_RECIPIENT_PER_WINDOW,
   RING_MAX_TTL_SECONDS,
@@ -68,7 +70,8 @@ import {
   MAX_WRAPS_PER_AUTHOR,
   mailBytesPerMember,
   mailStorageBytes,
-  MAX_GIFT_WRAPS_PER_IP_PER_WINDOW,
+  maxGiftWrapsPerIp,
+  maxGiftWrapsPerMember,
   MAX_LIVE_FEED_CONNECTIONS,
   MAX_MENTION_EVENT_INDEXED_TAGS,
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
@@ -167,6 +170,7 @@ import {
   instrumentSql,
   readMetricsSnapshot,
   type ReadMetricsSnapshot,
+  type ReadPath,
   withReadPath,
   writeMetricsSnapshot,
   type WriteMetricsSnapshot,
@@ -330,13 +334,31 @@ function stateFits(state: ConnState): boolean {
   return new TextEncoder().encode(JSON.stringify(state)).length <= MAX_CONN_STATE_BYTES;
 }
 
-// Per-IP message throttle, covering every WebSocket frame. In memory
-// rather than SQLite: it is best-effort abuse mitigation, so resetting on
-// hibernation is acceptable, and persisting it would cost rows written.
-// It bounds messages, not rows read over time; see limits.ts
-// MAX_FILTER_ROWS_READ for what 5 REQs/second at the cap adds up to.
+// Message throttle, covering every WebSocket frame. In memory rather than
+// SQLite: it is best-effort abuse mitigation, so resetting on hibernation
+// is acceptable, and persisting it would cost rows written. It bounds
+// messages, not rows read over time; see limits.ts MAX_FILTER_ROWS_READ
+// for what 5 REQs/second at the cap adds up to.
+//
+// Counted per IP, except on a connection signed in (NIP-42) as the owner
+// or a member, which is counted per signed-in pubkey with a higher cap
+// (Relay.isRateLimited). A member's app sends one signal per other person
+// in a group, so typing and seen receipts in a lively group run to dozens
+// of frames every ten seconds, and a household behind one address would
+// share 50. 200 per 10s per person sits above everything the per-member
+// caps let through in a minute (120 wraps, 600 signals, 120 group
+// messages) spread evenly, so it only catches bursts.
 const RATE_LIMIT_WINDOW_MS = 10_000;
 const RATE_LIMIT_MAX_MESSAGES = 50;
+const MEMBER_RATE_LIMIT_MAX_MESSAGES = 200;
+
+// How long a "this signed-in pubkey is the owner or a member" verdict is
+// reused (Relay.signedInMember), so the frame throttle does not pay a
+// lookup per frame. A removed member keeps the member allowances on an
+// open connection for at most this long; every write gate still checks
+// membership itself.
+const MEMBER_VERDICT_TTL_MS = 60_000;
+const MEMBER_VERDICTS_MAX_TRACKED = 1024;
 
 // RFC 6455 section 7.4.1: status codes that describe how a connection
 // ended and must never be sent in a Close frame; sending one throws. See
@@ -416,10 +438,16 @@ export class Relay extends DurableObject<Env> {
   // Per-IP message throttle state (RATE_LIMIT_* above).
   private rateLimits = new Map<string, { windowStart: number; count: number }>();
 
-  // Per-IP gift wrap throttle (limits.ts GIFT_WRAP_RATE_LIMIT_WINDOW_MS/
-  // MAX_GIFT_WRAPS_PER_IP_PER_WINDOW). Separate from the message throttle
-  // because it bounds rows written on a write path open to anyone.
+  // Gift wrap throttle (limits.ts GIFT_WRAP_RATE_LIMIT_WINDOW_MS,
+  // maxGiftWrapsPerIp, maxGiftWrapsPerMember): per IP for anyone not
+  // signed in as the owner or a member, per signed-in pubkey for them.
+  // Separate from the message throttle because it bounds rows written on a
+  // write path open to anyone.
   private giftWrapRateLimits = new Map<string, { windowStart: number; count: number }>();
+  private memberGiftWrapRateLimits = new Map<string, { windowStart: number; count: number }>();
+
+  // Relay.signedInMember's memo: pubkey -> verdict and when it was made.
+  private memberVerdicts = new Map<string, { member: boolean; at: number }>();
 
   // Per-IP kind-9021 join throttle (limits.ts
   // JOIN_REQUEST_RATE_LIMIT_WINDOW_MS/MAX_JOIN_REQUESTS_PER_IP_PER_WINDOW).
@@ -1354,18 +1382,45 @@ export class Relay extends DurableObject<Env> {
     }
   }
 
-  // True when this connection's IP has sent too many messages within the
-  // current window (RATE_LIMIT_* above).
+  // True when this connection has sent too many messages within the
+  // current window (RATE_LIMIT_* above): per signed-in pubkey for the
+  // owner and members, per IP for everyone else. The two kinds of key
+  // cannot collide: an IP never starts with "member:".
   private isRateLimited(ws: WebSocket): boolean {
-    const { ip } = getState(ws);
+    const state = getState(ws);
+    const member = this.signedInMember(state, "connect");
+    const key = member === null ? state.ip : `member:${member}`;
+    const max = member === null ? RATE_LIMIT_MAX_MESSAGES : MEMBER_RATE_LIMIT_MAX_MESSAGES;
     const now = Date.now();
-    const entry = this.rateLimits.get(ip);
+    const entry = this.rateLimits.get(key);
     if (!entry || now - entry.windowStart >= RATE_LIMIT_WINDOW_MS) {
-      this.rateLimits.set(ip, { windowStart: now, count: 1 });
+      this.rateLimits.set(key, { windowStart: now, count: 1 });
       return false;
     }
     entry.count++;
-    return entry.count > RATE_LIMIT_MAX_MESSAGES;
+    return entry.count > max;
+  }
+
+  // The pubkey this connection signed in as (NIP-42), if that is the
+  // owner or a member; null otherwise, including before AUTH. Gift wraps
+  // and signals are signed by throwaway keys, so this, not event.pubkey,
+  // is who is sending. Memoised for MEMBER_VERDICT_TTL_MS, so a busy
+  // member costs a lookup a minute rather than one per frame. A cache hit
+  // reads nothing and enters no read-metrics scope; a miss is billed to
+  // `path`.
+  private signedInMember(state: ConnState, path: ReadPath): string | null {
+    const pubkey = state.authedPubkey;
+    if (pubkey === undefined) return null;
+    const now = Date.now();
+    const cached = this.memberVerdicts.get(pubkey);
+    if (cached !== undefined && now - cached.at < MEMBER_VERDICT_TTL_MS) return cached.member ? pubkey : null;
+    const member = withReadPath(path, () => {
+      const owner = getOwnerPubkey(this.sql, this.env);
+      return owner !== null && (pubkey === owner || isMember(this.sql, pubkey));
+    });
+    if (this.memberVerdicts.size >= MEMBER_VERDICTS_MAX_TRACKED) this.memberVerdicts.clear();
+    this.memberVerdicts.set(pubkey, { member, at: now });
+    return member ? pubkey : null;
   }
 
   // A throttled EVENT that parses far enough to name an id gets
@@ -1531,9 +1586,12 @@ export class Relay extends DurableObject<Env> {
         ok(ws, event.id, false, refusal);
         return;
       }
-    } else if (this.isGiftWrapRateLimited(getState(ws).ip)) {
-      ok(ws, event.id, false, "rate-limited: too many gift wraps from this connection, slow down");
-      return;
+    } else {
+      const refusal = this.giftWrapRefusal(ws);
+      if (refusal !== null) {
+        ok(ws, event.id, false, refusal);
+        return;
+      }
     }
 
     // One key, many wraps: NIP-59 senders use a fresh key per wrap, so
@@ -1645,7 +1703,8 @@ export class Relay extends DurableObject<Env> {
       ok(ws, event.id, false, "restricted: signal is not addressed to this relay's owner or one of its members");
       return;
     }
-    if (this.windowLimited(this.signalRateLimits, sender, SIGNAL_RATE_LIMIT_WINDOW_MS, MAX_SIGNALS_PER_SENDER_PER_WINDOW)) {
+    const signalCap = maxSignalsPerMember(this.env);
+    if (signalCap !== null && this.windowLimited(this.signalRateLimits, sender, SIGNAL_RATE_LIMIT_WINDOW_MS, signalCap)) {
       ok(ws, event.id, false, "rate-limited: too many signals, slow down");
       return;
     }
@@ -1670,7 +1729,7 @@ export class Relay extends DurableObject<Env> {
     }
   }
 
-  // Per authenticated sender (limits.ts MAX_SIGNALS_PER_SENDER_PER_WINDOW).
+  // Per authenticated sender (limits.ts maxSignalsPerMember).
   private signalRateLimits = new Map<string, { windowStart: number; count: number }>();
 
   // A home group message (home-groups.ts, kind 1490): one sealed event for
@@ -1722,7 +1781,14 @@ export class Relay extends DurableObject<Env> {
       ok(ws, event.id, false, "invalid: created_at is too far in the future");
       return;
     }
-    if (this.windowLimited(this.groupMessageRateLimits, sender, SIGNAL_RATE_LIMIT_WINDOW_MS, MAX_SIGNALS_PER_SENDER_PER_WINDOW)) {
+    if (
+      this.windowLimited(
+        this.groupMessageRateLimits,
+        sender,
+        GROUP_MESSAGE_RATE_LIMIT_WINDOW_MS,
+        MAX_GROUP_MESSAGES_PER_SENDER_PER_WINDOW,
+      )
+    ) {
       ok(ws, event.id, false, "rate-limited: too many group messages, slow down");
       return;
     }
@@ -1859,16 +1925,38 @@ export class Relay extends DurableObject<Env> {
     return entry.count > MAX_JOIN_REQUESTS_PER_IP_PER_WINDOW;
   }
 
-  // See limits.ts GIFT_WRAP_RATE_LIMIT_WINDOW_MS/MAX_GIFT_WRAPS_PER_IP_PER_WINDOW.
-  private isGiftWrapRateLimited(ip: string): boolean {
-    const now = Date.now();
-    const entry = this.giftWrapRateLimits.get(ip);
-    if (!entry || now - entry.windowStart >= GIFT_WRAP_RATE_LIMIT_WINDOW_MS) {
-      this.giftWrapRateLimits.set(ip, { windowStart: now, count: 1 });
-      return false;
+  // The gift wrap rate limit (limits.ts maxGiftWrapsPerIp,
+  // maxGiftWrapsPerMember), or null to go on. Counted before schnorr, so it
+  // bounds that cost too. A connection signed in as the owner or a member
+  // is counted per pubkey; anyone else per IP. Over the per-IP limit, a
+  // connection that has not signed in gets an AUTH challenge and
+  // `auth-required:`: a member's app that sent mail before signing in
+  // (an app publishes the moment its socket opens, and nothing about a
+  // wrap asks it to AUTH) then signs in and sends again under its own
+  // allowance, and a stranger who signs in is still counted per IP.
+  private giftWrapRefusal(ws: WebSocket): string | null {
+    const state = getState(ws);
+    const member = this.signedInMember(state, "write");
+    if (member !== null) {
+      const cap = maxGiftWrapsPerMember(this.env);
+      if (cap !== null && this.windowLimited(this.memberGiftWrapRateLimits, member, GIFT_WRAP_RATE_LIMIT_WINDOW_MS, cap)) {
+        return "rate-limited: too many gift wraps from you, slow down";
+      }
+      return null;
     }
-    entry.count++;
-    return entry.count > MAX_GIFT_WRAPS_PER_IP_PER_WINDOW;
+    const cap = maxGiftWrapsPerIp(this.env);
+    if (cap === null || !this.windowLimited(this.giftWrapRateLimits, state.ip, GIFT_WRAP_RATE_LIMIT_WINDOW_MS, cap)) {
+      return null;
+    }
+    if (state.authedPubkey !== undefined) {
+      return "rate-limited: too many gift wraps from this address, slow down";
+    }
+    if (!state.challenge) {
+      state.challenge = crypto.randomUUID();
+      setState(ws, state);
+    }
+    send(ws, ["AUTH", state.challenge]);
+    return "auth-required: too many gift wraps from this address; members, sign in to send more";
   }
 
   // See limits.ts MAX_EVENTS_PER_PUBKEY_PER_WINDOW. `max` is the

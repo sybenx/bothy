@@ -14,6 +14,8 @@ import { collectStored, connectRelay, publish, type RelayConn } from "./helpers/
 
 isolateStorage();
 
+const mutableEnv = env as unknown as Record<string, unknown>;
+
 let nextIp = 0;
 function freshIp(): string {
   nextIp++;
@@ -155,18 +157,24 @@ describe("sealed signals", () => {
     const wrap = signal(bob.pubkeyHex, "mail", 1059);
     expect((await publish(conn, wrap))[2]).toBe(true);
 
-    // The signal limit, per sender, whatever the address: spread over
-    // fresh connections so the per-address frame throttle never trips.
+    // The signal limit, per sender, whatever the address. Lowered through
+    // its env var so the test does not send 600; the raised default is
+    // covered in test/gift-wrap-limits.test.ts.
+    mutableEnv.MAX_SIGNALS_PER_MEMBER_PER_MINUTE = "20";
     let refused = "";
-    let other = await connectAs(alice);
-    for (let i = 0; i < MAX_SIGNALS_PER_SENDER_PER_WINDOW && refused === ""; i++) {
-      if (i > 0 && i % 30 === 0) {
-        other.close();
-        other = await connectAs(alice);
+    let sent = 0;
+    const other = await connectAs(alice);
+    try {
+      for (let i = 0; i <= 20 && refused === ""; i++) {
+        const [, , ok, message] = await publish(other, signal(bob.pubkeyHex));
+        if (ok) sent++;
+        else refused = message;
       }
-      const [, , ok, message] = await publish(other, signal(bob.pubkeyHex));
-      if (!ok) refused = message;
+    } finally {
+      delete mutableEnv.MAX_SIGNALS_PER_MEMBER_PER_MINUTE;
     }
+    // The 8 above, on another address, count too: one counter per sender.
+    expect(sent).toBe(20 - (MAX_GIFT_WRAPS_PER_IP_PER_WINDOW + 3));
     expect(refused).toBe("rate-limited: too many signals, slow down");
     conn.close();
     other.close();

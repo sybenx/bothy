@@ -238,9 +238,11 @@ describe("a ring", () => {
     for (let i = 0; i < MAX_GIFT_WRAPS_PER_IP_PER_WINDOW; i++) {
       expect((await publish(conn, mail(bob.pubkeyHex)))[2]).toBe(true);
     }
-    // Mail from this address is now at its limit; rings still go.
+    // Mail from this address is now at its limit (an AUTH challenge, then
+    // the refusal, since this connection never signed in); rings still go.
     const over = mail(bob.pubkeyHex);
-    expect((await publish(conn, over))[3]).toMatch(/^rate-limited: too many gift wraps/);
+    expect((await publish(conn, over))[0]).toBe("AUTH");
+    expect((await conn.nextMessage())[3]).toMatch(/^auth-required: too many gift wraps/);
     expect((await publish(conn, ring(bob.pubkeyHex)))[2]).toBe(true);
     expect((await publish(conn, ring(carol.pubkeyHex)))[2]).toBe(true);
     conn.close();

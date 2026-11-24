@@ -63,6 +63,13 @@ interface Env {
   MAX_EVENT_BYTES?: string;
   MAX_EVENTS_PER_PUBKEY_PER_MINUTE?: string;
   NON_OWNER_STORAGE_BYTES?: string;
+  // Gift wraps a minute (limits.ts maxGiftWrapsPerIp, maxGiftWrapsPerMember):
+  // per IP for anyone not signed in as the owner or a member, and per
+  // signed-in person for them. Signals a minute per signed-in sender
+  // (limits.ts maxSignalsPerMember).
+  MAX_GIFT_WRAPS_PER_IP_PER_MINUTE?: string;
+  MAX_GIFT_WRAPS_PER_MEMBER_PER_MINUTE?: string;
+  MAX_SIGNALS_PER_MEMBER_PER_MINUTE?: string;
   // The relay's storage budget (limits.ts storageBudget): 1GB by default,
   // the smallest reading of the Free plan's per-object limit. Every share
   // is a fraction of it.

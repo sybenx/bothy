@@ -99,26 +99,26 @@ describe("NIP-59 gift wrap accept path", () => {
     conn.close();
   });
 
-  it("rate-limits gift wraps from a single connection", async () => {
+  // A connection that has not signed in is counted per address. Over the
+  // limit it gets an AUTH challenge with the refusal, so a member's app can
+  // sign in and send again under its own allowance
+  // (test/gift-wrap-limits.test.ts).
+  it("rate-limits gift wraps from a single connection that has not signed in", async () => {
     const conn = await connectRelay();
-    let lastMessage = "";
-    let sawRateLimited = false;
-    for (let i = 0; i < 10; i++) {
+    let refusal = "";
+    for (let i = 0; i < 10 && refusal === ""; i++) {
       const giftWrap = signEvent(randomKeypair().secretKeyHex, {
         kind: 1059,
         tags: [["p", OWNER_PUBKEY_HEX]],
         content: `message ${i}`,
       });
-      const [, , ok, message] = await publish(conn, giftWrap);
-      lastMessage = message;
-      if (!ok && message.startsWith("rate-limited:")) {
-        sawRateLimited = true;
-        break;
-      }
+      conn.send(["EVENT", giftWrap]);
+      let frame = await conn.nextMessage();
+      if (frame[0] === "AUTH") frame = await conn.nextMessage();
+      if (frame[2] === false) refusal = frame[3] as string;
     }
 
-    expect(sawRateLimited).toBe(true);
-    expect(lastMessage.startsWith("rate-limited:")).toBe(true);
+    expect(refusal.startsWith("auth-required:")).toBe(true);
     conn.close();
   });
 
