@@ -12,7 +12,7 @@ The name is the Scottish word for an unlocked shelter left for whoever needs it.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/sybenx/bothy)
 
-If you have already deployed, see "Keeping it updated" below for the one file that keeps your copy in step with this one automatically.
+If you have already deployed, see "Keeping it updated" below. 
 
 ## Setup
 
