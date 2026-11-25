@@ -108,6 +108,20 @@ import {
 } from "./limits";
 import { sqlitePhotoStore } from "./photos";
 import { deleteVaultRow, isVaultHash, listVaultRows, parseVaultPut, storeVaultRow } from "./vault";
+import {
+  addVoucher,
+  cancelVouch,
+  decideVouch,
+  deleteVouchCopy,
+  myVouch,
+  removeVoucher,
+  requestsFor,
+  storeVouchCopy,
+  VOUCH_OFF_MESSAGE,
+  vouchEnabled,
+  vouchersFor,
+  vouchListEntry,
+} from "./vouch";
 import { GROUPS_PAUSED_MESSAGE } from "./nip29";
 import { HOME_GROUP_METHODS, KEEPER_METHODS, handleGroupCall, removeFromAllGroups, type GroupOutboxEntry } from "./home-groups";
 import { pushConfigured } from "./push";
@@ -153,6 +167,23 @@ export interface ManagementResponse {
   // Not part of the response: people to wake with nothing to deliver.
   wake?: string[];
 }
+
+// Vouching's methods (src/vouch.ts), in one list so VOUCH=off can take
+// them all out of supportedmethods together.
+export const UNSIGNED_VOUCH_METHODS: readonly string[] = ["vouchask", "vouchstatus"];
+export const VOUCH_METHODS: readonly string[] = [
+  "vouchput",
+  "vouchdelete",
+  "vouchers",
+  "addvoucher",
+  "removevoucher",
+  "vouchrequests",
+  "vouchapprove",
+  "vouchdecline",
+  "myvouch",
+  "vouchcancel",
+  ...UNSIGNED_VOUCH_METHODS,
+];
 
 // Exactly the methods implemented below, and the value supportedmethods
 // returns. Adding a method means adding it here in the same commit --
@@ -245,6 +276,10 @@ export const SUPPORTED_METHODS = [
   "vaultdelete",
   "vaultchallenge",
   "vaultopen",
+  // bothy's own: vouching (src/vouch.ts), getting back into an account
+  // when the passkey is gone too. vouchask and vouchstatus are UNSIGNED
+  // (UNSIGNED_METHODS below); the rest are a member's.
+  ...VOUCH_METHODS,
   // bothy's own: a member letting in another key of their own, and the
   // owner forgetting that someone was removed on purpose.
   "addmykey",
@@ -305,6 +340,7 @@ export const MEMBER_CALLABLE_METHODS: readonly string[] = [
   "vaultput",
   "vaultlist",
   "vaultdelete",
+  ...VOUCH_METHODS.filter((m) => !UNSIGNED_VOUCH_METHODS.includes(m)),
   "addmykey",
   "myinvitees",
   "backedup",
@@ -318,7 +354,11 @@ export const MEMBER_CALLABLE_METHODS: readonly string[] = [
 // passkey assertion is the credential (src/vault.ts). index.ts routes them
 // before NIP-98 verification, to relay.ts vaultChallenge and vaultOpen;
 // they never reach handleManagementCall.
-export const UNSIGNED_METHODS: readonly string[] = ["vaultchallenge", "vaultopen"];
+//
+// vouchask and vouchstatus likewise (src/vouch.ts): the new phone has only
+// a one-time key, and a copy is only ever handed to that key. index.ts
+// routes them to relay.ts vouchAsk and vouchStatusCall.
+export const UNSIGNED_METHODS: readonly string[] = ["vaultchallenge", "vaultopen", ...UNSIGNED_VOUCH_METHODS];
 
 // The method ANY valid signature may call: redeeminvite, whose caller is
 // by definition not a member yet. The code is the authority, and the
@@ -395,9 +435,10 @@ export const NOT_A_MEMBER_REASON = "you are not a member of this relay";
 export const GROUP_METHODS: readonly string[] = [];
 
 export function supportedMethods(env: Env): string[] {
-  return groupsEnabled(env)
-    ? [...SUPPORTED_METHODS]
-    : SUPPORTED_METHODS.filter((method) => !GROUP_METHODS.includes(method));
+  return SUPPORTED_METHODS.filter(
+    (method) =>
+      (groupsEnabled(env) || !GROUP_METHODS.includes(method)) && (vouchEnabled(env) || !VOUCH_METHODS.includes(method)),
+  );
 }
 
 // The exact string blockip demands back as its `reason` before it will
@@ -686,6 +727,61 @@ function decodeBase64Url(value: string): Uint8Array | null {
   } catch {
     return null;
   }
+}
+
+// Vouching's member methods (src/vouch.ts). vouchask and vouchstatus are
+// unsigned and go through relay.ts instead.
+function handleVouchCall(
+  sql: SqlStorage,
+  env: Env,
+  method: string,
+  params: unknown[],
+  signer: string,
+  nowSec: number,
+): ManagementResponse {
+  // Dropping a copy and cancelling a request still work with vouching
+  // off: both only take something away.
+  if (!vouchEnabled(env) && method !== "vouchdelete" && method !== "vouchcancel") return err(`${method}: ${VOUCH_OFF_MESSAGE}`);
+  const owner = getOwnerPubkey(sql, env);
+  switch (method) {
+    case "vouchput": {
+      const refusal = storeVouchCopy(sql, env, signer, params[0], nowSec);
+      return refusal === null ? { result: true } : err(refusal);
+    }
+    case "vouchdelete":
+      deleteVouchCopy(sql, signer);
+      return { result: true };
+    case "vouchers":
+      return { result: vouchersFor(sql, owner, signer) };
+    case "addvoucher": {
+      const voucher = pubkeyParam(params, 0);
+      if (voucher === null) return err("addvoucher takes a pubkey, as npub or 64-character hex");
+      const refusal = addVoucher(sql, owner, signer, voucher, nowSec);
+      return refusal === null ? { result: true } : err(refusal);
+    }
+    case "removevoucher": {
+      const voucher = pubkeyParam(params, 0);
+      if (voucher === null) return err("removevoucher takes a pubkey, as npub or 64-character hex");
+      removeVoucher(sql, signer, voucher);
+      return { result: true };
+    }
+    case "vouchrequests":
+      return { result: requestsFor(sql, owner, signer, nowSec) };
+    case "vouchapprove":
+    case "vouchdecline": {
+      const outcome = decideVouch(sql, env, owner, signer, params, method === "vouchapprove", nowSec);
+      if (!outcome.ok) return err(outcome.error);
+      const result = method === "vouchapprove" ? { releaseAt: outcome.releaseAt } : true;
+      return { result, ...(outcome.outbox.length > 0 ? { outbox: outcome.outbox } : {}) };
+    }
+    case "myvouch":
+      return { result: myVouch(sql, signer, nowSec) };
+    // Idempotent: nothing open is not an error.
+    case "vouchcancel":
+      cancelVouch(sql, signer, nowSec);
+      return { result: true };
+  }
+  return err(`unknown method: ${method}`);
 }
 
 // `callerIp` (CF-Connecting-IP) is used only so blockip can recognize a
@@ -1344,8 +1440,15 @@ export function handleManagementCall(
       return refusal === null ? { result: true } : err(refusal);
     }
 
-    case "vaultlist":
-      return { result: listVaultRows(sql, signer) };
+    // Passkey rows first, each marked as one this relay cannot open; then
+    // the vouch copy if there is one, marked box-readable, with no hash or
+    // credential so an app that only knows passkey rows passes over it.
+    case "vaultlist": {
+      const rows: object[] = listVaultRows(sql, signer).map((row) => ({ ...row, seal: "passkey", boxReadable: false }));
+      const vouch = vouchListEntry(sql, signer);
+      if (vouch !== null) rows.push(vouch);
+      return { result: rows };
+    }
 
     case "vaultdelete": {
       const [hash] = params;
@@ -1353,6 +1456,19 @@ export function handleManagementCall(
       deleteVaultRow(sql, hash, signer);
       return { result: true };
     }
+
+    // Vouching (src/vouch.ts). vouchask and vouchstatus never reach here.
+    case "vouchput":
+    case "vouchdelete":
+    case "vouchers":
+    case "addvoucher":
+    case "removevoucher":
+    case "vouchrequests":
+    case "vouchapprove":
+    case "vouchdecline":
+    case "myvouch":
+    case "vouchcancel":
+      return handleVouchCall(sql, env, method, params, signer, nowSec);
 
     // Another key of the caller's own (src/own-keys.ts). The Worker has
     // checked the proof signed by that key; this decides whether it may

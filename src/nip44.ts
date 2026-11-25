@@ -139,8 +139,9 @@ function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
   return diff === 0;
 }
 
-// Only the tests decrypt: the relay never reads mail. Here so that a test
-// can open what the relay sent, and so the pair lives in one file.
+// The relay never reads mail. It decrypts one thing: a member's vouch
+// copy, sealed to the relay's own key on purpose (src/vouch.ts). The tests
+// use it to open what the relay sent.
 export function nip44Decrypt(payload: string, key: Uint8Array): string {
   const data = fromBase64(payload);
   if (data[0] !== VERSION) throw new Error("unknown NIP-44 version");

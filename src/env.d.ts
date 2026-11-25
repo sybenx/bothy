@@ -93,6 +93,9 @@ interface Env {
   // list ADDED to the defaults (https://dms.aaro.cc and the DMs Android
   // apps). Never needed for DMs itself.
   PASSKEY_ORIGINS?: string;
+  // Vouching (src/vouch.ts): "off" stops keeping vouch copies and taking
+  // requests, and drops `vouch` from NIP-11's `restore`. On by default.
+  VOUCH?: string;
   // Whether members can see who else is in the home (limits.ts
   // memberListVisibility): "members" (default) or "hidden".
   MEMBER_LIST?: string;

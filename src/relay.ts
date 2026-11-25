@@ -31,6 +31,10 @@ import {
   MAX_REQUEST_JOINS_PER_IP_PER_WINDOW,
   REQUEST_JOIN_RATE_LIMIT_WINDOW_MS,
   MAX_VAULT_CALLS_PER_IP_PER_WINDOW,
+  MAX_VOUCH_ASKS_PER_PUBKEY_PER_WINDOW,
+  MAX_VOUCH_CALLS_PER_IP_PER_WINDOW,
+  VOUCH_ASK_RATE_LIMIT_WINDOW_MS,
+  VOUCH_IP_RATE_LIMIT_WINDOW_MS,
   GROUP_MESSAGE_RATE_LIMIT_WINDOW_MS,
   MAX_GROUP_MESSAGES_PER_SENDER_PER_WINDOW,
   maxSignalsPerMember,
@@ -121,6 +125,7 @@ import {
   VAULT_NOT_FOUND,
   VAULT_RATE_LIMITED,
 } from "./vault";
+import { askVouch, parseAsk, VOUCH_ASK_USAGE, VOUCH_TOKEN_KEY_LABEL, vouchStatus } from "./vouch";
 import { relayDerivedKey } from "./relay-identity";
 import { resolveIcon, resolveName, type OwnerProfile } from "./nip11";
 import {
@@ -816,6 +821,72 @@ export class Relay extends DurableObject<Env> {
       return blob === null ? { error: VAULT_NOT_FOUND } : { result: { blob: JSON.parse(blob) as unknown } };
     });
   }
+
+  // ------------------------------------------------------------------
+  // Vouching's two unsigned methods (src/vouch.ts). index.ts reaches
+  // these without a signature and holds the same time floor as vaultopen.
+  // ------------------------------------------------------------------
+
+  private vouchTokenKey: Uint8Array | null = null;
+
+  private tokenKey(): Uint8Array {
+    this.vouchTokenKey ??= relayDerivedKey(this.sql, VOUCH_TOKEN_KEY_LABEL);
+    return this.vouchTokenKey;
+  }
+
+  // {token, code, expiresAt} for every well-formed ask, stored or not. The
+  // per-pubkey limit is counted for any pubkey, member or not.
+  async vouchAsk(params: unknown[], callerIp: string): Promise<ManagementResponse> {
+    if (this.windowLimited(this.vouchAskIpLimits, normalizeIp(callerIp), VOUCH_IP_RATE_LIMIT_WINDOW_MS, MAX_VOUCH_CALLS_PER_IP_PER_WINDOW)) {
+      return { error: VAULT_RATE_LIMITED };
+    }
+    const input = parseAsk(params);
+    if (input === null) return { error: VOUCH_ASK_USAGE };
+    if (this.windowLimited(this.vouchAskPubkeyLimits, input.pubkey, VOUCH_ASK_RATE_LIMIT_WINDOW_MS, MAX_VOUCH_ASKS_PER_PUBKEY_PER_WINDOW)) {
+      return { error: VAULT_RATE_LIMITED };
+    }
+    return this.metered(async () => {
+      const result = withReadPath("management", () => {
+        const sql = this.sql;
+        const { result, outbox } = askVouch(sql, this.env, getOwnerPubkey(sql, this.env), this.tokenKey(), input, nowSeconds());
+        this.deliverOutbox(sql, outbox);
+        return result;
+      });
+      await this.settlePushAlarm();
+      return { result };
+    });
+  }
+
+  // {state, ...}, or VAULT_NOT_FOUND for a token this relay did not issue.
+  async vouchStatusCall(params: unknown[], callerIp: string): Promise<ManagementResponse> {
+    if (this.windowLimited(this.vouchStatusIpLimits, normalizeIp(callerIp), VOUCH_IP_RATE_LIMIT_WINDOW_MS, MAX_VOUCH_CALLS_PER_IP_PER_WINDOW)) {
+      return { error: VAULT_RATE_LIMITED };
+    }
+    return this.metered(async () => {
+      const answer = withReadPath("management", () => {
+        const sql = this.sql;
+        const status = vouchStatus(sql, this.env, getOwnerPubkey(sql, this.env), this.tokenKey(), params, nowSeconds());
+        if (status === null) return null;
+        this.deliverOutbox(sql, status.outbox);
+        return status.result;
+      });
+      await this.settlePushAlarm();
+      return answer === null ? { error: VAULT_NOT_FOUND } : { result: answer };
+    });
+  }
+
+  // Messages a call stored, delivered like any accepted event: to open
+  // subscriptions, and to devices.
+  private deliverOutbox(sql: SqlStorage, outbox: NostrEvent[]): void {
+    for (const event of outbox) {
+      this.notePush(sql, event, pTagValues(event.tags));
+      this.broadcast(event);
+    }
+  }
+
+  private vouchAskIpLimits = new Map<string, { windowStart: number; count: number }>();
+  private vouchStatusIpLimits = new Map<string, { windowStart: number; count: number }>();
+  private vouchAskPubkeyLimits = new Map<string, { windowStart: number; count: number }>();
 
   private vaultChallengeIpLimits = new Map<string, { windowStart: number; count: number }>();
   private vaultOpenIpLimits = new Map<string, { windowStart: number; count: number }>();

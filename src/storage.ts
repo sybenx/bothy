@@ -2427,6 +2427,16 @@ export function unallowPubkey(
   sql.exec(`DELETE FROM fcm_tokens WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM inbox_push WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM call_push WHERE pubkey = ?`, pubkey);
+  // Vouching (src/vouch.ts): the copy this relay can open goes at once,
+  // not after the grace; their open request closes; and they stop
+  // vouching for anyone, and anyone named for them stops too.
+  sql.exec(`DELETE FROM vouch_copies WHERE pubkey = ?`, pubkey);
+  sql.exec(`DELETE FROM vouchers WHERE member = ? OR voucher = ?`, pubkey, pubkey);
+  sql.exec(
+    `UPDATE vouch_requests SET closed_at = ?, closed_why = 'left' WHERE pubkey = ? AND closed_at IS NULL`,
+    nowSec,
+    pubkey,
+  );
   sql.exec(
     `INSERT INTO former_members (pubkey, removed_at, reason, member_reason, member_allowed_at, member_source,
                                  member_invited_by, member_via_code, member_close)
@@ -2514,8 +2524,10 @@ export function eraseMember(
   deleteProfilesOf(sql, pubkey);
   sql.exec(`DELETE FROM join_requests WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM group_membership WHERE pubkey = ?`, pubkey);
-  // Their restore vault rows (src/vault.ts).
+  // Their restore vault rows (src/vault.ts), and their vouch requests,
+  // past ones included (src/vouch.ts).
   deleteVaultRowsOf(sql, pubkey);
+  sql.exec(`DELETE FROM vouch_requests WHERE pubkey = ?`, pubkey);
   // Their history backup watermark: nothing of theirs is left to retain.
   deleteBackupWatermark(sql, pubkey);
   unallowPubkey(sql, pubkey, nowSec, "erased");
@@ -3534,8 +3546,10 @@ export function sweepFormerMembers(
       // And their profile, before the gate stops covering it
       // (deleteProfilesOf).
       deleteProfilesOf(sql, pubkey);
-      // So do their restore vault rows, read-only until now (src/vault.ts).
+      // So do their restore vault rows, read-only until now (src/vault.ts),
+      // and the record of their vouch requests (src/vouch.ts).
       deleteVaultRowsOf(sql, pubkey);
+      sql.exec(`DELETE FROM vouch_requests WHERE pubkey = ?`, pubkey);
       // And their backup watermark, kept through the grace so letting
       // them back in resumes retention where it was.
       deleteBackupWatermark(sql, pubkey);

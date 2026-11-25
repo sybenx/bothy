@@ -11,6 +11,8 @@ import {
   maxEventBytes,
   photoMaxBytes,
   photoStorageBytes,
+  VOUCH_RELEASE_DELAY_SECONDS,
+  vouchEnabled,
 } from "./limits";
 import { PHOTO_TYPES } from "./photos";
 import { pushPublicKey } from "./push";
@@ -205,7 +207,12 @@ export function buildRelayInfo(
   // members' passkey-locked copies (vaultput, vaultopen). Omitted while
   // unclaimed, when there are no members to keep one for.
   if (ownerPubkey) {
-    info.restore = { v: 1 };
+    // `vouch` (src/vouch.ts): this home takes vouch copies sealed to `box`
+    // (this relay's own key, as `self`) and hands one to a new phone
+    // `wait` seconds after a voucher approves. Omitted with VOUCH=off.
+    info.restore = vouchEnabled(env)
+      ? { v: 1, vouch: { v: 1, box: relayPubkey, wait: VOUCH_RELEASE_DELAY_SECONDS } }
+      : { v: 1 };
     // Sealed signals (relay.ts handleSignal, kind 21059), bothy's own
     // field: typing, seen and call setup, delivered live, never stored.
     info.signals = { v: 1 };

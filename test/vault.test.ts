@@ -243,7 +243,7 @@ describe("discovery", () => {
     const info = await (
       await exports.default.fetch(new Request(MANAGEMENT_URL, { headers: { Accept: "application/nostr+json" } }))
     ).json<Record<string, unknown>>();
-    expect(info.restore).toEqual({ v: 1 });
+    expect(info.restore).toMatchObject({ v: 1 });
   });
 });
 
