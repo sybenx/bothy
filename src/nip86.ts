@@ -1090,6 +1090,8 @@ export function handleManagementCall(
     // A plain member gets the rows without the activity fields (lastSeen,
     // push, waiting), which stay the owner's and admins' (v0.29): a member
     // does not see when a friend was last online. Owner and admins keep them.
+    // The same for restore, the count of a member's vault rows: whether a
+    // friend has a way back is the owner's and admins' to see.
     case "myinvitees": {
       const owner = getOwnerPubkey(sql, env) ?? signer;
       const listing = listInvitees(sql, MEMBER_REMOVAL_GRACE_SECONDS, owner, signer, nowSec);
@@ -1098,9 +1100,16 @@ export function handleManagementCall(
         const { lastSeen: _seen, push: _push, waiting: _waiting, ...rest } = row;
         return rest;
       };
-      return { result: { members: listing.members.map(strip), removed: listing.removed.map(strip) } };
+      const stripMember = <T extends { lastSeen: unknown; push: unknown; waiting: unknown; restore: unknown }>(row: T) => {
+        const { restore: _restore, ...rest } = strip(row);
+        return rest;
+      };
+      return { result: { members: listing.members.map(stripMember), removed: listing.removed.map(strip) } };
     }
 
+    // Owner and admins only (ADMIN_CALLABLE_METHODS). Each current member's
+    // row carries restore, how many vault rows they keep here (storage.ts
+    // listMembers), so the DMs app can show who has no way back.
     case "listmembers":
       return { result: listMembers(sql, MEMBER_REMOVAL_GRACE_SECONDS, getOwnerPubkey(sql, env) ?? signer) };
 

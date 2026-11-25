@@ -281,6 +281,7 @@ describe("answering a request", () => {
         lastSeen: null,
         push: true,
         waiting: 0,
+        restore: 0,
       },
     ]);
   });

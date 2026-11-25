@@ -14,7 +14,7 @@ import {
   VAULT_OPEN_FLOOR_MS,
   VAULT_ROWS_PER_MEMBER,
 } from "../src/limits";
-import { MANAGEMENT_CONTENT_TYPE, NOT_A_MEMBER_REASON } from "../src/nip86";
+import { adminOnlyReason, MANAGEMENT_CONTENT_TYPE, NOT_A_MEMBER_REASON } from "../src/nip86";
 import type { Relay } from "../src/relay";
 import { sweepFormerMembers } from "../src/storage";
 import {
@@ -504,6 +504,65 @@ describe("leaving", () => {
     await sweep(removedAt + MEMBER_REMOVAL_GRACE_SECONDS);
     expect(await sqlRows(`SELECT hash FROM vault`)).toEqual([]);
     expect((await open(passkey)).body).toEqual({ error: VAULT_NOT_FOUND });
+  });
+});
+
+describe("listmembers' restore count", () => {
+  type Row = { pubkey: string; restore?: number };
+  type Listing = { members: Row[]; removed: Row[] };
+  const rowOf = (listing: Listing, who: Keypair) => listing.members.find((m) => m.pubkey === who.pubkeyHex);
+
+  it("gives the owner and admins each member's vault row count, 0 for none", async () => {
+    const alice = await newMember();
+    const bob = await newMember();
+    const admin = await newMember();
+    await callManagement("addadmin", [admin.pubkeyHex]);
+    const first = await stored(alice);
+    await stored(alice);
+
+    const owners = (await callManagement("listmembers")).result as Listing;
+    expect(rowOf(owners, alice)?.restore).toBe(2);
+    expect(rowOf(owners, bob)?.restore).toBe(0);
+    expect(rowOf(owners, admin)?.restore).toBe(0);
+    const admins = (await as(admin, "listmembers")).result as Listing;
+    expect(rowOf(admins, alice)?.restore).toBe(2);
+    expect(rowOf(admins, bob)?.restore).toBe(0);
+
+    // A delete is counted at once.
+    expect((await as(alice, "vaultdelete", [first.passkey.hash])).result).toBe(true);
+    expect(rowOf((await callManagement("listmembers")).result as Listing, alice)?.restore).toBe(1);
+  });
+
+  it("is on current members only, not removed ones", async () => {
+    const alice = await newMember();
+    await stored(alice);
+    expect((await callManagement("unallowpubkey", [alice.pubkeyHex])).result).toBe(true);
+    const { removed } = (await callManagement("listmembers")).result as Listing;
+    const row = removed.find((r) => r.pubkey === alice.pubkeyHex);
+    expect(row).toBeDefined();
+    expect(row).not.toHaveProperty("restore");
+  });
+
+  it("is left off a plain member's myinvitees, kept on the owner's and an admin's", async () => {
+    const alice = await newMember();
+    const code = ((await as(alice, "createinvite")).result as { code: string }).code;
+    const carol = randomKeypair();
+    expect((await as(carol, "redeeminvite", [code])).result).toBe(true);
+    await stored(carol);
+
+    const plain = (await as(alice, "myinvitees")).result as Listing;
+    expect(plain.members.map((m) => m.pubkey)).toEqual([carol.pubkeyHex]);
+    expect(plain.members[0]).not.toHaveProperty("restore");
+
+    expect(rowOf((await callManagement("myinvitees")).result as Listing, carol)?.restore).toBe(1);
+    await callManagement("addadmin", [alice.pubkeyHex]);
+    expect(rowOf((await as(alice, "myinvitees")).result as Listing, carol)?.restore).toBe(1);
+  });
+
+  it("is refused to a plain member", async () => {
+    const alice = await newMember();
+    const reply = await as(alice, "listmembers");
+    expect([reply.status, reply.error]).toEqual([401, adminOnlyReason("listmembers")]);
   });
 });
 

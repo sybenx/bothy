@@ -3211,6 +3211,11 @@ export interface MemberDetails extends MemberActivity {
   close: boolean;
   // invitedBy is the owner by default, not by record (see listMembers).
   inviterUnknown: boolean;
+  // How many restore vault rows (src/vault.ts) they keep here, 0 for none:
+  // whether a lost phone leaves them a way back. For the owner and admins
+  // (nip86.ts listmembers; myinvitees strips it for a plain member). On
+  // current members only: a removed member's rows go with their mail.
+  restore: number;
 }
 
 // Activity, from what bothy already keeps; nothing new is recorded for
@@ -3338,6 +3343,13 @@ export function listMembers(
     sql.exec<{ pubkey: string }>(`SELECT pubkey FROM admins`).toArray().map((r) => r.pubkey),
   );
   const activity = memberActivity(sql);
+  // One grouped read of the vault (idx_vault_pubkey), not one per member.
+  const vaultRows = new Map(
+    sql
+      .exec<{ pubkey: string; n: number }>(`SELECT pubkey, COUNT(*) AS n FROM vault GROUP BY pubkey`)
+      .toArray()
+      .map((r) => [r.pubkey, r.n] as const),
+  );
   const members = rows.map((r) => ({
     pubkey: r.pubkey,
     invitedBy: r.invited_by !== null && r.invited_by !== r.pubkey && present.has(r.invited_by) ? r.invited_by : owner,
@@ -3353,6 +3365,7 @@ export function listMembers(
       r.invited_by === null ||
       r.invited_by === r.pubkey ||
       (!present.has(r.invited_by) && r.invited_by !== owner),
+    restore: vaultRows.get(r.pubkey) ?? 0,
     ...activity(r.pubkey),
   }));
   const removed = sql
