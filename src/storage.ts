@@ -2536,6 +2536,7 @@ export function eraseMember(
   deleteBackupWatermark(sql, pubkey);
   // Their calendar link (src/door.ts).
   sql.exec(`DELETE FROM calendar_links WHERE pubkey = ?`, pubkey);
+  sql.exec(`DELETE FROM door_hidden WHERE pubkey = ?`, pubkey);
   unallowPubkey(sql, pubkey, nowSec, "erased");
   return deleted;
 }

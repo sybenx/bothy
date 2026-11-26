@@ -423,6 +423,8 @@ function bumpVersion(sql: SqlStorage, gid: string, version: number): void {
 function recordFormer(sql: SqlStorage, gid: string, pubkey: string, by: string, op: string, version: number, nowSec: number): void {
   sql.exec(`DELETE FROM home_group_members WHERE gid = ? AND pubkey = ?`, gid, pubkey);
   sql.exec(`DELETE FROM home_group_keys WHERE gid = ? AND member = ?`, gid, pubkey);
+  // What they hid on the door for themselves (src/door.ts doorhide).
+  sql.exec(`DELETE FROM door_hidden WHERE gid = ? AND pubkey = ?`, gid, pubkey);
   sql.exec(
     `INSERT OR REPLACE INTO home_group_former (gid, pubkey, by_key, op, version, at) VALUES (?, ?, ?, ?, ?, ?)`,
     gid,
@@ -471,6 +473,7 @@ function deleteGroup(sql: SqlStorage, gid: string, nowSec: number): void {
   // The door goes with the group (src/door.ts); its counter is on the
   // group's own row, deleted below.
   sql.exec(`DELETE FROM door_events WHERE gid = ?`, gid);
+  sql.exec(`DELETE FROM door_hidden WHERE gid = ?`, gid);
   stopLinks(sql, gid, null, nowSec);
   sql.exec(`DELETE FROM home_groups WHERE gid = ?`, gid);
 }

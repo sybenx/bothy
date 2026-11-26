@@ -224,8 +224,9 @@ export function buildRelayInfo(
     info.calendar = { v: 1 };
     // The Fridge door (src/door.ts), bothy's own field: each home group's
     // door is kept here (doorput, doorlist), with a live notice to open
-    // apps and push reason "door".
-    info.door = { v: 1 };
+    // apps and push reason "door". `pencil`: pencilled items and doorhide
+    // (door.ts).
+    info.door = { v: 1, pencil: 1 };
     // Sealed signals (relay.ts handleSignal, kind 21059), bothy's own
     // field: typing, seen and call setup, delivered live, never stored.
     info.signals = { v: 1 };

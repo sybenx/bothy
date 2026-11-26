@@ -328,6 +328,7 @@ export const SUPPORTED_METHODS = [
   // person's calendar link (src/door.ts).
   "doorput",
   "doorlist",
+  "doorhide",
   "doorcount",
   "callink",
   "callinknew",
@@ -411,8 +412,8 @@ export const ANYONE_CALLABLE_METHODS: readonly string[] = [
   // Home groups: each checks the signer is on that group's roster
   // (home-groups.ts), so a guest from another home can use their groups.
   ...HOME_GROUP_METHODS.filter((m) => m !== "groupcreate" && !KEEPER_METHODS.includes(m)),
-  // The door and calendar links (src/door.ts): doorput, doorlist and
-  // doorcount check the group's roster; a calendar link is for a member here or anyone in
+  // The door and calendar links (src/door.ts): doorput, doorlist,
+  // doorhide and doorcount check the group's roster; a calendar link is for a member here or anyone in
   // a group here (guests included), checked in handleDoorCall's caller.
   ...DOOR_METHODS,
 ];

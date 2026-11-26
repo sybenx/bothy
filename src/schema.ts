@@ -784,6 +784,16 @@ export const TABLES: readonly TableSpec[] = [
     tableConstraints: ["PRIMARY KEY (gid, d)"],
   },
   {
+    // The door items each person has hidden for themselves (src/door.ts
+    // doorhide), never a change to the item. Deleted with the group
+    // (home-groups.ts deleteGroup), when the person leaves it
+    // (recordFormer), with the person (storage.ts eraseMember), and with
+    // the item when a full door gives it up.
+    name: "door_hidden",
+    columns: [col("gid", "TEXT NOT NULL"), col("pubkey", "TEXT NOT NULL"), col("d", "TEXT NOT NULL")],
+    tableConstraints: ["PRIMARY KEY (gid, pubkey, d)"],
+  },
+  {
     // Each person's calendar link (src/door.ts callink): the secret in
     // GET /cal/<secret>.ics. One per person; callinknew replaces it.
     // Deleted by eraseme and when a removed member's grace ends

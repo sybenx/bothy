@@ -89,7 +89,7 @@ function put(who: Keypair, gid: string, items: unknown[]) {
   return callManagement("doorput", [gid, items], as(who));
 }
 
-type Listed = { seq: number; items: (DoorItem & Record<string, unknown>)[] };
+type Listed = { seq: number; items: (DoorItem & Record<string, unknown>)[]; hidden: string[] };
 
 async function list(who: Keypair, gid: string, since = 0): Promise<Listed> {
   const r = await callManagement("doorlist", [gid, since], as(who));
@@ -130,7 +130,7 @@ describe("the door's items", () => {
     const reply = await exports.default.fetch(new Request("https://example.com/", { headers: { Accept: "application/nostr+json" } }));
     const doc = (await reply.json()) as { calendar?: unknown; door?: unknown };
     expect(doc.calendar).toEqual({ v: 1 });
-    expect(doc.door).toEqual({ v: 1 });
+    expect(doc.door).toEqual({ v: 1, pencil: 1 });
   });
 
   it("are written and read only by people in the group", async () => {
@@ -441,6 +441,123 @@ describe("telling people about a door change", () => {
     expect(m("note", ev({ text: "hi" }), ev({ text: "hello" }), ["text"])).toBe(false);
     expect(m("birthday", null, ev({ name: "Ana", month: 1, day: 2 }), ["name"])).toBe(false);
     expect(m("wish", null, ev({ what: "Lego" }), ["what"])).toBe(false);
+    // Pencilled: nobody's phone, until it is made solid, which is new.
+    const pencilled = ev({ ...soon, pencil: true, said: "game sat at the gym", saidBy: "ab".repeat(32) });
+    expect(m("event", null, pencilled, ["title", "start", "place", "pencil"])).toBe(false);
+    expect(m("event", pencilled, ev({ ...pencilled.fields, place: "Park" }), ["place"])).toBe(false);
+    expect(m("event", pencilled, ev({ ...pencilled.fields, pencil: false }), ["pencil"])).toBe(true);
+    expect(m("note", ev({ text: "hi", pencil: true }), ev({ text: "hi", pencil: null }), ["pencil"])).toBe(true);
+  });
+});
+
+describe("pencilled items and each person's X", () => {
+  const mutableEnv = env as unknown as Record<string, unknown>;
+  beforeEach(() => {
+    mutableEnv.VAPID_PRIVATE_KEY = "DhUcIyoxOD9GTVRbYmlwd36FjJOaoaivtr3Ey9LZ4Oc";
+  });
+  afterEach(() => {
+    delete mutableEnv.VAPID_PRIVATE_KEY;
+  });
+  const queued = () => sql((s) => s.exec<{ pubkey: string }>(`SELECT pubkey FROM door_push ORDER BY pubkey`).toArray().map((r) => r.pubkey));
+
+  async function family() {
+    const ana = await newMember();
+    const ben = await newMember();
+    const cy = await newMember();
+    const gid = await create(ana, [ben, cy]);
+    for (const who of [ana, ben, cy]) {
+      const phone = await makeDevice(`https://push.example/${who.pubkeyHex.slice(0, 8)}`);
+      expect((await callManagement("subscribepush", [{ endpoint: phone.endpoint, keys: phone.keys }], as(who))).result).toBe(true);
+    }
+    return { ana, ben, cy, gid };
+  }
+
+  const pencilled = (saidBy: Keypair) => ({
+    ...hike,
+    set: { ...hike.set, pencil: true, said: "  Hike Saturday at 9, Mill Creek?  ", saidBy: saidBy.pubkeyHex, from: "msg-1" },
+    at: { ...hike.at, pencil: 10, said: 10, saidBy: 10, from: 10 },
+  });
+
+  it("show at once, wake nobody, stay off calendars, and become ordinary when made solid", async () => {
+    const { ana, ben, cy, gid } = await family();
+    const path = await linkOf(cy);
+    expect((await put(ana, gid, [pencilled(ben)])).result).toEqual({ seq: 1, refused: 0 });
+    expect(await queued()).toEqual([]);
+    const item = (await list(cy, gid)).items[0]!;
+    expect(item.fields).toMatchObject({ pencil: true, said: "Hike Saturday at 9, Mill Creek?", saidBy: ben.pubkeyHex, from: "msg-1" });
+    expect(await calText(path)).not.toContain("BEGIN:VEVENT");
+    // Edits while pencilled wake nobody either.
+    await put(cy, gid, [{ d: D1, set: { place: "Trailhead" }, at: { place: 11 } }]);
+    expect(await queued()).toEqual([]);
+    // Anyone makes it solid: new, so the others' phones wake, and it is on the calendar.
+    await put(cy, gid, [{ d: D1, set: { pencil: false }, at: { pencil: 12 } }]);
+    expect(await queued()).toEqual([ana.pubkeyHex, ben.pubkeyHex].sort());
+    expect(await calText(path)).toContain("SUMMARY:Hike at Mill Creek\r\n");
+    // Bad pencil fields are refused.
+    const bad = [
+      { d: D2, kind: "note", set: { text: "x", pencil: "yes" }, at: { text: 1, pencil: 1 } },
+      { d: D2, kind: "note", set: { text: "x", saidBy: "ben" }, at: { text: 1, saidBy: 1 } },
+      { d: D2, kind: "note", set: { text: "x", said: "y".repeat(600), from: "" }, at: { text: 1, said: 1, from: 1 } },
+    ];
+    expect((await put(ana, gid, bad)).result).toEqual({ seq: 3, refused: 3 });
+    expect((await put(ana, gid, [{ d: D2, kind: "note", set: { text: "x", said: "y".repeat(600) }, at: { text: 1, said: 1 } }])).result).toEqual({ seq: 4, refused: 0 });
+    expect((await list(ana, gid, 3)).items[0]!.fields.said).toHaveLength(500);
+  });
+
+  it("are taken down for everyone only by the person who said it", async () => {
+    const { ana, ben, cy, gid } = await family();
+    await put(ana, gid, [pencilled(ben)]);
+    const remove = { d: D1, set: { removed: true }, at: { removed: 20 } };
+    expect((await put(ana, gid, [remove])).result).toEqual({ seq: 1, refused: 1 });
+    expect((await put(cy, gid, [remove])).result).toEqual({ seq: 1, refused: 1 });
+    // Nor can someone make themselves the one who said it.
+    expect((await put(cy, gid, [{ d: D1, set: { saidBy: cy.pubkeyHex }, at: { saidBy: 30 } }])).result).toEqual({ seq: 1, refused: 1 });
+    expect((await put(ben, gid, [remove])).result).toEqual({ seq: 2, refused: 0 });
+    expect(isRemoved((await list(ana, gid)).items[0]!.fields, (await list(ana, gid)).items[0]!.stamps)).toBe(true);
+    // A pencilled removal wakes nobody; a solid item anyone may remove.
+    expect(await queued()).toEqual([]);
+    await put(ana, gid, [{ ...hike, d: D2, set: { ...hike.set, pencil: true, saidBy: ben.pubkeyHex }, at: { ...hike.at, pencil: 1, saidBy: 1 } }]);
+    expect((await put(cy, gid, [{ d: D2, set: { pencil: null }, at: { pencil: 2 } }])).result).toEqual({ seq: 4, refused: 0 });
+    expect((await put(ana, gid, [{ d: D2, set: { removed: true }, at: { removed: 40 } }])).result).toEqual({ seq: 5, refused: 0 });
+  });
+
+  it("stay as history: past items, pencilled or solid, never age off", async () => {
+    const ana = await newMember();
+    const gid = await create(ana, []);
+    await put(ana, gid, [
+      { d: "e1", kind: "event", set: { title: "Long ago", start: { date: "2001-01-01" }, pencil: true }, at: { title: 1, start: 1, pencil: 1 } },
+      { d: "e2", kind: "event", set: { title: "Also long ago", start: { date: "2001-02-01" } }, at: { title: 1, start: 1 } },
+    ]);
+    expect((await list(ana, gid)).items.map((i) => i.d)).toEqual(["e1", "e2"]);
+  });
+
+  it("hide an item for one person only, until they show it again", async () => {
+    const { ana, ben, gid } = await family();
+    await put(ana, gid, [pencilled(ben)]);
+    const stranger = await newMember();
+    expect((await callManagement("doorhide", [gid, D1, true], as(stranger))).error).toBe("doorhide: you are not in this group");
+    expect((await callManagement("doorhide", [gid, D2, true], as(ben))).error).toBe("doorhide: there is no such item on this door");
+    expect((await callManagement("doorhide", [gid, D1, "yes"], as(ben))).error).toMatch(/^doorhide: /);
+    expect((await callManagement("doorhide", [gid, D1, true], as(ben))).result).toBe(true);
+    expect((await callManagement("doorhide", [gid, D1, true], as(ben))).result).toBe(true);
+    let l = await list(ben, gid);
+    expect(l.hidden).toEqual([D1]);
+    // The item itself is untouched, and nobody else has it hidden.
+    expect(l.seq).toBe(1);
+    expect(l.items[0]!.seq).toBe(1);
+    expect((await list(ana, gid)).hidden).toEqual([]);
+    expect((await list(ben, gid, 1)).hidden).toEqual([D1]);
+    expect((await callManagement("doorhide", [gid, D1, false], as(ben))).result).toBe(true);
+    expect((await list(ben, gid)).hidden).toEqual([]);
+
+    // Gone when they leave the group, and with the group.
+    await callManagement("doorhide", [gid, D1, true], as(ben));
+    await callManagement("doorhide", [gid, D1, true], as(ana));
+    expect((await callManagement("groupleave", [gid], as(ben))).error).toBeUndefined();
+    const rows = () => sql((s) => s.exec<{ pubkey: string }>(`SELECT pubkey FROM door_hidden WHERE gid = ?`, gid).toArray().map((r) => r.pubkey));
+    expect(await rows()).toEqual([ana.pubkeyHex]);
+    await callManagement("unallowpubkey", [ana.pubkeyHex]);
+    expect(await rows()).toEqual([]);
   });
 });
 

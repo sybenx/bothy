@@ -7,7 +7,8 @@
 // The methods (nip86.ts), each for people on the group's roster here:
 //
 //   doorput [gid, [{d, kind, set, at}, ...]]  -> {seq, refused}
-//   doorlist [gid, since]                     -> {seq, items}
+//   doorlist [gid, since]                     -> {seq, items, hidden}
+//   doorhide [gid, d, hidden]                 -> true
 //   doorcount [gid]                           -> {events}
 //   callink []        a member, or anyone in a group here
 //   callinknew []     the same
@@ -28,6 +29,21 @@
 // stored change, and each changed item takes the new number. doorlist hands
 // back every item above the reader's `since`, removed ones included, so an
 // app keeps its copy current by asking for what is new.
+//
+// A PENCILLED item (DMs docs/fridge.md 15.1) is one an app put up from
+// something said in the group's chat: any kind, with `pencil: true`, `said`
+// (the line), `saidBy` (who said it) and `from` (the message). Everyone in
+// the group sees it at once. It never wakes a phone and never goes on a
+// calendar link. Anyone may make it solid (`pencil` false or null), after
+// which it is an ordinary item and that change counts as new. Only its
+// `saidBy` may remove it for everyone while it is pencilled, and `saidBy`
+// cannot be changed once set. Each person can also hide any item for
+// themselves alone (doorhide); the item itself never changes for that.
+//
+// Nothing on the door ages off here: past items stay as history. The only
+// thing that ever drops an item is a full door (DOOR_ITEMS_PER_GROUP)
+// giving up its oldest long-removed one; calendar links leave out events
+// long over, but only from the file they serve.
 //
 // Telling people (relay.ts manage): every stored change sends a tiny notice
 // (DOOR_NOTICE_KIND, below) to the group's connected members who asked for
@@ -53,7 +69,7 @@ import {
   CALENDAR_LINK_PAST_DAYS,
 } from "./limits";
 
-export const DOOR_METHODS: readonly string[] = ["doorput", "doorlist", "doorcount", "callink", "callinknew", "callinkoff"];
+export const DOOR_METHODS: readonly string[] = ["doorput", "doorlist", "doorhide", "doorcount", "callink", "callinknew", "callinkoff"];
 
 // The live notice: "this group's door changed, it is now at seq N". An
 // ephemeral kind, signed by this home's own key (relay-identity.ts), with
@@ -69,6 +85,8 @@ export const PLACE_MAX = 200;
 export const NOTE_MAX = 1000;
 export const LINK_MAX = 500;
 export const NAME_MAX = 100;
+export const SAID_MAX = 500;
+export const FROM_MAX = 200;
 
 const GID_RE = /^[0-9a-f]{32}$/;
 const D_RE = /^[0-9a-f]{1,64}$/;
@@ -117,6 +135,13 @@ export const KNOWN_FIELDS: Readonly<Record<string, readonly string[]>> = {
   birthday: ["who", "name", "month", "day", "year", "removed"],
   note: ["text", "removed"],
 };
+
+// The pencil's fields, checked on an item of any kind.
+export const PENCIL_FIELDS: readonly string[] = ["pencil", "said", "saidBy", "from"];
+
+export function isPencilled(fields: Record<string, unknown>): boolean {
+  return own(fields, "pencil") === true;
+}
 
 function isObj(x: unknown): x is Record<string, unknown> {
   return typeof x === "object" && x !== null && !Array.isArray(x);
@@ -174,6 +199,16 @@ function intIn(v: unknown, lo: number, hi: number): v is number {
 // ignores a bad change whole).
 function knownValue(kind: string, f: string, v: unknown): unknown {
   if (f === "removed") return typeof v === "boolean" ? v : undefined;
+  switch (f) {
+    case "pencil":
+      return v === null || typeof v === "boolean" ? v : undefined;
+    case "said":
+      return optionalText(v, SAID_MAX);
+    case "saidBy":
+      return v === null ? null : typeof v === "string" && HEX64_RE.test(v) ? v : undefined;
+    case "from":
+      return v === null ? null : typeof v === "string" && v.length > 0 && v.length <= FROM_MAX ? v : undefined;
+  }
   switch (`${kind}.${f}`) {
     case "event.title":
       return typeof v === "string" && v.trim().length > 0 ? clip(v, TITLE_MAX) : undefined;
@@ -237,7 +272,7 @@ export function cleanSet(kind: string, set: Record<string, unknown>): Record<str
   const known = KNOWN_FIELDS[kind] ?? [];
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(set)) {
-    const value = known.includes(k) || k === "removed" ? knownValue(kind, k, v) : v;
+    const value = known.includes(k) || k === "removed" || PENCIL_FIELDS.includes(k) ? knownValue(kind, k, v) : v;
     if (value === undefined) return null;
     out[k] = value;
   }
@@ -295,8 +330,11 @@ function eventOver(x: Shape, nowMs: number): boolean {
 // place moving, an event removed, a new note. Not birthdays, other edits or
 // kinds this home does not know. An event already over is no news, which
 // also keeps an app's one-time bring-over of old events quiet. An item
-// coming back from removed counts as new.
-export function changeMatters(kind: string, before: Shape | null, after: Shape, changed: ReadonlySet<string>, nowMs: number): boolean {
+// coming back from removed counts as new. A pencilled item matters to
+// nobody's phone; once made solid it is new.
+export function changeMatters(kind: string, was: Shape | null, after: Shape, changed: ReadonlySet<string>, nowMs: number): boolean {
+  if (isPencilled(after.fields)) return false;
+  const before = was !== null && isPencilled(was.fields) ? null : was;
   if (kind === "event") {
     const was = eventShown(before);
     const is = eventShown(after);
@@ -371,6 +409,10 @@ function doorPut(sql: SqlStorage, params: unknown[], signer: string, nowSec: num
     }
     const before: Shape | null = row === undefined ? null : { fields: JSON.parse(row.fields), stamps: JSON.parse(row.stamps) };
     const m = merge(before?.fields ?? {}, before?.stamps ?? {}, { set, at: inc.at });
+    if (before !== null && !mayChangePencil(before, m, signer)) {
+      refused++;
+      continue;
+    }
     const stamps = JSON.stringify(m.stamps);
     // Nothing newer than what is here: not a change.
     if (row !== undefined && stamps === row.stamps) continue;
@@ -417,6 +459,17 @@ function doorPut(sql: SqlStorage, params: unknown[], signer: string, nowSec: num
   return { result: { seq, refused }, door: { gid, seq, wake } };
 }
 
+// The pencil's two rules on an existing item: who said it never changes
+// once set, and while it is pencilled only they may remove it for everyone.
+function mayChangePencil(before: Shape, after: Shape, signer: string): boolean {
+  const saidBy = own(before.fields, "saidBy");
+  if (typeof saidBy === "string" && own(after.fields, "saidBy") !== saidBy) return false;
+  const removing = isRemoved(after.fields, after.stamps) && !isRemoved(before.fields, before.stamps);
+  if (!removing || !isPencilled(after.fields)) return true;
+  const owner = typeof saidBy === "string" ? saidBy : own(after.fields, "saidBy");
+  return owner === signer;
+}
+
 // A full door gives up the removed item whose last change is oldest for a
 // new one. A reader that has not asked since before that item was removed
 // keeps it until it next lists from 0; at DOOR_ITEMS_PER_GROUP that is
@@ -430,6 +483,7 @@ function makeRoom(sql: SqlStorage, gid: string): boolean {
   const gone = rows.find((r) => isRemoved(JSON.parse(r.fields), JSON.parse(r.stamps)));
   if (gone === undefined) return false;
   sql.exec(`DELETE FROM door_events WHERE gid = ? AND d = ?`, gid, gone.d);
+  sql.exec(`DELETE FROM door_hidden WHERE gid = ? AND d = ?`, gid, gone.d);
   return true;
 }
 
@@ -469,7 +523,35 @@ function doorList(sql: SqlStorage, params: unknown[], signer: string): DoorReply
     )
     .toArray()
     .map(itemOf);
-  return { result: { seq, items } };
+  const hidden = sql
+    .exec<{ d: string }>(`SELECT d FROM door_hidden WHERE gid = ? AND pubkey = ? ORDER BY d`, gid, signer)
+    .toArray()
+    .map((r) => r.d);
+  return { result: { seq, items, hidden } };
+}
+
+// The caller's own X: hides an item for them alone, or shows it again. The
+// item is not changed and nobody else is told; doorlist hands the caller
+// their whole hidden list every time.
+function doorHide(sql: SqlStorage, params: unknown[], signer: string): DoorReply {
+  const gid = gidParam(params);
+  if (gid === null) return { error: "doorhide: the first parameter must be a group id" };
+  if (memberOf(sql, gid, signer) === null) return { error: `doorhide: ${NOT_IN_GROUP}` };
+  const d = params[1];
+  const hidden = params[2];
+  if (typeof d !== "string" || !D_RE.test(d) || typeof hidden !== "boolean") {
+    return { error: "doorhide: the parameters are a group id, an item's d and true or false" };
+  }
+  if (!hidden) {
+    sql.exec(`DELETE FROM door_hidden WHERE gid = ? AND pubkey = ? AND d = ?`, gid, signer, d);
+    return { result: true };
+  }
+  // Only items on the door, so a person's list is never longer than it.
+  if (sql.exec(`SELECT 1 FROM door_events WHERE gid = ? AND d = ?`, gid, d).toArray().length === 0) {
+    return { error: "doorhide: there is no such item on this door" };
+  }
+  sql.exec(`INSERT INTO door_hidden (gid, pubkey, d) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`, gid, signer, d);
+  return { result: true };
 }
 
 // For an app's one-time bring-over of the events it used to keep itself.
@@ -543,6 +625,8 @@ export function handleDoorCall(
       return doorPut(sql, params, signer, nowSec);
     case "doorlist":
       return doorList(sql, params, signer);
+    case "doorhide":
+      return doorHide(sql, params, signer);
     case "doorcount":
       return doorCount(sql, params, signer);
     case "callink":
@@ -791,7 +875,7 @@ function birthdayEntry(b: LinkItem | DoorItem, nameOf: (gid: string, who: string
 
 const noNames = () => null;
 
-// The whole file for a link. Removed items and events that ended more than
+// The whole file for a link. Removed and pencilled items, and events that ended more than
 // CALENDAR_LINK_PAST_DAYS ago are left out, so the calendar app drops them;
 // an event never complete (no title or start), or a birthday without a
 // real date, is left out too.
@@ -814,8 +898,9 @@ export function calendarFile(
   ];
   let lastModified = 0;
   let n = 0;
+  // Pencilled items stay off phone calendars until someone makes them solid.
   const shown = items
-    .filter((it) => !isRemoved(it.fields, it.stamps))
+    .filter((it) => !isRemoved(it.fields, it.stamps) && !isPencilled(it.fields))
     .sort((a, b) => (a.d < b.d ? -1 : 1));
   for (const it of shown) {
     const entry = it.kind === "event" ? eventEntry(it, cutoff) : it.kind === "birthday" ? birthdayEntry(it, nameOf) : null;
