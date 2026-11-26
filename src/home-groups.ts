@@ -40,9 +40,11 @@ export const GROUP_DECISIONS = {
   // 4 (open): someone cut off from the home (unallowpubkey, banpubkey,
   // eraseme) leaves every group on it, and cannot be added back while cut off.
   cutOffLeavesGroups: true,
-  // 7 (answered 2026-11-23: 100): the most people in one group, the keeper
-  // not counted.
-  maxMembers: 100,
+  // 7 (answered 2026-11-23: 100; raised 2026-11-26: 500): the most people
+  // in one group, the keeper not counted. At 500 a message still costs one
+  // stored row plus, per member with push, a push-queue check and write
+  // (relay.ts wakeOnly); pushes past MAX_PUSHES_PER_TICK go on the next tick.
+  maxMembers: 500,
   // 2 (answered 2026-11-23: the box ALWAYS holds every group's key, no
   // opt-out) and 9. The keeper is the home's storage service (setstorage's
   // key): every group on the home has it in its envelopes (keeperPlus), and
