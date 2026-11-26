@@ -217,11 +217,15 @@ export function buildRelayInfo(
     info.restore = vouchEnabled(env)
       ? { v: 1, vouch: { v: 1, box: relayPubkey, wait: VOUCH_RELEASE_DELAY_SECONDS }, noprf: { v: 1 } }
       : { v: 1 };
-    // Calendar links (src/door.ts), bothy's own field: members' apps write
-    // a home group's events here readable (doorput), and each person can
-    // get a link the phone's calendar app follows (callink, GET
-    // /cal/<secret>.ics).
+    // Calendar links (src/door.ts), bothy's own field: each person can get
+    // a link the phone's calendar app follows (callink, GET
+    // /cal/<secret>.ics), with the events and birthdays on their groups'
+    // doors.
     info.calendar = { v: 1 };
+    // The Fridge door (src/door.ts), bothy's own field: each home group's
+    // door is kept here (doorput, doorlist), with a live notice to open
+    // apps and push reason "door".
+    info.door = { v: 1 };
     // Sealed signals (relay.ts handleSignal, kind 21059), bothy's own
     // field: typing, seen and call setup, delivered live, never stored.
     info.signals = { v: 1 };

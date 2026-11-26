@@ -2427,6 +2427,7 @@ export function unallowPubkey(
   sql.exec(`DELETE FROM fcm_tokens WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM inbox_push WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM call_push WHERE pubkey = ?`, pubkey);
+  sql.exec(`DELETE FROM door_push WHERE pubkey = ?`, pubkey);
   // Vouching (src/vouch.ts): the copy this relay can open goes at once,
   // not after the grace; their open request closes; and they stop
   // vouching for anyone, and anyone named for them stops too.
@@ -4060,6 +4061,26 @@ export function pendingCallPushes(sql: SqlStorage, limit: number): string[] {
 
 export function clearCallPush(sql: SqlStorage, pubkey: string): void {
   sql.exec(`DELETE FROM call_push WHERE pubkey = ?`, pubkey);
+}
+
+// The door push queue (schema.ts `door_push`), the same three calls.
+export function queueDoorPush(sql: SqlStorage, pubkey: string, nowSec: number): void {
+  sql.exec(
+    `INSERT INTO door_push (pubkey, queued_at) VALUES (?, ?) ON CONFLICT(pubkey) DO NOTHING`,
+    pubkey,
+    nowSec,
+  );
+}
+
+export function pendingDoorPushes(sql: SqlStorage, limit: number): string[] {
+  return sql
+    .exec<{ pubkey: string }>(`SELECT pubkey FROM door_push ORDER BY queued_at ASC, pubkey ASC LIMIT ?`, limit)
+    .toArray()
+    .map((row) => row.pubkey);
+}
+
+export function clearDoorPush(sql: SqlStorage, pubkey: string): void {
+  sql.exec(`DELETE FROM door_push WHERE pubkey = ?`, pubkey);
 }
 
 export function markPushEndpointOk(sql: SqlStorage, endpoint: string, nowSec: number): void {

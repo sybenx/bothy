@@ -199,7 +199,15 @@ import { normalizeIp } from "./ip";
 import { connMetricsSnapshot, noteClose, noteRefusal, type ConnMetricsSnapshot } from "./conn-metrics";
 import { reqCacheSnapshot, type ReqCacheSnapshot } from "./req-cache";
 import { initSchema } from "./schema";
-import { calendarFile, eventsForLink, type CalendarFile } from "./door";
+import {
+  calendarFile,
+  doorNotice,
+  itemsForLink,
+  memberNames,
+  DOOR_NOTICE_KIND,
+  type CalendarFile,
+  type DoorChange,
+} from "./door";
 import {
   groupHost,
   advancePush,
@@ -260,6 +268,9 @@ import {
   type FcmTokenRow,
   queueCallPush,
   queueInboxPush,
+  queueDoorPush,
+  pendingDoorPushes,
+  clearDoorPush,
   sweepFormerMembers,
   mailRetentionOn,
   sweepRetention,
@@ -288,6 +299,10 @@ const PING_PONG = new WebSocketRequestResponsePair("ping", "pong");
 // ctx.getWebSockets(LIVE_FEED_TAG), with no memory-only registry to
 // rebuild after hibernation.
 const LIVE_FEED_TAG = "live-feed";
+
+// The kinds a live-only home group REQ may ask for (handleReqInner): the
+// group's own traffic and the door's notice (src/door.ts).
+const LIVE_GROUP_KINDS: readonly number[] = [...GROUP_KINDS, DOOR_NOTICE_KIND];
 
 // A live feed socket's attachment: only the connect time, which alarm()
 // uses to enforce LIVE_FEED_MAX_LIFETIME_MS.
@@ -769,7 +784,8 @@ export class Relay extends DurableObject<Env> {
         }
         for (const entry of reply.groupOutbox ?? []) this.deliverGroupEvent(sql, entry);
         if (reply.wake?.length) this.wakeOnly(sql, reply.wake);
-        const { outbox: _delivered, groupOutbox: _groupDelivered, wake: _woken, ...rest } = reply;
+        if (reply.door) this.announceDoor(sql, reply.door);
+        const { outbox: _delivered, groupOutbox: _groupDelivered, wake: _woken, door: _door, ...rest } = reply;
         return rest;
       });
       await this.settlePushAlarm();
@@ -970,10 +986,10 @@ export class Relay extends DurableObject<Env> {
   async calendarFeed(secret: string): Promise<CalendarFile | null> {
     return this.metered(() =>
       withReadPath("calendar", () => {
-        const events = eventsForLink(this.sql, secret);
-        if (events === null) return null;
+        const items = itemsForLink(this.sql, secret);
+        if (items === null) return null;
         const name = resolveName(this.env, getRelaySettings(this.sql), getOwnerProfile(this.sql, this.env));
-        return calendarFile(events, name, Date.now());
+        return calendarFile(items, name, Date.now(), memberNames(this.sql));
       }),
     );
   }
@@ -1598,6 +1614,11 @@ export class Relay extends DurableObject<Env> {
       this.handleSignal(ws, event);
       return;
     }
+    // The door's live notice (src/door.ts) comes from this home alone.
+    if (event.kind === DOOR_NOTICE_KIND) {
+      ok(ws, event.id, false, "invalid: door notices come from the home itself");
+      return;
+    }
     // Home group messages (src/home-groups.ts): signed by a throwaway key,
     // so the sender's AUTH and the group's roster are the authority.
     // Changes (kind 1491) arrive only through groupchange.
@@ -1950,6 +1971,54 @@ export class Relay extends DurableObject<Env> {
       }
     }
     this.wakeOnly(sql, entry.wake);
+  }
+
+  // A stored change to a group's Fridge door (src/door.ts doorput).
+  //
+  // Live: the notice goes to each connected roster member's subscriptions
+  // that asked for DOOR_NOTICE_KIND, the writer's other devices included,
+  // so an open door shows the change within a second. The sockets are
+  // walked first and the roster read only for someone listening, so a
+  // change nobody has open costs no read and no signature; the notice is
+  // signed once, when the first listener is found.
+  //
+  // Phones: when the change matters, a "door" push for each other member
+  // with a device, through the door push queue (one per person per burst,
+  // after PUSH_ALARM_DELAY_MS, skipped while one of their apps is listening
+  // for the notice: it already has the change).
+  private announceDoor(sql: SqlStorage, change: DoorChange): void {
+    let notice: NostrEvent | null = null;
+    const member = new Map<string, boolean>();
+    for (const ws of this.ctx.getWebSockets()) {
+      if (this.ctx.getTags(ws).includes(LIVE_FEED_TAG)) continue;
+      const state = getState(ws);
+      const authed = state.authedPubkey;
+      if (authed === undefined) continue;
+      for (const [subId, filters] of Object.entries(state.subs)) {
+        const asked = filters.filter((f) => f.kinds?.includes(DOOR_NOTICE_KIND));
+        if (asked.length === 0) continue;
+        let onRoster = member.get(authed);
+        if (onRoster === undefined) {
+          onRoster = memberOf(sql, change.gid, authed) !== null;
+          member.set(authed, onRoster);
+        }
+        if (!onRoster) break;
+        notice ??= doorNotice(sql, change.gid, change.seq, nowSeconds());
+        if (matchesAnyFilter(notice, asked)) send(ws, ["EVENT", subId, notice]);
+      }
+    }
+    if (change.wake.length === 0) return;
+    const web = pushConfigured(this.env);
+    const android = fcmConfigured(this.env);
+    if (!web && !android) return;
+    withReadPath("push", () => {
+      const now = nowSeconds();
+      for (const pubkey of change.wake) {
+        if (!hasPushSubscription(sql, pubkey, web, android)) continue;
+        queueDoorPush(sql, pubkey, now);
+        this.pushAlarmWanted = true;
+      }
+    });
   }
 
   // The content-free wake, through the inbox push queue.
@@ -2580,12 +2649,20 @@ export class Relay extends DurableObject<Env> {
   // already see what arrived. Only authenticated sockets count; group
   // reads and gift wrap reads both require NIP-42, so a client reading
   // either has authenticated. No storage: the pubkey is in the attachment.
-  private onlinePubkeys(): Set<string> {
+  //
+  // With `listeningFor`, only sockets with a subscription asking for that
+  // kind count.
+  private onlinePubkeys(listeningFor?: number): Set<string> {
     const online = new Set<string>();
     for (const ws of this.ctx.getWebSockets()) {
       if (this.ctx.getTags(ws).includes(LIVE_FEED_TAG)) continue;
-      const authed = getState(ws).authedPubkey;
-      if (authed !== undefined) online.add(authed);
+      const state = getState(ws);
+      const authed = state.authedPubkey;
+      if (authed === undefined) continue;
+      if (listeningFor !== undefined && !Object.values(state.subs).some((fs) => fs.some((f) => f.kinds?.includes(listeningFor)))) {
+        continue;
+      }
+      online.add(authed);
     }
     return online;
   }
@@ -2620,11 +2697,17 @@ export class Relay extends DurableObject<Env> {
     return this.drainPersonalPushes(budget, "call", pendingCallPushes, clearCallPush);
   }
 
+  // Announces door changes (schema.ts `door_push`) exactly as mail is
+  // announced, with the kind "door".
+  private drainDoorPushes(budget: number): Promise<{ spent: number; more: boolean }> {
+    return this.drainPersonalPushes(budget, "door", pendingDoorPushes, clearDoorPush);
+  }
+
   // The body of both drains above: a queue keyed by recipient, each
   // served whole to their own devices.
   private async drainPersonalPushes(
     budget: number,
-    kind: "message" | "call",
+    kind: "message" | "call" | "door",
     pendingOf: (sql: SqlStorage, limit: number) => string[],
     clear: (sql: SqlStorage, pubkey: string) => void,
   ): Promise<{ spent: number; more: boolean }> {
@@ -2635,8 +2718,13 @@ export class Relay extends DurableObject<Env> {
     // Rings took every subrequest this time: come back for the rest.
     if (budget <= 0) return { spent: 0, more: withReadPath("push", () => pendingOf(sql, 1).length > 0) };
     const nowSec = nowSeconds();
-    // Who is online only matters for mail: a ring is pushed regardless.
-    const online = kind === "call" ? new Set<string>() : this.onlinePubkeys();
+    // Who is online only matters for mail and the door: a ring is pushed
+    // regardless. For the door, online means an app listening for its
+    // notice, which reached it already; an app with a socket open for
+    // anything else (an Android app keeping its chats live) still gets
+    // the push, since it is what makes the app read the door.
+    const online =
+      kind === "call" ? new Set<string>() : kind === "door" ? this.onlinePubkeys(DOOR_NOTICE_KIND) : this.onlinePubkeys();
     const mint = account !== null && needsAccessToken(account, nowSec) ? 1 : 0;
 
     const plan = withReadPath("push", () => {
@@ -2983,8 +3071,10 @@ export class Relay extends DurableObject<Env> {
     // LIVE ONLY, answered EOSE at once; stored traffic comes from
     // groupsince, which carries the home's numbers. Every group it names
     // must be one the reader is on the roster of; deliverGroupEvent checks
-    // the roster again for each event.
-    if (filters.every((f) => f.kinds !== undefined && f.kinds.length > 0 && f.kinds.every((k) => GROUP_KINDS.includes(k)))) {
+    // the roster again for each event. The door's notice (src/door.ts)
+    // counts as a group kind here, so an app adds it to the same REQ;
+    // announceDoor checks the roster for each notice.
+    if (filters.every((f) => f.kinds !== undefined && f.kinds.length > 0 && f.kinds.every((k) => LIVE_GROUP_KINDS.includes(k)))) {
       if (state.authedPubkey === undefined) {
         if (!state.challenge) {
           state.challenge = crypto.randomUUID();
@@ -3348,11 +3438,12 @@ export class Relay extends DurableObject<Env> {
     // Push first: it is the one with a deadline. Rings before anything,
     // since a ring is stale in seconds. Mail before group traffic: it is
     // for one person, and it is the reason most members have push at all.
-    // All three share one invocation's subrequests.
+    // The door after mail. All four share one invocation's subrequests.
     const calls = await this.drainCallPushes(MAX_PUSHES_PER_TICK);
     const inbox = await this.drainInboxPushes(MAX_PUSHES_PER_TICK - calls.spent);
-    const moreGroupPushes = await this.drainPushOutbox(MAX_PUSHES_PER_TICK - calls.spent - inbox.spent);
-    const morePushes = inbox.more || moreGroupPushes;
+    const door = await this.drainDoorPushes(MAX_PUSHES_PER_TICK - calls.spent - inbox.spent);
+    const moreGroupPushes = await this.drainPushOutbox(MAX_PUSHES_PER_TICK - calls.spent - inbox.spent - door.spent);
+    const morePushes = inbox.more || door.more || moreGroupPushes;
 
     const now = Date.now();
     // Rings left over come back at once; anything else after the delay.

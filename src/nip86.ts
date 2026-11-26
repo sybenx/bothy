@@ -139,7 +139,7 @@ import {
   isInAnyGroup,
   type GroupOutboxEntry,
 } from "./home-groups";
-import { DOOR_METHODS, handleDoorCall } from "./door";
+import { DOOR_METHODS, handleDoorCall, type DoorChange } from "./door";
 import { pushConfigured } from "./push";
 import { fcmConfigured } from "./fcm";
 import { joinRequestMessage, oneLine } from "./join-requests";
@@ -182,6 +182,9 @@ export interface ManagementResponse {
   groupOutbox?: GroupOutboxEntry[];
   // Not part of the response: people to wake with nothing to deliver.
   wake?: string[];
+  // Not part of the response: a stored change to a group's Fridge door,
+  // which relay.ts manage() announces (src/door.ts).
+  door?: DoorChange;
 }
 
 // Vouching's methods (src/vouch.ts), in one list so VOUCH=off can take
@@ -321,9 +324,10 @@ export const SUPPORTED_METHODS = [
   "groupseal",
   "keepergroups",
   "groupkept",
-  // bothy's own: the Fridge door's events kept readable, and each
+  // bothy's own: the Fridge door, kept here as its only copy, and each
   // person's calendar link (src/door.ts).
   "doorput",
+  "doorlist",
   "doorcount",
   "callink",
   "callinknew",
@@ -407,8 +411,8 @@ export const ANYONE_CALLABLE_METHODS: readonly string[] = [
   // Home groups: each checks the signer is on that group's roster
   // (home-groups.ts), so a guest from another home can use their groups.
   ...HOME_GROUP_METHODS.filter((m) => m !== "groupcreate" && !KEEPER_METHODS.includes(m)),
-  // The door and calendar links (src/door.ts): doorput and doorcount check
-  // the group's roster; a calendar link is for a member here or anyone in
+  // The door and calendar links (src/door.ts): doorput, doorlist and
+  // doorcount check the group's roster; a calendar link is for a member here or anyone in
   // a group here (guests included), checked in handleDoorCall's caller.
   ...DOOR_METHODS,
 ];

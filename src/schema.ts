@@ -622,6 +622,16 @@ export const TABLES: readonly TableSpec[] = [
     columns: [col("pubkey", "TEXT PRIMARY KEY"), col("queued_at", "INTEGER NOT NULL")],
   },
   {
+    // Door changes waiting to be announced (relay.ts drainDoorPushes), one
+    // row per RECIPIENT, the same shape as `inbox_push` and its own queue,
+    // so the push says "door" rather than "message". A change that matters
+    // (door.ts changeMatters) queues the group's other members; more
+    // changes before the alarm fold into the row, so a burst is one push.
+    // Nothing about the change is recorded, only who it is for.
+    name: "door_push",
+    columns: [col("pubkey", "TEXT PRIMARY KEY"), col("queued_at", "INTEGER NOT NULL")],
+  },
+  {
     // Member invite codes (nip86.ts createinvite/redeeminvite). Separate
     // from `group_invites`: those admit to a NIP-29 group, are created by a
     // signed kind-9009 and are single-use by construction; these make
@@ -749,11 +759,15 @@ export const TABLES: readonly TableSpec[] = [
     ],
   },
   {
-    // The Fridge door's events, readable (src/door.ts): one row per event
-    // per home group, its fields and their stamps as the wire's JSON
-    // (calendar-wire.md). `seq` counts the changes a person would see, for
-    // SEQUENCE in calendar links. Deleted with the group (home-groups.ts
-    // deleteGroup).
+    // The Fridge door (src/door.ts), the only copy: one row per item per
+    // home group, its fields and their stamps as the wire's JSON
+    // (calendar-wire.md). `kind` is the first write's (event, birthday,
+    // note, or one a later app adds). `seq` is the number the group's
+    // counter (home_groups.door_seq) had at the item's last stored change,
+    // which doorlist reads from and calendar links use as SEQUENCE. Rows
+    // from before kinds (bc4fe83) are events, numbered once by
+    // migrateDoorItems. Named for what it first held. Deleted with the
+    // group (home-groups.ts deleteGroup).
     name: "door_events",
     columns: [
       col("gid", "TEXT NOT NULL"),
@@ -763,6 +777,9 @@ export const TABLES: readonly TableSpec[] = [
       col("seq", "INTEGER NOT NULL"),
       col("updated_at", "INTEGER NOT NULL"),
       col("updated_by", "TEXT NOT NULL"),
+      col("kind", "TEXT NOT NULL DEFAULT 'event'"),
+      col("created_by", "TEXT NOT NULL DEFAULT ''"),
+      col("created_at", "INTEGER NOT NULL DEFAULT 0"),
     ],
     tableConstraints: ["PRIMARY KEY (gid, d)"],
   },
@@ -980,6 +997,9 @@ export const TABLES: readonly TableSpec[] = [
       col("created_by", "TEXT NOT NULL"),
       // The keeper has every message through this home number (groupkept).
       col("kept_seq", "INTEGER"),
+      // The door's counter (src/door.ts): raised on every stored change to
+      // the group's door items, so doorlist can answer "what is new".
+      col("door_seq", "INTEGER NOT NULL DEFAULT 0"),
     ],
   },
   {
@@ -1432,7 +1452,13 @@ export const INDEXES: readonly IndexSpec[] = [
     table: "photos",
     keyColumns: ["sha256"],
   },
-  // Serves GET /cal/<secret>.ics (src/door.ts eventsForLink).
+  // Serves doorlist (src/door.ts): a group's items changed after a seq.
+  {
+    name: "idx_door_events_seq",
+    table: "door_events",
+    keyColumns: ["gid", "seq"],
+  },
+  // Serves GET /cal/<secret>.ics (src/door.ts itemsForLink).
   {
     name: "idx_calendar_links_secret",
     table: "calendar_links",
@@ -1956,6 +1982,32 @@ function rekeyPushSubscriptions(sql: SqlStorage): void {
   sql.exec(`DROP TABLE push_subscriptions_old`);
 }
 
+// door_events rows from before kinds (bc4fe83) counted `seq` per event and
+// had no creator. Each such row is given its group's next door number, in
+// the order they last changed, and its last writer as creator; the group's
+// counter ends past them, so a reader's first doorlist from 0 sees them
+// all. `kind` came in as 'event' by its default. Marked done by
+// created_by, so a second pass finds nothing.
+export function migrateDoorItems(sql: SqlStorage): void {
+  const gids = sql.exec<{ gid: string }>(`SELECT DISTINCT gid FROM door_events WHERE created_by = ''`).toArray();
+  for (const { gid } of gids) {
+    let n = sql.exec<{ s: number }>(`SELECT door_seq AS s FROM home_groups WHERE gid = ?`, gid).toArray()[0]?.s ?? 0;
+    const rows = sql
+      .exec<{ d: string }>(`SELECT d FROM door_events WHERE gid = ? AND created_by = '' ORDER BY updated_at, d`, gid)
+      .toArray();
+    for (const { d } of rows) {
+      n++;
+      sql.exec(
+        `UPDATE door_events SET seq = ?, created_by = updated_by, created_at = updated_at WHERE gid = ? AND d = ?`,
+        n,
+        gid,
+        d,
+      );
+    }
+    sql.exec(`UPDATE home_groups SET door_seq = ? WHERE gid = ?`, n, gid);
+  }
+}
+
 export function initSchema(sql: SqlStorage): void {
   ensureSchemaMetaTable(sql);
   const hash = currentSchemaHash();
@@ -1973,6 +2025,7 @@ export function initSchema(sql: SqlStorage): void {
     sql.exec(createIndexSql(index));
   }
   dropUndeclaredIndexes(sql);
+  migrateDoorItems(sql);
   // Tables of removed features, dropped where they still exist: `mutes`
   // (NIP-51 mute-list write revocation), and `stats_snapshot` and
   // `live_stats` (caches for /api/stats figures that are now maintained

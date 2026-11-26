@@ -468,7 +468,8 @@ function deleteGroup(sql: SqlStorage, gid: string, nowSec: number): void {
   sql.exec(`DELETE FROM home_group_events WHERE gid = ?`, gid);
   sql.exec(`DELETE FROM home_group_keys WHERE gid = ?`, gid);
   sql.exec(`DELETE FROM home_group_members WHERE gid = ?`, gid);
-  // The door's readable events go with the group (src/door.ts).
+  // The door goes with the group (src/door.ts); its counter is on the
+  // group's own row, deleted below.
   sql.exec(`DELETE FROM door_events WHERE gid = ?`, gid);
   stopLinks(sql, gid, null, nowSec);
   sql.exec(`DELETE FROM home_groups WHERE gid = ?`, gid);
@@ -481,6 +482,7 @@ function dropGuestDevices(sql: SqlStorage, owner: string | null, pubkeys: readon
     sql.exec(`DELETE FROM push_subscriptions WHERE pubkey = ?`, pubkey);
     sql.exec(`DELETE FROM fcm_tokens WHERE pubkey = ?`, pubkey);
     sql.exec(`DELETE FROM inbox_push WHERE pubkey = ?`, pubkey);
+    sql.exec(`DELETE FROM door_push WHERE pubkey = ?`, pubkey);
   }
 }
 

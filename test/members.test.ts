@@ -302,6 +302,7 @@ describe("invite codes", () => {
       "groupjoin",
       "groupseal",
       "doorput",
+      "doorlist",
       "doorcount",
       "callink",
       "callinknew",

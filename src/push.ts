@@ -42,8 +42,10 @@ export const CALL_PRESENCE_KIND = 25051;
 // switch on: hearth's service worker renders "voice" as "somebody is at
 // the fire" and anything else as "there's a message"; "call" is a ring
 // (relay.ts handleGiftWrap), which the DMs apps answer by fetching the
-// ring wrap and ringing.
-export type PushReason = "message" | "voice" | "call";
+// ring wrap and ringing. "door" says a home group's Fridge door changed in
+// a way worth knowing (door.ts changeMatters); the DMs apps call doorlist
+// and decide what to show.
+export type PushReason = "message" | "voice" | "call" | "door";
 
 // What a push carries, and deliberately all it carries: no message content
 // and no sender. The payload travels through Apple's or Google's push

@@ -250,6 +250,20 @@ describe("initSchema against historical table shapes", () => {
       seed: `INSERT INTO vault (hash, pubkey, credential_id, public_key, alg, blob, size, added_at, updated_at) VALUES ('h1', 'p1', 'c', 'k', -7, '{}', 10, 1, 1)`,
       expectAdded: ["seal"],
     },
+    {
+      table: "door_events",
+      label: "bc4fe83, the door before kinds",
+      create: `CREATE TABLE door_events (gid TEXT NOT NULL, d TEXT NOT NULL, fields TEXT NOT NULL, stamps TEXT NOT NULL, seq INTEGER NOT NULL, updated_at INTEGER NOT NULL, updated_by TEXT NOT NULL, PRIMARY KEY (gid, d))`,
+      seed: `INSERT INTO door_events (gid, d, fields, stamps, seq, updated_at, updated_by) VALUES ('g', 'd1', '{}', '{}', 0, 1, 'p1')`,
+      expectAdded: ["kind", "created_by", "created_at"],
+    },
+    {
+      table: "home_groups",
+      label: "v0.35.0, before the door's counter",
+      create: `CREATE TABLE home_groups (gid TEXT PRIMARY KEY, version INTEGER NOT NULL, epoch INTEGER NOT NULL, needs_key INTEGER NOT NULL DEFAULT 0, settings TEXT NOT NULL, created_at INTEGER NOT NULL, created_by TEXT NOT NULL, kept_seq INTEGER)`,
+      seed: `INSERT INTO home_groups (gid, version, epoch, settings, created_at, created_by) VALUES ('g', 1, 1, '{}', 1, 'p1')`,
+      expectAdded: ["door_seq"],
+    },
   ];
 
   for (const { table, label, create, seed, expectAdded } of HISTORICAL) {

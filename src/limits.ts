@@ -941,14 +941,17 @@ export function vaultStorageBytes(env: Env): number | null {
   return resolveLimit(env.VAULT_STORAGE_BYTES, Math.floor(storageBudget(env) * VAULT_SHARE_OF_BUDGET));
 }
 
-// The Fridge door's events (src/door.ts). A family puts up a few events a
-// week; 2000 a group is years of them. A full door gives up its
-// longest-removed event for a new one, and refuses only when none is
-// removed. One event's fields (title 100, place 200, note 1000 characters
-// and the stamps) fit well under 4 KB.
-export const DOOR_EVENTS_PER_GROUP = 2000;
-export const DOOR_EVENTS_PER_CALL = 200;
-export const DOOR_EVENT_MAX_BYTES = 4096;
+// The Fridge door (src/door.ts). A family puts up a few events, notes and
+// birthdays a week; 2000 items a group is years of them. A full door gives
+// up its longest-removed item for a new one, and refuses only when none is
+// removed. One item's fields and stamps, as stored, fit in 4096 characters
+// of JSON: an event at its longest (title 100, place 200, note 1000, link
+// 500 characters) is about 2,100, which leaves room for the fields later
+// apps add. At most 32 fields in one item's change.
+export const DOOR_ITEMS_PER_GROUP = 2000;
+export const DOOR_ITEMS_PER_CALL = 200;
+export const DOOR_ITEM_MAX_BYTES = 4096;
+export const DOOR_ITEM_MAX_FIELDS = 32;
 // A calendar link (GET /cal/<secret>.ics) leaves out events over for more
 // than this many days, and holds at most this many, so the file a calendar
 // app fetches every hour stays small.
@@ -1167,8 +1170,10 @@ export const MAX_FCM_TOKENS_PER_PUBKEY = 4;
 // 8030 TTL). A message stays true for the hour; "somebody is in the call"
 // stops being true when they leave, so a voice notification older than
 // five minutes would announce an empty room. A ring stops being true when
-// it stops ringing, so a call push lives 30 seconds.
-export const PUSH_TTL_SECONDS = { message: 3600, voice: 300, call: 30 } as const;
+// it stops ringing, so a call push lives 30 seconds. A door change stays
+// true like a message, and a phone off longer than that catches up at its
+// app's regular check.
+export const PUSH_TTL_SECONDS = { message: 3600, voice: 300, call: 30, door: 3600 } as const;
 
 // RFC 8188 record size, written into the body header. One record; the
 // payload is a room name and one word, so this sits well clear of the
