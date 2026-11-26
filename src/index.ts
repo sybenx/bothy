@@ -375,7 +375,8 @@ function unsignedVaultCall(body: Uint8Array): { method: string; params: unknown[
   return { method: call.method, params: Array.isArray(call.params) ? (call.params as unknown[]) : [] };
 }
 
-// vaultchallenge and vaultopen (src/vault.ts). Every vaultopen answer,
+// vaultchallenge and vaultopen (src/vault.ts), vouchask and vouchstatus
+// (src/vouch.ts). Every answer but vaultchallenge's,
 // found or not, rate limited or not, leaves no sooner than
 // VAULT_OPEN_FLOOR_MS after the request arrived, so the row lookup and
 // the signature check behind it cannot be timed.
@@ -389,9 +390,18 @@ async function handleUnsignedVault(
   if (call.method === "vaultchallenge") {
     return managementResponse(await relayStub(env).vaultChallenge(ip));
   }
+  // vaultopen, vouchask and vouchstatus: all held to the floor, so the
+  // work behind an account that exists cannot be timed against one that
+  // does not (src/vouch.ts).
   let reply: ManagementResponse;
   try {
-    reply = await relayStub(env).vaultOpen(call.params, ip);
+    const relay = relayStub(env);
+    reply =
+      call.method === "vouchask"
+        ? await relay.vouchAsk(call.params, ip)
+        : call.method === "vouchstatus"
+          ? await relay.vouchStatusCall(call.params, ip)
+          : await relay.vaultOpen(call.params, ip);
   } catch {
     reply = { error: VAULT_NOT_FOUND };
   }

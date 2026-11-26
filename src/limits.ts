@@ -973,6 +973,47 @@ export const MAX_VAULT_CALLS_PER_IP_PER_WINDOW = 10;
 export const VAULT_HASH_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
 export const MAX_VAULT_OPENS_PER_HASH_PER_WINDOW = 20;
 
+// ---------------------------------------------------------------------
+// Vouching (src/vouch.ts): a person someone trusts lets them back into
+// their account on a new phone, from a copy this relay CAN open.
+// ---------------------------------------------------------------------
+
+// VOUCH=off turns it off (env.d.ts).
+export function vouchEnabled(env: Env): boolean {
+  return (env.VOUCH ?? "").trim().toLowerCase() !== "off";
+}
+
+// From a voucher's approval to the copy being handed over. The account's
+// other devices hear about the request at once and can cancel in this
+// time; a phone that was taken would otherwise have no warning at all.
+export const VOUCH_RELEASE_DELAY_SECONDS = 24 * 60 * 60;
+
+// How long a request waits for a voucher before it lapses.
+export const VOUCH_REQUEST_TTL_SECONDS = 24 * 60 * 60;
+
+// After the delay, how long the new phone has to collect the copy.
+export const VOUCH_PICKUP_SECONDS = 24 * 60 * 60;
+
+// People a member may name to vouch for them, besides the owner and the
+// admins (a parent, a sibling).
+export const VOUCHERS_PER_MEMBER = 5;
+
+// The vouch copy: a 32-byte key sealed with NIP-44 is about 200 bytes.
+export const VOUCH_COPY_MAX_BYTES = 512;
+
+// Past requests kept per account, so the account sees every release.
+export const VOUCH_HISTORY_PER_MEMBER = 10;
+
+// Per pubkey asked about, counted whether it has an account here or not:
+// three asks an hour. In memory, like the vault's limits.
+export const VOUCH_ASK_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
+export const MAX_VOUCH_ASKS_PER_PUBKEY_PER_WINDOW = 3;
+
+// Per address, per method (vouchask and vouchstatus each). A waiting
+// phone asks for its status about once a minute.
+export const VOUCH_IP_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+export const MAX_VOUCH_CALLS_PER_IP_PER_WINDOW = 10;
+
 // How far ahead of now a kind-24242 auth event's `created_at` may be,
 // matching nip98.ts HTTP_AUTH_MAX_DRIFT_SECONDS. Its expiry is its own
 // `expiration` tag (BUD-01).

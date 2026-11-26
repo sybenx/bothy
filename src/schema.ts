@@ -770,6 +770,55 @@ export const TABLES: readonly TableSpec[] = [
     columns: [col("nonce", "TEXT PRIMARY KEY"), col("expires_at", "INTEGER NOT NULL")],
   },
   {
+    // Vouching (src/vouch.ts): each member's vouch-only copy of their key,
+    // sealed to this relay's own key, so unlike `vault` this relay CAN
+    // open it. One per member. `size` counts against the vault's share
+    // (limits.ts vaultStorageBytes). Deleted when the member leaves or is
+    // removed (storage.ts unallowPubkey), not kept through the grace.
+    name: "vouch_copies",
+    columns: [
+      col("pubkey", "TEXT PRIMARY KEY"),
+      col("blob", "TEXT NOT NULL"),
+      col("size", "INTEGER NOT NULL"),
+      col("added_at", "INTEGER NOT NULL"),
+      col("updated_at", "INTEGER NOT NULL"),
+    ],
+  },
+  {
+    // Vouching: the people a member named who may vouch for them, beside
+    // the owner and admins. Both sides are dropped when either leaves
+    // (storage.ts unallowPubkey).
+    name: "vouchers",
+    columns: [
+      col("member", "TEXT NOT NULL"),
+      col("voucher", "TEXT NOT NULL"),
+      col("added_at", "INTEGER NOT NULL"),
+    ],
+    tableConstraints: ["PRIMARY KEY (member, voucher)"],
+  },
+  {
+    // Vouching: requests from a new phone (vouchask), open and past. `key`
+    // is the new phone's one-time key, the only key a copy is ever handed
+    // to. At most limits.ts VOUCH_HISTORY_PER_MEMBER per account, and only
+    // for accounts with a vouch copy, so bounded by the member count. Past
+    // rows are what the account sees in myvouch. Deleted with the member
+    // (eraseme, the end of the removal grace).
+    name: "vouch_requests",
+    columns: [
+      col("id", "INTEGER PRIMARY KEY"),
+      col("pubkey", "TEXT NOT NULL"),
+      col("key", "TEXT NOT NULL"),
+      col("asked_at", "INTEGER NOT NULL"),
+      col("approved_by", "TEXT"),
+      col("approved_at", "INTEGER"),
+      col("release_at", "INTEGER"),
+      col("released_at", "INTEGER"),
+      col("closed_at", "INTEGER"),
+      col("closed_by", "TEXT"),
+      col("closed_why", "TEXT"),
+    ],
+  },
+  {
     // Home activity (nip86.ts homestats), the one per-person thing it keeps:
     // the last UTC day each member completed NIP-42 auth, one row each,
     // overwritten, never a log. Read only as counts ("members seen in the
@@ -1326,6 +1375,20 @@ export const INDEXES: readonly IndexSpec[] = [
     name: "idx_vault_pubkey",
     table: "vault",
     keyColumns: ["pubkey"],
+  },
+  // Serves "who named this person" when they leave (storage.ts
+  // unallowPubkey); the primary key serves the member's own list.
+  {
+    name: "idx_vouchers_voucher",
+    table: "vouchers",
+    keyColumns: ["voucher"],
+  },
+  // Serves an account's latest request (src/vouch.ts) and its history.
+  {
+    name: "idx_vouch_requests_pubkey",
+    table: "vouch_requests",
+    keyColumns: ["pubkey"],
+    orderedBy: "asked_at",
   },
   // Serves the cron tick's drop of expired spent challenges.
   {
