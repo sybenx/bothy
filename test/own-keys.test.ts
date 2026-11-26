@@ -328,9 +328,10 @@ describe("myinvitees", () => {
     expect(pubkeys(mine.members)).toEqual([bob.pubkeyHex, carol.pubkeyHex, child.pubkeyHex].sort());
     expect(pubkeys(mine.members)).not.toContain(outsider.pubkeyHex);
     expect(pubkeys(mine.members)).not.toContain(alice.pubkeyHex);
-    // listmembers' row, less the activity fields a plain member may not see.
+    // listmembers' row, less the activity fields and the restore count a
+    // plain member may not see.
     const all = ((await callManagement("listmembers")).result as Listing).members;
-    const { lastSeen: _s, push: _p, waiting: _w, ...shared } = all.find((r) => r.pubkey === carol.pubkeyHex)! as Record<
+    const { lastSeen: _s, push: _p, waiting: _w, restore: _r, ...shared } = all.find((r) => r.pubkey === carol.pubkeyHex)! as Record<
       string,
       unknown
     >;
