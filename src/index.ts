@@ -30,6 +30,7 @@ import {
   type ManagementResponse,
 } from "./nip86";
 import { VAULT_NOT_FOUND } from "./vault";
+import { CAL_PATH, etagOf } from "./door";
 import { checkOwnKeyProof } from "./own-keys";
 import { nip11Response } from "./nip11";
 import { verifyClaimAuthEvent } from "./nip42";
@@ -549,6 +550,38 @@ async function routePhotos(request: Request, env: Env, url: URL): Promise<Respon
   return photoError(405, "photos are fetched with GET, uploaded with PUT /upload and deleted with DELETE");
 }
 
+// ---------------------------------------------------------------------
+// A person's calendar link (src/door.ts): GET /cal/<secret>.ics, fetched
+// by the phone's calendar app (or Apple's or Google's servers) about once
+// an hour. The secret is the only key; an unknown one is a plain 404.
+// ETag lets an unchanged calendar answer 304 with no body.
+// ---------------------------------------------------------------------
+
+async function routeCalendar(request: Request, env: Env, url: URL): Promise<Response | null> {
+  const m = CAL_PATH.exec(url.pathname);
+  if (m === null) return null;
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return new Response("calendar links are read with GET", { status: 405, headers: { Allow: "GET, HEAD" } });
+  }
+  const limited = await rateLimited(env.RATE_LIMIT_API, request);
+  if (limited !== null) return limited;
+  const file = await relayStub(env).calendarFeed(m[1]!);
+  if (file === null) return new Response("no calendar at this link", { status: 404 });
+  const etag = etagOf(file.body);
+  const headers: Record<string, string> = {
+    "Content-Type": "text/calendar; charset=utf-8",
+    "Content-Disposition": 'inline; filename="calendar.ics"',
+    // Private: one person's calendar. Short: a change should reach the
+    // phone at its next check, and the hint in the file says an hour.
+    "Cache-Control": "private, max-age=300",
+    ETag: etag,
+    ...CORS_HEADERS,
+  };
+  if (file.lastModified > 0) headers["Last-Modified"] = new Date(file.lastModified).toUTCString();
+  if (request.headers.get("If-None-Match") === etag) return new Response(null, { status: 304, headers });
+  return new Response(request.method === "HEAD" ? null : file.body, { headers });
+}
+
 function nowSec(): number {
   return Math.floor(Date.now() / 1000);
 }
@@ -657,6 +690,9 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   const photos = await routePhotos(request, env, url);
   if (photos !== null) return photos;
+
+  const calendar = await routeCalendar(request, env, url);
+  if (calendar !== null) return calendar;
 
   if (url.pathname === "/api/claim") return handleClaim(request, env);
   if (url.pathname === "/api/claim-nonce") return handleClaimNonce(request, env);

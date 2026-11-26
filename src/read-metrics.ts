@@ -76,6 +76,7 @@ export const READ_PATHS = [
   "management",
   // Profile photos (src/photos.ts): serving, uploading and deleting one.
   "photos",
+  "calendar",
   // schema.ts initSchema, which runs in the Durable Object constructor,
   // so on every wake from hibernation.
   "schema",

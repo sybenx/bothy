@@ -199,6 +199,7 @@ import { normalizeIp } from "./ip";
 import { connMetricsSnapshot, noteClose, noteRefusal, type ConnMetricsSnapshot } from "./conn-metrics";
 import { reqCacheSnapshot, type ReqCacheSnapshot } from "./req-cache";
 import { initSchema } from "./schema";
+import { calendarFile, eventsForLink, type CalendarFile } from "./door";
 import {
   groupHost,
   advancePush,
@@ -961,6 +962,20 @@ export class Relay extends DurableObject<Env> {
   // key (nip86.ts setstorage)? One row.
   async isStorageService(pubkey: string): Promise<boolean> {
     return this.metered(() => withReadPath("management", () => storagePubkey(this.sql) === pubkey));
+  }
+
+  // Backs GET /cal/<secret>.ics (src/index.ts, src/door.ts): the person's
+  // calendar file, or null when no link has that secret. Named after the
+  // home, the way the calendar app lists it.
+  async calendarFeed(secret: string): Promise<CalendarFile | null> {
+    return this.metered(() =>
+      withReadPath("calendar", () => {
+        const events = eventsForLink(this.sql, secret);
+        if (events === null) return null;
+        const name = resolveName(this.env, getRelaySettings(this.sql), getOwnerProfile(this.sql, this.env));
+        return calendarFile(events, name, Date.now());
+      }),
+    );
   }
 
   // For the Worker's push gate (src/index.ts GUEST_PUSH_METHODS): is this

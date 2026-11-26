@@ -468,6 +468,8 @@ function deleteGroup(sql: SqlStorage, gid: string, nowSec: number): void {
   sql.exec(`DELETE FROM home_group_events WHERE gid = ?`, gid);
   sql.exec(`DELETE FROM home_group_keys WHERE gid = ?`, gid);
   sql.exec(`DELETE FROM home_group_members WHERE gid = ?`, gid);
+  // The door's readable events go with the group (src/door.ts).
+  sql.exec(`DELETE FROM door_events WHERE gid = ?`, gid);
   stopLinks(sql, gid, null, nowSec);
   sql.exec(`DELETE FROM home_groups WHERE gid = ?`, gid);
 }

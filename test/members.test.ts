@@ -287,7 +287,8 @@ describe("invite codes", () => {
 
   it("is one of the few methods a stranger may call", async () => {
     // Plus the home group calls, which check the group's roster themselves
-    // (src/home-groups.ts), so a guest from another home can use them.
+    // (src/home-groups.ts), so a guest from another home can use them, and
+    // the door and calendar link calls, which check the same (src/door.ts).
     expect(ANYONE_CALLABLE_METHODS).toEqual([
       "redeeminvite",
       "requestjoin",
@@ -300,6 +301,11 @@ describe("invite codes", () => {
       "groupsince",
       "groupjoin",
       "groupseal",
+      "doorput",
+      "doorcount",
+      "callink",
+      "callinknew",
+      "callinkoff",
     ]);
     const stranger = randomKeypair();
     for (const method of ["listallowedpubkeys", "listunusedinvites", "unallowpubkey"]) {

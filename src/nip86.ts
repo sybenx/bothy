@@ -136,8 +136,10 @@ import {
   homeLinkFor,
   mayJoinByLink,
   removeFromAllGroups,
+  isInAnyGroup,
   type GroupOutboxEntry,
 } from "./home-groups";
+import { DOOR_METHODS, handleDoorCall } from "./door";
 import { pushConfigured } from "./push";
 import { fcmConfigured } from "./fcm";
 import { joinRequestMessage, oneLine } from "./join-requests";
@@ -319,6 +321,13 @@ export const SUPPORTED_METHODS = [
   "groupseal",
   "keepergroups",
   "groupkept",
+  // bothy's own: the Fridge door's events kept readable, and each
+  // person's calendar link (src/door.ts).
+  "doorput",
+  "doorcount",
+  "callink",
+  "callinknew",
+  "callinkoff",
 ] as const;
 
 // The methods a MEMBER may call, not just the owner.
@@ -398,6 +407,10 @@ export const ANYONE_CALLABLE_METHODS: readonly string[] = [
   // Home groups: each checks the signer is on that group's roster
   // (home-groups.ts), so a guest from another home can use their groups.
   ...HOME_GROUP_METHODS.filter((m) => m !== "groupcreate" && !KEEPER_METHODS.includes(m)),
+  // The door and calendar links (src/door.ts): doorput and doorcount check
+  // the group's roster; a calendar link is for a member here or anyone in
+  // a group here (guests included), checked in handleDoorCall's caller.
+  ...DOOR_METHODS,
 ];
 
 // The push methods a group guest (on a home group's roster here, not a
@@ -825,6 +838,12 @@ export function handleManagementCall(
 
   if (HOME_GROUP_METHODS.includes(method)) {
     return handleGroupCall(sql, getOwnerPubkey(sql, env), method, params, signer, nowSec);
+  }
+
+  if (DOOR_METHODS.includes(method)) {
+    const owner = getOwnerPubkey(sql, env);
+    const mayHave = signer === owner || isMember(sql, signer) || isInAnyGroup(sql, signer);
+    return handleDoorCall(sql, method, params, signer, nowSec, mayHave);
   }
 
   switch (method) {

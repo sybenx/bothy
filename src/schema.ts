@@ -749,6 +749,36 @@ export const TABLES: readonly TableSpec[] = [
     ],
   },
   {
+    // The Fridge door's events, readable (src/door.ts): one row per event
+    // per home group, its fields and their stamps as the wire's JSON
+    // (calendar-wire.md). `seq` counts the changes a person would see, for
+    // SEQUENCE in calendar links. Deleted with the group (home-groups.ts
+    // deleteGroup).
+    name: "door_events",
+    columns: [
+      col("gid", "TEXT NOT NULL"),
+      col("d", "TEXT NOT NULL"),
+      col("fields", "TEXT NOT NULL"),
+      col("stamps", "TEXT NOT NULL"),
+      col("seq", "INTEGER NOT NULL"),
+      col("updated_at", "INTEGER NOT NULL"),
+      col("updated_by", "TEXT NOT NULL"),
+    ],
+    tableConstraints: ["PRIMARY KEY (gid, d)"],
+  },
+  {
+    // Each person's calendar link (src/door.ts callink): the secret in
+    // GET /cal/<secret>.ics. One per person; callinknew replaces it.
+    // Deleted by eraseme and when a removed member's grace ends
+    // (storage.ts eraseMember).
+    name: "calendar_links",
+    columns: [
+      col("pubkey", "TEXT PRIMARY KEY"),
+      col("secret", "TEXT NOT NULL"),
+      col("created_at", "INTEGER NOT NULL"),
+    ],
+  },
+  {
     // History backup (nip86.ts backedup): per person, the latest stored
     // time (`events.ingested_at`) of mail their app has verified its backup
     // holds. Only ever moves forward, and never past the call's own time.
@@ -1401,6 +1431,12 @@ export const INDEXES: readonly IndexSpec[] = [
     name: "idx_photos_sha256",
     table: "photos",
     keyColumns: ["sha256"],
+  },
+  // Serves GET /cal/<secret>.ics (src/door.ts eventsForLink).
+  {
+    name: "idx_calendar_links_secret",
+    table: "calendar_links",
+    keyColumns: ["secret"],
   },
   // Serves a member's own vault rows (src/vault.ts vaultlist, the per-member
   // cap) and their deletion with the member.

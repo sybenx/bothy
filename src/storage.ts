@@ -2533,6 +2533,8 @@ export function eraseMember(
   sql.exec(`DELETE FROM vouch_requests WHERE pubkey = ?`, pubkey);
   // Their history backup watermark: nothing of theirs is left to retain.
   deleteBackupWatermark(sql, pubkey);
+  // Their calendar link (src/door.ts).
+  sql.exec(`DELETE FROM calendar_links WHERE pubkey = ?`, pubkey);
   unallowPubkey(sql, pubkey, nowSec, "erased");
   return deleted;
 }

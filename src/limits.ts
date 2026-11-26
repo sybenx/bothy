@@ -941,6 +941,20 @@ export function vaultStorageBytes(env: Env): number | null {
   return resolveLimit(env.VAULT_STORAGE_BYTES, Math.floor(storageBudget(env) * VAULT_SHARE_OF_BUDGET));
 }
 
+// The Fridge door's events (src/door.ts). A family puts up a few events a
+// week; 2000 a group is years of them. A full door gives up its
+// longest-removed event for a new one, and refuses only when none is
+// removed. One event's fields (title 100, place 200, note 1000 characters
+// and the stamps) fit well under 4 KB.
+export const DOOR_EVENTS_PER_GROUP = 2000;
+export const DOOR_EVENTS_PER_CALL = 200;
+export const DOOR_EVENT_MAX_BYTES = 4096;
+// A calendar link (GET /cal/<secret>.ics) leaves out events over for more
+// than this many days, and holds at most this many, so the file a calendar
+// app fetches every hour stays small.
+export const CALENDAR_LINK_PAST_DAYS = 365;
+export const CALENDAR_LINK_MAX_EVENTS = 1500;
+
 // Rows one person may have: one per passkey. Usually one synced passkey
 // covers every phone; ten is room for a few passkey apps and rotations.
 export const VAULT_ROWS_PER_MEMBER = 10;
