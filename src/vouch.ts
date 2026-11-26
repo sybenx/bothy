@@ -689,6 +689,12 @@ export function handOverToPhone(
 ): { copy: HandedCopy; outbox: NostrEvent[] } | null {
   const pubkey = opened.row.pubkey;
   if (!vouchEnabled(env) || owner === null || roleOf(sql, pubkey, owner) === "none") return null;
+  // The row was read before the signature check awaited: it must still be
+  // there, and still a box row, when the copy is handed over.
+  const still = sql
+    .exec(`SELECT 1 FROM vault WHERE hash = ? AND pubkey = ? AND seal = 'box'`, opened.row.hash, pubkey)
+    .toArray();
+  if (still.length === 0) return null;
   const stored = sql.exec<{ blob: string }>(`SELECT blob FROM vouch_copies WHERE pubkey = ?`, pubkey).toArray()[0];
   const secret = stored === undefined ? null : openVouchCopy(sql, pubkey, JSON.parse(stored.blob) as unknown);
   if (secret === null) return null;

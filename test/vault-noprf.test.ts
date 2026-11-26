@@ -631,7 +631,7 @@ describe("what a stranger sees", () => {
     // A successful open writes: the spent challenge, the row's counter and
     // last use, the history row, and the account's message (its event row
     // and what storeEvent keeps beside it), 21 rows with their indexes; it
-    // reads 21. Recorded so a change shows. The message moves the public
+    // reads 22 (one is the re-check that the row is still a box row). Recorded so a change shows. The message moves the public
     // counts on /api/stats (totalEvents, ingested24h, rowsWrittenToday),
     // so a watcher can tell that some phone got in this way just then,
     // not whose account it was; it needs the person's passkey.
@@ -649,7 +649,7 @@ describe("what a stranger sees", () => {
 // A successful bound open, measured (Workers Free plan: 100,000 rows
 // written and 5,000,000 rows read a day; the per-hash limit allows 20
 // opens an hour per row).
-const SUCCESS_COST = { read: 21, written: 21 };
+const SUCCESS_COST = { read: 22, written: 21 };
 
 describe("'passkey' rows are unchanged", () => {
   it("a member with both kinds opens each only its own way", async () => {
