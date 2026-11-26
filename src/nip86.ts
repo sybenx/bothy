@@ -72,6 +72,7 @@ import {
   listUnusedInvites,
   listUnusedMemberInvites,
   redeemMemberInvite,
+  admitByGroupLink,
   revokeInvite,
   revokeMemberInvite,
   setRelaySetting,
@@ -127,7 +128,16 @@ import {
   vouchListEntry,
 } from "./vouch";
 import { GROUPS_PAUSED_MESSAGE } from "./nip29";
-import { HOME_GROUP_METHODS, KEEPER_METHODS, handleGroupCall, removeFromAllGroups, type GroupOutboxEntry } from "./home-groups";
+import {
+  HOME_GROUP_METHODS,
+  KEEPER_METHODS,
+  countHomeLinkJoin,
+  handleGroupCall,
+  homeLinkFor,
+  mayJoinByLink,
+  removeFromAllGroups,
+  type GroupOutboxEntry,
+} from "./home-groups";
 import { pushConfigured } from "./push";
 import { fcmConfigured } from "./fcm";
 import { joinRequestMessage, oneLine } from "./join-requests";
@@ -1097,8 +1107,26 @@ export function handleManagementCall(
       const code = stringParam(params, 0);
       if (code === null || code === "") return err("redeeminvite takes the invite code as a string");
       if (getOwnerPubkey(sql, env) === signer) return { result: true };
-      const outcome = redeemMemberInvite(sql, code, signer, nowSec, getOwnerPubkey(sql, env));
+      const owner = getOwnerPubkey(sql, env);
+      const outcome = redeemMemberInvite(sql, code, signer, nowSec, owner);
       if (outcome === "joined" || outcome === "already-member") return { result: true };
+      // Not a member code: a group's join link also lets someone new into
+      // the home (home-groups.ts homeLinkFor), on its maker's invite places
+      // as if they had made a code then. Their app joins the group next,
+      // with groupjoin and the same code.
+      if (outcome === "unknown") {
+        const link = homeLinkFor(sql, code, nowSec);
+        if (
+          link !== null &&
+          mayJoinByLink(sql, owner, signer) &&
+          roleOf(sql, link.madeBy, owner) !== "none" &&
+          inviteStanding(sql, env, link.madeBy, nowSec).canInvite
+        ) {
+          admitByGroupLink(sql, signer, link.madeBy, link.hash, nowSec, owner);
+          countHomeLinkJoin(sql, link.gid, link.hash);
+          return { result: true };
+        }
+      }
       return err(REDEEM_REFUSAL_MESSAGE);
     }
 

@@ -953,7 +953,7 @@ export const TABLES: readonly TableSpec[] = [
     ],
   },
   {
-    // Live join links per group: the sha256 of each code (the app keeps
+    // Join links per group: the sha256 of each code (the app keeps
     // the code), made by an admin's signed link change.
     name: "home_group_links",
     columns: [
@@ -961,6 +961,19 @@ export const TABLES: readonly TableSpec[] = [
       col("hash", "TEXT NOT NULL"),
       col("made_by", "TEXT NOT NULL"),
       col("version", "INTEGER NOT NULL"),
+      // When the link stops (the change's `until` tag). NULL on links made
+      // without one, which never stop and admit to the group only.
+      col("until", "INTEGER"),
+      // 1 when the link also lets people new to this home in (redeeminvite
+      // with the link's code): it had an `until` and its maker was in the
+      // home when they made it.
+      col("home", "INTEGER NOT NULL DEFAULT 0"),
+      // People this link let into the home. Each spends one of a plain
+      // member maker's invite places (storage.ts inviteSlotsUsed), so a
+      // row with any is kept, turned off (`off_at`), when the link is
+      // stopped or the group goes.
+      col("home_joined", "INTEGER NOT NULL DEFAULT 0"),
+      col("off_at", "INTEGER"),
     ],
     tableConstraints: ["PRIMARY KEY (gid, hash)"],
   },
@@ -1370,6 +1383,18 @@ export const INDEXES: readonly IndexSpec[] = [
     name: "idx_member_invites_created_by",
     table: "member_invites",
     keyColumns: ["created_by"],
+  },
+  // redeeminvite finds a group link by its code's hash alone (the code
+  // names no group), and inviteSlotsUsed counts a maker's home joins.
+  {
+    name: "idx_home_group_links_hash",
+    table: "home_group_links",
+    keyColumns: ["hash"],
+  },
+  {
+    name: "idx_home_group_links_made_by",
+    table: "home_group_links",
+    keyColumns: ["made_by"],
   },
   // Serves GET /<sha256> (src/photos.ts): a photo is found by its hash.
   {

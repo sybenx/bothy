@@ -22,6 +22,7 @@ import type { NostrEvent } from "./nostr";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { getRelayPubkey, signAsRelay } from "./relay-identity";
+import { INVITE_MAX_TTL_SECONDS } from "./limits";
 import { isPubkeyBanned, isRemovedOnPurpose, roleOf, storagePubkey } from "./storage";
 
 export const GROUP_MESSAGE_KIND = 1490;
@@ -439,7 +440,7 @@ function recordFormer(sql: SqlStorage, gid: string, pubkey: string, by: string, 
 function settleAfterLeaving(sql: SqlStorage, gid: string, nowSec: number, outbox: GroupOutboxEntry[]): void {
   const members = membersOf(sql, gid);
   if (members.length === 0) {
-    deleteGroup(sql, gid);
+    deleteGroup(sql, gid, nowSec);
     return;
   }
   if (members.some((m) => m.role === "admin")) return;
@@ -453,7 +454,7 @@ function settleAfterLeaving(sql: SqlStorage, gid: string, nowSec: number, outbox
   outbox.push({ gid, event, wake: members.map((m) => m.pubkey) });
 }
 
-function deleteGroup(sql: SqlStorage, gid: string): void {
+function deleteGroup(sql: SqlStorage, gid: string, nowSec: number): void {
   // Give the senders their bytes back.
   const charged = sql
     .exec<{ sender: string; kind: number; bytes: number }>(
@@ -467,7 +468,7 @@ function deleteGroup(sql: SqlStorage, gid: string): void {
   sql.exec(`DELETE FROM home_group_events WHERE gid = ?`, gid);
   sql.exec(`DELETE FROM home_group_keys WHERE gid = ?`, gid);
   sql.exec(`DELETE FROM home_group_members WHERE gid = ?`, gid);
-  sql.exec(`DELETE FROM home_group_links WHERE gid = ?`, gid);
+  stopLinks(sql, gid, null, nowSec);
   sql.exec(`DELETE FROM home_groups WHERE gid = ?`, gid);
 }
 
@@ -712,12 +713,19 @@ function groupChange(sql: SqlStorage, owner: string | null, params: unknown[], s
       break;
     // A join link: the app keeps the code, the chain keeps its sha256, so
     // every member's app can check a later join against a link an admin made.
+    // A link with an `until` tag stops then (at most GROUP_LINK_MAX_SECONDS
+    // away), and also lets people new to this home in when its maker is in
+    // the home (nip86.ts redeeminvite).
     case "link":
     case "unlink": {
       if (!isAdmin) return err("groupchange: only admins can make or stop join links");
       const hash = tagValue(change.event, "code-hash");
       if (hash === undefined || !HEX64_RE.test(hash)) return err("groupchange: a link change carries its code's sha256 in a code-hash tag");
-      if (change.op === "unlink" && !linkActive(sql, gid, hash)) return err("groupchange: that link is not active");
+      if (change.op === "unlink" && !linkOn(sql, gid, hash)) return err("groupchange: that link is not active");
+      if (change.op === "link") {
+        const until = linkUntil(change.event, nowSec);
+        if (typeof until === "string") return err(until);
+      }
       break;
     }
   }
@@ -777,11 +785,24 @@ function groupChange(sql: SqlStorage, owner: string | null, params: unknown[], s
     case "settings":
       sql.exec(`UPDATE home_groups SET settings = ? WHERE gid = ?`, JSON.stringify(change.settings), gid);
       break;
-    case "link":
-      sql.exec(`INSERT OR REPLACE INTO home_group_links (gid, hash, made_by, version) VALUES (?, ?, ?, ?)`, gid, tagValue(change.event, "code-hash"), signer, nextVersion);
+    case "link": {
+      const until = linkUntil(change.event, nowSec) as number | null;
+      const home = until !== null && roleOf(sql, signer, owner) !== "none" ? 1 : 0;
+      sql.exec(
+        `INSERT INTO home_group_links (gid, hash, made_by, version, until, home) VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(gid, hash) DO UPDATE SET made_by = excluded.made_by, version = excluded.version,
+             until = excluded.until, home = excluded.home, off_at = NULL`,
+        gid,
+        tagValue(change.event, "code-hash"),
+        signer,
+        nextVersion,
+        until,
+        home,
+      );
       break;
+    }
     case "unlink":
-      sql.exec(`DELETE FROM home_group_links WHERE gid = ? AND hash = ?`, gid, tagValue(change.event, "code-hash"));
+      stopLinks(sql, gid, tagValue(change.event, "code-hash")!, nowSec);
       break;
   }
   if (envelopes !== null) storeKeys(sql, gid, signer, envelopes);
@@ -936,8 +957,79 @@ function groupSince(sql: SqlStorage, params: unknown[], signer: string): GroupRe
 // a leave, and backs up every message (groupkept).
 // ---------------------------------------------------------------------
 
-function linkActive(sql: SqlStorage, gid: string, hash: string): boolean {
-  return sql.exec(`SELECT 1 FROM home_group_links WHERE gid = ? AND hash = ?`, gid, hash).toArray().length > 0;
+// The longest a link with an `until` lasts: the longest a home invite
+// lasts, since it is one.
+export const GROUP_LINK_MAX_SECONDS = INVITE_MAX_TTL_SECONDS;
+
+// A link change's `until`: null when it has none, the time when it is a
+// whole number in (now, now + GROUP_LINK_MAX_SECONDS], else the refusal.
+function linkUntil(event: NostrEvent, nowSec: number): number | null | string {
+  const raw = tagValue(event, "until");
+  if (raw === undefined) return null;
+  const until = Number(raw);
+  if (!/^[0-9]+$/.test(raw) || until <= nowSec || until > nowSec + GROUP_LINK_MAX_SECONDS) {
+    return `groupchange: a link's until tag must be a time within ${GROUP_LINK_MAX_SECONDS / 86400} days`;
+  }
+  return until;
+}
+
+// Made and not turned off (an expired link may still be turned off).
+function linkOn(sql: SqlStorage, gid: string, hash: string): boolean {
+  return sql.exec(`SELECT 1 FROM home_group_links WHERE gid = ? AND hash = ? AND off_at IS NULL`, gid, hash).toArray().length > 0;
+}
+
+// On, and not past its `until`: someone may join with it now.
+function linkActive(sql: SqlStorage, gid: string, hash: string, nowSec: number): boolean {
+  return (
+    sql
+      .exec(
+        `SELECT 1 FROM home_group_links WHERE gid = ? AND hash = ? AND off_at IS NULL AND (until IS NULL OR until > ?)`,
+        gid,
+        hash,
+        nowSec,
+      )
+      .toArray().length > 0
+  );
+}
+
+// Turns off one link (or every link of the group, `hash` null). A link
+// that let someone into the home is kept, off, so its maker's count of
+// invite places stays right (schema.ts home_group_links).
+function stopLinks(sql: SqlStorage, gid: string, hash: string | null, nowSec: number): void {
+  const which = hash === null ? "" : " AND hash = ?";
+  const args = hash === null ? [gid] : [gid, hash];
+  sql.exec(`DELETE FROM home_group_links WHERE gid = ?${which} AND home_joined = 0`, ...args);
+  sql.exec(`UPDATE home_group_links SET off_at = COALESCE(off_at, ?) WHERE gid = ?${which}`, nowSec, ...args);
+}
+
+// The link a code opens for someone new to this home (nip86.ts
+// redeeminvite), or null: on, not expired, made to admit to the home, its
+// group still there with room for one more, and under its own cap of
+// home joins. The caller checks the maker's invite places.
+export function homeLinkFor(sql: SqlStorage, code: string, nowSec: number): { gid: string; hash: string; madeBy: string } | null {
+  if (!CODE_RE.test(code)) return null;
+  const hash = sha256Hex(code);
+  const row = sql
+    .exec<{ gid: string; made_by: string; home_joined: number }>(
+      `SELECT gid, made_by, home_joined FROM home_group_links
+        WHERE hash = ? AND home = 1 AND off_at IS NULL AND until > ?`,
+      hash,
+      nowSec,
+    )
+    .toArray()[0];
+  if (row === undefined || groupRow(sql, row.gid) === null) return null;
+  if (row.home_joined >= GROUP_DECISIONS.maxMembers) return null;
+  if (rosterPubkeys(sql, row.gid).length + 1 > GROUP_DECISIONS.maxMembers) return null;
+  return { gid: row.gid, hash, madeBy: row.made_by };
+}
+
+export function countHomeLinkJoin(sql: SqlStorage, gid: string, hash: string): void {
+  sql.exec(`UPDATE home_group_links SET home_joined = home_joined + 1 WHERE gid = ? AND hash = ?`, gid, hash);
+}
+
+// Whether `pubkey` may come in by a link: not cut off from this home.
+export function mayJoinByLink(sql: SqlStorage, owner: string | null, pubkey: string): boolean {
+  return cutOffReason(sql, owner, pubkey) === null;
 }
 
 function sha256Hex(text: string): string {
@@ -955,7 +1047,7 @@ function groupJoin(sql: SqlStorage, owner: string | null, params: unknown[], sig
   const code = params[1];
   if (gid === null || typeof code !== "string" || !CODE_RE.test(code)) return err("groupjoin takes [gid, code, change?]");
   const group = groupRow(sql, gid);
-  if (group === null || !linkActive(sql, gid, sha256Hex(code))) return err(LINK_REFUSAL);
+  if (group === null || !linkActive(sql, gid, sha256Hex(code), nowSec)) return err(LINK_REFUSAL);
   if (memberOf(sql, gid, signer) !== null) return { result: { version: group.version, epoch: group.epoch, member: true } };
   const why = cutOffReason(sql, owner, signer);
   if (why !== null) return err(LINK_REFUSAL);

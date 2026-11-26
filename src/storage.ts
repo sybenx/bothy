@@ -2544,6 +2544,14 @@ export function eraseMember(
 // `uses_allowed` frees the place without making a used-up code
 // redeemable again.
 function giveBackInvite(sql: SqlStorage, creator: string, code: string | null): void {
+  if (code !== null && code.startsWith(GROUP_LINK_VIA_PREFIX)) {
+    sql.exec(
+      `UPDATE home_group_links SET home_joined = MAX(home_joined - 1, 0) WHERE hash = ? AND made_by = ?`,
+      code.slice(GROUP_LINK_VIA_PREFIX.length),
+      creator,
+    );
+    return;
+  }
   const exact =
     code === null
       ? undefined
@@ -2711,13 +2719,21 @@ export function countOutstandingMemberInvites(sql: SqlStorage, nowSec: number, c
 // memberInviteLimits): every use of a live code, used or not, and only the
 // used ones of a revoked or expired code, so revoking a code, or letting
 // it lapse, gives its unused slots back.
+//
+// A group's join link (home-groups.ts homeLinkFor) spends a place only per
+// person it actually let into the home, not per person it might: it may
+// admit a whole family, and holding all those places would leave its maker
+// none for anything else.
 export function inviteSlotsUsed(sql: SqlStorage, createdBy: string, nowSec: number): number {
   return (
     sql
       .exec<{ n: number }>(
-        `SELECT COALESCE(SUM(CASE WHEN revoked_at IS NULL AND expires_at > ? THEN uses_allowed ELSE uses END), 0) AS n
-           FROM member_invites WHERE created_by = ?`,
+        `SELECT
+           (SELECT COALESCE(SUM(CASE WHEN revoked_at IS NULL AND expires_at > ? THEN uses_allowed ELSE uses END), 0)
+              FROM member_invites WHERE created_by = ?)
+         + (SELECT COALESCE(SUM(home_joined), 0) FROM home_group_links WHERE made_by = ?) AS n`,
         nowSec,
+        createdBy,
         createdBy,
       )
       .toArray()[0]?.n ?? 0
@@ -2832,6 +2848,36 @@ export function redeemMemberInvite(
   );
   readmitFormerMember(sql, pubkey);
   return "joined";
+}
+
+// `allowed_pubkeys.via_code` for someone a group's join link let in: this
+// prefix and the link's code hash (the home never keeps the code itself).
+export const GROUP_LINK_VIA_PREFIX = "link:";
+
+// Someone new comes into the home on a group's join link made by `madeBy`
+// (nip86.ts redeeminvite, after home-groups.ts homeLinkFor and the maker's
+// invite places are checked). Location trust as for a member code: on when
+// the owner or an admin made the link.
+export function admitByGroupLink(
+  sql: SqlStorage,
+  pubkey: string,
+  madeBy: string,
+  hash: string,
+  nowSec: number,
+  owner: string | null,
+): void {
+  const close = madeBy === owner || isAdmin(sql, madeBy) ? 1 : 0;
+  sql.exec(
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, invited_by, via_code, close)
+       VALUES (?, 'joined with a group link', ?, 'member', ?, ?, ?)
+       ON CONFLICT(pubkey) DO NOTHING`,
+    pubkey,
+    nowSec,
+    madeBy,
+    GROUP_LINK_VIA_PREFIX + hash,
+    close,
+  );
+  readmitFormerMember(sql, pubkey);
 }
 
 export type RevokeMemberInviteOutcome = "revoked" | "unknown" | "used-up" | "already-revoked";

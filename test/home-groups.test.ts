@@ -126,7 +126,7 @@ describe("home groups", () => {
       new Request("https://example.com/", { headers: { Accept: "application/nostr+json" } }),
     );
     const doc = (await reply.json()) as { groups?: unknown };
-    expect(doc.groups).toEqual({ v: 1, keeper: null });
+    expect(doc.groups).toEqual({ v: 1, keeper: null, links: { v: 1, days: 30 } });
   });
 
   it("are created by a home member, with the creator as the only admin", async () => {
@@ -512,7 +512,7 @@ describe("home groups", () => {
       const doc = (await (
         await exports.default.fetch(new Request("https://example.com/", { headers: { Accept: "application/nostr+json" } }))
       ).json()) as { groups?: unknown };
-      expect(doc.groups).toEqual({ v: 1, keeper: box.pubkeyHex });
+      expect(doc.groups).toEqual({ v: 1, keeper: box.pubkeyHex, links: { v: 1, days: 30 } });
       const ana = await newMember();
       const ben = await newMember();
       const gid = newGid();

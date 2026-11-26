@@ -1,7 +1,7 @@
 // NIP-11 relay information document. List only what is actually
 // implemented and enforced, never ahead of it.
 
-import { GROUP_DECISIONS } from "./home-groups";
+import { GROUP_DECISIONS, GROUP_LINK_MAX_SECONDS } from "./home-groups";
 import {
   CALL_ICE_SERVERS,
   groupsEnabled,
@@ -237,7 +237,14 @@ export function buildRelayInfo(
     info.backup = { v: 1 };
     // Home groups (src/home-groups.ts), bothy's own field. `keeper` is the
     // box's key once a box keeps every group's keys; null until then.
-    info.groups = { v: 1, keeper: GROUP_DECISIONS.keeperIsStorage && stored.storageUrl && stored.storagePubkey ? stored.storagePubkey : null };
+    // `links`: a group's join link with an `until` (at most `days` away)
+    // also lets people new to this home in (nip86.ts redeeminvite), so an
+    // app may offer it to people who are not on DMs yet.
+    info.groups = {
+      v: 1,
+      keeper: GROUP_DECISIONS.keeperIsStorage && stored.storageUrl && stored.storagePubkey ? stored.storagePubkey : null,
+      links: { v: 1, days: GROUP_LINK_MAX_SECONDS / 86400 },
+    };
   }
   const contact = resolveContact(profile);
   if (contact) {
