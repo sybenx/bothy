@@ -323,7 +323,7 @@ describe("a new phone getting back in", () => {
     // Alice sees the release afterwards, as a message and in myvouch.
     expect(await noticesTo(alice)).toContain(`vouchreleased:${alice.pubkeyHex}`);
     const after = (await as(alice, "myvouch")).result as { open: unknown; past: { releasedAt: number | null; approvedBy: string }[] };
-    expect(after.open).toMatchObject({ state: "ready" });
+    expect(after.open).toMatchObject({ state: "ready", releasedAt: expect.any(Number) });
     // Past the pickup window it closes, and the release stays on record.
     await windClock(alice.pubkeyHex, VOUCH_PICKUP_SECONDS);
     expect(await status(alice.pubkeyHex, a)).toEqual({ result: { state: "closed" } });

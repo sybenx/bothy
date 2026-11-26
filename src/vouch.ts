@@ -600,6 +600,9 @@ export interface VoucherView {
   approvedBy: string | null;
   approvedAt: number | null;
   releaseAt: number | null;
+  // Set once the new phone has collected the copy. The request stays open
+  // through the pickup window, so apps use this to stop offering Cancel.
+  releasedAt: number | null;
 }
 
 function view(row: VouchRequestRow, nowSec: number): VoucherView {
@@ -613,6 +616,7 @@ function view(row: VouchRequestRow, nowSec: number): VoucherView {
     approvedBy: row.approved_by,
     approvedAt: row.approved_at,
     releaseAt: row.release_at,
+    releasedAt: row.released_at,
   };
 }
 
