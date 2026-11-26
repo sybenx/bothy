@@ -36,8 +36,11 @@
 // made again at the moment of release, so a voucher removed or demoted
 // during the wait releases nothing.
 //
-// The two unsigned methods keep the vault's rule: they must not tell a
-// stranger who has an account here. vouchask answers every well-formed
+// The two unsigned methods answer the same way for everyone. That is not
+// the whole of what a stranger can learn: a stored request sends
+// messages, which move the public counts on /api/stats, so someone who
+// watches those around an ask can tell that a key is a member here with
+// a copy. The README says so. vouchask answers every well-formed
 // call the same way, {token, code, expiresAt}, whether a request was
 // stored or not, and the token carries its own time and MAC so a request
 // that was never stored can be asked about like one that was. A request is
@@ -214,16 +217,25 @@ export function vouchListEntry(sql: SqlStorage, pubkey: string): VouchListEntry 
 export type VoucherWhy = "owner" | "admin" | "named";
 
 // May `voucher` vouch for `member`, now.
+//
+// Nobody is let into an account above their own standing: the owner's
+// account opens only for people the owner named, and an admin's only for
+// the owner or people that admin named. Without this an admin could ask
+// for the owner's account from a key of their own, approve it themselves,
+// and hold the owner's key a day later (vouchask is unsigned).
 export function mayVouch(sql: SqlStorage, owner: string | null, voucher: string, member: string): boolean {
   if (voucher === member) return false;
-  if (owner !== null && voucher === owner) return true;
-  if (isAdmin(sql, voucher)) return true;
+  const memberIsOwner = owner !== null && member === owner;
+  if (!memberIsOwner) {
+    if (owner !== null && voucher === owner) return true;
+    if (isAdmin(sql, voucher) && !isAdmin(sql, member)) return true;
+  }
   if (roleOf(sql, voucher, owner) === "none") return false;
   return sql.exec(`SELECT 1 FROM vouchers WHERE member = ? AND voucher = ?`, member, voucher).toArray().length > 0;
 }
 
-// Everyone who may vouch for `member`, the owner first, then admins, then
-// the people they named, each once.
+// Everyone who may vouch for `member` (the same rule as mayVouch), the
+// owner first, then admins, then the people they named, each once.
 export function vouchersFor(
   sql: SqlStorage,
   owner: string | null,
@@ -235,7 +247,8 @@ export function vouchersFor(
     seen.add(owner);
     out.push({ pubkey: owner, why: "owner", addedAt: null });
   }
-  for (const a of listAdmins(sql)) {
+  const byStanding = !(owner !== null && member === owner) && !isAdmin(sql, member);
+  for (const a of byStanding ? listAdmins(sql) : []) {
     if (seen.has(a.pubkey)) continue;
     seen.add(a.pubkey);
     out.push({ pubkey: a.pubkey, why: "admin", addedAt: null });
@@ -395,8 +408,8 @@ function closeRequest(sql: SqlStorage, id: number, nowSec: number, by: string | 
 
 // A message from this relay to one person, as join requests are sent
 // (join-requests.ts): NIP-17, sealed with the relay's key, stored in their
-// mailbox here. Skipped when their mailbox has no room; the same thing is
-// always in vouchrequests and myvouch.
+// mailbox here. A voucher's is skipped when their mailbox has no room (the
+// same thing is always in vouchrequests); the account's own is always kept.
 export const VOUCH_TAG = "bothy";
 
 function notice(
@@ -424,7 +437,10 @@ function notice(
     mailStorageBytes(env),
     mailBytesPerMember(env),
   );
-  if (fits !== "ok") return null;
+  // The account's own warning is what makes the 24-hour wait worth
+  // anything, so it is stored even when their mailbox is full: it is a
+  // few hundred bytes, and asks are limited to 3 an hour per account.
+  if (fits !== "ok" && recipient !== account) return null;
   return storeEvent(sql, wrap, nowSec).stored ?? null;
 }
 
@@ -449,7 +465,7 @@ export const ASKED_OWN_TEXT =
 
 export function approvedOwnText(approver: string): string {
   return [
-    `A new phone was let into your account by:`,
+    `Someone approved a new phone for your account:`,
     mention(approver),
     `It gets in after ${VOUCH_DELAY_WORDS}. If that wasn't you, cancel it in DMs on this phone before then.`,
   ].join("\n\n");

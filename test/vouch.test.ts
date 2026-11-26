@@ -239,9 +239,28 @@ describe("who may vouch", () => {
       [admin.pubkeyHex, "admin"],
       [mum.pubkeyHex, "named"],
     ]);
-    // The owner's own list leaves the owner out.
+    // The owner's own list has only people the owner named: an admin is not let in above their standing.
     const owners = (await callManagement("vouchers")).result as { pubkey: string }[];
-    expect(owners.map((v) => v.pubkey)).toEqual([admin.pubkeyHex]);
+    expect(owners.map((v) => v.pubkey)).toEqual([]);
+    await callManagement("addvoucher", [mum.pubkeyHex]);
+    expect(((await callManagement("vouchers")).result as { pubkey: string }[]).map((v) => v.pubkey)).toEqual([mum.pubkeyHex]);
+    // An admin's list: the owner and the people they named, not the other admins.
+    const admin2 = await newMember();
+    await callManagement("addadmin", [admin2.pubkeyHex]);
+    const admins = (await as(admin, "vouchers")).result as { pubkey: string }[];
+    expect(admins.map((v) => v.pubkey)).toEqual([OWNER_PUBKEY_HEX]);
+  });
+
+  it("an admin cannot let a phone into another admin's account", async () => {
+    const target = await withCopy();
+    const admin = await newMember();
+    await callManagement("addadmin", [target.pubkeyHex]);
+    await callManagement("addadmin", [admin.pubkeyHex]);
+    const a = await ask(target.pubkeyHex);
+    expect(await noticesTo(admin)).toEqual([]);
+    expect((await as(admin, "vouchapprove", [target.pubkeyHex, a.phone.pubkeyHex])).error).toBeDefined();
+    await windClock(target.pubkeyHex);
+    expect(((await status(target.pubkeyHex, a)).result as { state: string }).state).not.toBe("ready");
   });
 
   it("refuses yourself, strangers, and more than the cap", async () => {
