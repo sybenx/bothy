@@ -243,6 +243,13 @@ describe("initSchema against historical table shapes", () => {
       seed: `INSERT INTO backfill_relays (relay_url, until_cursor, exhausted) VALUES ('wss://r', 500, 1)`,
       expectAdded: ["last_refusal"],
     },
+    {
+      table: "vault",
+      label: "v0.33.0, before seal",
+      create: `CREATE TABLE vault (hash TEXT PRIMARY KEY, pubkey TEXT NOT NULL, credential_id TEXT NOT NULL, public_key TEXT NOT NULL, alg INTEGER NOT NULL, blob TEXT NOT NULL, label TEXT, size INTEGER NOT NULL, counter INTEGER NOT NULL DEFAULT 0, added_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_used_at INTEGER)`,
+      seed: `INSERT INTO vault (hash, pubkey, credential_id, public_key, alg, blob, size, added_at, updated_at) VALUES ('h1', 'p1', 'c', 'k', -7, '{}', 10, 1, 1)`,
+      expectAdded: ["seal"],
+    },
   ];
 
   for (const { table, label, create, seed, expectAdded } of HISTORICAL) {

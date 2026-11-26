@@ -209,9 +209,13 @@ export function buildRelayInfo(
   if (ownerPubkey) {
     // `vouch` (src/vouch.ts): this home takes vouch copies sealed to `box`
     // (this relay's own key, as `self`) and hands one to a new phone
-    // `wait` seconds after a voucher approves. Omitted with VOUCH=off.
+    // `wait` seconds after a voucher approves. `noprf` (v0.34, src/vault.ts
+    // 'box' rows): a passkey whose app gives no PRF may be kept as a
+    // sign-in that hands over that same copy, through vaultput's seal
+    // "box" and vaultopen's bound form. Both omitted with VOUCH=off, when
+    // the operator declined to hold copies the home can open.
     info.restore = vouchEnabled(env)
-      ? { v: 1, vouch: { v: 1, box: relayPubkey, wait: VOUCH_RELEASE_DELAY_SECONDS } }
+      ? { v: 1, vouch: { v: 1, box: relayPubkey, wait: VOUCH_RELEASE_DELAY_SECONDS }, noprf: { v: 1 } }
       : { v: 1 };
     // Sealed signals (relay.ts handleSignal, kind 21059), bothy's own
     // field: typing, seen and call setup, delivered live, never stored.

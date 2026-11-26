@@ -12,10 +12,23 @@
 // The methods (nip86.ts, index.ts):
 //
 //   vaultput [hash, {credentialId, publicKey, alg, blob, label}]   member
+//   vaultput [hash, {credentialId, publicKey, alg, label,
+//                    seal: "box", copy?}]                           member (v0.34)
 //   vaultlist []                                                    member
 //   vaultdelete [hash]                                              member
 //   vaultchallenge []                                               anyone, unsigned
 //   vaultopen [hash, assertion]                                     anyone, unsigned
+//   vaultopen [hash, assertion, oneTimeKey, challenge]              anyone, unsigned (v0.34)
+//
+// The second forms are DMs' recovery layer 1b: a passkey app that gives no
+// PRF (Bitwarden today) cannot lock a copy, so its passkey is used only as
+// a sign-in. Its row (seal 'box') holds no blob; after the same assertion
+// checks, vaultopen hands the new phone the member's vouch copy
+// (src/vouch.ts), which this relay can open, sealed to a one-time key the
+// phone made. That key is bound into the assertion: the phone signs
+// base64url(sha256(challenge bytes || one-time key bytes)) as its WebAuthn
+// challenge, and this relay recomputes it, so nobody who sees or replays
+// an assertion can swap in a key of their own (openVaultBound below).
 //
 // The public key arrives on the member-signed vaultput as SPKI with its
 // COSE algorithm, so nothing here parses CBOR or attestation.
@@ -27,6 +40,11 @@
 // either way, counts the per-hash rate limit either way, and is held to a
 // fixed time floor in the Worker (limits.ts VAULT_OPEN_FLOOR_MS).
 // vaultchallenge takes no credential id at all, so it cannot differ by one.
+// Both forms of vaultopen share all of it: one method, one rate limit per
+// address and per hash, one check (checkAssertion), and a row asked the
+// other form's way fails only at the end, after the same work, with the
+// same body. The form a call uses is the caller's own choice, so the
+// little extra work the bound form does (one hash) tells them nothing.
 //
 // WebAuthn is verified here directly (ES256, EdDSA and RS256 over
 // WebCrypto) rather than with @simplewebauthn/server: that library wants a
@@ -35,6 +53,7 @@
 import { hmac } from "@noble/hashes/hmac.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes, randomBytes } from "@noble/hashes/utils.js";
+import { schnorr } from "@noble/curves/secp256k1.js";
 import { oneLine } from "./join-requests";
 import {
   VAULT_BLOB_MAX_BYTES,
@@ -360,6 +379,24 @@ export function isVaultHash(value: unknown): value is string {
   return typeof value === "string" && HASH_RE.test(value);
 }
 
+// A 64-character hex x-only key that is a point on the curve, so NIP-44
+// can encrypt to it: the one-time key a new phone makes (here and in
+// src/vouch.ts).
+export function isUsableKey(value: unknown): value is string {
+  if (typeof value !== "string" || !HASH_RE.test(value)) return false;
+  try {
+    schnorr.utils.lift_x(BigInt("0x" + value));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// What a row is (schema.ts vault.seal): 'passkey' holds the PRF-locked
+// blob this relay cannot open; 'box' holds no blob and stands for the
+// member's vouch copy, which it can.
+export type VaultSeal = "passkey" | "box";
+
 export type VaultRow = {
   hash: string;
   pubkey: string;
@@ -368,13 +405,14 @@ export type VaultRow = {
   alg: number;
   blob: string;
   counter: number;
+  seal: VaultSeal;
 };
 
 export function vaultRow(sql: SqlStorage, hash: string): VaultRow | null {
   return (
     sql
       .exec<VaultRow>(
-        `SELECT hash, pubkey, credential_id, public_key, alg, blob, counter FROM vault WHERE hash = ?`,
+        `SELECT hash, pubkey, credential_id, public_key, alg, blob, counter, seal FROM vault WHERE hash = ?`,
         hash,
       )
       .toArray()[0] ?? null
@@ -396,12 +434,29 @@ export interface VaultPutInput {
   publicKey: Uint8Array;
   publicKeyText: string;
   alg: number;
+  // The JSON text of the locked copy; "" for a 'box' row, which has none.
   blob: string;
   label: string | null;
   size: number;
+  seal: VaultSeal;
+  // A 'box' row only: a vouch copy sent with it, as given (src/vouch.ts
+  // checkVouchCopy checks it). Absent when the member already keeps one.
+  copy?: unknown;
 }
 
 const utf8Length = (value: string) => new TextEncoder().encode(value).length;
+
+// A row's label: one line, at most VAULT_LABEL_MAX_LENGTH characters,
+// null for none.
+function parseLabel(value: unknown): string | null | { error: string } {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") return { error: "vaultput: label must be a string" };
+  const label = oneLine(value);
+  if (label.length > VAULT_LABEL_MAX_LENGTH) {
+    return { error: `vaultput: label can be at most ${VAULT_LABEL_MAX_LENGTH} characters` };
+  }
+  return label === "" ? null : label;
+}
 
 // vaultput's parameters, checked as far as can be done without WebCrypto
 // (relay.ts manage then imports the key). A refusal message otherwise.
@@ -426,6 +481,34 @@ export function parseVaultPut(params: unknown[], signer: string): VaultPutInput 
   if (typeof f.alg !== "number" || !SUPPORTED_ALGS.has(f.alg)) {
     return "vaultput: alg must be -7 (ES256), -8 (EdDSA) or -257 (RS256)";
   }
+  const credentialId = toBase64url(credentialBytes);
+  const publicKeyText = toBase64url(publicKey);
+
+  // A passkey with no PRF (layer 1b): no blob, and maybe a vouch copy.
+  // An app that has never heard of `seal` sends none and gets exactly the
+  // checks below, in the same order, with the same messages.
+  if (f.seal !== undefined && f.seal !== "passkey") {
+    if (f.seal !== "box") return 'vaultput: seal must be "passkey" (with a blob) or "box" (without one)';
+    if (f.blob !== undefined) return 'vaultput: a "box" row carries no blob; its copy is your vouch copy';
+    const label = parseLabel(f.label);
+    if (typeof label === "object" && label !== null) return label.error;
+    const size = credentialId.length + publicKeyText.length + (label === null ? 0 : utf8Length(label));
+    if (size > VAULT_ROW_MAX_BYTES) return `vaultput: a row can be at most ${VAULT_ROW_MAX_BYTES} bytes`;
+    return {
+      hash,
+      credentialId,
+      publicKey,
+      publicKeyText,
+      alg: f.alg,
+      blob: "",
+      label,
+      size,
+      seal: "box",
+      ...(f.copy === undefined || f.copy === null ? {} : { copy: f.copy }),
+    };
+  }
+  if (f.copy !== undefined) return 'vaultput: copy goes only with seal "box"';
+
   // The locked copy, as a JSON object (a string holding one is taken too).
   // Stored as its JSON text, which is what the size cap counts, and given
   // back as an object by vaultopen.
@@ -453,30 +536,26 @@ export function parseVaultPut(params: unknown[], signer: string): VaultPutInput 
   if (blobCred === null || bytesToHex(blobCred) !== bytesToHex(credentialBytes)) {
     return "vaultput: the blob must name this credential";
   }
-  let label: string | null = null;
-  if (f.label !== undefined && f.label !== null) {
-    if (typeof f.label !== "string") return "vaultput: label must be a string";
-    label = oneLine(f.label);
-    if (label.length > VAULT_LABEL_MAX_LENGTH) {
-      return `vaultput: label can be at most ${VAULT_LABEL_MAX_LENGTH} characters`;
-    }
-    if (label === "") label = null;
-  }
-  const credentialId = toBase64url(credentialBytes);
-  const publicKeyText = toBase64url(publicKey);
+  const label = parseLabel(f.label);
+  if (typeof label === "object" && label !== null) return label.error;
   const size = credentialId.length + publicKeyText.length + utf8Length(blobText) + (label === null ? 0 : utf8Length(label));
   if (size > VAULT_ROW_MAX_BYTES) return `vaultput: a row can be at most ${VAULT_ROW_MAX_BYTES} bytes`;
-  return { hash, credentialId, publicKey, publicKeyText, alg: f.alg, blob: blobText, label, size };
+  return { hash, credentialId, publicKey, publicKeyText, alg: f.alg, blob: blobText, label, size, seal: "passkey" };
 }
 
 // Stores a checked vaultput (the key already imported). A refusal
 // message, or null when stored.
+//
+// `copy` is a 'box' row's vouch copy when the call carried one, already
+// opened and checked (src/vouch.ts checkVouchCopy). It is stored with the
+// row, after every check has passed, so a refused call stores neither.
 export function storeVaultRow(
   sql: SqlStorage,
   env: Env,
   input: VaultPutInput,
   signer: string,
   nowSec: number,
+  copy: { text: string; size: number } | null = null,
 ): string | null {
   const existing = sql
     .exec<{ pubkey: string; size: number; public_key: string }>(
@@ -495,18 +574,48 @@ export function storeVaultRow(
     }
   }
   const cap = vaultStorageBytes(env);
-  if (cap !== null) {
+  if (cap !== null && input.seal === "passkey") {
     const used = sql.exec<{ n: number }>(`SELECT COALESCE(SUM(size), 0) AS n FROM vault`).toArray()[0]?.n ?? 0;
     if (used - (existing?.size ?? 0) + input.size > cap) return VAULT_FULL_MESSAGE;
   }
-  // A new public key starts its signature counter again.
+  // A 'box' row is counted against everything the vault's share holds,
+  // vouch copies included (as src/vouch.ts storeVouchCopy counts it), with
+  // the copy it brings in place of the one it replaces.
+  if (cap !== null && input.seal === "box") {
+    const used =
+      sql
+        .exec<{ n: number }>(
+          `SELECT (SELECT COALESCE(SUM(size), 0) FROM vault) + (SELECT COALESCE(SUM(size), 0) FROM vouch_copies) AS n`,
+        )
+        .toArray()[0]?.n ?? 0;
+    const oldCopy =
+      copy === null
+        ? 0
+        : (sql.exec<{ size: number }>(`SELECT size FROM vouch_copies WHERE pubkey = ?`, signer).toArray()[0]?.size ?? 0);
+    if (used - (existing?.size ?? 0) - oldCopy + input.size + (copy?.size ?? 0) > cap) return VAULT_FULL_MESSAGE;
+  }
+  if (copy !== null) {
+    sql.exec(
+      `INSERT INTO vouch_copies (pubkey, blob, size, added_at, updated_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(pubkey) DO UPDATE SET blob = excluded.blob, size = excluded.size, updated_at = excluded.updated_at`,
+      signer,
+      copy.text,
+      copy.size,
+      nowSec,
+      nowSec,
+    );
+  }
+  // A new public key starts its signature counter again. The same
+  // credential put again with the other seal replaces the row in place:
+  // that is how a 'box' row becomes a 'passkey' one when the passkey app
+  // gains PRF (and back, if the member moves to an app without it).
   const keepCounter = existing !== undefined && existing.public_key === input.publicKeyText;
   sql.exec(
-    `INSERT INTO vault (hash, pubkey, credential_id, public_key, alg, blob, label, size, counter, added_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+    `INSERT INTO vault (hash, pubkey, credential_id, public_key, alg, blob, label, size, counter, added_at, updated_at, seal)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
        ON CONFLICT(hash) DO UPDATE SET public_key = excluded.public_key, alg = excluded.alg,
          blob = excluded.blob, label = excluded.label, size = excluded.size,
-         counter = ${keepCounter ? "vault.counter" : "0"}, updated_at = excluded.updated_at`,
+         counter = ${keepCounter ? "vault.counter" : "0"}, updated_at = excluded.updated_at, seal = excluded.seal`,
     input.hash,
     signer,
     input.credentialId,
@@ -517,6 +626,7 @@ export function storeVaultRow(
     input.size,
     nowSec,
     nowSec,
+    input.seal,
   );
   return null;
 }
@@ -532,6 +642,10 @@ export interface VaultListEntry {
   addedAt: number;
   updatedAt: number;
   lastUsedAt: number | null;
+  // 'passkey': this relay cannot open what the row holds. 'box': the row
+  // hands over the vouch copy, which it can (layer 1b).
+  seal: VaultSeal;
+  boxReadable: boolean;
 }
 
 // The signer's rows, oldest first, without their blobs.
@@ -546,8 +660,9 @@ export function listVaultRows(sql: SqlStorage, signer: string): VaultListEntry[]
       added_at: number;
       updated_at: number;
       last_used_at: number | null;
+      seal: VaultSeal;
     }>(
-      `SELECT hash, credential_id, public_key, alg, label, added_at, updated_at, last_used_at FROM vault
+      `SELECT hash, credential_id, public_key, alg, label, added_at, updated_at, last_used_at, seal FROM vault
         WHERE pubkey = ? ORDER BY added_at ASC, hash ASC`,
       signer,
     )
@@ -561,6 +676,8 @@ export function listVaultRows(sql: SqlStorage, signer: string): VaultListEntry[]
       addedAt: r.added_at,
       updatedAt: r.updated_at,
       lastUsedAt: r.last_used_at,
+      seal: r.seal,
+      boxReadable: r.seal === "box",
     }));
 }
 
@@ -569,32 +686,39 @@ export function deleteVaultRow(sql: SqlStorage, hash: string, signer: string): v
   sql.exec(`DELETE FROM vault WHERE hash = ? AND pubkey = ?`, hash, signer);
 }
 
+// The member's 'box' rows: with their vouch copy (vouchdelete), since
+// they hand over nothing without it, and when they leave or are removed
+// (storage.ts unallowPubkey), when the copy goes too.
+export function deleteBoxRowsOf(sql: SqlStorage, pubkey: string): void {
+  sql.exec(`DELETE FROM vault WHERE pubkey = ? AND seal = 'box'`, pubkey);
+}
+
 // ---------------------------------------------------------------------
 // vaultopen. The caller (relay.ts) has applied the rate limits; the
-// Worker holds the time floor. Returns the blob, or null for every kind
-// of failure.
+// Worker holds the time floor. Every kind of failure is null.
 //
 // The work is the same whether the row exists: the challenge is read and
 // spent first, the row looked up, and the signature verified against the
-// row's key or a dummy one. Only then are the results combined.
+// row's key or a dummy one. Only then are the results combined. Both
+// forms run this one check; they differ only in which challenge the
+// assertion must carry and which seal the row must have.
 // ---------------------------------------------------------------------
 
-export async function openVault(
+async function checkAssertion(
   sql: SqlStorage,
   env: Env,
   challengeKey: Uint8Array,
   hash: string,
-  assertionValue: unknown,
+  parsed: ParsedAssertion,
+  // The challenge this relay issued, read and spent here.
+  issued: unknown,
+  // Whether clientDataJSON's challenge is what this form expects of it.
+  clientChallengeOk: boolean,
+  seal: VaultSeal,
   nowSec: number,
-): Promise<string | null> {
-  const parsed = parseAssertion(assertionValue);
-  if (parsed === null) return null;
-
+): Promise<{ row: VaultRow; count: number } | null> {
   // Spent on every call that names a live challenge, found or not.
-  const challenge =
-    typeof parsed.clientData.challenge === "string"
-      ? readChallenge(challengeKey, parsed.clientData.challenge, nowSec)
-      : null;
+  const challenge = typeof issued === "string" ? readChallenge(challengeKey, issued, nowSec) : null;
   const challengeOk = challenge !== null && spendChallenge(sql, challenge.nonce, challenge.expiresAt);
 
   const row = vaultRow(sql, hash);
@@ -609,9 +733,67 @@ export async function openVault(
   const shapeOk = assertionShapeOk(parsed, passkeyOrigins(env));
   const idOk = bytesToHex(sha256(parsed.credentialId)) === hash;
   const count = signCount(parsed.authData);
-  if (row === null || !challengeOk || !signatureOk || !shapeOk || !idOk) return null;
+  if (row === null || !challengeOk || !clientChallengeOk || !signatureOk || !shapeOk || !idOk) return null;
+  // A row asked the other form's way fails here, after all the same work.
+  if (row.seal !== seal) return null;
   if ((count !== 0 || row.counter !== 0) && count <= row.counter) return null;
   if (parsed.userHandle !== null && !sameBytes(parsed.userHandle, hexToBytes(row.pubkey))) return null;
-  recordVaultUse(sql, hash, count, nowSec);
-  return row.blob;
+  return { row, count };
+}
+
+// vaultopen [hash, assertion]: a 'passkey' row's blob, the assertion
+// signed over the challenge itself. Unchanged by v0.34 but for the seal.
+export async function openVault(
+  sql: SqlStorage,
+  env: Env,
+  challengeKey: Uint8Array,
+  hash: string,
+  assertionValue: unknown,
+  nowSec: number,
+): Promise<string | null> {
+  const parsed = parseAssertion(assertionValue);
+  if (parsed === null) return null;
+  const opened = await checkAssertion(sql, env, challengeKey, hash, parsed, parsed.clientData.challenge, true, "passkey", nowSec);
+  if (opened === null) return null;
+  recordVaultUse(sql, hash, opened.count, nowSec);
+  return opened.row.blob;
+}
+
+// What a phone signs for the bound form: the WebAuthn challenge it passes
+// to the passkey app is these 32 bytes, which the browser or Credential
+// Manager writes into clientDataJSON as their unpadded base64url.
+export function boundChallenge(issued: Uint8Array, oneTimeKey: string): Uint8Array {
+  const input = new Uint8Array(issued.length + 32);
+  input.set(issued, 0);
+  input.set(hexToBytes(oneTimeKey), issued.length);
+  return sha256(input);
+}
+
+// vaultopen [hash, assertion, oneTimeKey, challenge]: a 'box' row, the
+// assertion signed over boundChallenge(challenge, oneTimeKey). Returns
+// the row and the signature counter for the caller to record once the
+// copy has been handed over (src/vouch.ts handOverToPhone); null for
+// every failure.
+//
+// A malformed one-time key or challenge returns before any lookup, like
+// a malformed assertion: that depends on nothing but the caller's input.
+// Everything after is checkAssertion, the same as the other form.
+export async function openVaultBound(
+  sql: SqlStorage,
+  env: Env,
+  challengeKey: Uint8Array,
+  hash: string,
+  assertionValue: unknown,
+  oneTimeKey: unknown,
+  issued: unknown,
+  nowSec: number,
+): Promise<{ row: VaultRow; count: number; oneTimeKey: string } | null> {
+  const parsed = parseAssertion(assertionValue);
+  if (parsed === null || !isUsableKey(oneTimeKey)) return null;
+  const issuedBytes = fromBase64url(issued);
+  if (issuedBytes === null || issuedBytes.length === 0) return null;
+  const expected = toBase64url(boundChallenge(issuedBytes, oneTimeKey));
+  const clientChallengeOk = parsed.clientData.challenge === expected;
+  const opened = await checkAssertion(sql, env, challengeKey, hash, parsed, issued, clientChallengeOk, "box", nowSec);
+  return opened === null ? null : { ...opened, oneTimeKey };
 }

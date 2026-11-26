@@ -18,7 +18,7 @@
 // The methods (nip86.ts, index.ts):
 //
 //   vouchput [copy]                        member: keep my vouch copy
-//   vouchdelete []                         member: drop it
+//   vouchdelete []                         member: drop it (and the 'box' vault rows that hand it over)
 //   vouchers []                            member: who may vouch for me
 //   addvoucher [pubkey]                    member: name a member who may
 //   removevoucher [pubkey]                 member
@@ -29,6 +29,10 @@
 //   vouchcancel []                         member: cancel my open request
 //   vouchask [pubkey, key]                 anyone, unsigned
 //   vouchstatus [pubkey, key, token]       anyone, unsigned
+//
+// The same copy is what a password manager with no PRF lets a new phone
+// have, through a 'box' vault row and vaultopen's bound form (src/vault.ts,
+// handOverToPhone below): no voucher and no wait, the passkey is the proof.
 //
 // Who may vouch for a member: the owner and the admins, and the members
 // they named themselves; never the member. A named voucher who leaves the
@@ -75,25 +79,21 @@ import { nip44Decrypt, nip44Encrypt, wrapDirectMessage } from "./nip44";
 import type { NostrEvent } from "./nostr";
 import { getRelayPubkey, relayConversationKey, signAsRelay } from "./relay-identity";
 import { isAdmin, listAdmins, mailRoom, roleOf, storeEvent, wrapBytes } from "./storage";
-import { fromBase64url, toBase64url, VAULT_FULL_MESSAGE } from "./vault";
+import {
+  deleteBoxRowsOf,
+  fromBase64url,
+  isUsableKey,
+  recordVaultUse,
+  toBase64url,
+  VAULT_FULL_MESSAGE,
+  type VaultRow,
+} from "./vault";
 
-export { vouchEnabled };
+export { isUsableKey, vouchEnabled };
 
 export const VOUCH_OFF_MESSAGE = "this home does not take vouching";
 
 const HEX64 = /^[0-9a-f]{64}$/;
-
-// A 64-character hex x-only key that is a point on the curve, so NIP-44
-// can encrypt to it.
-export function isUsableKey(value: unknown): value is string {
-  if (typeof value !== "string" || !HEX64.test(value)) return false;
-  try {
-    schnorr.utils.lift_x(BigInt("0x" + value));
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 // ---------------------------------------------------------------------
 // The vouch copy.
@@ -125,8 +125,38 @@ export function openVouchCopy(sql: SqlStorage, pubkey: string, copy: unknown): s
   return secret;
 }
 
-// vouchput: checked by opening it, so a copy that could never be handed
-// over is refused now rather than discovered on the day it is needed.
+// A vouch copy as sent, checked by opening it, so a copy that could never
+// be handed over is refused now rather than discovered on the day it is
+// needed. Its JSON text and size, or a refusal starting with `method`
+// (vouchput, or vaultput carrying one for a 'box' row).
+export function checkVouchCopy(
+  sql: SqlStorage,
+  signer: string,
+  value: unknown,
+  method: string,
+): { text: string; size: number } | string {
+  let copy: unknown = value;
+  if (typeof copy === "string") {
+    try {
+      copy = JSON.parse(copy);
+    } catch {
+      return `${method}: the copy must be a JSON object`;
+    }
+  }
+  if (typeof copy !== "object" || copy === null || Array.isArray(copy)) {
+    return `${method}: the copy must be a JSON object`;
+  }
+  const text = JSON.stringify(copy);
+  const size = new TextEncoder().encode(text).length;
+  if (size > VOUCH_COPY_MAX_BYTES) return `${method}: the copy can be at most ${VOUCH_COPY_MAX_BYTES} bytes`;
+  if ((copy as { pubkey?: unknown }).pubkey !== signer) return `${method}: the copy must name your own pubkey`;
+  if (openVouchCopy(sql, signer, copy) === null) {
+    return `${method}: the copy must be {"v": 3, "seal": "box", "pubkey", "ct"}, your key sealed to this home's key`;
+  }
+  return { text, size };
+}
+
+// vouchput.
 export function storeVouchCopy(
   sql: SqlStorage,
   env: Env,
@@ -134,24 +164,9 @@ export function storeVouchCopy(
   value: unknown,
   nowSec: number,
 ): string | null {
-  let copy: unknown = value;
-  if (typeof copy === "string") {
-    try {
-      copy = JSON.parse(copy);
-    } catch {
-      return "vouchput: the copy must be a JSON object";
-    }
-  }
-  if (typeof copy !== "object" || copy === null || Array.isArray(copy)) {
-    return "vouchput: the copy must be a JSON object";
-  }
-  const text = JSON.stringify(copy);
-  const size = new TextEncoder().encode(text).length;
-  if (size > VOUCH_COPY_MAX_BYTES) return `vouchput: the copy can be at most ${VOUCH_COPY_MAX_BYTES} bytes`;
-  if ((copy as { pubkey?: unknown }).pubkey !== signer) return "vouchput: the copy must name your own pubkey";
-  if (openVouchCopy(sql, signer, copy) === null) {
-    return 'vouchput: the copy must be {"v": 3, "seal": "box", "pubkey", "ct"}, your key sealed to this home\'s key';
-  }
+  const checked = checkVouchCopy(sql, signer, value, "vouchput");
+  if (typeof checked === "string") return checked;
+  const { text, size } = checked;
   const cap = vaultStorageBytes(env);
   if (cap !== null) {
     const existing =
@@ -181,11 +196,17 @@ export function vaultBytesUsed(sql: SqlStorage): number {
   );
 }
 
+// vouchdelete: the copy, and the member's 'box' vault rows with it. Those
+// rows hand over this copy and nothing else, so without it they could
+// only fail; and a member who asks the home to hold no copy it can open
+// has asked for them to go too. (The apps call vouchdelete on a change of
+// home and when a home turns vouching off, where both are moot anyway.)
 export function deleteVouchCopy(sql: SqlStorage, pubkey: string): void {
   sql.exec(`DELETE FROM vouch_copies WHERE pubkey = ?`, pubkey);
+  deleteBoxRowsOf(sql, pubkey);
 }
 
-function hasVouchCopy(sql: SqlStorage, pubkey: string): boolean {
+export function hasVouchCopy(sql: SqlStorage, pubkey: string): boolean {
   return sql.exec(`SELECT 1 FROM vouch_copies WHERE pubkey = ?`, pubkey).toArray().length > 0;
 }
 
@@ -380,11 +401,15 @@ const isOpen = (state: VouchState) => state !== "closed";
 const REQUEST_COLUMNS =
   "id, pubkey, key, asked_at, approved_by, approved_at, release_at, released_at, closed_at, closed_by, closed_why";
 
+// The latest request, passing over the record of a password-manager
+// hand-over (handOverToPhone): that row is history only, closed when
+// written, and must not hide a vouch request still open behind it.
 function latestRequest(sql: SqlStorage, pubkey: string): VouchRequestRow | null {
   return (
     sql
       .exec<VouchRequestRow>(
-        `SELECT ${REQUEST_COLUMNS} FROM vouch_requests WHERE pubkey = ? ORDER BY asked_at DESC, id DESC LIMIT 1`,
+        `SELECT ${REQUEST_COLUMNS} FROM vouch_requests WHERE pubkey = ? AND closed_why IS NOT '${NOPRF_WHY}'
+          ORDER BY asked_at DESC, id DESC LIMIT 1`,
         pubkey,
       )
       .toArray()[0] ?? null
@@ -597,13 +622,111 @@ export function vouchStatus(
     closeRequest(sql, row.id, nowSec, null, "no-copy");
     return { result: { state: "closed" }, outbox };
   }
-  const ct = nip44Encrypt(secret, relayConversationKey(sql, key));
+  const copy = sealTo(sql, pubkey, secret, key);
   if (row.released_at === null) {
     sql.exec(`UPDATE vouch_requests SET released_at = ? WHERE id = ?`, nowSec, row.id);
     const own = notice(sql, env, pubkey, "vouchreleased", pubkey, releasedOwnText(row.approved_by!), nowSec);
     if (own !== null) outbox.push(own);
   }
-  return { result: { state: "ready", copy: { v: 1, pubkey, box: getRelayPubkey(sql), ct } }, outbox };
+  return { result: { state: "ready", copy }, outbox };
+}
+
+// What a new phone is handed, by vouchstatus and by vaultopen's bound
+// form alike: the account's key, NIP-44 sealed from this relay's key to
+// the phone's one-time key. Never the bare key.
+export type HandedCopy = { v: 1; pubkey: string; box: string; ct: string };
+
+function sealTo(sql: SqlStorage, pubkey: string, secret: string, oneTimeKey: string): HandedCopy {
+  return { v: 1, pubkey, box: getRelayPubkey(sql), ct: nip44Encrypt(secret, relayConversationKey(sql, oneTimeKey)) };
+}
+
+// ---------------------------------------------------------------------
+// A password manager with no PRF (DMs' layer 1b, src/vault.ts): the
+// passkey is a sign-in, and what it lets a new phone have is the same
+// vouch copy a voucher would release, with no voucher and no wait. The
+// passkey is the proof, as it is for a 'passkey' row.
+//
+// Why the vouch copy and not a copy per row: the home then holds one copy
+// it can open per member, whatever number of password managers they use,
+// and vaultlist shows one thing the box can read plus the rows that hand
+// it over. The apps already keep that copy on every home that takes
+// vouching (DMs 0.5.8), so registering a 'box' row usually sends none.
+// What it costs: vouchdelete takes the 'box' rows with the copy
+// (deleteVouchCopy), and a member who keeps a 'box' row can be vouched
+// for, since that needs only the copy; the apps write it for everyone
+// anyway, and vouching has its own wait and notices.
+// ---------------------------------------------------------------------
+
+// myvouch's `why` for a phone let in this way, and the history row's
+// closed_why.
+export const NOPRF_WHY = "noprf";
+
+// The tag on the account's message (["bothy", NOPRF_NOTICE, account]).
+export const NOPRF_NOTICE = "noprfreleased";
+
+export const NOPRF_RELEASED_TEXT =
+  "A new phone got into your account with your password manager. If that wasn't you, tell the person who runs your home.";
+
+// vaultput's refusal of a 'box' row with VOUCH=off: the operator said no
+// to holding copies the home can open.
+export const NOPRF_OFF_MESSAGE = "this home does not keep a copy it can open, so it needs a passkey app that can lock one";
+
+export const NOPRF_NEEDS_COPY_MESSAGE =
+  'vaultput: a "box" row needs your vouch copy. Send it as copy, or keep one with vouchput first.';
+
+// vaultopen's bound form, after openVaultBound accepted the assertion:
+// every check that makes a release count is made again now, as
+// vouchstatus does. The copy, or null (which the caller answers with the
+// same not-found as any other failure). Only on success does this write:
+// the row's counter and last use, one closed history row the account sees
+// in myvouch, and a message to the account.
+export function handOverToPhone(
+  sql: SqlStorage,
+  env: Env,
+  owner: string | null,
+  opened: { row: VaultRow; count: number; oneTimeKey: string },
+  nowSec: number,
+): { copy: HandedCopy; outbox: NostrEvent[] } | null {
+  const pubkey = opened.row.pubkey;
+  if (!vouchEnabled(env) || owner === null || roleOf(sql, pubkey, owner) === "none") return null;
+  const stored = sql.exec<{ blob: string }>(`SELECT blob FROM vouch_copies WHERE pubkey = ?`, pubkey).toArray()[0];
+  const secret = stored === undefined ? null : openVouchCopy(sql, pubkey, JSON.parse(stored.blob) as unknown);
+  if (secret === null) return null;
+  const copy = sealTo(sql, pubkey, secret, opened.oneTimeKey);
+
+  recordVaultUse(sql, opened.row.hash, opened.count, nowSec);
+  // Closed as it is written, so it is never an open request (stateOf),
+  // never in a voucher's list (requestsFor) and never the request
+  // latestRequest finds. Counts toward the history kept per account.
+  sql.exec(
+    `INSERT INTO vouch_requests (pubkey, key, asked_at, released_at, closed_at, closed_why) VALUES (?, ?, ?, ?, ?, ?)`,
+    pubkey,
+    opened.oneTimeKey,
+    nowSec,
+    nowSec,
+    nowSec,
+    NOPRF_WHY,
+  );
+  // The newest VOUCH_HISTORY_PER_MEMBER rows stay, as pruneHistory keeps
+  // them, and so does a vouch request still open behind them: a run of
+  // these must not quietly drop a request the account has yet to see.
+  const open = openRequest(sql, pubkey, nowSec);
+  sql.exec(
+    `DELETE FROM vouch_requests WHERE pubkey = ? AND id IS NOT ? AND id NOT IN
+       (SELECT id FROM vouch_requests WHERE pubkey = ? ORDER BY asked_at DESC, id DESC LIMIT ?)`,
+    pubkey,
+    open?.id ?? null,
+    pubkey,
+    VOUCH_HISTORY_PER_MEMBER,
+  );
+  // Kept even when their mailbox is full, like vouching's own notices
+  // (notice): it is the account's one warning. Each needs a fresh
+  // assertion with the person present and verified, and the per-hash
+  // limit allows twenty an hour.
+  const outbox: NostrEvent[] = [];
+  const own = notice(sql, env, pubkey, NOPRF_NOTICE, pubkey, NOPRF_RELEASED_TEXT, nowSec);
+  if (own !== null) outbox.push(own);
+  return { copy, outbox };
 }
 
 export interface VoucherView {

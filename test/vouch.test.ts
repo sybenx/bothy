@@ -163,7 +163,8 @@ describe("discovery", () => {
       expect(methods).toContain(m);
     }
     const doc = await info();
-    expect(doc.restore).toEqual({ v: 1, vouch: { v: 1, box: doc.self, wait: VOUCH_RELEASE_DELAY_SECONDS } });
+    // v0.34 adds `noprf` beside `vouch` (test/vault-noprf.test.ts).
+    expect(doc.restore).toEqual({ v: 1, vouch: { v: 1, box: doc.self, wait: VOUCH_RELEASE_DELAY_SECONDS }, noprf: { v: 1 } });
   });
 
   it("VOUCH=off takes it out of both, and refuses new copies", async () => {

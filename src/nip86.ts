@@ -111,9 +111,13 @@ import { deleteVaultRow, isVaultHash, listVaultRows, parseVaultPut, storeVaultRo
 import {
   addVoucher,
   cancelVouch,
+  checkVouchCopy,
   decideVouch,
   deleteVouchCopy,
+  hasVouchCopy,
   myVouch,
+  NOPRF_NEEDS_COPY_MESSAGE,
+  NOPRF_OFF_MESSAGE,
   removeVoucher,
   requestsFor,
   storeVouchCopy,
@@ -1186,8 +1190,9 @@ export function handleManagementCall(
     // A plain member gets the rows without the activity fields (lastSeen,
     // push, waiting), which stay the owner's and admins' (v0.29): a member
     // does not see when a friend was last online. Owner and admins keep them.
-    // The same for restore, the count of a member's vault rows: whether a
-    // friend has a way back is the owner's and admins' to see.
+    // The same for restore, the count of a member's vault rows, and
+    // restoreBoxReadable: whether a friend has a way back is the owner's
+    // and admins' to see.
     case "myinvitees": {
       const owner = getOwnerPubkey(sql, env) ?? signer;
       const listing = listInvitees(sql, MEMBER_REMOVAL_GRACE_SECONDS, owner, signer, nowSec);
@@ -1196,8 +1201,12 @@ export function handleManagementCall(
         const { lastSeen: _seen, push: _push, waiting: _waiting, ...rest } = row;
         return rest;
       };
-      const stripMember = <T extends { lastSeen: unknown; push: unknown; waiting: unknown; restore: unknown }>(row: T) => {
-        const { restore: _restore, ...rest } = strip(row);
+      const stripMember = <
+        T extends { lastSeen: unknown; push: unknown; waiting: unknown; restore: unknown; restoreBoxReadable: unknown },
+      >(
+        row: T,
+      ) => {
+        const { restore: _restore, restoreBoxReadable: _box, ...rest } = strip(row);
         return rest;
       };
       return { result: { members: listing.members.map(stripMember), removed: listing.removed.map(strip) } };
@@ -1205,7 +1214,9 @@ export function handleManagementCall(
 
     // Owner and admins only (ADMIN_CALLABLE_METHODS). Each current member's
     // row carries restore, how many vault rows they keep here (storage.ts
-    // listMembers), so the DMs app can show who has no way back.
+    // listMembers), so the DMs app can show who has no way back, and
+    // restoreBoxReadable, how many of those hand over a copy this home can
+    // open.
     case "listmembers":
       return { result: listMembers(sql, MEMBER_REMOVAL_GRACE_SECONDS, getOwnerPubkey(sql, env) ?? signer) };
 
@@ -1442,18 +1453,37 @@ export function handleManagementCall(
     // owner and admins still get it.
     // The restore vault (src/vault.ts), a member's own rows. vaultput's key
     // was imported by relay.ts manage before this ran.
+    //
+    // A 'box' row (seal "box", layer 1b) hands over the member's vouch
+    // copy, so it needs one: the one they keep here, or one sent with it
+    // as `copy` (checked like vouchput's, and stored as their vouch copy).
+    // With VOUCH=off the operator declined to hold copies the home can
+    // open, so it is refused; a 'passkey' row is not affected.
     case "vaultput": {
       const input = parseVaultPut(params, signer);
       if (typeof input === "string") return err(input);
-      const refusal = storeVaultRow(sql, env, input, signer, nowSec);
+      let copy: { text: string; size: number } | null = null;
+      if (input.seal === "box") {
+        if (!vouchEnabled(env)) return err(`vaultput: ${NOPRF_OFF_MESSAGE}`);
+        if (input.copy !== undefined) {
+          const checked = checkVouchCopy(sql, signer, input.copy, "vaultput");
+          if (typeof checked === "string") return err(checked);
+          copy = checked;
+        } else if (!hasVouchCopy(sql, signer)) {
+          return err(NOPRF_NEEDS_COPY_MESSAGE);
+        }
+      }
+      const refusal = storeVaultRow(sql, env, input, signer, nowSec, copy);
       return refusal === null ? { result: true } : err(refusal);
     }
 
-    // Passkey rows first, each marked as one this relay cannot open; then
-    // the vouch copy if there is one, marked box-readable, with no hash or
-    // credential so an app that only knows passkey rows passes over it.
+    // The vault rows first, each with its seal: "passkey" for one this
+    // relay cannot open, "box" (boxReadable) for one that hands over the
+    // vouch copy. Then the vouch copy if there is one, marked box-readable,
+    // with no hash or credential so an app that only knows passkey rows
+    // passes over it.
     case "vaultlist": {
-      const rows: object[] = listVaultRows(sql, signer).map((row) => ({ ...row, seal: "passkey", boxReadable: false }));
+      const rows: object[] = listVaultRows(sql, signer);
       const vouch = vouchListEntry(sql, signer);
       if (vouch !== null) rows.push(vouch);
       return { result: rows };

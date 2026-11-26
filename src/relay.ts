@@ -119,13 +119,14 @@ import {
   isVaultHash,
   issueChallenge,
   openVault,
+  openVaultBound,
   parseVaultPut,
   sweepSpentChallenges,
   VAULT_CHALLENGE_KEY_LABEL,
   VAULT_NOT_FOUND,
   VAULT_RATE_LIMITED,
 } from "./vault";
-import { askVouch, parseAsk, VOUCH_ASK_USAGE, VOUCH_TOKEN_KEY_LABEL, vouchStatus } from "./vouch";
+import { askVouch, handOverToPhone, parseAsk, VOUCH_ASK_USAGE, VOUCH_TOKEN_KEY_LABEL, vouchStatus } from "./vouch";
 import { relayDerivedKey } from "./relay-identity";
 import { resolveIcon, resolveName, type OwnerProfile } from "./nip11";
 import {
@@ -806,14 +807,35 @@ export class Relay extends DurableObject<Env> {
 
   // {blob}, or VAULT_NOT_FOUND for every failure. The per-hash limit is
   // counted for any well-formed hash, stored or not.
+  //
+  // With a third and fourth parameter, [hash, assertion, oneTimeKey,
+  // challenge], it is the bound form for a 'box' row (src/vault.ts
+  // openVaultBound): {copy}, or the same VAULT_NOT_FOUND. Both forms pass
+  // the same two rate limits first, so asking the other way buys no
+  // extra tries at a hash.
   async vaultOpen(params: unknown[], callerIp: string): Promise<ManagementResponse> {
     if (this.windowLimited(this.vaultOpenIpLimits, normalizeIp(callerIp), VAULT_IP_RATE_LIMIT_WINDOW_MS, MAX_VAULT_CALLS_PER_IP_PER_WINDOW)) {
       return { error: VAULT_RATE_LIMITED };
     }
-    const [hash, assertion] = params;
+    const [hash, assertion, oneTimeKey, issued] = params;
     if (!isVaultHash(hash)) return { error: VAULT_NOT_FOUND };
     if (this.windowLimited(this.vaultHashLimits, hash, VAULT_HASH_RATE_LIMIT_WINDOW_MS, MAX_VAULT_OPENS_PER_HASH_PER_WINDOW)) {
       return { error: VAULT_RATE_LIMITED };
+    }
+    if (params.length > 2) {
+      return this.metered(async () => {
+        const opened = await openVaultBound(this.sql, this.env, this.challengeKey(), hash, assertion, oneTimeKey, issued, nowSeconds());
+        if (opened === null) return { error: VAULT_NOT_FOUND };
+        const copy = withReadPath("management", () => {
+          const sql = this.sql;
+          const handed = handOverToPhone(sql, this.env, getOwnerPubkey(sql, this.env), opened, nowSeconds());
+          if (handed === null) return null;
+          this.deliverOutbox(sql, handed.outbox);
+          return handed.copy;
+        });
+        await this.settlePushAlarm();
+        return copy === null ? { error: VAULT_NOT_FOUND } : { result: { copy } };
+      });
     }
     return this.metered(async () => {
       const blob = await openVault(this.sql, this.env, this.challengeKey(), hash, assertion, nowSeconds());

@@ -1,5 +1,5 @@
 import { buildFilterQuery, compareEvents, expandFilter, type FilterQueryOptions } from "./filters";
-import { deleteVaultRowsOf } from "./vault";
+import { deleteBoxRowsOf, deleteVaultRowsOf } from "./vault";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 import {
@@ -2431,6 +2431,9 @@ export function unallowPubkey(
   // not after the grace; their open request closes; and they stop
   // vouching for anyone, and anyone named for them stops too.
   sql.exec(`DELETE FROM vouch_copies WHERE pubkey = ?`, pubkey);
+  // Their 'box' vault rows go with the copy they hand over (src/vault.ts
+  // deleteBoxRowsOf); 'passkey' rows stay read-only through the grace.
+  deleteBoxRowsOf(sql, pubkey);
   sql.exec(`DELETE FROM vouchers WHERE member = ? OR voucher = ?`, pubkey, pubkey);
   sql.exec(
     `UPDATE vouch_requests SET closed_at = ?, closed_why = 'left' WHERE pubkey = ? AND closed_at IS NULL`,
@@ -3228,6 +3231,10 @@ export interface MemberDetails extends MemberActivity {
   // (nip86.ts listmembers; myinvitees strips it for a plain member). On
   // current members only: a removed member's rows go with their mail.
   restore: number;
+  // How many of those are 'box' rows (src/vault.ts, layer 1b): a password
+  // manager with no PRF, whose sign-in hands over a copy this home can
+  // open. Shown and stripped with `restore`.
+  restoreBoxReadable: number;
 }
 
 // Activity, from what bothy already keeps; nothing new is recorded for
@@ -3355,12 +3362,16 @@ export function listMembers(
     sql.exec<{ pubkey: string }>(`SELECT pubkey FROM admins`).toArray().map((r) => r.pubkey),
   );
   const activity = memberActivity(sql);
-  // One grouped read of the vault (idx_vault_pubkey), not one per member.
+  // One grouped read of the vault, not one per member. Counting the
+  // 'box' rows reads the rows themselves rather than idx_vault_pubkey
+  // alone: at most ten a member, so one row read per vault row.
   const vaultRows = new Map(
     sql
-      .exec<{ pubkey: string; n: number }>(`SELECT pubkey, COUNT(*) AS n FROM vault GROUP BY pubkey`)
+      .exec<{ pubkey: string; n: number; box: number }>(
+        `SELECT pubkey, COUNT(*) AS n, SUM(seal = 'box') AS box FROM vault GROUP BY pubkey`,
+      )
       .toArray()
-      .map((r) => [r.pubkey, r.n] as const),
+      .map((r) => [r.pubkey, r] as const),
   );
   const members = rows.map((r) => ({
     pubkey: r.pubkey,
@@ -3377,7 +3388,8 @@ export function listMembers(
       r.invited_by === null ||
       r.invited_by === r.pubkey ||
       (!present.has(r.invited_by) && r.invited_by !== owner),
-    restore: vaultRows.get(r.pubkey) ?? 0,
+    restore: vaultRows.get(r.pubkey)?.n ?? 0,
+    restoreBoxReadable: vaultRows.get(r.pubkey)?.box ?? 0,
     ...activity(r.pubkey),
   }));
   const removed = sql

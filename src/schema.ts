@@ -738,6 +738,14 @@ export const TABLES: readonly TableSpec[] = [
       col("added_at", "INTEGER NOT NULL"),
       col("updated_at", "INTEGER NOT NULL"),
       col("last_used_at", "INTEGER"),
+      // What the row is (v0.34). 'passkey': `blob` is the PRF-locked copy
+      // above. 'box': a passkey whose app gives no PRF (Bitwarden today),
+      // used only as a sign-in; `blob` is empty and vaultopen hands over
+      // the member's vouch copy instead (src/vouch.ts handOverToPhone), so
+      // this relay CAN open what it releases. Added with a constant
+      // default, so every row a deployed relay already holds is 'passkey'
+      // without a rebuild or a backfill.
+      col("seal", "TEXT NOT NULL DEFAULT 'passkey'"),
     ],
   },
   {

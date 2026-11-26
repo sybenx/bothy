@@ -282,6 +282,7 @@ describe("answering a request", () => {
         push: true,
         waiting: 0,
         restore: 0,
+        restoreBoxReadable: 0,
       },
     ]);
   });
