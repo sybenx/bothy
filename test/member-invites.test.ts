@@ -1,5 +1,5 @@
 // Members making their own invites (nip86.ts createinvite from a member,
-// myinvites): five people each, three steps from the owner, the owner and
+// myinvites): INVITES_PER_MEMBER_DEFAULT people each, three steps from the owner, the owner and
 // admins unlimited.
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
@@ -69,24 +69,25 @@ describe("a member's allowance", () => {
   it(`is ${INVITES_PER_MEMBER_DEFAULT} people, counted whether the code was used or not`, async () => {
     const { a } = await chain();
     // a has spent one slot on b already.
-    expect(await myinvites(a)).toEqual({ left: 4, limit: 5, depth: 1, canInvite: true });
-    for (let i = 0; i < 4; i++) await codeFrom(a);
+    const n = INVITES_PER_MEMBER_DEFAULT;
+    expect(await myinvites(a)).toEqual({ left: n - 1, limit: n, depth: 1, canInvite: true });
+    for (let i = 0; i < n - 1; i++) await codeFrom(a);
     expect(await myinvites(a)).toEqual({
       left: 0,
-      limit: 5,
+      limit: n,
       depth: 1,
       canInvite: false,
-      reason: invitesUsedUpMessage(5),
+      reason: invitesUsedUpMessage(n),
     });
-    expect((await as(a, "createinvite")).error).toBe("createinvite: you have used all 5 of your invites");
+    expect((await as(a, "createinvite")).error).toBe(`createinvite: you have used all ${n} of your invites`);
   });
 
   it("gets a slot back for a revoked code, but not for a used one", async () => {
     const { a } = await chain();
     const spare = await codeFrom(a);
-    expect((await myinvites(a)).left).toBe(3);
+    expect((await myinvites(a)).left).toBe(INVITES_PER_MEMBER_DEFAULT - 2);
     expect((await as(a, "revokeinvite", [spare])).result).toBe(true);
-    expect((await myinvites(a)).left).toBe(4);
+    expect((await myinvites(a)).left).toBe(INVITES_PER_MEMBER_DEFAULT - 1);
   });
 
   it("gets a slot back when an unused code expires", async () => {
@@ -95,17 +96,18 @@ describe("a member's allowance", () => {
     await runInDurableObject(env.RELAY.get(env.RELAY.idFromName("relay")), (_i: Relay, state) => {
       state.storage.sql.exec(`UPDATE member_invites SET expires_at = 1 WHERE code = ?`, lapsed);
     });
-    expect((await myinvites(a)).left).toBe(4);
+    expect((await myinvites(a)).left).toBe(INVITES_PER_MEMBER_DEFAULT - 1);
   });
 
   it("counts every person a code may admit, and says how many are left", async () => {
     const a = await joinWith(await codeFrom(null));
     await codeFrom(a, [3]);
-    expect((await myinvites(a)).left).toBe(2);
-    expect((await as(a, "createinvite", [3])).error).toBe(
-      "createinvite: you have 2 invites left, so a code can admit at most 2 people",
+    const left = INVITES_PER_MEMBER_DEFAULT - 3;
+    expect((await myinvites(a)).left).toBe(left);
+    expect((await as(a, "createinvite", [left + 1])).error).toBe(
+      `createinvite: you have ${left} invites left, so a code can admit at most ${left} people`,
     );
-    expect((await as(a, "createinvite", [2])).result).toBeDefined();
+    expect((await as(a, "createinvite", [left])).result).toBeDefined();
   });
 
   it("is not spent by a join request that came through their link", async () => {
@@ -113,7 +115,7 @@ describe("a member's allowance", () => {
     const robin = randomKeypair();
     await as(robin, "requestjoin", [{ name: "Robin", via: a.pubkeyHex }]);
     await callManagement("approvejoin", [robin.pubkeyHex]);
-    expect((await myinvites(a)).left).toBe(5);
+    expect((await myinvites(a)).left).toBe(INVITES_PER_MEMBER_DEFAULT);
     const { members } = (await callManagement("listmembers")).result as {
       members: { pubkey: string; invitedBy: string }[];
     };
@@ -126,8 +128,8 @@ describe(`depth ${INVITE_DEPTH_DEFAULT}`, () => {
     const { a, b, c } = await chain();
     expect((await myinvites(b)).depth).toBe(2);
     expect(await myinvites(c)).toEqual({
-      left: 5,
-      limit: 5,
+      left: INVITES_PER_MEMBER_DEFAULT,
+      limit: INVITES_PER_MEMBER_DEFAULT,
       depth: 3,
       canInvite: false,
       reason: inviteDepthMessage(3),
@@ -146,7 +148,7 @@ describe(`depth ${INVITE_DEPTH_DEFAULT}`, () => {
     const { a, c } = await chain();
     await callManagement("unallowpubkey", [a.pubkeyHex]);
     // b now hangs from the owner, so c is two steps away and may invite.
-    expect(await myinvites(c)).toEqual({ left: 5, limit: 5, depth: 2, canInvite: true });
+    expect(await myinvites(c)).toEqual({ left: INVITES_PER_MEMBER_DEFAULT, limit: INVITES_PER_MEMBER_DEFAULT, depth: 2, canInvite: true });
   });
 });
 

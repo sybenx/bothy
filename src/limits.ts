@@ -835,7 +835,7 @@ export const NETWORK_RELAYS = ["wss://relay.primal.net", "wss://relay.damus.io",
 // a live code holds all its uses, a revoked or expired one only those
 // already used (storage.ts inviteSlotsUsed). "off" on either turns
 // member invites off, back to owner and admins only.
-export const INVITES_PER_MEMBER_DEFAULT = 5;
+export const INVITES_PER_MEMBER_DEFAULT = 50;
 export const INVITE_DEPTH_DEFAULT = 3;
 
 export function memberInviteLimits(env: Env): { perMember: number; depth: number } | null {
