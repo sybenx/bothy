@@ -38,6 +38,7 @@ import { lookupProfileCached } from "./profile-lookup";
 import { normalizeIp } from "./ip";
 import { normalizePubkey } from "./pubkey";
 import { relayStub } from "./relay-stub";
+import { OUTSIDER_SHUN_MS, SHUN_HEADER } from "./relay";
 import { cachedUpstreamVersion, describeUpdate, updateCheckEnabled } from "./upstream-version";
 
 export { Relay } from "./relay";
@@ -611,6 +612,37 @@ async function handleProfile(request: Request, env: Env): Promise<Response> {
   return json({ profile });
 }
 
+// Addresses the relay DO closed for sending what it refuses (relay.ts
+// noteOutsiderRefusal), remembered here in this isolate so their next
+// upgrades are turned away without waking the DO: each wake is a billed
+// request, and a client that is turned away tends to reconnect at once.
+// Best effort: another isolate asks the DO once and learns it too.
+const edgeShuns = new Map<string, number>();
+const EDGE_SHUNS_MAX = 1024;
+
+function shunnedAtEdge(ip: string): number {
+  const until = edgeShuns.get(ip);
+  if (until === undefined) return 0;
+  const left = until - Date.now();
+  if (left <= 0) {
+    edgeShuns.delete(ip);
+    return 0;
+  }
+  return Math.ceil(left / 1000);
+}
+
+function rememberShun(ip: string, seconds: number): void {
+  if (edgeShuns.size >= EDGE_SHUNS_MAX) edgeShuns.clear();
+  edgeShuns.set(ip, Date.now() + Math.min(seconds, OUTSIDER_SHUN_MS / 1000) * 1000);
+}
+
+function shunResponse(seconds: number): Response {
+  return new Response("too many refused messages; try again later", {
+    status: 429,
+    headers: { "Retry-After": String(seconds), [SHUN_HEADER]: String(seconds) },
+  });
+}
+
 // The routing table, separate from `fetch` so the exhaustion wrapper there
 // covers it.
 async function route(request: Request, env: Env): Promise<Response> {
@@ -652,7 +684,13 @@ async function route(request: Request, env: Env): Promise<Response> {
     // connect-and-drop loop. Connects are limited, not staying connected.
     const limited = await rateLimited(env.RATE_LIMIT_API, request);
     if (limited !== null) return limited;
-    return relayStub(env).fetch(request);
+    const ip = normalizeIp(request.headers.get("CF-Connecting-IP") ?? "unknown");
+    const shun = shunnedAtEdge(ip);
+    if (shun > 0) return shunResponse(shun);
+    const response = await relayStub(env).fetch(request);
+    const told = Number(response.headers.get(SHUN_HEADER));
+    if (response.status === 429 && told > 0) rememberShun(ip, told);
+    return response;
   }
 
   const photos = await routePhotos(request, env, url);

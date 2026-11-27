@@ -323,7 +323,33 @@ interface ConnState {
   // attachment without them still parses.
   connectedAt?: number;
   reqs?: number;
+  // Who is talking, for the frame census (noteFrame): the first
+  // characters of the User-Agent, or the cf-worker zone for a request
+  // from another Cloudflare Worker.
+  agent?: string;
 }
+
+// Frame census (Relay.noteFrame): every CENSUS_EVERY frames, one log line
+// with the busiest senders in that stretch, by frame type, subscription id
+// shape (or event kind), signed-in pubkey prefix and agent, so a live tail
+// names whatever floods the relay. Memory only and log only: nothing
+// stored, nothing on the public /api/stats.
+export const CENSUS_EVERY = 5000;
+const CENSUS_TOP = 8;
+const CENSUS_KEYS_MAX = 512;
+
+// The shape of a subscription id with its numbers masked: DMs web `s<n>`,
+// Android `<prefix>-<n>`, the service worker's `p`, Pinket's `grp-...`.
+function subShape(id: unknown): string {
+  if (typeof id !== "string") return "-";
+  return id.slice(0, 24).replace(/[0-9a-f]{8,}/g, "#").replace(/\d+/g, "N");
+}
+
+// A connection whose frames keep being throttled is closed (Relay
+// isRateLimited): past this many times its allowance in one window it is a
+// loop, not a burst, and each throttled frame is still a billed message
+// plus a reply.
+const THROTTLED_CLOSE_FACTOR = 2;
 
 function getState(ws: WebSocket): ConnState {
   return (ws.deserializeAttachment() as ConnState | null) ?? { ip: "unknown", host: "unknown", subs: {} };
@@ -358,6 +384,35 @@ function stateFits(state: ConnState): boolean {
 const RATE_LIMIT_WINDOW_MS = 10_000;
 const RATE_LIMIT_MAX_MESSAGES = 50;
 const MEMBER_RATE_LIMIT_MAX_MESSAGES = 200;
+
+// Refused messages from a connection that is not signed in as the owner or
+// a member (Relay.noteOutsiderRefusal). Every frame that reaches the DO is
+// billed, and the throttle above only changes the reply: a client that
+// keeps sending what this home will never take (an outside relay
+// re-broadcasting the network's notes, a crawler re-asking for what is
+// refused) costs one message in and one reply out each, all day. Past
+// OUTSIDER_REFUSALS_MAX refusals in OUTSIDER_REFUSALS_WINDOW_MS the socket
+// is closed and its address is turned away at the upgrade for
+// OUTSIDER_SHUN_MS (in memory, like the throttle). Nothing a member's app
+// or a stranger's mail does comes near it: a stranger's gift wraps are
+// capped at a few a minute and are taken, not refused, and auth-required
+// and duplicate answers do not count.
+export const OUTSIDER_REFUSALS_WINDOW_MS = 60_000;
+export const OUTSIDER_REFUSALS_MAX = 30;
+export const OUTSIDER_SHUN_MS = 15 * 60_000;
+const OUTSIDER_TRACKED_MAX = 1024;
+// The close code for it (RFC 6455 1008, policy violation) and the header
+// the Worker reads to turn the address away itself (index.ts).
+export const OUTSIDER_CLOSE_CODE = 1008;
+export const SHUN_HEADER = "X-Bothy-Shun";
+
+// Set by ok() and Relay.refuse() when the reply refuses something for good
+// (not auth-required, not a duplicate); read and reset around each frame
+// in webSocketMessageInner, which runs synchronously.
+let refusedThisFrame = false;
+function countsAsRefusal(message: string): boolean {
+  return !message.startsWith("auth-required") && !message.startsWith("duplicate");
+}
 
 // How long a "this signed-in pubkey is the owner or a member" verdict is
 // reused (Relay.signedInMember), so the frame throttle does not pay a
@@ -396,6 +451,7 @@ function send(ws: WebSocket, message: unknown[]): void {
 }
 
 function ok(ws: WebSocket, id: string, accepted: boolean, message: string): void {
+  if (!accepted && countsAsRefusal(message)) refusedThisFrame = true;
   send(ws, ["OK", id, accepted, message]);
 }
 
@@ -444,6 +500,10 @@ function readsOnlyOwnMail(filter: Filter, pubkey: string): boolean {
 export class Relay extends DurableObject<Env> {
   // Per-IP message throttle state (RATE_LIMIT_* above).
   private rateLimits = new Map<string, { windowStart: number; count: number }>();
+  // OUTSIDER_REFUSALS_*: refusals per address, and addresses turned away
+  // until a time (ms).
+  private outsiderRefusals = new Map<string, { windowStart: number; count: number }>();
+  private shunned = new Map<string, number>();
 
   // Gift wrap throttle (limits.ts GIFT_WRAP_RATE_LIMIT_WINDOW_MS,
   // maxGiftWrapsPerIp, maxGiftWrapsPerMember): per IP for anyone not
@@ -554,6 +614,16 @@ export class Relay extends DurableObject<Env> {
     if (blocked) {
       return new Response("blocked", { status: 403 });
     }
+    // An address closed for sending what this home refuses
+    // (noteOutsiderRefusal): turned away before a socket exists. The
+    // header lets the Worker turn it away too, without waking the DO.
+    const shun = this.shunnedFor(request.headers.get("CF-Connecting-IP") ?? "unknown");
+    if (shun > 0) {
+      return new Response("too many refused messages; try again later", {
+        status: 429,
+        headers: { "Retry-After": String(shun), [SHUN_HEADER]: String(shun) },
+      });
+    }
 
     const pair = new WebSocketPair();
     const client = pair[0];
@@ -587,6 +657,7 @@ export class Relay extends DurableObject<Env> {
       subs: {},
       connectedAt: Date.now(),
       reqs: 0,
+      agent: (request.headers.get("cf-worker") ? "worker:" + request.headers.get("cf-worker") : request.headers.get("User-Agent") ?? "-").slice(0, 40),
     });
 
     return new Response(null, { status: 101, webSocket: client });
@@ -1440,12 +1511,93 @@ export class Relay extends DurableObject<Env> {
     // The live feed is push-only and carries a LiveFeedState, not a
     // ConnState, so anything it sends is ignored before frame parsing.
     if (this.ctx.getTags(ws).includes(LIVE_FEED_TAG)) return;
+    // Frames already in flight when this side closed the socket
+    // (noteOutsiderRefusal): nothing may be sent on it any more.
+    if (ws.readyState !== WebSocket.OPEN) return;
 
-    if (this.isRateLimited(ws)) {
+    this.noteFrame(ws, message);
+    refusedThisFrame = false;
+    const limited = this.isRateLimited(ws);
+    if (limited !== false) {
       this.handleRateLimitedMessage(ws, message);
+      refusedThisFrame = true;
+      if (limited === "close") {
+        try {
+          ws.close(OUTSIDER_CLOSE_CODE, "rate-limited: too many messages; reconnect later");
+        } catch {
+          /* already closing */
+        }
+      }
+    } else {
+      this.handleFrame(ws, message);
+    }
+    if (refusedThisFrame) {
+      refusedThisFrame = false;
+      const state = getState(ws);
+      if (this.signedInMember(state, "connect") === null) this.noteOutsiderRefusal(ws, state.ip);
+    }
+  }
+
+  private census = new Map<string, number>();
+  private censusFrames = 0;
+  private censusSince = Date.now();
+
+  // CENSUS_EVERY: counts this frame under its sender's key, and logs the
+  // busiest keys once the stretch is full.
+  private noteFrame(ws: WebSocket, message: string): void {
+    const state = getState(ws);
+    const type = /^\s*\[\s*"([A-Z]{1,8})"/.exec(message)?.[1] ?? "?";
+    let sub = "-";
+    if (type === "REQ" || type === "CLOSE") sub = subShape(/^\s*\[\s*"[A-Z]+"\s*,\s*"([^"]{0,64})"/.exec(message)?.[1]);
+    else if (type === "EVENT") sub = "k" + (/"kind"\s*:\s*(\d+)/.exec(message)?.[1] ?? "?");
+    const who = state.authedPubkey ? state.authedPubkey.slice(0, 8) : "anon";
+    const key = `${type} ${sub} ${who} ${state.agent ?? "-"}`;
+    if (this.census.size < CENSUS_KEYS_MAX || this.census.has(key)) this.census.set(key, (this.census.get(key) ?? 0) + 1);
+    if (++this.censusFrames < CENSUS_EVERY) return;
+    const top = [...this.census.entries()].sort((a, b) => b[1] - a[1]).slice(0, CENSUS_TOP);
+    console.log(
+      JSON.stringify({ census: { frames: this.censusFrames, seconds: Math.round((Date.now() - this.censusSince) / 1000), sockets: this.ctx.getWebSockets().length, top } }),
+    );
+    this.census.clear();
+    this.censusFrames = 0;
+    this.censusSince = Date.now();
+  }
+
+  // OUTSIDER_REFUSALS_MAX: one more refusal for `ip`; past the cap, this
+  // socket closes and the address is turned away at the upgrade for a while.
+  private noteOutsiderRefusal(ws: WebSocket, ip: string): void {
+    const now = Date.now();
+    const entry = this.outsiderRefusals.get(ip);
+    if (!entry || now - entry.windowStart >= OUTSIDER_REFUSALS_WINDOW_MS) {
+      if (this.outsiderRefusals.size >= OUTSIDER_TRACKED_MAX) this.outsiderRefusals.clear();
+      this.outsiderRefusals.set(ip, { windowStart: now, count: 1 });
       return;
     }
+    entry.count++;
+    if (entry.count <= OUTSIDER_REFUSALS_MAX) return;
+    this.outsiderRefusals.delete(ip);
+    if (this.shunned.size >= OUTSIDER_TRACKED_MAX) this.shunned.clear();
+    this.shunned.set(ip, now + OUTSIDER_SHUN_MS);
+    try {
+      ws.close(OUTSIDER_CLOSE_CODE, "too many refused messages; this relay takes events from its members");
+    } catch {
+      /* already closing */
+    }
+  }
 
+  // Seconds `ip` is still turned away for, or 0.
+  private shunnedFor(ip: string): number {
+    const until = this.shunned.get(ip);
+    if (until === undefined) return 0;
+    const left = until - Date.now();
+    if (left <= 0) {
+      this.shunned.delete(ip);
+      return 0;
+    }
+    return Math.ceil(left / 1000);
+  }
+
+  private handleFrame(ws: WebSocket, message: string): void {
     let frame: unknown;
     try {
       frame = JSON.parse(message);
@@ -1480,7 +1632,7 @@ export class Relay extends DurableObject<Env> {
   // current window (RATE_LIMIT_* above): per signed-in pubkey for the
   // owner and members, per IP for everyone else. The two kinds of key
   // cannot collide: an IP never starts with "member:".
-  private isRateLimited(ws: WebSocket): boolean {
+  private isRateLimited(ws: WebSocket): boolean | "close" {
     const state = getState(ws);
     const member = this.signedInMember(state, "connect");
     const key = member === null ? state.ip : `member:${member}`;
@@ -1492,6 +1644,7 @@ export class Relay extends DurableObject<Env> {
       return false;
     }
     entry.count++;
+    if (entry.count > max * THROTTLED_CLOSE_FACTOR) return "close";
     return entry.count > max;
   }
 
@@ -2856,6 +3009,7 @@ export class Relay extends DurableObject<Env> {
   // conn-metrics.ts can count refusals by reason.
   private refuse(ws: WebSocket, subId: string, reason: string): void {
     noteRefusal(reason);
+    if (countsAsRefusal(reason)) refusedThisFrame = true;
     send(ws, ["CLOSED", subId, reason]);
   }
 
