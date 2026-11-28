@@ -12,7 +12,7 @@ import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
 import { OWNER_SECRET_KEY_HEX } from "./helpers/keys";
 import { connectRelay } from "./helpers/socket";
-import { OUTSIDER_CLOSE_CODE, OUTSIDER_REFUSALS_MAX, SHUN_HEADER } from "../src/relay";
+import { OUTSIDER_CLOSE_CODE, OUTSIDER_REFUSALS_MAX, OUTSIDER_SHUN_MS, REPEAT_SHUN_MS, SHUN_HEADER } from "../src/relay";
 
 isolateStorage();
 
@@ -96,5 +96,45 @@ describe("refused messages from outside the home", () => {
       }
     }
     expect((await closed).code).toBe(OUTSIDER_CLOSE_CODE);
+  });
+
+  it("turns a looping app's address away, for longer the second time, and keeps that in storage", async () => {
+    const ip = "198.51.100.74";
+    async function loopUntilClosed() {
+      const conn = await signedInOwner(ip);
+      const closed = (conn as unknown as { closed: Promise<{ code: number }> }).closed;
+      for (let i = 0; i < 2 * 200 + 10; i++) {
+        try {
+          conn.send(["CLOSE", `loop-${i}`]);
+        } catch {
+          break;
+        }
+      }
+      expect((await closed).code).toBe(OUTSIDER_CLOSE_CODE);
+    }
+    await loopUntilClosed();
+    const first = await upgrade(ip);
+    expect(first.status).toBe(429);
+    const firstSeconds = Number(first.headers.get(SHUN_HEADER));
+    expect(firstSeconds).toBeGreaterThan(0);
+    expect(firstSeconds).toBeLessThanOrEqual(OUTSIDER_SHUN_MS / 1000);
+
+    // Saved, not only in memory: what a hibernated object wakes up to.
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    const { runInDurableObject } = await import("cloudflare:test");
+    const saved = await runInDurableObject(stub, (_i, state) => state.storage.kv.get<{ until: number; strikes: number }>(`shun:${ip}`));
+    expect(saved?.strikes).toBe(1);
+
+    // Its time runs out; it loops again the same day: two hours this time.
+    await runInDurableObject(stub, (instance, state) => {
+      (instance as unknown as { shunned: Map<string, number> }).shunned.clear();
+      const s = state.storage.kv.get<{ until: number; strikes: number; last: number }>(`shun:${ip}`)!;
+      state.storage.kv.put(`shun:${ip}`, { ...s, until: Date.now() - 1 });
+    });
+    await loopUntilClosed();
+    const second = await upgrade(ip);
+    expect(second.status).toBe(429);
+    expect(Number(second.headers.get(SHUN_HEADER))).toBeGreaterThan(OUTSIDER_SHUN_MS / 1000);
+    expect(Number(second.headers.get(SHUN_HEADER))).toBeLessThanOrEqual(REPEAT_SHUN_MS / 1000);
   });
 });

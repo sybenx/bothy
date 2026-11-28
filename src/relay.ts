@@ -401,6 +401,23 @@ export const OUTSIDER_REFUSALS_WINDOW_MS = 60_000;
 export const OUTSIDER_REFUSALS_MAX = 30;
 export const OUTSIDER_SHUN_MS = 15 * 60_000;
 const OUTSIDER_TRACKED_MAX = 1024;
+// An address turned away again within SHUN_STRIKE_MEMORY_MS of its last
+// time (a looping app that comes back as soon as it may) is turned away
+// for REPEAT_SHUN_MS. Both the owner's and members' sockets count here
+// when they loop (isRateLimited "close"): a looping app is broken, and each
+// of its frames is billed against the home's daily allowance. Shuns are
+// kept in the DO's storage, not only in memory, because the object
+// hibernates between bursts and would forget them: before this, a loop
+// that reconnected every 15 minutes still cost the whole day's allowance.
+export const REPEAT_SHUN_MS = 2 * 60 * 60_000;
+export const MAX_SHUN_MS = REPEAT_SHUN_MS;
+const SHUN_STRIKE_MEMORY_MS = 24 * 60 * 60_000;
+const SHUN_KEY_PREFIX = "shun:";
+interface StoredShun {
+  until: number;
+  strikes: number;
+  last: number;
+}
 // The close code for it (RFC 6455 1008, policy violation) and the header
 // the Worker reads to turn the address away itself (index.ts).
 export const OUTSIDER_CLOSE_CODE = 1008;
@@ -1522,6 +1539,7 @@ export class Relay extends DurableObject<Env> {
       this.handleRateLimitedMessage(ws, message);
       refusedThisFrame = true;
       if (limited === "close") {
+        this.shunAddress(getState(ws).ip);
         try {
           ws.close(OUTSIDER_CLOSE_CODE, "rate-limited: too many messages; reconnect later");
         } catch {
@@ -1576,8 +1594,7 @@ export class Relay extends DurableObject<Env> {
     entry.count++;
     if (entry.count <= OUTSIDER_REFUSALS_MAX) return;
     this.outsiderRefusals.delete(ip);
-    if (this.shunned.size >= OUTSIDER_TRACKED_MAX) this.shunned.clear();
-    this.shunned.set(ip, now + OUTSIDER_SHUN_MS);
+    this.shunAddress(ip);
     try {
       ws.close(OUTSIDER_CLOSE_CODE, "too many refused messages; this relay takes events from its members");
     } catch {
@@ -1585,9 +1602,46 @@ export class Relay extends DurableObject<Env> {
     }
   }
 
-  // Seconds `ip` is still turned away for, or 0.
+  // Turns `ip` away at the upgrade: OUTSIDER_SHUN_MS the first time,
+  // REPEAT_SHUN_MS when it comes back to it within a day. Kept in memory
+  // and in storage (StoredShun), so hibernation does not forget it. Rare
+  // (one write per shun), never per frame. Its sockets still open are left
+  // to the caller, which closes the one that tripped it.
+  private shunAddress(ip: string): void {
+    if (ip === "unknown") return;
+    const now = Date.now();
+    const key = SHUN_KEY_PREFIX + ip;
+    let prior: StoredShun | undefined;
+    try {
+      prior = this.ctx.storage.kv.get<StoredShun>(key);
+    } catch {
+      prior = undefined;
+    }
+    const strikes = prior && now - prior.last < SHUN_STRIKE_MEMORY_MS ? prior.strikes + 1 : 1;
+    const until = now + (strikes > 1 ? REPEAT_SHUN_MS : OUTSIDER_SHUN_MS);
+    if (this.shunned.size >= OUTSIDER_TRACKED_MAX) this.shunned.clear();
+    this.shunned.set(ip, until);
+    try {
+      this.ctx.storage.kv.put<StoredShun>(key, { until, strikes, last: now });
+    } catch {
+      /* memory still holds it */
+    }
+    console.log(JSON.stringify({ shun: { ip, strikes, minutes: Math.round((until - now) / 60_000) } }));
+  }
+
+  // Seconds `ip` is still turned away for, or 0. Memory first; storage
+  // when the object woke from hibernation and memory is empty. One read
+  // per upgrade, like the blockip check beside it.
   private shunnedFor(ip: string): number {
-    const until = this.shunned.get(ip);
+    let until = this.shunned.get(ip);
+    if (until === undefined) {
+      try {
+        until = this.ctx.storage.kv.get<StoredShun>(SHUN_KEY_PREFIX + ip)?.until;
+      } catch {
+        until = undefined;
+      }
+      if (until !== undefined && until > Date.now()) this.shunned.set(ip, until);
+    }
     if (until === undefined) return 0;
     const left = until - Date.now();
     if (left <= 0) {

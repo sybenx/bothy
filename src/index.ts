@@ -38,7 +38,7 @@ import { lookupProfileCached } from "./profile-lookup";
 import { normalizeIp } from "./ip";
 import { normalizePubkey } from "./pubkey";
 import { relayStub } from "./relay-stub";
-import { OUTSIDER_SHUN_MS, SHUN_HEADER } from "./relay";
+import { MAX_SHUN_MS, SHUN_HEADER } from "./relay";
 import { cachedUpstreamVersion, describeUpdate, updateCheckEnabled } from "./upstream-version";
 
 export { Relay } from "./relay";
@@ -633,7 +633,7 @@ function shunnedAtEdge(ip: string): number {
 
 function rememberShun(ip: string, seconds: number): void {
   if (edgeShuns.size >= EDGE_SHUNS_MAX) edgeShuns.clear();
-  edgeShuns.set(ip, Date.now() + Math.min(seconds, OUTSIDER_SHUN_MS / 1000) * 1000);
+  edgeShuns.set(ip, Date.now() + Math.min(seconds, MAX_SHUN_MS / 1000) * 1000);
 }
 
 function shunResponse(seconds: number): Response {
